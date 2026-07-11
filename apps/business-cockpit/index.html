@@ -1,0 +1,108 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>ArcheOS 经营驾驶舱</title>
+  <link rel="stylesheet" href="./styles.css" />
+</head>
+<body>
+  <div class="app-shell">
+    <aside class="sidebar">
+      <div class="brand">
+        <div class="brand-mark">◈</div>
+        <div><strong>ArcheOS</strong><span>Agent 经营控制与进化系统</span></div>
+      </div>
+      <nav>
+        <a class="active" href="#overview">经营驾驶舱</a>
+        <a href="#performance">业务表现</a>
+        <a href="#agents">Agent 贡献</a>
+        <a href="#skills">能力视图</a>
+        <a href="#evolution">进化中心</a>
+        <a href="#governance">治理规则</a>
+        <a href="#runtime">运行时管理</a>
+        <a href="#memory">知识与记忆</a>
+        <a href="#audit">审计日志</a>
+      </nav>
+      <div class="sidebar-footer">
+        <div><span>租户</span><strong id="sidebarTenant">Amazon US Store</strong></div>
+        <div><span>环境</span><strong>生产环境</strong></div>
+      </div>
+    </aside>
+
+    <main class="main-content">
+      <header class="topbar">
+        <label>当前租户
+          <select id="tenantSelect">
+            <option value="amazon">Amazon US Store</option>
+            <option value="showroom">黄鸿儒展厅</option>
+          </select>
+        </label>
+        <div class="top-actions"><button class="ghost">帮助</button><button class="ghost">通知 3</button><button class="avatar">经</button></div>
+      </header>
+
+      <section class="page-heading" id="overview">
+        <div><h1>经营驾驶舱</h1><p>从经营目标出发，观察业务结果、Agent 行为和系统进化。</p></div>
+        <div class="period">2026-06-01 ～ 2026-06-30</div>
+      </section>
+
+      <section class="kpi-grid" id="kpiGrid"></section>
+
+      <section class="layout-grid primary-grid">
+        <article class="card strategy-card">
+          <div class="card-header"><div><h2>经营目标与策略</h2><p>当前租户业务宪章的摘要</p></div><button id="editStrategyBtn" class="link-btn">编辑</button></div>
+          <div id="strategyContent"></div>
+        </article>
+
+        <article class="card chart-card" id="performance">
+          <div class="card-header"><div><h2>业务表现趋势</h2><p>业务指标，而不是 Runtime 技术指标</p></div><select><option>按日</option><option>按周</option></select></div>
+          <div class="legend"><span class="blue">销售额</span><span class="green">毛利润</span><span class="orange">现金流</span><span class="purple">广告效率</span></div>
+          <div class="chart" aria-label="业务趋势图">
+            <svg viewBox="0 0 700 260" role="img">
+              <g class="grid-lines"><line x1="40" y1="40" x2="680" y2="40"/><line x1="40" y1="95" x2="680" y2="95"/><line x1="40" y1="150" x2="680" y2="150"/><line x1="40" y1="205" x2="680" y2="205"/></g>
+              <polyline class="series sales" points="40,95 95,120 150,112 205,80 260,92 315,70 370,82 425,60 480,68 535,48 590,72 645,55"/>
+              <polyline class="series profit" points="40,150 95,138 150,146 205,128 260,132 315,116 370,126 425,104 480,112 535,96 590,108 645,92"/>
+              <polyline class="series cash" points="40,195 95,180 150,186 205,170 260,176 315,160 370,166 425,148 480,155 535,142 590,150 645,136"/>
+              <polyline class="series acos" points="40,215 95,210 150,218 205,204 260,212 315,198 370,206 425,196 480,202 535,190 590,198 645,188"/>
+            </svg>
+          </div>
+        </article>
+
+        <article class="card agent-card" id="agents">
+          <div class="card-header"><div><h2>Agent 贡献概览</h2><p>区分“Agent 做了什么”与“业务发生了什么”</p></div><button class="link-btn">详情</button></div>
+          <div id="agentTable" class="table-list"></div>
+        </article>
+      </section>
+
+      <section class="layout-grid secondary-grid">
+        <article class="card alert-card">
+          <div class="card-header"><div><h2>高风险预警</h2><p>需经营负责人关注</p></div><button class="link-btn">更多</button></div>
+          <div id="riskList" class="stack-list"></div>
+        </article>
+
+        <article class="card proposal-card" id="evolution">
+          <div class="card-header"><div><h2>进化建议</h2><p>先提出假设，再由人类审批</p></div><span class="badge">待审批 3</span></div>
+          <div id="proposalList" class="stack-list"></div>
+        </article>
+
+        <article class="card skill-card" id="skills">
+          <div class="card-header"><div><h2>能力状态概览</h2><p>由 Skill、工具可用性和 Evaluation 派生</p></div><button class="link-btn">详情</button></div>
+          <div id="skillTable" class="table-list"></div>
+        </article>
+      </section>
+    </main>
+  </div>
+
+  <dialog id="strategyDialog">
+    <form method="dialog">
+      <div class="dialog-header"><h2>编辑经营方向</h2><button value="cancel" class="close">×</button></div>
+      <label>首要目标<input id="primaryGoalInput" /></label>
+      <label>次级目标<input id="secondaryGoalInput" /></label>
+      <label>重大约束<textarea id="constraintInput" rows="4"></textarea></label>
+      <menu><button value="cancel" class="ghost">取消</button><button id="saveStrategyBtn" value="default" class="primary">保存草案</button></menu>
+    </form>
+  </dialog>
+
+  <script src="./app.js"></script>
+</body>
+</html>
