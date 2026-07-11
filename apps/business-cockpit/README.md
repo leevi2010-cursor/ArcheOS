@@ -1,21 +1,22 @@
 # ArcheOS Business Governance Cockpit
 
-这是 ArcheOS 的第一版经营驾驶舱前端原型。
+这是 ArcheOS 面向经营负责人的完整前端原型，属于 **Human Governance / Business Control Plane**。
 
-## 目标
+## 页面结构
 
-让经营负责人从业务视角看清：
-
-- 当前租户的经营方向与业务宪章；
-- 业务指标和趋势；
-- Agent 的贡献与采用率；
-- 高风险业务预警；
-- Skill / Capability View 的健康状态；
-- 需要人类审批的进化建议。
+- `#overview`：经营驾驶舱——目标、KPI、风险、Agent 贡献和进化建议总览；
+- `#performance`：业务表现——趋势、经营归因假设、异常指标和复盘问题；
+- `#agents`：Agent 贡献——职责、权限、采纳率、人工介入和资源加载情况；
+- `#capabilities`：能力视图——由 Skill、Tool、Policy 和 Evaluation 派生的覆盖矩阵；
+- `#evolution`：进化中心——从业务信号到实验、发布和回滚的闭环；
+- `#governance`：治理规则——平台规则、租户宪章、Agent Policy 与 Skill Defaults；
+- `#runtime`：执行面管理——可插拔 Runtime、Adapter、部署版本和业务级状态；
+- `#memory`：知识与记忆——Tolaria 对象、记忆生命周期和知识质量；
+- `#audit`：审计日志——决策、规则、发布、运行、审批和回滚记录。
 
 ## 运行
 
-这是一个零依赖静态原型：
+这是零依赖静态原型：
 
 ```bash
 cd apps/business-cockpit
@@ -24,32 +25,18 @@ python3 -m http.server 8080
 
 浏览器访问 `http://localhost:8080`。
 
-也可以直接打开 `index.html`。
+## 已实现交互
 
-## 当前实现
-
-- Amazon US Store 与黄鸿儒展厅两个 mock 租户；
-- 租户切换；
-- 业务 KPI、策略、Agent 贡献、预警、进化建议和能力状态；
+- Amazon US Store 与黄鸿儒展厅两个 mock 租户切换；
+- Hash 路由和九个主要页面；
 - 经营策略草案编辑；
-- 进化提案进入审批队列的演示交互；
-- 响应式桌面与窄屏布局。
+- 新建经营议题；
+- 进化提案进入审批队列；
+- 桌面和窄屏响应式布局。
 
-## 边界
+## 架构边界
 
-该目录只属于 **Human Governance / Business Control Plane**。
-
-它不负责：
-
-- Agent Runtime 的任务调度；
-- Skill 的真实安装和版本发布；
-- 业务数据采集；
-- 生产认证、权限和多租户隔离；
-- 自动修改 Skill 或经营策略。
-
-## 后续接口建议
-
-前端未来通过 ArcheOS Control Plane API 获取数据，不直接连接 Hermes 或业务数据库：
+前端未来只连接 ArcheOS Control Plane API，不直接连接 Hermes、Codex、Tolaria 或业务数据库：
 
 ```text
 Business Cockpit
@@ -58,12 +45,19 @@ ArcheOS Control Plane API
       ├── Tenant Constitution
       ├── Business Metrics
       ├── Agent Contribution
-      ├── Evolution Proposals
-      └── Capability View
+      ├── Skill / Capability View
+      ├── Evolution & Governance
+      ├── Runtime Inventory
+      ├── Knowledge References
+      └── Audit Events
              ↓
-Runtime Adapters / Business Data Connectors
+Runtime Adapters / Tolaria Adapter / Business Data Connectors
 ```
 
-建议后续迁移到 React + TypeScript 时保持 `apps/business-cockpit/` 作为应用边界。
+本原型不负责生产认证、多租户数据隔离、真实 Skill 发布、Runtime 调度或自动修改经营策略。
+
+## 后续工程化建议
+
+保留 `apps/business-cockpit/` 应用边界，下一阶段迁移至 React + TypeScript，并将页面拆为独立 route、feature 和 API client。迁移前先确定 Control Plane API contract，避免前端直接耦合具体 Runtime。
 
 关联 Issue：#2
