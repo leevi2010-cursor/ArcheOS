@@ -1,148 +1,26 @@
-const tenants = {
-  amazon: {
-    name: "Amazon US Store",
-    kpis: [
-      ["总销售额", "$1,234,567", "↑ 12.5%", true],
-      ["毛利润", "$234,567", "↑ 8.3%", true],
-      ["现金流（30天）", "$123,456", "↑ 15.2%", true],
-      ["ACoS", "18.7%", "↑ 2.1pp", false],
-      ["库存周转天数", "58 天", "↓ 6 天", true],
-      ["高风险预警", "3 项", "↑ 1 项", false]
-    ],
-    strategy: {
-      primary: "现金流安全",
-      primaryDesc: "确保现金流稳定，保障库存与运营安全。",
-      secondary: "利润增长",
-      secondaryDesc: "在毛利率不低于 15% 的前提下增长利润。",
-      cycle: "2026 Q3",
-      owner: "经营负责人",
-      constraints: ["库存周转天数不超过 90 天", "单日广告预算调整不得超过 ±20%", "高风险动作需经营负责人审批"]
-    },
-    agents: [
-      ["广告优化师", "广告投放优化", "$45,678", 82],
-      ["选品分析师", "选品与机会发现", "$32,456", 74],
-      ["库存管理师", "库存健康管理", "$18,765", 68],
-      ["Listing 优化师", "Listing 优化", "$12,345", 62],
-      ["客服助手", "客户服务与回复", "$5,678", 55]
-    ],
-    risks: [
-      ["现金流风险", "现金余额预计将在 6 天后低于安全线。", "高"],
-      ["库存积压风险", "SKU B07XYZ 库存周转天数已达 85 天。", "中"],
-      ["广告 ACoS 异常", "关键词 running shoes 的 ACoS 上升异常。", "中"]
-    ],
-    proposals: [
-      ["增强广告优化师的现金流约束感知", "当前广告优化建议未充分考虑现金流约束，建议在 Skill 中加入现金流上下文。", "预计收益：$8,000+/月"],
-      ["优化库存预测模型的季节性修正", "库存预测在季节性波动期间偏高，建议引入季节性因子。", "预计收益：$3,200+/月"],
-      ["调整 Listing 优化评价权重", "当前评价更偏重关键词密度，建议提高转化率权重。", "预计收益：$1,200+/月"]
-    ],
-    skills: [
-      ["广告优化", "稳定", 87, "2026-06-10"],
-      ["选品分析", "稳定", 82, "2026-06-12"],
-      ["库存预测", "实验中", 63, "2026-06-18"],
-      ["财务预测", "实验中", 58, "2026-06-20"],
-      ["市场情报", "未覆盖", 0, "—"]
-    ]
-  },
-  showroom: {
-    name: "黄鸿儒展厅",
-    kpis: [
-      ["有效客流", "386", "↑ 9.4%", true],
-      ["成交金额", "¥1,086,000", "↑ 11.8%", true],
-      ["毛利润", "¥284,000", "↑ 7.1%", true],
-      ["到店转化率", "24.6%", "↓ 1.2pp", false],
-      ["平均跟进时长", "2.8 天", "↓ 0.7 天", true],
-      ["高风险预警", "2 项", "持平", true]
-    ],
-    strategy: {
-      primary: "客户转化质量",
-      primaryDesc: "提升有效客户识别和持续跟进质量，而非单纯追求客流。",
-      secondary: "组织能力沉淀",
-      secondaryDesc: "把店长、导购和客户运营经验沉淀为可复用方法。",
-      cycle: "2026 Q3",
-      owner: "黄鸿儒 / 项目负责人",
-      constraints: ["不得牺牲客户体验换取短期成交", "高价值客户必须由人类负责人参与", "新增流程先小范围验证再推广"]
-    },
-    agents: [
-      ["客户运营助手", "线索分层与跟进", "¥126,000", 78],
-      ["店长助手", "经营复盘与任务推进", "¥88,000", 71],
-      ["导购教练", "话术与案例辅导", "¥65,000", 66],
-      ["内容助手", "内容计划与素材整理", "¥42,000", 59]
-    ],
-    risks: [
-      ["高价值客户流失", "7 位高意向客户超过 3 天未完成关键跟进。", "高"],
-      ["转化率下降", "客流增加但到店转化率连续两周下降。", "中"]
-    ],
-    proposals: [
-      ["调整客户分层规则", "当前模型过度依赖预算字段，建议加入空间进度和决策链完整度。", "预计提升转化率 2–4pp"],
-      ["增加店长周复盘 Skill", "将客户、人员、陈列和活动问题统一进入周复盘。", "预计减少遗漏 30%"],
-      ["建立导购案例评价集", "将优秀与失败案例结构化，用于持续校准导购教练。", "提升辅导一致性"]
-    ],
-    skills: [
-      ["客户分层", "稳定", 81, "2026-06-09"],
-      ["跟进建议", "实验中", 69, "2026-06-15"],
-      ["店长复盘", "实验中", 61, "2026-06-20"],
-      ["导购辅导", "实验中", 57, "2026-06-21"],
-      ["活动归因", "未覆盖", 0, "—"]
-    ]
-  }
-};
-
-const el = id => document.getElementById(id);
-const spark = (positive = true) => `<svg class="spark" viewBox="0 0 120 28"><polyline fill="none" stroke="${positive ? '#356df3' : '#e64646'}" stroke-width="2" points="0,22 12,18 24,20 36,12 48,15 60,7 72,14 84,5 96,11 108,4 120,9"/></svg>`;
-
-function render(key) {
-  const data = tenants[key];
-  el("sidebarTenant").textContent = data.name;
-  el("kpiGrid").innerHTML = data.kpis.map(([label, value, delta, good]) => `
-    <article class="kpi"><div class="label">${label}</div><div class="value">${value}</div><div class="delta ${good ? 'positive' : 'negative'}">${delta}</div>${spark(good)}</article>`).join("");
-
-  const s = data.strategy;
-  el("strategyContent").innerHTML = `
-    <div class="strategy-block"><strong>首要目标 · ${s.primary}</strong><p>${s.primaryDesc}</p></div>
-    <div class="strategy-block secondary"><strong>次级目标 · ${s.secondary}</strong><p>${s.secondaryDesc}</p></div>
-    <div class="meta-list"><div><span>策略周期</span><strong>${s.cycle}</strong></div><div><span>最终裁决者</span><strong>${s.owner}</strong></div></div>
-    <div class="constraints"><strong>重大约束</strong><ul>${s.constraints.map(c => `<li>${c}</li>`).join("")}</ul></div>`;
-
-  el("agentTable").innerHTML = data.agents.map(([name, role, value, rate]) => `
-    <div class="table-row"><div><strong>${name}</strong><small>${role}</small></div><div><strong>${value}</strong><small>估算贡献</small></div><div>${rate}%<div class="progress"><span style="width:${rate}%"></span></div></div></div>`).join("");
-
-  el("riskList").innerHTML = data.risks.map(([title, desc, severity]) => `
-    <div class="list-item risk"><h3>${severity === '高' ? '🔥' : '⚠️'} ${title}</h3><p>${desc}</p><div class="item-footer"><span class="${severity === '高' ? 'severity-high' : 'severity-mid'}">影响：${severity}</span><button class="approve-btn">处理</button></div></div>`).join("");
-
-  el("proposalList").innerHTML = data.proposals.map(([title, desc, impact], index) => `
-    <div class="list-item"><h3>${title}</h3><p>${desc}</p><div class="item-footer"><span>${impact}</span><button class="approve-btn" data-proposal="${index}">查看提案</button></div></div>`).join("");
-
-  el("skillTable").innerHTML = data.skills.map(([name, status, health, date]) => `
-    <div class="table-row"><div><strong>${name}</strong><small>Capability View</small></div><div><strong>${status}</strong><small>最近变更 ${date}</small></div><div>${health ? `${health}%<div class="progress"><span style="width:${health}%"></span></div>` : '—'}</div></div>`).join("");
-}
-
-el("tenantSelect").addEventListener("change", event => render(event.target.value));
-
-const dialog = el("strategyDialog");
-el("editStrategyBtn").addEventListener("click", () => {
-  const s = tenants[el("tenantSelect").value].strategy;
-  el("primaryGoalInput").value = s.primary;
-  el("secondaryGoalInput").value = s.secondary;
-  el("constraintInput").value = s.constraints.join("\n");
-  dialog.showModal();
-});
-
-el("saveStrategyBtn").addEventListener("click", event => {
-  event.preventDefault();
-  const key = el("tenantSelect").value;
-  const s = tenants[key].strategy;
-  s.primary = el("primaryGoalInput").value.trim() || s.primary;
-  s.secondary = el("secondaryGoalInput").value.trim() || s.secondary;
-  s.constraints = el("constraintInput").value.split("\n").map(x => x.trim()).filter(Boolean);
-  dialog.close();
-  render(key);
-});
-
-document.addEventListener("click", event => {
-  const button = event.target.closest("[data-proposal]");
-  if (!button) return;
-  button.textContent = "已进入审批队列";
-  button.disabled = true;
-});
-
-render("amazon");
+const tenants={amazon:{name:'Amazon US Store',kpis:[['总销售额','$1,234,567','↑ 12.5%',1],['毛利润','$234,567','↑ 8.3%',1],['现金流（30天）','$123,456','↑ 15.2%',1],['ACoS','18.7%','↑ 2.1pp',0],['库存周转天数','58 天','↓ 6 天',1],['高风险预警','3 项','↑ 1 项',0]],strategy:{primary:'现金流安全',primaryDesc:'确保现金流稳定，保障库存与运营安全。',secondary:'利润增长',secondaryDesc:'在毛利率不低于 15% 的前提下增长利润。',cycle:'2026 Q3',owner:'经营负责人',constraints:['库存周转天数不超过 90 天','单日广告预算调整不得超过 ±20%','高风险动作需经营负责人审批']},agents:[['广告优化师','广告投放优化','$45,678',82,'稳定'],['选品分析师','选品与机会发现','$32,456',74,'稳定'],['库存管理师','库存健康管理','$18,765',68,'观察'],['Listing 优化师','Listing 优化','$12,345',62,'观察'],['客服助手','客户服务与回复','$5,678',55,'稳定']],risks:[['现金流风险','现金余额预计将在 6 天后低于安全线。','高'],['库存积压风险','SKU B07XYZ 库存周转天数已达 85 天。','中'],['广告 ACoS 异常','关键词 running shoes 的 ACoS 上升异常。','中']],proposals:[['增强广告优化师的现金流约束感知','当前广告建议未充分考虑现金流约束，建议在 Skill 中加入现金流上下文。','$8,000+/月'],['优化库存预测模型的季节性修正','库存预测在季节性波动期间偏高，建议引入季节性因子。','$3,200+/月'],['调整 Listing 优化评价权重','当前评价偏重关键词密度，建议提高转化率权重。','$1,200+/月']],skills:[['广告优化','amazon-ads-optimizer','稳定',87,'Amazon Ads API'],['选品分析','product-research','稳定',82,'market-data'],['库存预测','inventory-forecast','实验中',63,'inventory-api'],['财务预测','cashflow-forecast','实验中',58,'finance-ledger'],['市场情报','market-intelligence','未覆盖',0,'—']],runtimes:[['Hermes · amazon-prod-01','在线','v0.9.4','12','99.2%'],['Codex Builder','按需','gpt-5.6','2','97.8%'],['Hermes · amazon-shadow','暂停','v0.9.4','0','—']],memories:[['业务宪章','Tenant Constitution','2026-06-28','已批准'],['Amazon 广告优化协议','Protocol','2026-06-26','稳定'],['现金流风险复盘 2026-06','Decision','2026-06-24','已沉淀'],['Listing 转化案例集','Tutorial / Cases','2026-06-21','更新中']]},showroom:{name:'黄鸿儒展厅',kpis:[['有效客流','386','↑ 9.4%',1],['成交金额','¥1,086,000','↑ 11.8%',1],['毛利润','¥284,000','↑ 7.1%',1],['到店转化率','24.6%','↓ 1.2pp',0],['平均跟进时长','2.8 天','↓ 0.7 天',1],['高风险预警','2 项','持平',1]],strategy:{primary:'客户转化质量',primaryDesc:'提升有效客户识别和持续跟进质量，而非单纯追求客流。',secondary:'组织能力沉淀',secondaryDesc:'把店长、导购和客户运营经验沉淀为可复用方法。',cycle:'2026 Q3',owner:'黄鸿儒 / 项目负责人',constraints:['不得牺牲客户体验换取短期成交','高价值客户必须由人类负责人参与','新增流程先小范围验证再推广']},agents:[['客户运营助手','线索分层与跟进','¥126,000',78,'稳定'],['店长助手','经营复盘与任务推进','¥88,000',71,'稳定'],['导购教练','话术与案例辅导','¥65,000',66,'观察'],['内容助手','内容计划与素材整理','¥42,000',59,'观察']],risks:[['高价值客户流失','7 位高意向客户超过 3 天未完成关键跟进。','高'],['转化率下降','客流增加但到店转化率连续两周下降。','中']],proposals:[['调整客户分层规则','当前模型过度依赖预算字段，建议加入空间进度和决策链完整度。','转化率 +2–4pp'],['增加店长周复盘 Skill','将客户、人员、陈列和活动问题统一进入周复盘。','遗漏 -30%'],['建立导购案例评价集','将优秀与失败案例结构化，用于持续校准导购教练。','一致性提升']],skills:[['客户分层','lead-segmentation','稳定',81,'crm-data'],['跟进建议','follow-up-advisor','实验中',69,'tenant-policy'],['店长复盘','manager-review','实验中',61,'meeting-notes'],['导购辅导','sales-coach','实验中',57,'case-library'],['活动归因','event-attribution','未覆盖',0,'—']],runtimes:[['Hermes · showroom-prod','在线','v0.9.4','8','98.7%'],['Codex Builder','按需','gpt-5.6','1','99.0%']],memories:[['展厅经营宪章','Tenant Constitution','2026-06-29','草案'],['客户分层协议','Protocol','2026-06-25','稳定'],['高价值客户流失复盘','Decision','2026-06-23','已沉淀'],['优秀导购案例集','Tutorial / Cases','2026-06-19','更新中']]}};
+const $=id=>document.getElementById(id);let tenantKey='amazon';
+const spark=g=>`<svg class="spark" viewBox="0 0 120 28"><polyline fill="none" stroke="${g?'#356df3':'#e64646'}" stroke-width="2" points="0,22 12,18 24,20 36,12 48,15 60,7 72,14 84,5 96,11 108,4 120,9"/></svg>`;
+const heading=(t,d,a='<div class="period">2026-06-01 ～ 2026-06-30</div>')=>`<section class="page-heading"><div><h1>${t}</h1><p>${d}</p></div>${a}</section>`;
+const kpis=d=>`<section class="kpi-grid">${d.kpis.map(([l,v,x,g])=>`<article class="kpi"><div class="label">${l}</div><div class="value">${v}</div><div class="delta ${g?'positive':'negative'}">${x}</div>${spark(g)}</article>`).join('')}</section>`;
+const strategy=d=>`<div class="strategy-block"><strong>首要目标 · ${d.strategy.primary}</strong><p>${d.strategy.primaryDesc}</p></div><div class="strategy-block secondary"><strong>次级目标 · ${d.strategy.secondary}</strong><p>${d.strategy.secondaryDesc}</p></div><div class="meta-list"><div><span>策略周期</span><strong>${d.strategy.cycle}</strong></div><div><span>最终裁决者</span><strong>${d.strategy.owner}</strong></div></div><div class="constraints"><strong>重大约束</strong><ul>${d.strategy.constraints.map(x=>`<li>${x}</li>`).join('')}</ul></div>`;
+const chart=()=>`<div class="legend"><span class="blue">销售额</span><span class="green">毛利润</span><span class="orange">现金流</span><span class="purple">效率</span></div><div class="chart"><svg viewBox="0 0 700 260"><g class="grid-lines"><line x1="40" y1="40" x2="680" y2="40"/><line x1="40" y1="95" x2="680" y2="95"/><line x1="40" y1="150" x2="680" y2="150"/><line x1="40" y1="205" x2="680" y2="205"/></g><polyline class="series sales" points="40,95 95,120 150,112 205,80 260,92 315,70 370,82 425,60 480,68 535,48 590,72 645,55"/><polyline class="series profit" points="40,150 95,138 150,146 205,128 260,132 315,116 370,126 425,104 480,112 535,96 590,108 645,92"/><polyline class="series cash" points="40,195 95,180 150,186 205,170 260,176 315,160 370,166 425,148 480,155 535,142 590,150 645,136"/><polyline class="series acos" points="40,215 95,210 150,218 205,204 260,212 315,198 370,206 425,196 480,202 535,190 590,198 645,188"/></svg></div>`;
+const agents=d=>d.agents.map(([n,r,v,p,s])=>`<div class="table-row"><div><strong>${n}</strong><small>${r}</small></div><div><strong>${v}</strong><small>估算贡献</small></div><div>${p}%<div class="progress"><span style="width:${p}%"></span></div></div><div><span class="status ${s==='稳定'?'stable':'test'}">${s}</span></div></div>`).join('');
+const risks=d=>d.risks.map(([t,x,s])=>`<div class="list-item risk"><h3>${s==='高'?'🔥':'⚠️'} ${t}</h3><p>${x}</p><div class="item-footer"><span class="${s==='高'?'severity-high':'severity-mid'}">影响：${s}</span><button class="approve-btn">处理</button></div></div>`).join('');
+const proposals=d=>d.proposals.map(([t,x,i],n)=>`<div class="list-item"><h3>${t}</h3><p>${x}</p><div class="item-footer"><span>${i}</span><button class="approve-btn" data-proposal="${n}">查看提案</button></div></div>`).join('');
+function overview(d){return `<div class="page">${heading('经营驾驶舱','从经营目标出发，观察业务结果、Agent 行为和系统进化。')}${kpis(d)}<section class="layout-grid grid-main"><article class="card"><div class="card-header"><div><h2>经营目标与策略</h2><p>当前租户业务宪章摘要</p></div><button class="link-btn" data-action="edit-strategy">编辑</button></div>${strategy(d)}</article><article class="card tall"><div class="card-header"><div><h2>业务表现趋势</h2><p>不以 Runtime 指标代替经营指标</p></div></div>${chart()}</article><article class="card"><div class="card-header"><div><h2>Agent 贡献概览</h2><p>区分贡献估算与业务事实</p></div></div><div class="table-list">${agents(d)}</div></article></section><section class="layout-grid grid-3"><article class="card"><h2>高风险预警</h2><div class="stack-list">${risks(d)}</div></article><article class="card"><h2>进化建议</h2><div class="stack-list">${proposals(d)}</div></article><article class="card"><h2>能力健康</h2><div class="table-list">${skillRows(d)}</div></article></section></div>`}
+function performance(d){return `<div class="page">${heading('业务表现','把业务指标、Agent 动作和外部环境放在同一分析视图中。','<div class="toolbar"><select><option>最近 30 天</option><option>本季度</option></select><button class="ghost">导出复盘</button></div>')}${kpis(d)}<section class="layout-grid grid-2"><article class="card tall"><h2>核心指标趋势</h2>${chart()}</article><article class="card tall"><h2>经营归因假设</h2><div class="timeline">${['利润改善与广告结构调整相关','现金流风险主要来自补货节奏','Agent 动作贡献仍需对照组'].map(x=>`<div class="timeline-item"><div class="timeline-dot"></div><div class="timeline-body"><h3>${x}</h3><p>当前为待验证假设，不作为最终因果结论。</p></div></div>`).join('')}</div></article></section><section class="layout-grid grid-3"><article class="card"><h2>目标达成度</h2><div class="metric-strip"><div class="metric-box">现金流安全<strong>72%</strong></div><div class="metric-box">利润增长<strong>81%</strong></div><div class="metric-box">库存健康<strong>68%</strong></div><div class="metric-box">风险控制<strong>76%</strong></div></div></article><article class="card"><h2>异常指标</h2><div class="stack-list">${risks(d)}</div></article><article class="card"><h2>建议复盘问题</h2><div class="list-item"><h3>增长是否透支现金流？</h3><p>建议经营负责人确认本周期目标权重。</p></div></article></section></div>`}
+function agentPage(d){return `<div class="page">${heading('Agent 贡献','查看业务 Agent 的目标、动作、权限、贡献和人工介入点。','<div class="toolbar"><button class="primary">新增 Agent 配置</button></div>')}<section class="layout-grid"><article class="card"><h2>Agent 组合</h2><div class="table-list">${agents(d)}</div></article></section><section class="layout-grid grid-3">${d.agents.slice(0,3).map(([n,r,v,p,s],i)=>`<article class="card"><div class="card-header"><div><h2>${n}</h2><p>${r}</p></div><span class="status ${s==='稳定'?'stable':'test'}">${s}</span></div><div class="meta-list"><div><span>本期贡献估算</span><strong>${v}</strong></div><div><span>建议采纳率</span><strong>${p}%</strong></div><div><span>自动执行权限</span><strong>${i===0?'受限写入':'只读'}</strong></div><div><span>Runtime</span><strong>Hermes</strong></div></div><div class="pill-row"><span class="pill">3 Skills</span><span class="pill">2 Policies</span><span class="pill">4 Tools</span></div></article>`).join('')}</section><section class="layout-grid grid-2"><article class="card"><h2>人工介入队列</h2><div class="list-item"><h3>预算调整超过 20%</h3><p>请求经营负责人审批。</p></div></article><article class="card"><h2>职责边界</h2><div class="policy-tree"><div class="policy-node">Agent：领域目标与决策协调</div><div class="policy-node agent">Skill：可复用执行方法</div><div class="policy-node skill">Tool：外部系统操作能力</div></div></article></section></div>`}
+function skillRows(d){return d.skills.map(([n,id,s,h])=>`<div class="table-row three"><div><strong>${n}</strong><small>${id}</small></div><div><span class="status ${s==='稳定'?'stable':s==='未覆盖'?'offline':'test'}">${s}</span></div><div>${h?`${h}%<div class="progress"><span style="width:${h}%"></span></div>`:'—'}</div></div>`).join('')}
+function capabilities(d){return `<div class="page">${heading('能力视图','Capability 是由已安装 Skill、Tool、Policy 与 Evaluation 派生的治理视图。','<div class="toolbar"><button class="ghost">同步 Registry</button><button class="primary">发布 Skill</button></div>')}<section class="layout-grid"><article class="card"><div class="matrix"><div class="head">能力 / Agent</div>${d.agents.slice(0,4).map(a=>`<div class="head">${a[0]}</div>`).join('')}${d.skills.map((s,i)=>`<div><strong>${s[0]}</strong><br><span class="muted">${s[1]}</span></div>${d.agents.slice(0,4).map((a,j)=>`<div class="${i===j||i<2?'yes':'partial'}">${i===j||i<2?'● 已具备':'◐ 部分'}</div>`).join('')}`).join('')}</div></article></section><section class="layout-grid grid-2"><article class="card"><h2>Skill Registry</h2><div class="table-list">${skillRows(d)}</div></article><article class="card"><h2>依赖与发布</h2><div class="policy-tree"><div class="policy-node">Package：tenant-agent@1.4.0</div><div class="policy-node tenant">Composite Skill：monthly-review</div><div class="policy-node agent">Atomic Skills：analysis / action / report</div><div class="policy-node skill">Tools：APIs / Files / DB</div></div><div class="constraints"><ul><li>优先引用固定版本，不复制分叉</li><li>安装前检测宿主 Policy 冲突</li><li>升级必须支持回滚</li></ul></div></article></section></div>`}
+function evolution(d){return `<div class="page">${heading('进化中心','把业务表现转化为有证据、可审批、可测试、可回滚的系统变更。','<div class="toolbar"><button class="primary">发起进化议题</button></div>')}<section class="layout-grid grid-2"><article class="card tall"><h2>进化建议队列</h2><div class="stack-list">${proposals(d)}</div></article><article class="card tall"><h2>进化闭环</h2><div class="timeline">${['业务信号与人类问题','诊断 Strategy / Policy / Skill / Data','形成可证伪的变更假设','Codex 创建 PR 与测试','Shadow / 小流量验证','批准发布或回滚'].map((x,i)=>`<div class="timeline-item"><div class="timeline-dot"></div><div class="timeline-body"><h3>${i+1}. ${x}</h3><p>保留证据、负责人、版本和决策记录。</p></div></div>`).join('')}</div></article></section><section class="layout-grid grid-3"><article class="card"><h2>正在实验</h2><div class="metric-strip"><div class="metric-box">实验数<strong>3</strong></div><div class="metric-box">成功<strong>1</strong></div><div class="metric-box">观察中<strong>2</strong></div><div class="metric-box">回滚<strong>0</strong></div></div></article><article class="card"><h2>变更风险</h2><div class="list-item risk"><h3>评价指标漂移</h3><p>优化短期利润可能损害长期品牌。</p></div></article><article class="card"><h2>发布通道</h2><div class="pill-row"><span class="pill">Draft</span><span class="pill">Shadow</span><span class="pill">Canary 10%</span><span class="pill">Stable</span><span class="pill">Rollback</span></div></article></section></div>`}
+function governance(d){return `<div class="page">${heading('治理规则','管理经营宪章、Agent Policy、Skill Defaults 及其作用域和冲突。','<div class="toolbar"><button class="ghost">查看冲突</button><button class="primary" data-action="edit-strategy">编辑租户宪章</button></div>')}<section class="layout-grid grid-2"><article class="card tall"><h2>规则层级</h2><div class="policy-tree"><div class="policy-node"><strong>Platform Constitution</strong><div class="muted">安全、隔离、审计、回滚、不静默覆盖</div></div><div class="policy-node tenant"><strong>Tenant Business Constitution</strong><div class="muted">${d.strategy.primary} / ${d.strategy.secondary}</div></div><div class="policy-node agent"><strong>Agent Policy</strong><div class="muted">权限、自动化边界、审批条件</div></div><div class="policy-node skill"><strong>Skill Defaults</strong><div class="muted">局部默认建议，可被上层覆盖</div></div></div></article><article class="card tall"><h2>当前租户宪章</h2>${strategy(d)}</article></section><section class="layout-grid grid-2"><article class="card"><h2>Policy 冲突</h2><div class="list-item risk"><h3>自动预算调整冲突</h3><p>宿主规则要求全部人工审批；Package 默认允许 10% 内自动调整。</p><div class="item-footer"><span>默认采用宿主规则</span><button class="approve-btn">解决</button></div></div></article><article class="card"><h2>规则变更原则</h2><ul class="muted"><li>租户宪章由租户负责人批准</li><li>Package 只能提供局部 Default 或 Requirement</li><li>冲突不得静默覆盖</li><li>保留版本、理由与回滚点</li></ul></article></section></div>`}
+function runtime(d){return `<div class="page">${heading('执行面管理','管理可插拔 Runtime 实例、部署版本和业务状态，不替代 Runtime 技术后台。','<div class="toolbar"><button class="primary">连接 Runtime</button></div>')}<section class="layout-grid grid-3">${d.runtimes.map(([n,s,v,a,u])=>`<article class="card runtime-card"><div><div class="card-header"><div><h2>${n}</h2><p>可插拔执行面</p></div></div><span class="status ${s==='在线'?'stable':s==='暂停'?'offline':'info'}">${s}</span><div class="runtime-meta"><div>版本<strong>${v}</strong></div><div>Agent 数<strong>${a}</strong></div><div>成功率<strong>${u}</strong></div></div></div><button class="ghost">管理</button></article>`).join('')}</section><section class="layout-grid grid-2"><article class="card tall"><h2>部署拓扑</h2><div class="policy-tree"><div class="policy-node">ArcheOS Control Plane</div><div class="policy-node tenant">Runtime Adapter Layer</div>${d.runtimes.map(x=>`<div class="policy-node agent">${x[0]} · ${x[1]}</div>`).join('')}<div class="policy-node skill">External Business Systems</div></div></article><article class="card tall"><h2>业务级运行观察</h2><div class="metric-strip"><div class="metric-box">今日任务<strong>42</strong></div><div class="metric-box">人工介入<strong>4</strong></div><div class="metric-box">失败任务<strong>2</strong></div><div class="metric-box">成本预算<strong>67%</strong></div></div><div class="constraints"><ul><li>ArcheOS 管理部署意图、版本与业务状态</li><li>Runtime 管理会话、Tool 调用、调度与技术日志</li><li>Adapter 负责契约转换与遥测回传</li></ul></div></article></section></div>`}
+function memory(d){return `<div class="page">${heading('知识与记忆','通过 Tolaria 与结构化引用提供租户知识、决策历史和长期上下文。','<div class="toolbar"><button class="ghost">同步 Tolaria</button><button class="primary">新建知识对象</button></div>')}<section class="layout-grid grid-2"><article class="card tall"><h2>知识对象</h2><div class="table-list">${d.memories.map(([n,t,date,s])=>`<div class="table-row three"><div><strong>${n}</strong><small>${t}</small></div><div><strong>${s}</strong><small>${date}</small></div><div><button class="link-btn">查看</button></div></div>`).join('')}</div></article><article class="card tall"><h2>记忆生命周期</h2><div class="timeline">${['运行事件与人类讨论','候选记忆与证据','人工确认 / 规则筛选','写入 Tolaria Type','被 Agent 按引用加载','过期、修订或废弃'].map(x=>`<div class="timeline-item"><div class="timeline-dot"></div><div class="timeline-body"><h3>${x}</h3><p>保留来源、作用域和版本。</p></div></div>`).join('')}</div></article></section><section class="layout-grid grid-3"><article class="card"><h2>Type 分布</h2><div class="pill-row"><span class="pill">Protocol 12</span><span class="pill">Decision 18</span><span class="pill">Tutorial 9</span><span class="pill">Case 37</span><span class="pill">Issue 14</span></div></article><article class="card"><h2>待沉淀</h2><div class="list-item"><h3>现金流讨论</h3><p>建议提升为经营 Decision。</p></div></article><article class="card"><h2>质量风险</h2><div class="list-item risk"><h3>3 条知识缺少来源</h3><p>禁止直接作为高风险决策依据。</p></div></article></section></div>`}
+function audit(){const r=[['2026-07-11 18:04','经营负责人','批准现金流优先策略草案','成功'],['2026-07-11 17:42','Evolution Agent','创建 Skill 变更提案 EV-018','待审批'],['2026-07-11 16:30','Hermes','执行 optimizer@1.3.2','成功'],['2026-07-11 15:12','Codex Builder','提交 PR #3','成功'],['2026-07-11 13:55','Policy Engine','阻止高风险预算调整','已阻止']];return `<div class="page">${heading('审计日志','追踪经营决策、规则变更、Skill 发布、Runtime 执行和人工审批。','<div class="toolbar"><select><option>全部事件</option><option>治理变更</option><option>运行事件</option></select><button class="ghost">导出</button></div>')}<section class="layout-grid"><article class="card tall"><div class="audit-row"><strong>时间</strong><strong>操作者</strong><strong>事件</strong><strong>结果</strong></div>${r.map(x=>`<div class="audit-row"><span>${x[0]}</span><span>${x[1]}</span><span>${x[2]}</span><span class="status ${x[3]==='成功'?'stable':x[3]==='待审批'?'test':'offline'}">${x[3]}</span></div>`).join('')}</article></section><section class="layout-grid grid-3"><article class="card"><h2>审计覆盖</h2><div class="metric-strip"><div class="metric-box">决策<strong>100%</strong></div><div class="metric-box">发布<strong>100%</strong></div><div class="metric-box">高风险动作<strong>100%</strong></div><div class="metric-box">只读查询<strong>72%</strong></div></div></article><article class="card"><h2>回滚点</h2><div class="list-item"><h3>tenant-agent@1.3.1</h3><p>最后稳定版本，可一键回滚。</p></div></article><article class="card"><h2>合规提醒</h2><div class="list-item risk"><h3>1 个 Adapter 未上传完整 Trace</h3><p>降低审计完整度。</p></div></article></section></div>`}
+const pages={overview,performance,agents:agentPage,capabilities,evolution,governance,runtime,memory,audit};
+function page(){const p=location.hash.slice(1);return pages[p]?p:'overview'}
+function openStrategy(){const s=tenants[tenantKey].strategy;$('primaryGoalInput').value=s.primary;$('secondaryGoalInput').value=s.secondary;$('constraintInput').value=s.constraints.join('\n');$('strategyDialog').showModal()}
+function bind(){document.querySelectorAll('[data-action="edit-strategy"]').forEach(b=>b.onclick=openStrategy);document.querySelectorAll('[data-proposal]').forEach(b=>b.onclick=()=>{b.textContent='已进入审批队列';b.disabled=true})}
+function render(){const p=page(),d=tenants[tenantKey];$('sidebarTenant').textContent=d.name;$('app').innerHTML=pages[p](d);document.querySelectorAll('#mainNav a').forEach(a=>a.classList.toggle('active',a.dataset.page===p));bind()}
+$('tenantSelect').onchange=e=>{tenantKey=e.target.value;render()};$('commandBtn').onclick=()=>$('issueDialog').showModal();$('saveStrategyBtn').onclick=e=>{e.preventDefault();const s=tenants[tenantKey].strategy;s.primary=$('primaryGoalInput').value.trim()||s.primary;s.secondary=$('secondaryGoalInput').value.trim()||s.secondary;s.constraints=$('constraintInput').value.split('\n').map(x=>x.trim()).filter(Boolean);$('strategyDialog').close();render()};$('saveIssueBtn').onclick=e=>{e.preventDefault();$('issueDialog').close();alert('经营议题已加入决策队列（原型演示）。')};window.addEventListener('hashchange',render);render();
