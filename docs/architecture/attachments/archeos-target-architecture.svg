@@ -1,0 +1,39 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="1000" viewBox="0 0 1600 1000" role="img" aria-labelledby="title desc">
+  <title id="title">ArcheOS v0.3 系统架构</title>
+  <desc id="desc">人类治理、ArcheOS 控制与演进、执行面、知识记忆和外部业务环境之间的关系。</desc>
+  <defs>
+    <style>
+      .bg{fill:#f7f8fb}.box{fill:#fff;stroke:#24324a;stroke-width:3;rx:18}.control{fill:#e8f0ff;stroke:#315b9e}.exec{fill:#eaf8f0;stroke:#28734d}.memory{fill:#fff4db;stroke:#9a6817}.external{fill:#f5eefe;stroke:#6d4695}.title{font:700 34px system-ui;fill:#172238}.label{font:700 22px system-ui;fill:#172238}.body{font:17px system-ui;fill:#35435b}.arrow{stroke:#40516d;stroke-width:4;fill:none}.dash{stroke:#6d4695;stroke-width:4;stroke-dasharray:12 9;fill:none}.hint{font:15px system-ui;fill:#65738a}
+    </style>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#40516d"/></marker>
+  </defs>
+  <rect class="bg" width="1600" height="1000"/>
+  <text x="70" y="65" class="title">ArcheOS v0.3 — Governed Agent Evolution</text>
+  <rect x="360" y="105" width="880" height="120" class="box"/>
+  <text x="800" y="150" text-anchor="middle" class="label">L1 Human Governance</text>
+  <text x="800" y="185" text-anchor="middle" class="body">经营哲学 · 业务宪章 · 目标 · 策略 · 风险偏好 · 审批</text>
+  <rect x="270" y="300" width="760" height="230" class="box control"/>
+  <text x="650" y="345" text-anchor="middle" class="label">L2 Control &amp; Evolution</text>
+  <text x="650" y="385" text-anchor="middle" class="body">Business Intent · Policy · Measure · Change</text>
+  <text x="650" y="420" text-anchor="middle" class="body">Authorization · Intent Resolver · Change · Writer Lease</text>
+  <text x="650" y="470" text-anchor="middle" class="hint">Capability = 派生视图　Evaluation = 基于 Measure 的过程</text>
+  <rect x="1090" y="300" width="420" height="230" class="box memory"/>
+  <text x="1300" y="345" text-anchor="middle" class="label">L4 Knowledge &amp; Memory</text>
+  <text x="1300" y="390" text-anchor="middle" class="body">Tolaria · 上下文 · 决策历史</text>
+  <text x="1300" y="425" text-anchor="middle" class="body">案例 · 长期记忆</text>
+  <rect x="270" y="620" width="760" height="200" class="box exec"/>
+  <text x="650" y="665" text-anchor="middle" class="label">L3 Execution Plane</text>
+  <text x="650" y="710" text-anchor="middle" class="body">Runtime Instance · Agent Deployment · Skill · Tool</text>
+  <text x="650" y="750" text-anchor="middle" class="body">Scheduler · Write Ledger · SecretRef · Observation</text>
+  <rect x="1090" y="620" width="420" height="200" class="box external"/>
+  <text x="1300" y="665" text-anchor="middle" class="label">L0 External Business</text>
+  <text x="1300" y="710" text-anchor="middle" class="body">Amazon · 展厅 · ERP · CRM</text>
+  <text x="1300" y="750" text-anchor="middle" class="body">银行 · 客户 · 员工 · 市场</text>
+  <path d="M800 225 L700 295" class="arrow" marker-end="url(#arrow)"/>
+  <path d="M650 530 L650 615" class="arrow" marker-end="url(#arrow)"/>
+  <path d="M690 620 C850 570 900 550 940 500" class="arrow" marker-end="url(#arrow)"/>
+  <path d="M1090 405 L1035 405" class="arrow" marker-end="url(#arrow)"/>
+  <path d="M1030 720 L1085 720" class="arrow" marker-end="url(#arrow)"/>
+  <path d="M1300 620 C1270 550 1130 510 1020 475" class="dash" marker-end="url(#arrow)"/>
+  <text x="75" y="950" class="hint">治理：Human → Control → Execution　执行：Execution → Business　反馈：Business / Telemetry → Control　知识：Memory → Control</text>
+</svg>

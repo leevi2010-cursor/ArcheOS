@@ -1,0 +1,85 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1800" height="1280" viewBox="0 0 1800 1280" role="img" aria-labelledby="title desc">
+  <title id="title">ArcheOS v0.5 Capability and Knowledge evolutionary blueprint</title>
+  <desc id="desc">A single top-down responsibility chain from business KPI through Agent Deployment, Capability Package, Skill, Tool and external system to business result, supported by Knowledge on the left, Policy and Governance on the right, and an evidence feedback chain at the bottom.</desc>
+  <defs>
+    <style>
+      .bg{fill:#f7f9fc}.frame{fill:#fff;stroke:#c8d1df;stroke-width:2}.main{fill:#eef4ff;stroke:#3865aa;stroke-width:2.5}.agent{fill:#eaf8f1;stroke:#2f7b57}.cap{fill:#f4edff;stroke:#7650a7}.skill{fill:#fff6e6;stroke:#a8741f}.tool{fill:#f2f4f8;stroke:#62718a}.result{fill:#eaf7f8;stroke:#277b82}.support{fill:#fff;stroke:#7f8da2;stroke-width:1.5}.supportNext{fill:#fff;stroke:#7f8da2;stroke-width:1.5;stroke-dasharray:9 7}.supportFuture{fill:#fff;stroke:#7f8da2;stroke-width:1.5;stroke-dasharray:3 7}.knowledge{fill:#fff7dc;stroke:#9a6a18;stroke-width:2.5}.governance{fill:#edf3ff;stroke:#315ca8;stroke-width:2.5}.feedbackBox{fill:#f8efff;stroke:#7a51a6;stroke-width:1.8}.title{font:700 32px system-ui;fill:#17233a}.subtitle{font:16px system-ui;fill:#52617a}.section{font:700 21px system-ui;fill:#18243a}.nodeTitle{font:700 18px system-ui;fill:#1b2940}.nodeText{font:13px system-ui;fill:#52617a}.small{font:12px system-ui;fill:#66758d}.edgeLabel{font:700 12px system-ui;fill:#3e4e68}.phase{font:700 12px system-ui}.mvpText{fill:#1e7045}.nextText{fill:#7650a7}.futureText{fill:#986718}.mainEdge{fill:none;stroke:#40516d;stroke-width:3}.supportEdge{fill:none;stroke:#9a6a18;stroke-width:2;stroke-dasharray:8 7}.govEdge{fill:none;stroke:#315ca8;stroke-width:2;stroke-dasharray:8 7}.feedbackEdge{fill:none;stroke:#7650a7;stroke-width:2.5;stroke-dasharray:9 7}
+    </style>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto"><path d="M0 0L10 5L0 10Z" fill="#40516d"/></marker>
+    <marker id="goldArrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0L10 5L0 10Z" fill="#9a6a18"/></marker>
+    <marker id="blueArrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0L10 5L0 10Z" fill="#315ca8"/></marker>
+    <marker id="purpleArrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0L10 5L0 10Z" fill="#7650a7"/></marker>
+  </defs>
+
+  <rect class="bg" width="1800" height="1280"/>
+  <text x="45" y="54" class="title">ArcheOS 元枢 · Capability 与 Knowledge 可演进蓝图</text>
+  <text x="45" y="83" class="subtitle">唯一主责任链自上而下 / Knowledge 左侧支撑 / Policy &amp; Governance 右侧约束 / Evidence Feedback 底部演进</text>
+  <g transform="translate(1355 33)"><rect x="0" y="0" width="92" height="28" rx="14" fill="#e5f4eb"/><text x="46" y="19" text-anchor="middle" class="phase mvpText">v0.1 MVP</text><rect x="104" y="0" width="106" height="28" rx="14" fill="#f1e9fb"/><text x="157" y="19" text-anchor="middle" class="phase nextText">M1 平台化</text><rect x="222" y="0" width="106" height="28" rx="14" fill="#fff1d4"/><text x="275" y="19" text-anchor="middle" class="phase futureText">M2 远期</text></g>
+
+  <rect x="500" y="105" width="790" height="775" rx="20" class="frame"/>
+  <text x="895" y="139" text-anchor="middle" class="section">Primary Responsibility &amp; Dependency Chain</text>
+
+  <g><rect x="605" y="160" width="580" height="76" rx="13" class="main"/><text x="895" y="190" text-anchor="middle" class="nodeTitle">Business Intent / KPI</text><text x="895" y="216" text-anchor="middle" class="nodeText">经营方向 · Measure · 目标值 · 时间窗口 · 风险边界</text></g>
+  <path d="M895 236V270" class="mainEdge" marker-end="url(#arrow)"/><text x="913" y="257" class="edgeLabel">委托经营责任</text>
+
+  <g><rect x="605" y="280" width="580" height="76" rx="13" class="agent"/><text x="895" y="310" text-anchor="middle" class="nodeTitle">Agent Deployment</text><text x="895" y="336" text-anchor="middle" class="nodeText">对 Workspace KPI 负责 · 协调履职、异常与人工交接</text></g>
+  <path d="M895 356V390" class="mainEdge" marker-end="url(#arrow)"/><text x="913" y="377" class="edgeLabel">装载已发布版本</text>
+
+  <g><rect x="605" y="400" width="580" height="88" rx="13" class="cap"/><text x="895" y="430" text-anchor="middle" class="nodeTitle">Capability / Capability Package</text><text x="895" y="456" text-anchor="middle" class="nodeText">对独立业务结果契约负责 · 版本化 · 可发布 · 可验收 · 可回滚</text><text x="895" y="476" text-anchor="middle" class="small">一个对象：Capability 是业务身份，Package 是版本化发布制品</text></g>
+  <path d="M895 488V522" class="mainEdge" marker-end="url(#arrow)"/><text x="913" y="509" class="edgeLabel">组合执行方法</text>
+
+  <g><rect x="605" y="532" width="580" height="76" rx="13" class="skill"/><text x="895" y="562" text-anchor="middle" class="nodeTitle">Skill</text><text x="895" y="588" text-anchor="middle" class="nodeText">对执行方法、输入输出和局部正确性负责 · 可调用子 Skill</text></g>
+  <path d="M895 608V642" class="mainEdge" marker-end="url(#arrow)"/><text x="913" y="629" class="edgeLabel">调用接口</text>
+
+  <g><rect x="605" y="652" width="580" height="76" rx="13" class="tool"/><text x="895" y="682" text-anchor="middle" class="nodeTitle">Tool / External System</text><text x="895" y="708" text-anchor="middle" class="nodeText">Tool 对调用契约负责 · Amazon / ERP / CRM 提供外部事实与响应</text></g>
+  <path d="M895 728V762" class="mainEdge" marker-end="url(#arrow)"/><text x="913" y="749" class="edgeLabel">产生真实后果</text>
+
+  <g><rect x="605" y="772" width="580" height="76" rx="13" class="result"/><text x="895" y="802" text-anchor="middle" class="nodeTitle">Business Result</text><text x="895" y="828" text-anchor="middle" class="nodeText">收入 · 利润 · 现金流 · 广告效率 · 风险 · 人类反馈</text></g>
+
+  <rect x="45" y="160" width="410" height="688" rx="18" class="knowledge"/>
+  <text x="250" y="199" text-anchor="middle" class="section">Knowledge Support</text>
+  <text x="250" y="224" text-anchor="middle" class="small">统一契约：owner · scope · version · permission · source · distribution</text>
+  <g><rect x="75" y="255" width="350" height="92" rx="12" class="support"/><text x="250" y="286" text-anchor="middle" class="nodeTitle">System Core Knowledge</text><text x="250" y="311" text-anchor="middle" class="nodeText">架构 · 安全 · 接口 · 治理原则</text><text x="250" y="331" text-anchor="middle" class="small">默认不向企业 Agent 分发</text></g>
+  <g><rect x="75" y="365" width="350" height="92" rx="12" class="support"/><text x="250" y="396" text-anchor="middle" class="nodeTitle">Distributable Domain Knowledge</text><text x="250" y="421" text-anchor="middle" class="nodeText">Amazon / 展厅领域知识与方法</text><text x="250" y="441" text-anchor="middle" class="small">脱离客户事实后按版本分发</text></g>
+  <g><rect x="75" y="475" width="350" height="92" rx="12" class="support"/><text x="250" y="506" text-anchor="middle" class="nodeTitle">Enterprise Private Knowledge</text><text x="250" y="531" text-anchor="middle" class="nodeText">店铺 · 客户 · 成本 · 策略 · 项目</text><text x="250" y="551" text-anchor="middle" class="small">只在所属 Workspace 使用</text></g>
+  <g><rect x="75" y="585" width="350" height="104" rx="12" class="support"/><text x="250" y="616" text-anchor="middle" class="nodeTitle">Runtime Evidence / Learning Candidate</text><text x="250" y="641" text-anchor="middle" class="nodeText">Observation · 失败案例 · 反馈 · 假设</text><text x="250" y="661" text-anchor="middle" class="small">默认不是正式知识；经受控提升后分发</text></g>
+  <g><rect x="75" y="715" width="350" height="96" rx="12" class="supportNext"/><text x="250" y="746" text-anchor="middle" class="nodeTitle">Knowledge Adapter / Registry</text><text x="250" y="771" text-anchor="middle" class="nodeText">标准 Markdown + 元数据 · 影响检查</text><text x="250" y="791" text-anchor="middle" class="small">Tolaria 可选载体，不是运行依赖</text></g>
+
+  <path d="M455 411H595" class="supportEdge" marker-end="url(#goldArrow)"/><text x="494" y="397" class="edgeLabel">领域上下文</text>
+  <path d="M455 521C520 521 535 444 595 444" class="supportEdge" marker-end="url(#goldArrow)"/>
+  <path d="M455 637C530 637 530 570 595 570" class="supportEdge" marker-end="url(#goldArrow)"/><text x="482" y="625" class="edgeLabel">候选 / 证据</text>
+
+  <rect x="1335" y="105" width="420" height="743" rx="18" class="governance"/>
+  <text x="1545" y="145" text-anchor="middle" class="section">Policy &amp; Governance</text>
+  <text x="1545" y="169" text-anchor="middle" class="small">横向约束，不进入业务数据主链</text>
+  <g><rect x="1365" y="197" width="360" height="82" rx="12" class="support"/><text x="1545" y="227" text-anchor="middle" class="nodeTitle">Authorization &amp; Policy</text><text x="1545" y="252" text-anchor="middle" class="nodeText">allow · deny · require approval · fail closed</text></g>
+  <g><rect x="1365" y="295" width="360" height="82" rx="12" class="support"/><text x="1545" y="325" text-anchor="middle" class="nodeTitle">Agent Factory</text><text x="1545" y="350" text-anchor="middle" class="nodeText">资产选择 · Profile 候选 · 验证 · 发布确认</text></g>
+  <g><rect x="1365" y="393" width="360" height="82" rx="12" class="support"/><text x="1545" y="423" text-anchor="middle" class="nodeTitle">Asset Lifecycle</text><text x="1545" y="448" text-anchor="middle" class="nodeText">草稿 · 验证 · 发布 · 暂停 · 废弃 · 回滚</text></g>
+  <g><rect x="1365" y="491" width="360" height="82" rx="12" class="support"/><text x="1545" y="521" text-anchor="middle" class="nodeTitle">Architecture &amp; Contracts</text><text x="1545" y="546" text-anchor="middle" class="nodeText">对象边界 · 兼容性 · 依赖影响 · ADR</text></g>
+  <g><rect x="1365" y="589" width="360" height="82" rx="12" class="support"/><text x="1545" y="619" text-anchor="middle" class="nodeTitle">Safety &amp; Operations</text><text x="1545" y="644" text-anchor="middle" class="nodeText">SecretRef · Writer Lease · Ledger · 人工接管</text></g>
+  <g><rect x="1365" y="687" width="360" height="82" rx="12" class="supportNext"/><text x="1545" y="717" text-anchor="middle" class="nodeTitle">Platform Governance</text><text x="1545" y="742" text-anchor="middle" class="nodeText">多 Workspace · 质量中心 · Fleet · 成本</text></g>
+  <g><rect x="1365" y="785" width="360" height="38" rx="12" class="supportFuture"/><text x="1545" y="809" text-anchor="middle" class="nodeTitle">Tenant · Compliance · Commercialization</text></g>
+
+  <path d="M1335 318H1195" class="govEdge" marker-end="url(#blueArrow)"/><text x="1217" y="304" class="edgeLabel">创建 / 发布</text>
+  <path d="M1335 444H1195" class="govEdge" marker-end="url(#blueArrow)"/><text x="1220" y="430" class="edgeLabel">生命周期</text>
+  <path d="M1335 570C1270 570 1260 570 1195 570" class="govEdge" marker-end="url(#blueArrow)"/>
+  <path d="M1335 690C1270 690 1260 690 1195 690" class="govEdge" marker-end="url(#blueArrow)"/><text x="1210" y="676" class="edgeLabel">安全约束</text>
+
+  <rect x="45" y="900" width="1710" height="182" rx="18" class="frame"/>
+  <text x="70" y="934" class="section">Evidence Feedback &amp; Controlled Evolution</text>
+  <g><rect x="80" y="958" width="250" height="76" rx="12" class="feedbackBox"/><text x="205" y="988" text-anchor="middle" class="nodeTitle">Business Result</text><text x="205" y="1013" text-anchor="middle" class="nodeText">真实业务后果</text></g>
+  <g><rect x="370" y="958" width="250" height="76" rx="12" class="feedbackBox"/><text x="495" y="988" text-anchor="middle" class="nodeTitle">Observation</text><text x="495" y="1013" text-anchor="middle" class="nodeText">不可变事实与 trace</text></g>
+  <g><rect x="660" y="958" width="250" height="76" rx="12" class="feedbackBox"/><text x="785" y="988" text-anchor="middle" class="nodeTitle">Measure / Evaluation</text><text x="785" y="1013" text-anchor="middle" class="nodeText">计算、解释与判断过程</text></g>
+  <g><rect x="950" y="958" width="250" height="76" rx="12" class="feedbackBox"/><text x="1075" y="988" text-anchor="middle" class="nodeTitle">Change</text><text x="1075" y="1013" text-anchor="middle" class="nodeText">候选 · 风险 · 验证 · 审批</text></g>
+  <g><rect x="1240" y="958" width="250" height="76" rx="12" class="feedbackBox"/><text x="1365" y="988" text-anchor="middle" class="nodeTitle">Release / Rollback</text><text x="1365" y="1013" text-anchor="middle" class="nodeText">版本指针与后续观察</text></g>
+  <g><rect x="1530" y="958" width="190" height="76" rx="12" class="feedbackBox"/><text x="1625" y="988" text-anchor="middle" class="nodeTitle">New Version</text><text x="1625" y="1013" text-anchor="middle" class="nodeText">Agent / Capability / Skill…</text></g>
+  <path d="M330 996H360M620 996H650M910 996H940M1200 996H1230M1490 996H1520" class="feedbackEdge" marker-end="url(#purpleArrow)"/>
+  <path d="M895 848V884H205V948" class="feedbackEdge" marker-end="url(#purpleArrow)"/>
+  <path d="M1625 958V880H1775V434H1735" class="feedbackEdge" marker-end="url(#purpleArrow)"/>
+
+  <text x="45" y="1125" class="section">Evolution without re-layering</text>
+  <g><rect x="45" y="1148" width="525" height="76" rx="13" class="support"/><text x="70" y="1177" class="nodeTitle">v0.1 · Amazon MVP</text><text x="70" y="1203" class="nodeText">单 Workspace · Ads Agent · Capability / Knowledge 生命周期 · 双容器安全写入</text></g>
+  <g><rect x="597" y="1148" width="525" height="76" rx="13" class="supportNext"/><text x="622" y="1177" class="nodeTitle">M1 · Platform</text><text x="622" y="1203" class="nodeText">多 Workspace · 资产发现与质量中心 · Knowledge 提升 · Runtime Fleet · 模型与成本</text></g>
+  <g><rect x="1149" y="1148" width="606" height="76" rx="13" class="supportFuture"/><text x="1174" y="1177" class="nodeTitle">M2 · Cross-domain / Enterprise</text><text x="1174" y="1203" class="nodeText">多 Domain Agent · 组织与租户 · 合规 · Agent 授权升级与商业化；核心责任链保持不变</text></g>
+  <text x="45" y="1260" class="small">实线 = v0.1 必需　虚线 = M1 平台化　点线 = M2 远期　中央实线 = 唯一依赖主链　金色/蓝色虚线 = 横向支撑　紫色虚线 = 反馈与演进</text>
+</svg>

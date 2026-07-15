@@ -1,0 +1,90 @@
+{
+  "schema_version": 1,
+  "project": {
+    "id": "archeos",
+    "name": "元枢 ArcheOS",
+    "status": "active",
+    "repository": "/Users/leo/Projects/ArcheOS"
+  },
+  "artifacts": {
+    "product_brief": {
+      "id": "AR-Product-Brief",
+      "path": "docs/product/product-brief.md",
+      "version": "0.4.0",
+      "status": "approved",
+      "sha256": "14217bf87037ccb902ef306cd0a1b8ff1faed4f2584096e167530684288d12a2"
+    },
+    "prd": {
+      "id": "AR-PRD",
+      "path": "docs/product/prd.md",
+      "version": "0.7.0",
+      "status": "in_review",
+      "sha256": "f89c02f268286d9f989532d03c8d5c667da7dbbdb453b20a53080ecff8b5c963",
+      "depends_on": {
+        "product_brief": {"version": "0.4.0", "status": "approved"}
+      }
+    },
+    "architecture": {
+      "id": "AR-ARCH",
+      "path": "docs/architecture/system-architecture.md",
+      "version": "0.5.0",
+      "status": "stale",
+      "sha256": "3c5a34d26cc0a50059a43f459a4d8fa3e4afefa728b48bec0a95bf2d0dca682e",
+      "depends_on": {
+        "prd": {"version": "0.7.0", "status": "in_review"}
+      },
+      "note": "Stale after PRD v0.7.0 candidate added owner-dashboard target/guardrail semantics, Agent reporting relationships, persistent Goal Checkpoint/Operating Strategy/Operating Action contracts, and governed node-context conversation/draft-change semantics; technical lead review required after PRD approval."
+    },
+    "roadmap": {
+      "id": "AR-RM-v0.1",
+      "path": "docs/project/roadmap.md",
+      "version": "0.3.0",
+      "status": "stale",
+      "sha256": "34cd5197947d0a67ccb4898dc514c80aea9c9ad21bb87dd45af4d030c320760b",
+      "depends_on": {
+        "architecture": {"version": "0.5.0", "status": "stale"}
+      }
+    },
+    "ux_prototype": {
+      "id": "AR-UX-PROTOTYPE",
+      "owner_role": "product-manager",
+      "version": "0.2.2-prototype",
+      "status": "stale",
+      "path_or_entry": "apps/business-cockpit/index.html",
+      "sha256": "51790d499ffcfc15ae029f6a39520b82308144083d0d3a5e3fe5bdaf754e6fab",
+      "depends_on": {
+        "prd": {
+          "version": "0.7.0",
+          "status": "in_review",
+          "sha256": "f89c02f268286d9f989532d03c8d5c667da7dbbdb453b20a53080ecff8b5c963"
+        },
+        "architecture": {
+          "version": "0.5.0",
+          "status": "stale",
+          "sha256": "3c5a34d26cc0a50059a43f459a4d8fa3e4afefa728b48bec0a95bf2d0dca682e"
+        }
+      },
+      "walkthrough_evidence": {
+        "status": "pending",
+        "path": null,
+        "sha256": null
+      },
+      "leo_approval": {
+        "status": "pending",
+        "date": null,
+        "prototype_sha256": null
+      }
+    },
+    "milestone": {
+      "id": "AR-M0",
+      "path": "docs/project/milestones/m0-project-constitution.md",
+      "version": "0.0.0",
+      "status": "blocked",
+      "depends_on": {
+        "roadmap": {"version": "0.3.0", "status": "stale"}
+      }
+    },
+    "issue": {"status": "blocked"},
+    "pull_request": {"status": "blocked"}
+  }
+}

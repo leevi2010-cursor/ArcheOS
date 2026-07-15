@@ -1,0 +1,10 @@
+AR-UX-PROTOTYPE@0.2.2-prototype
+digest algorithm: sort relative paths; SHA-256 each file; hash concatenated path + NUL + file_sha256 + LF records
+
+app.js\0819395dbd6c2ea2d3dc29d4307743ff3b0ed761696bb1872845f6d638e610919
+index.html\07e5f7c316bce83b16a9ad2299ecbe4fce2f921c88d87efb45f02393808d96054
+styles.css\02016d39bef43bdadd2dd4ee1bd22e314ddef39896289497eb5363cb5a995a279
+
+bundle_sha256=51790d499ffcfc15ae029f6a39520b82308144083d0d3a5e3fe5bdaf754e6fab
+
+README.md and evidence/ are documentation and walkthrough evidence; they are intentionally excluded from the runnable bundle digest.

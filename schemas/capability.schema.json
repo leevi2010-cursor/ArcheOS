@@ -1,22 +1,110 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "title": "ArcheOS Capability",
+  "$id": "https://archeos.local/schemas/capability-package.schema.json",
+  "title": "ArcheOS Capability Package",
+  "description": "A versioned release artifact for one independently callable and verifiable business capability. Capability and Capability Package share one identity and lifecycle.",
   "type": "object",
-  "required": ["id", "name", "domain", "status", "outcome", "inputs", "outputs", "dependencies", "evaluation"],
+  "required": [
+    "capability_id",
+    "version",
+    "name",
+    "status",
+    "business_outcome",
+    "scope",
+    "owner_role",
+    "responsibilities",
+    "non_responsibilities",
+    "inputs",
+    "outputs",
+    "preconditions",
+    "skills",
+    "tool_requirements",
+    "knowledge_requirements",
+    "policies",
+    "measures",
+    "success_thresholds",
+    "evidence_requirements",
+    "permissions",
+    "approval_requirements",
+    "compatible_versions",
+    "acceptance",
+    "failure_impact",
+    "rollback_target",
+    "source_of_truth"
+  ],
   "properties": {
-    "id": {"type": "string", "pattern": "^[a-z0-9-]+$"},
-    "name": {"type": "string"},
-    "domain": {"type": "string"},
-    "status": {"enum": ["draft", "validated", "stable", "deprecated"]},
-    "outcome": {"type": "string"},
-    "inputs": {"type": "array", "items": {"type": "string"}},
-    "outputs": {"type": "array", "items": {"type": "string"}},
-    "dependencies": {"type": "array", "items": {"type": "string"}},
-    "protocols": {"type": "array", "items": {"type": "string"}},
-    "skills": {"type": "array", "items": {"type": "string"}},
-    "evaluation": {"type": "array", "items": {"type": "string"}},
-    "source_of_truth": {"type": "array", "items": {"type": "string"}},
-    "non_responsibilities": {"type": "array", "items": {"type": "string"}}
+    "capability_id": {
+      "type": "string",
+      "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*$"
+    },
+    "version": {
+      "type": "string",
+      "pattern": "^(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)(?:-[0-9A-Za-z.-]+)?$"
+    },
+    "name": {"type": "string", "minLength": 1},
+    "status": {
+      "enum": ["draft", "validating", "publishable", "published", "paused", "deprecated"]
+    },
+    "business_outcome": {"type": "string", "minLength": 1},
+    "scope": {"type": "string", "minLength": 1},
+    "owner_role": {"type": "string", "minLength": 1},
+    "responsibilities": {"$ref": "#/$defs/nonEmptyStrings"},
+    "non_responsibilities": {"$ref": "#/$defs/nonEmptyStrings"},
+    "inputs": {"$ref": "#/$defs/nonEmptyStrings"},
+    "outputs": {"$ref": "#/$defs/nonEmptyStrings"},
+    "preconditions": {"$ref": "#/$defs/strings"},
+    "skills": {"$ref": "#/$defs/versionedRefs"},
+    "tool_requirements": {"$ref": "#/$defs/strings"},
+    "knowledge_requirements": {"$ref": "#/$defs/versionedRefs"},
+    "policies": {"$ref": "#/$defs/versionedRefs"},
+    "measures": {"$ref": "#/$defs/versionedRefs"},
+    "success_thresholds": {"$ref": "#/$defs/nonEmptyStrings"},
+    "evidence_requirements": {"$ref": "#/$defs/nonEmptyStrings"},
+    "permissions": {"$ref": "#/$defs/strings"},
+    "approval_requirements": {"$ref": "#/$defs/strings"},
+    "compatible_versions": {
+      "type": "object",
+      "properties": {
+        "skills": {"$ref": "#/$defs/strings"},
+        "tools": {"$ref": "#/$defs/strings"},
+        "knowledge": {"$ref": "#/$defs/strings"}
+      },
+      "additionalProperties": false
+    },
+    "acceptance": {"$ref": "#/$defs/nonEmptyStrings"},
+    "failure_impact": {"$ref": "#/$defs/nonEmptyStrings"},
+    "rollback_target": {
+      "anyOf": [
+        {
+          "type": "string",
+          "pattern": "^capability://[a-z0-9]+(?:-[a-z0-9]+)*@[0-9]+\\.[0-9]+\\.[0-9]+(?:-[0-9A-Za-z.-]+)?$"
+        },
+        {"type": "null"}
+      ]
+    },
+    "source_of_truth": {"$ref": "#/$defs/nonEmptyStrings"}
+  },
+  "$defs": {
+    "strings": {
+      "type": "array",
+      "items": {"type": "string", "minLength": 1},
+      "uniqueItems": true
+    },
+    "nonEmptyStrings": {
+      "type": "array",
+      "minItems": 1,
+      "items": {"type": "string", "minLength": 1},
+      "uniqueItems": true
+    },
+    "versionedRefs": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "string",
+        "pattern": "^[a-z][a-z0-9+.-]*://[^@\\s]+@[^@\\s]+$"
+      },
+      "uniqueItems": true
+    }
   },
   "additionalProperties": false
 }

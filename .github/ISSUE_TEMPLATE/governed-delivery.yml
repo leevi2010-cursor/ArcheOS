@@ -1,0 +1,48 @@
+name: Governed delivery issue
+description: Deliver one result under an approved milestone
+title: "[Delivery] "
+labels: ["governed-delivery"]
+body:
+  - type: input
+    id: milestone
+    attributes:
+      label: Milestone ID
+    validations:
+      required: true
+  - type: input
+    id: roadmap
+    attributes:
+      label: Roadmap ID and version
+    validations:
+      required: true
+  - type: input
+    id: architecture
+    attributes:
+      label: Architecture ID, version, and digest
+    validations:
+      required: true
+  - type: textarea
+    id: outcome
+    attributes:
+      label: User or system outcome
+    validations:
+      required: true
+  - type: textarea
+    id: scope
+    attributes:
+      label: Scope and non-scope
+    validations:
+      required: true
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Acceptance criteria
+      placeholder: "- [ ] Observable result"
+    validations:
+      required: true
+  - type: textarea
+    id: validation
+    attributes:
+      label: Validation and rollback
+    validations:
+      required: true

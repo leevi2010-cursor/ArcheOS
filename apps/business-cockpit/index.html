@@ -1,50 +1,29 @@
 <!doctype html>
 <html lang="zh-CN">
 <head>
-  <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>ArcheOS 经营控制与进化系统</title>
-  <link rel="stylesheet" href="./styles.css" />
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>元枢 ArcheOS 双工作台原型</title>
+  <link rel="stylesheet" href="./styles.css">
 </head>
 <body>
   <div class="app-shell">
     <aside class="sidebar">
-      <div class="brand"><div class="brand-mark">◈</div><div><strong>ArcheOS</strong><span>Agent 经营控制与进化系统</span></div></div>
-      <nav id="mainNav">
-        <a href="#overview" data-page="overview">经营驾驶舱</a>
-        <a href="#performance" data-page="performance">业务表现</a>
-        <a href="#agents" data-page="agents">Agent 贡献</a>
-        <a href="#capabilities" data-page="capabilities">能力视图</a>
-        <a href="#evolution" data-page="evolution">进化中心</a>
-        <a href="#governance" data-page="governance">治理规则</a>
-        <a href="#runtime" data-page="runtime">执行面管理</a>
-        <a href="#memory" data-page="memory">知识与记忆</a>
-        <a href="#audit" data-page="audit">审计日志</a>
-      </nav>
-      <div class="sidebar-footer"><div><span>租户</span><strong id="sidebarTenant"></strong></div><div><span>环境</span><strong>原型环境</strong></div></div>
+      <div class="brand"><span class="brand-mark" aria-hidden="true">A</span><div><strong>元枢 ArcheOS</strong><span>双工作台交互原型</span></div></div>
+      <div class="role-label" id="roleLabel"></div>
+      <nav id="mainNav" aria-label="工作台导航"></nav>
     </aside>
     <main class="main-content">
-      <header class="topbar">
-        <label>当前租户 <select id="tenantSelect"><option value="amazon">Amazon US Store</option><option value="showroom">黄鸿儒展厅</option></select></label>
-        <div class="top-actions"><button class="ghost" id="commandBtn">新建经营议题</button><button class="ghost">通知 3</button><button class="avatar">经</button></div>
+      <header class="topbar-lite">
+        <div class="current-scope"><strong id="scopeRole"></strong><span aria-hidden="true">·</span><span>Amazon US Store</span></div>
+        <button class="role-switch" id="roleSwitch">我的</button>
       </header>
-      <div id="app"></div>
+      <div id="app" tabindex="-1"></div>
     </main>
   </div>
-  <dialog id="strategyDialog"><form method="dialog">
-    <div class="dialog-header"><h2>编辑经营方向</h2><button value="cancel" class="close">×</button></div>
-    <label>首要目标<input id="primaryGoalInput" /></label>
-    <label>次级目标<input id="secondaryGoalInput" /></label>
-    <label>重大约束<textarea id="constraintInput" rows="4"></textarea></label>
-    <menu><button value="cancel" class="ghost">取消</button><button id="saveStrategyBtn" value="default" class="primary">保存草案</button></menu>
-  </form></dialog>
-  <dialog id="issueDialog"><form method="dialog">
-    <div class="dialog-header"><h2>新建经营议题</h2><button value="cancel" class="close">×</button></div>
-    <label>议题标题<input id="issueTitle" placeholder="例如：广告增长是否应让位于现金流安全" /></label>
-    <label>背景与观察<textarea id="issueContext" rows="5"></textarea></label>
-    <label>建议交给<select id="issueOwner"><option>经营负责人</option><option>治理 Agent</option><option>Amazon Agent Owner</option><option>Chief Architect</option></select></label>
-    <menu><button value="cancel" class="ghost">取消</button><button id="saveIssueBtn" value="default" class="primary">加入决策队列</button></menu>
-  </form></dialog>
+  <div class="drawer-backdrop" id="drawerBackdrop" hidden></div>
+  <aside class="drawer" id="drawer" aria-label="任务详情" aria-hidden="true"><div id="drawerContent"></div></aside>
+  <dialog id="roleDialog"><form method="dialog"><header><div><small>我的</small><h2>身份与工作空间</h2></div><button class="icon-button" value="cancel" aria-label="关闭">×</button></header><div class="profile-context"><div><span>当前身份</span><strong id="contextRole"></strong></div><div><span>Workspace</span><strong>Amazon US Store</strong></div><div><span>权限范围</span><strong id="contextPermission"></strong></div><div><span>环境</span><strong>交互原型 / 假数据</strong></div></div><p class="dialog-note">切换身份会同步改变导航、默认首页和可操作范围，Workspace 保持不变。</p><div class="role-options"><button value="operator" data-role="operator"><strong>店铺经营者</strong><span>经营结果、配置、审批、异常恢复</span></button><button value="admin" data-role="admin"><strong>平台管理者</strong><span>平台资产、发布、部署与跨 Agent 治理</span></button></div></form></dialog>
   <script src="./app.js"></script>
 </body>
 </html>

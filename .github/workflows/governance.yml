@@ -1,0 +1,17 @@
+name: Governance Gate
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  governance:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Audit governed artifact chain
+        run: ./scripts/governance-check audit
+      - name: Validate pull request gate
+        if: github.event_name == 'pull_request'
+        run: ./scripts/governance-check create-pr

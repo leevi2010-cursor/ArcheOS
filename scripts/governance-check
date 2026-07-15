@@ -1,0 +1,71 @@
+#!/usr/bin/env python3
+import hashlib
+import json
+import pathlib
+import sys
+
+CHAIN = {
+    "create-prd": "product_brief",
+    "create-architecture": "prd",
+    "create-roadmap": "architecture",
+    "create-milestone": "roadmap",
+    "create-issue": "milestone",
+    "implement-issue": "issue",
+    "create-pr": "issue",
+    "release": "pull_request"
+}
+
+root = pathlib.Path(__file__).resolve().parents[1]
+manifest_path = root / "governance" / "manifest.json"
+
+def sha256(path):
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+def main():
+    action = sys.argv[1] if len(sys.argv) > 1 else "audit"
+    if action != "audit" and action not in CHAIN:
+        print(f"UNKNOWN ACTION: {action}")
+        return 64
+    data = json.loads(manifest_path.read_text())
+    artifacts = data["artifacts"]
+    errors = []
+    notices = []
+
+    for key, item in artifacts.items():
+        rel = item.get("path")
+        if not rel:
+            continue
+        path = root / rel
+        if not path.exists():
+            if item.get("status") == "approved":
+                errors.append(f"{key}: approved artifact is missing ({rel})")
+            else:
+                notices.append(f"{key}: file not present; status={item.get('status')}")
+            continue
+        expected = item.get("sha256")
+        actual = sha256(path)
+        if expected == "TO_BE_REFRESHED":
+            notices.append(f"{key}: manifest digest must be refreshed to {actual}")
+        elif expected and expected != actual:
+            errors.append(f"{key}: digest mismatch; record change, bump version, and assess downstream impact")
+
+    if action != "audit":
+        required = CHAIN[action]
+        artifact = artifacts.get(required)
+        if not artifact:
+            errors.append(f"{required}: not registered")
+        elif artifact.get("status") != "approved":
+            errors.append(f"{required}: status={artifact.get('status')}; approved required for {action}")
+
+    for notice in notices:
+        print(f"NOTICE: {notice}")
+    if errors:
+        print("BLOCKED")
+        for error in errors:
+            print(f"- {error}")
+        return 2
+    print(f"PASS: {action}")
+    return 0
+
+if __name__ == "__main__":
+    raise SystemExit(main())
