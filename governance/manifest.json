@@ -3,8 +3,26 @@
   "project": {
     "id": "archeos",
     "name": "元枢 ArcheOS",
-    "status": "active",
+    "status": "archived",
+    "archived_at": "2026-07-16",
+    "archive_decision": "tolaria://archeos-retirement-decision",
+    "archive_reason": "Stop unvalidated future-platform construction and preserve ArcheOS as a recoverable historical concept asset.",
+    "recovery_entry": "README.md#恢复条件",
     "repository": "/Users/leo/Projects/ArcheOS"
+  },
+  "archive": {
+    "status": "archived",
+    "effective_date": "2026-07-16",
+    "decision": "tolaria://archeos-retirement-decision",
+    "preserve_artifact_states": true,
+    "production_dependency": false,
+    "recovery_entry": "README.md#恢复条件",
+    "recovery_conditions": [
+      "Two or more domain Agents show repeated deployment, permission, version, or audit requirements.",
+      "A second real customer or independent environment needs replication.",
+      "Existing Codex, OIOS, or domain-system approaches cannot solve the need with a lighter design.",
+      "A validated willingness to pay for a unified platform appears."
+    ]
   },
   "artifacts": {
     "product_brief": {

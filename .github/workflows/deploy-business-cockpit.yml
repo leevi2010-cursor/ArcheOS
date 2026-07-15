@@ -1,11 +1,6 @@
-name: Deploy Business Cockpit to GitHub Pages
+name: Archived Business Cockpit Preview (manual only)
 
 on:
-  push:
-    branches: [main]
-    paths:
-      - 'apps/business-cockpit/**'
-      - '.github/workflows/deploy-business-cockpit.yml'
   workflow_dispatch:
 
 permissions:

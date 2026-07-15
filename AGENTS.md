@@ -6,6 +6,14 @@
 
 本仓库采用全局 `governed-vibe-coding` 协议。任何产品、架构、规划或实现动作开始前，必须：
 
+### 0.0 项目归档优先门禁
+
+当 `governance/manifest.json` 的 `project.status` 为 `archived` 时，归档状态优先于下方工件链：
+
+- 只允许历史读取、`governance-check audit`、证据核验和经 Sponsor 新 Decision 明确授权的恢复准备；
+- 不得创建或推进 PRD、Architecture、Roadmap、Milestone、Issue、Implementation、PR 或 Release；
+- 恢复必须先形成新的 Sponsor Decision，重核全部工件与外部依赖，再显式更新 manifest 和 README；不得自动沿用历史批准或候选状态。
+
 1. 读取 `governance/manifest.json`；
 2. 识别本次动作所依赖的上游工件；
 3. 运行 `./scripts/governance-check <action>`；

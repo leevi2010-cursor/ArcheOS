@@ -27,9 +27,26 @@ def main():
         print(f"UNKNOWN ACTION: {action}")
         return 64
     data = json.loads(manifest_path.read_text())
+    project = data.get("project", {})
+    project_status = project.get("status")
     artifacts = data["artifacts"]
     errors = []
     notices = []
+
+    if project_status == "archived":
+        archive = data.get("archive", {})
+        if not archive.get("decision"):
+            errors.append("project: archived project must record archive decision")
+        if not archive.get("recovery_entry"):
+            errors.append("project: archived project must record recovery entry")
+        if not archive.get("recovery_conditions"):
+            errors.append("project: archived project must record recovery conditions")
+        if action == "audit":
+            notices.append("project: archived; all non-audit lifecycle actions are disabled")
+        else:
+            errors.append(f"project: status=archived; {action} is disabled until Sponsor-approved recovery")
+    elif project_status != "active":
+        errors.append(f"project: unsupported status={project_status}")
 
     for key, item in artifacts.items():
         rel = item.get("path")
