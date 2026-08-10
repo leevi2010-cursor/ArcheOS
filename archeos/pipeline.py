@@ -103,6 +103,32 @@ def _evidence(
     ]
 
 
+def _digestion_coverage(
+    transcript: Transcript,
+    analysis: AnalysisResult,
+) -> dict[str, int]:
+    expected = {
+        index
+        for index, segment in enumerate(transcript.segments, start=1)
+        if segment.text.strip()
+    }
+    accounted = {
+        reference
+        for item in (*analysis.atomic_notes, *analysis.residue)
+        for reference in item.evidence_segments
+        if reference in expected
+    }
+    unaccounted = sorted(expected - accounted)
+    if unaccounted:
+        references = ", ".join(str(reference) for reference in unaccounted)
+        raise ValueError(f"unaccounted transcript segments: {references}")
+    return {
+        "total_segments": len(expected),
+        "accounted_segments": len(accounted),
+        "unaccounted_segments": 0,
+    }
+
+
 def _transcript_markdown(source: dict[str, object], transcript: Transcript) -> str:
     has_speakers = any(segment.speaker for segment in transcript.segments)
     lines = [
@@ -142,13 +168,13 @@ def _bullets(items: tuple[str, ...], *, empty: str = "待人工确认") -> str:
     return "\n".join(f"- {item}" for item in items) if items else f"- {empty}"
 
 
-def _summary_markdown(source: dict[str, object], analysis: AnalysisResult) -> str:
+def _summary_markdown(analysis: AnalysisResult) -> str:
     summary = analysis.meeting_summary
     participants = "、".join(summary.participants) if summary.participants else "待人工确认"
     return f"""# Basic Information
 
 Topic: {summary.topic}
-Time: {source['modified_at']}
+Time: 待人工确认
 Participants: {participants}
 
 # Discussion Goal
@@ -269,6 +295,7 @@ def process_audio(
         if not transcript.segments:
             raise ValueError("transcription did not contain any segments")
         analysis = analysis_provider.analyze(transcript)
+        digestion_coverage = _digestion_coverage(transcript, analysis)
     except (OSError, RuntimeError, ValueError, json.JSONDecodeError) as exc:
         raise ProcessingError(str(exc)) from exc
 
@@ -308,6 +335,7 @@ def process_audio(
             "atomic_notes": len(analysis.atomic_notes),
             "residue_items": len(analysis.residue),
         },
+        "digestion_coverage": digestion_coverage,
         "review": {
             "status": "awaiting_human_review",
             "automatic_core_write": False,
@@ -324,7 +352,7 @@ def process_audio(
             _transcript_markdown(source, transcript), encoding="utf-8"
         )
         (staging / "meeting_summary.md").write_text(
-            _summary_markdown(source, analysis), encoding="utf-8"
+            _summary_markdown(analysis), encoding="utf-8"
         )
         (staging / "atomic_notes.jsonl").write_text(
             _atomic_notes_jsonl(source, transcript, analysis), encoding="utf-8"

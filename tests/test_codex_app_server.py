@@ -115,6 +115,10 @@ class CodexAnalysisProviderTest(unittest.TestCase):
         self.assertEqual(run_kwargs["sandbox"], "read-only")
         self.assertIn("output_schema", run_kwargs)
         self.assertNotIn("model", run_kwargs)
+        prompt = run_kwargs["prompt"]
+        self.assertIsInstance(prompt, str)
+        self.assertIn("Every non-empty transcript segment", prompt)
+        self.assertIn("filler, context, or noise", prompt)
 
     def test_surfaces_sdk_failure_without_retry(self) -> None:
         FakeCodex.thread = FakeThread(None, RuntimeError("runtime unavailable"))

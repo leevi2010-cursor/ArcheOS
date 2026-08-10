@@ -130,6 +130,18 @@ class FailingAnalysisProvider:
         raise RuntimeError("runtime unavailable")
 
 
+class IncompleteAnalysisProvider:
+    name = "incomplete-analysis"
+
+    def analyze(self, transcript: Transcript) -> AnalysisResult:
+        result = StubAnalysisProvider().analyze(transcript)
+        return AnalysisResult(
+            result.meeting_summary,
+            result.atomic_notes,
+            (),
+        )
+
+
 class FailingSpeakerProvider:
     name = "failing-speakers"
 
@@ -246,6 +258,60 @@ class PipelineTest(unittest.TestCase):
                     (second / artifact).read_bytes(),
                     artifact,
                 )
+
+    def test_reports_full_transcript_digestion_coverage(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            audio = root / "discussion.wav"
+            write_silent_wav(audio)
+
+            package = run_pipeline(audio, root / "out")
+            manifest = json.loads((package / "manifest.json").read_text())
+
+            self.assertEqual(
+                manifest["digestion_coverage"],
+                {
+                    "total_segments": 4,
+                    "accounted_segments": 4,
+                    "unaccounted_segments": 0,
+                },
+            )
+
+    def test_missing_digestion_coverage_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            audio = root / "discussion.wav"
+            write_silent_wav(audio)
+            output = root / "out"
+
+            with self.assertRaisesRegex(
+                ProcessingError, "unaccounted transcript segments: 2, 3"
+            ):
+                process_audio(
+                    audio,
+                    output,
+                    StubTranscriptionProvider(),
+                    StubSpeakerProvider(),
+                    IncompleteAnalysisProvider(),
+                )
+
+            self.assertFalse(output.exists())
+
+    def test_meeting_time_is_not_inferred_from_source_mtime(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            audio = root / "discussion.wav"
+            write_silent_wav(audio)
+
+            package = run_pipeline(audio, root / "out")
+            manifest = json.loads((package / "manifest.json").read_text())
+            summary = (package / "meeting_summary.md").read_text()
+
+            self.assertIn("Time: 待人工确认", summary)
+            self.assertNotIn(
+                f"Time: {manifest['source']['modified_at']}",
+                summary,
+            )
 
     def test_rejects_unsupported_input(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

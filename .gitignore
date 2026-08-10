@@ -1,12 +1,8 @@
 .DS_Store
 
-# Raw audio and generated processing packages may contain private business data.
-01_inbox/*.m4a
-01_inbox/*.mp3
-01_inbox/*.wav
-01_inbox/*.transcript.json
-01_inbox/*.speakers.json
-01_inbox/*.analysis.json
+# Raw inputs and generated processing packages may contain private business data.
+01_inbox/**
+!01_inbox/AGENTS.md
 02_processing/*/
 
 # Python runtime artifacts

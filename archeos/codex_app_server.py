@@ -43,9 +43,13 @@ Requirements:
 - Atomic notes are semantic units, not transcript segments. You may split one
   segment into multiple notes or combine multiple segments into one note.
 - Every atomic note must cite all supporting segment numbers.
+- Every non-empty transcript segment must be referenced by at least one atomic
+  note or residue item.
 - concerns names who or what the statement concerns. Do not invent identities.
 - Put ambiguous references, contradictions, missing context, insufficient
   evidence, and uncertain but potentially important information into residue.
+- Put content that is not safely absorbed, including filler, context, or noise,
+  into residue. Group segment references when appropriate, but omit none.
 - Do not create or update core objects. All output is proposed for human review.
 
 Transcript segments:
