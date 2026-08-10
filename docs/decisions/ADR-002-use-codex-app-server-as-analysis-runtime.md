@@ -6,31 +6,99 @@ Accepted
 
 ## Context
 
-ArcheOS M1 requires semantic analysis of processed information. The system should not embed a specific model implementation into its core information lifecycle.
-
-The first implementation originally used deterministic rules after transcription. This does not satisfy the goal of transforming unstructured information into meaningful atomic information, context summaries, and residue.
-
-ArcheOS needs an analysis runtime that can provide reasoning capability while keeping the Core architecture independent from any single model provider.
+ArcheOS M1 requires semantic analysis of processed information while keeping the Core lifecycle independent from any single model implementation. M1 also needs neutral speaker attribution so semantic evidence can preserve who said what without prematurely binding a voice to a real `Person`.
 
 ## Decision
 
-ArcheOS will use a provider-based analysis architecture.
+ArcheOS uses provider boundaries for transcription, speaker attribution, and semantic analysis:
 
-The first production implementation of `AnalysisProvider` will use the local Codex app-server runtime.
-
-The architecture boundary is:
-
+```text
+Audio
+ ↓
+TranscriptionProvider
+ ↓
+SpeakerProvider
+ ↓
+AnalysisProvider
+ ↓
+Meeting Summary + Atomic Notes + Residue
+ ↓
+Human Review
 ```
+
+### Analysis runtime
+
+The first production `AnalysisProvider` implementation uses the local Codex app-server runtime through the **official `openai-codex` Python SDK**.
+
+M1 pins:
+
+- `openai-codex==0.144.4`.
+
+The boundary is:
+
+```text
 ArcheOS Core
-    |
     ↓
-AnalysisProvider Interface
-    |
+AnalysisProvider
     ↓
-Codex App Server Provider
+CodexAnalysisProvider
+    ↓
+official openai-codex Python SDK
+    ↓
+Codex app-server runtime
 ```
 
-ArcheOS Core does not directly depend on Codex implementation details.
+ArcheOS must not maintain a hand-written Codex JSON-RPC/app-server protocol client when the official SDK provides the required surface.
+
+All `openai_codex` imports and SDK-specific types remain isolated inside the Codex provider adapter. ArcheOS Core remains SDK-agnostic.
+
+The Codex provider uses a deny-all approval policy, read-only sandbox, isolated temporary working directory, ephemeral thread, and ArcheOS-owned structured output schema. ArcheOS does not manage Codex authentication tokens, login flows, model retry strategy, or model-specific output repair.
+
+### M1 speaker diarization
+
+Automatic local neutral speaker diarization is part of M1.
+
+The first production `SpeakerProvider` implementation uses:
+
+- `pyannote.audio==4.0.7`;
+- `pyannote/speaker-diarization-community-1`.
+
+Use exclusive diarization output when practical for transcript alignment.
+
+Backend speaker labels are normalized to neutral ArcheOS labels:
+
+- `Speaker_1`
+- `Speaker_2`
+- `Speaker_3`
+
+Labels are ordered by first chronological appearance. They are not identities and must not be interpreted as `Person` objects.
+
+Speaker-to-transcript alignment is conservative:
+
+- use positive timestamp overlap;
+- assign a speaker only when one speaker clearly dominates the segment;
+- do not resolve ambiguous ties through speaker number, first appearance, or another arbitrary heuristic;
+- preserve speaker as unknown/`None` when attribution is unsafe;
+- if a transcript lacks usable timestamps and safe automatic alignment cannot be performed, fail with an actionable message or require a supplied speaker map.
+
+M1 does **not** implement:
+
+- voice embeddings;
+- voiceprint storage;
+- automatic real-person identification;
+- Person matching or binding.
+
+`FileSpeakerProvider` remains supported for deterministic tests, imported diarization, and manual correction.
+
+### Privacy
+
+ArcheOS defaults the pyannote execution path to:
+
+```text
+PYANNOTE_METRICS_ENABLED=0
+```
+
+ArcheOS does not store, print, copy, or commit Hugging Face access tokens. Model-download authentication remains local runtime configuration.
 
 ## Responsibilities
 
@@ -39,81 +107,37 @@ ArcheOS Core does not directly depend on Codex implementation details.
 Responsible for:
 
 - information lifecycle;
-- input/output contracts;
-- traceability;
+- provider contracts;
+- source traceability;
 - processing artifacts;
-- human review boundaries.
+- semantic output contracts;
+- human-review boundaries.
 
 Not responsible for:
 
-- model authentication;
-- token management;
-- runtime scheduling;
-- model retry strategy;
-- model-specific output repair.
+- Codex authentication/token management;
+- Codex runtime retry strategy;
+- model-specific output repair;
+- Hugging Face credential storage;
+- speaker identity inference.
 
-### Codex Runtime
+### Provider runtimes
 
-Responsible for:
+Responsible for their own runtime execution behind the provider boundary.
 
-- model execution;
-- ChatGPT authentication state;
-- structured analysis generation;
-- runtime-level failures.
-
-## Analysis Pipeline
-
-```
-Audio
- ↓
-Transcription Provider
- ↓
-Speaker Provider
- ↓
-Analysis Provider
- ↓
-Meeting Summary
-Atomic Notes
-Residue
- ↓
-Human Review
-```
-
-## Speaker Handling
-
-M1 only supports speaker attribution with neutral labels:
-
-- Speaker_1
-- Speaker_2
-
-Automatic identity matching is not implemented.
-
-Future voice profile and Person matching capabilities require separate architecture decisions.
-
-## Alternatives Considered
-
-### OpenAI API directly from ArcheOS
-
-Rejected for M1 because it couples the Core system to API credentials and provider implementation details.
-
-### codex exec
-
-Rejected as the primary runtime because ArcheOS requires a persistent agent-oriented runtime boundary in future evolution.
-
-### Local model directly embedded in ArcheOS
-
-Deferred. It may become another AnalysisProvider implementation later.
+Runtime/configuration failures are processing failures, not residue, and must not be converted into information assets.
 
 ## Consequences
 
 Benefits:
 
-- clean separation between information lifecycle and intelligence runtime;
-- future support for multiple analysis providers;
-- compatible with local Codex workflows.
+- Core remains independent from Codex and pyannote implementation details;
+- official Codex SDK absorbs app-server protocol changes;
+- speaker attribution becomes available in evidence without prematurely introducing identity models;
+- future analysis or speaker providers can be added without changing the canonical lifecycle.
 
 Costs:
 
-- requires local Codex runtime availability;
-- requires clear provider contracts;
-- introduces another runtime dependency.
+- M1 depends on local Codex runtime availability;
+- M1 speaker diarization depends on pyannote model availability and local model setup;
+- provider adapters require version-pinned compatibility tests.
