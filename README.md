@@ -98,17 +98,40 @@ Agent 记忆是治理后信息的一种使用方式，而不是独立的事实�
 
 ## M1 通用音频处理
 
-仓库提供一个最小 Python CLI，将 `.m4a`、`.mp3` 或 `.wav` 音频转换为待人工审核的处理包。运行环境需要 `ffmpeg`；默认使用本机 `mlx_whisper`，不会修改原始音频，也不会自动写入 `03_notes/`、`04_core/` 或决策层。
+仓库提供一个最小 Python CLI，将 `.m4a`、`.mp3` 或 `.wav` 音频转换为待人工审核的处理包。运行环境需要 `ffmpeg`、`mlx_whisper` 和已登录的 Codex CLI；不会修改原始音频，也不会自动写入 `03_notes/`、`04_core/` 或决策层。
+
+处理链分为三个可替换边界：
+
+```text
+audio → Transcriber → SpeakerProvider → AnalysisProvider → review package
+```
+
+- `Transcriber` 默认使用本机 `mlx_whisper`；
+- `SpeakerProvider` 保留已有标签，或读取仅包含 `Speaker_N` 中性标签的 diarization map；
+- `AnalysisProvider` 默认通过本机 `codex exec` 生成结构化语义分析，不读取或复制登录令牌。
 
 ```bash
 python3 -m archeos process 01_inbox/discussion.m4a --language zh
 ```
 
-首次运行可能需要由 `mlx_whisper` 下载指定模型。也可以用已有的 Whisper JSON 或纯文本转写文件进行可重复处理：
+首次运行可能需要由 `mlx_whisper` 下载指定模型。也可以使用已有 Whisper JSON、speaker map 或 schema-compliant analysis JSON 进行可重复处理和诊断：
 
 ```bash
 python3 -m archeos process 01_inbox/discussion.m4a \
-  --transcript /path/to/transcript.json
+  --transcript /path/to/discussion.transcript.json \
+  --speaker-map /path/to/discussion.speakers.json \
+  --analysis-file /path/to/discussion.analysis.json
+```
+
+speaker map 使用转写片段编号，只接受中性标签，不执行 Person 身份匹配：
+
+```json
+{
+  "segments": [
+    {"segment": 1, "speaker": "Speaker_1"},
+    {"segment": 2, "speaker": "Speaker_2"}
+  ]
+}
 ```
 
 每个来源会生成确定性的 `source_id`，输出位于 `02_processing/<source_id>/`：
@@ -121,7 +144,7 @@ atomic_notes.jsonl
 residue.md
 ```
 
-同一来源已有处理包时，CLI 会停止而不是覆盖。所有生成信息保持 `proposed` / `awaiting_human_review` 状态。
+同一来源已有处理包时，CLI 会停止而不是覆盖。分析可以从一个转写片段提取多条原子信息，也可以用多个片段共同支持一条原子信息；歧义、冲突、上下文不足或证据不足的信息进入 residue。所有生成信息保持 `proposed` / `awaiting_human_review` 状态。
 
 运行自动化测试：
 

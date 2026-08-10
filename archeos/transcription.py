@@ -14,6 +14,7 @@ class TranscriptSegment:
     text: str
     start: float | None = None
     end: float | None = None
+    speaker: str | None = None
 
 
 @dataclass(frozen=True)
@@ -46,6 +47,12 @@ def _from_json(payload: object, *, engine: str) -> Transcript:
                     text=str(item["text"]).strip(),
                     start=float(start) if isinstance(start, (int, float)) else None,
                     end=float(end) if isinstance(end, (int, float)) else None,
+                    speaker=(
+                        str(item["speaker"]).strip()
+                        if isinstance(item.get("speaker"), str)
+                        and str(item["speaker"]).strip()
+                        else None
+                    ),
                 )
             )
 

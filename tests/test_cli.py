@@ -1,62 +1,37 @@
 from __future__ import annotations
 
-import json
-import subprocess
-import sys
-import tempfile
 import unittest
-import wave
+from contextlib import redirect_stdout
+from io import StringIO
 from pathlib import Path
+from unittest.mock import Mock, patch
+
+from archeos.cli import main
 
 
 class CliTest(unittest.TestCase):
-    def test_processes_audio_with_provided_transcript(self) -> None:
-        with tempfile.TemporaryDirectory() as temp:
-            root = Path(temp)
-            audio = root / "sample.wav"
-            with wave.open(str(audio), "wb") as wav_file:
-                wav_file.setnchannels(1)
-                wav_file.setsampwidth(2)
-                wav_file.setframerate(16_000)
-                wav_file.writeframes(b"\x00\x00" * 1_600)
-            transcript = root / "transcript.json"
-            transcript.write_text(
-                json.dumps(
-                    {
-                        "text": "目前方案需要验证。为什么现在开始？",
-                        "language": "zh",
-                        "segments": [
-                            {"start": 0, "end": 1.5, "text": "目前方案需要验证。"},
-                            {"start": 1.5, "end": 3, "text": "为什么现在开始？"},
-                        ],
-                    },
-                    ensure_ascii=False,
-                ),
-                encoding="utf-8",
-            )
-            output_root = root / "processing"
-
-            result = subprocess.run(
+    @patch("archeos.cli.process_audio")
+    def test_constructs_file_backed_providers(self, process_audio: Mock) -> None:
+        process_audio.return_value = Path("/tmp/package")
+        with redirect_stdout(StringIO()):
+            result = main(
                 [
-                    sys.executable,
-                    "-m",
-                    "archeos",
                     "process",
-                    str(audio),
+                    "sample.wav",
                     "--transcript",
-                    str(transcript),
-                    "--output-root",
-                    str(output_root),
-                ],
-                capture_output=True,
-                text=True,
-                cwd=Path(__file__).parents[1],
+                    "transcript.json",
+                    "--speaker-map",
+                    "speakers.json",
+                    "--analysis-file",
+                    "analysis.json",
+                ]
             )
-
-            self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
-            package = Path(result.stdout.strip())
-            self.assertTrue((package / "manifest.json").is_file())
-            self.assertIn("为什么现在开始？", (package / "meeting_summary.md").read_text())
+        self.assertEqual(result, 0)
+        self.assertEqual(process_audio.call_count, 1)
+        transcriber, speaker_provider, analysis_provider = process_audio.call_args.args[2:]
+        self.assertEqual(transcriber.transcript_file, Path("transcript.json"))
+        self.assertEqual(speaker_provider.speaker_map, Path("speakers.json"))
+        self.assertEqual(analysis_provider.analysis_file, Path("analysis.json"))
 
 
 if __name__ == "__main__":

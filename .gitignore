@@ -4,6 +4,9 @@
 01_inbox/*.m4a
 01_inbox/*.mp3
 01_inbox/*.wav
+01_inbox/*.transcript.json
+01_inbox/*.speakers.json
+01_inbox/*.analysis.json
 02_processing/*/
 
 # Python runtime artifacts

@@ -3,7 +3,9 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
+from .analysis import CodexAnalysisProvider, FileAnalysisProvider
 from .pipeline import ProcessingError, process_audio
+from .speakers import FileSpeakerProvider, PreserveSpeakerProvider
 from .transcription import FileTranscriber, MlxWhisperTranscriber
 
 
@@ -32,6 +34,20 @@ def build_parser() -> argparse.ArgumentParser:
         help="mlx_whisper model name or local path.",
     )
     process.add_argument("--language", help="Optional transcription language code.")
+    process.add_argument(
+        "--speaker-map",
+        type=Path,
+        help="Optional JSON diarization map using neutral Speaker_N labels.",
+    )
+    process.add_argument(
+        "--analysis-model",
+        help="Optional model override passed to the local Codex CLI.",
+    )
+    process.add_argument(
+        "--analysis-file",
+        type=Path,
+        help="Use an existing schema-compliant analysis JSON instead of Codex.",
+    )
     return parser
 
 
@@ -45,8 +61,24 @@ def main(argv: list[str] | None = None) -> int:
         if args.transcript
         else MlxWhisperTranscriber(model=args.model, language=args.language)
     )
+    speaker_provider = (
+        FileSpeakerProvider(args.speaker_map)
+        if args.speaker_map
+        else PreserveSpeakerProvider()
+    )
+    analysis_provider = (
+        FileAnalysisProvider(args.analysis_file)
+        if args.analysis_file
+        else CodexAnalysisProvider(model=args.analysis_model)
+    )
     try:
-        package = process_audio(args.audio, args.output_root, transcriber)
+        package = process_audio(
+            args.audio,
+            args.output_root,
+            transcriber,
+            speaker_provider,
+            analysis_provider,
+        )
     except ProcessingError as exc:
         print(f"error: {exc}")
         return 1
