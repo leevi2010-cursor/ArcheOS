@@ -95,3 +95,36 @@ Agent 记忆是治理后信息的一种使用方式，而不是独立的事实�
 3. 定义收集、校验、写入、读回、修订、归档与删除协议；
 4. 定义 Codex 与其他 Agent 的读取、记忆生成和受控回写方式；
 5. 选择一个真实领域做小规模迁移试点，再决定是否扩大到电脑中的其他信息。
+
+## M1 通用音频处理
+
+仓库提供一个最小 Python CLI，将 `.m4a`、`.mp3` 或 `.wav` 音频转换为待人工审核的处理包。运行环境需要 `ffmpeg`；默认使用本机 `mlx_whisper`，不会修改原始音频，也不会自动写入 `03_notes/`、`04_core/` 或决策层。
+
+```bash
+python3 -m archeos process 01_inbox/discussion.m4a --language zh
+```
+
+首次运行可能需要由 `mlx_whisper` 下载指定模型。也可以用已有的 Whisper JSON 或纯文本转写文件进行可重复处理：
+
+```bash
+python3 -m archeos process 01_inbox/discussion.m4a \
+  --transcript /path/to/transcript.json
+```
+
+每个来源会生成确定性的 `source_id`，输出位于 `02_processing/<source_id>/`：
+
+```text
+manifest.json
+transcript.md
+meeting_summary.md
+atomic_notes.jsonl
+residue.md
+```
+
+同一来源已有处理包时，CLI 会停止而不是覆盖。所有生成信息保持 `proposed` / `awaiting_human_review` 状态。
+
+运行自动化测试：
+
+```bash
+python3 -m unittest discover -s tests -v
+```

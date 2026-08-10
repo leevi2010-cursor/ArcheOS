@@ -1,1 +1,11 @@
 .DS_Store
+
+# Raw audio and generated processing packages may contain private business data.
+01_inbox/*.m4a
+01_inbox/*.mp3
+01_inbox/*.wav
+02_processing/*/
+
+# Python runtime artifacts
+__pycache__/
+*.py[cod]
