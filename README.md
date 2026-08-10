@@ -98,17 +98,19 @@ Agent 记忆是治理后信息的一种使用方式，而不是独立的事实�
 
 ## M1 通用音频处理
 
-仓库提供一个最小 Python CLI，将 `.m4a`、`.mp3` 或 `.wav` 音频转换为待人工审核的处理包。运行环境需要 `ffmpeg`、`mlx_whisper` 和已登录的 Codex CLI；不会修改原始音频，也不会自动写入 `03_notes/`、`04_core/` 或决策层。
+仓库提供一个最小 Python CLI，将 `.m4a`、`.mp3` 或 `.wav` 音频转换为待人工审核的处理包。运行环境需要 `ffmpeg`、`mlx_whisper` 和带有 app-server 能力且已登录的 Codex CLI；不会修改原始音频，也不会自动写入 `03_notes/`、`04_core/` 或决策层。
 
 处理链分为三个可替换边界：
 
 ```text
-audio → Transcriber → SpeakerProvider → AnalysisProvider → review package
+audio → TranscriptionProvider → SpeakerProvider → AnalysisProvider → review package
 ```
 
-- `Transcriber` 默认使用本机 `mlx_whisper`；
+- `TranscriptionProvider` 默认使用本机 `mlx_whisper`；
 - `SpeakerProvider` 保留已有标签，或读取仅包含 `Speaker_N` 中性标签的 diarization map；
-- `AnalysisProvider` 默认通过本机 `codex exec` 生成结构化语义分析，不读取或复制登录令牌。
+- `AnalysisProvider` 的首个实现通过 `codex app-server --stdio` 使用本机 runtime 生成结构化语义分析，不读取或复制登录令牌。
+
+Codex runtime 负责登录、模型执行、运行时管理、重试和 structured output；ArcheOS 只提交 AnalysisProvider 输入输出契约并消费已完成结果。ArcheOS 不启动或重启 daemon，不管理 token，不选择模型，也不修补非法模型输出。
 
 ```bash
 python3 -m archeos process 01_inbox/discussion.m4a --language zh

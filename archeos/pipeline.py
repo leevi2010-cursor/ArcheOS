@@ -13,7 +13,7 @@ from pathlib import Path
 from . import __version__
 from .analysis import AnalysisProvider, AnalysisResult
 from .speakers import SpeakerProvider
-from .transcription import Transcript, TranscriptSegment, Transcriber
+from .transcription import Transcript, TranscriptSegment, TranscriptionProvider
 
 
 SUPPORTED_AUDIO = {".m4a", ".mp3", ".wav"}
@@ -241,7 +241,7 @@ def _residue_markdown(
 def process_audio(
     audio: Path,
     output_root: Path,
-    transcriber: Transcriber,
+    transcription_provider: TranscriptionProvider,
     speaker_provider: SpeakerProvider,
     analysis_provider: AnalysisProvider,
     *,
@@ -264,7 +264,7 @@ def process_audio(
         raise ProcessingError(f"processing package already exists: {package}")
 
     try:
-        transcript = transcriber.transcribe(audio)
+        transcript = transcription_provider.transcribe(audio)
         transcript = speaker_provider.attribute(audio, transcript)
         if not transcript.segments:
             raise ValueError("transcription did not contain any segments")
@@ -289,6 +289,7 @@ def process_audio(
         "pipeline_version": __version__,
         "source": source,
         "transcription": {
+            "provider": transcription_provider.__class__.__name__,
             "engine": transcript.engine,
             "model": transcript.model,
             "language": transcript.language,
@@ -300,7 +301,6 @@ def process_audio(
         },
         "analysis": {
             "provider": analysis_provider.name,
-            "model": analysis_provider.model,
         },
         "artifacts": list(ARTIFACTS),
         "counts": {

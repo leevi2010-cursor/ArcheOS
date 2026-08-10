@@ -26,7 +26,7 @@ class Transcript:
     language: str | None = None
 
 
-class Transcriber(Protocol):
+class TranscriptionProvider(Protocol):
     def transcribe(self, audio: Path) -> Transcript: ...
 
 
@@ -77,7 +77,7 @@ def _from_json(payload: object, *, engine: str) -> Transcript:
     )
 
 
-class FileTranscriber:
+class FileTranscriptionProvider:
     def __init__(self, transcript_file: Path) -> None:
         self.transcript_file = transcript_file
 
@@ -97,7 +97,7 @@ class FileTranscriber:
         return Transcript(text=text, segments=segments, engine="provided-text")
 
 
-class MlxWhisperTranscriber:
+class MlxWhisperTranscriptionProvider:
     def __init__(
         self,
         *,

@@ -3,10 +3,11 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
-from .analysis import CodexAnalysisProvider, FileAnalysisProvider
+from .analysis import FileAnalysisProvider
+from .codex_app_server import CodexAppServerAnalysisProvider
 from .pipeline import ProcessingError, process_audio
 from .speakers import FileSpeakerProvider, PreserveSpeakerProvider
-from .transcription import FileTranscriber, MlxWhisperTranscriber
+from .transcription import FileTranscriptionProvider, MlxWhisperTranscriptionProvider
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -40,10 +41,6 @@ def build_parser() -> argparse.ArgumentParser:
         help="Optional JSON diarization map using neutral Speaker_N labels.",
     )
     process.add_argument(
-        "--analysis-model",
-        help="Optional model override passed to the local Codex CLI.",
-    )
-    process.add_argument(
         "--analysis-file",
         type=Path,
         help="Use an existing schema-compliant analysis JSON instead of Codex.",
@@ -57,9 +54,12 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     transcriber = (
-        FileTranscriber(args.transcript)
+        FileTranscriptionProvider(args.transcript)
         if args.transcript
-        else MlxWhisperTranscriber(model=args.model, language=args.language)
+        else MlxWhisperTranscriptionProvider(
+            model=args.model,
+            language=args.language,
+        )
     )
     speaker_provider = (
         FileSpeakerProvider(args.speaker_map)
@@ -69,7 +69,7 @@ def main(argv: list[str] | None = None) -> int:
     analysis_provider = (
         FileAnalysisProvider(args.analysis_file)
         if args.analysis_file
-        else CodexAnalysisProvider(model=args.analysis_model)
+        else CodexAppServerAnalysisProvider()
     )
     try:
         package = process_audio(

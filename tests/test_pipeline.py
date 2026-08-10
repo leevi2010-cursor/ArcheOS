@@ -21,7 +21,7 @@ from archeos.transcription import Transcript, TranscriptSegment
 FIXED_TIME = datetime(2026, 8, 10, 12, 0, tzinfo=timezone.utc)
 
 
-class StubTranscriber:
+class StubTranscriptionProvider:
     def transcribe(self, audio: Path) -> Transcript:
         self.audio = audio
         return Transcript(
@@ -122,6 +122,14 @@ class StubAnalysisProvider:
         )
 
 
+class FailingAnalysisProvider:
+    name = "failing-analysis"
+
+    def analyze(self, transcript: Transcript) -> AnalysisResult:
+        del transcript
+        raise RuntimeError("runtime unavailable")
+
+
 def write_silent_wav(path: Path) -> None:
     with wave.open(str(path), "wb") as audio:
         audio.setnchannels(1)
@@ -134,7 +142,7 @@ def run_pipeline(audio: Path, output: Path) -> Path:
     return process_audio(
         audio,
         output,
-        StubTranscriber(),
+        StubTranscriptionProvider(),
         StubSpeakerProvider(),
         StubAnalysisProvider(),
         processed_at=FIXED_TIME,
@@ -243,6 +251,22 @@ class PipelineTest(unittest.TestCase):
             audio.write_bytes(b"not audio")
             with self.assertRaisesRegex(ProcessingError, "invalid audio input"):
                 run_pipeline(audio, Path(temp) / "out")
+
+    def test_runtime_failure_does_not_create_partial_package(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            audio = root / "discussion.wav"
+            write_silent_wav(audio)
+            output = root / "out"
+            with self.assertRaisesRegex(ProcessingError, "runtime unavailable"):
+                process_audio(
+                    audio,
+                    output,
+                    StubTranscriptionProvider(),
+                    StubSpeakerProvider(),
+                    FailingAnalysisProvider(),
+                )
+            self.assertFalse(output.exists())
 
 
 if __name__ == "__main__":
