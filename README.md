@@ -98,7 +98,7 @@ Agent 记忆是治理后信息的一种使用方式，而不是独立的事实�
 
 ## M1 通用音频处理
 
-仓库提供一个最小 Python CLI，将 `.m4a`、`.mp3` 或 `.wav` 音频转换为待人工审核的处理包。运行环境需要 `ffmpeg`、`mlx_whisper` 和带有 app-server 能力且已登录的 Codex CLI；不会修改原始音频，也不会自动写入 `03_notes/`、`04_core/` 或决策层。
+仓库提供一个最小 Python CLI，将 `.m4a`、`.mp3` 或 `.wav` 音频转换为待人工审核的处理包。运行环境需要 `ffmpeg`、`mlx_whisper`、官方 Codex Python SDK 和本地 pyannote 模型；不会修改原始音频，也不会自动写入 `03_notes/`、`04_core/` 或决策层。
 
 处理链分为三个可替换边界：
 
@@ -107,16 +107,35 @@ audio → TranscriptionProvider → SpeakerProvider → AnalysisProvider → rev
 ```
 
 - `TranscriptionProvider` 默认使用本机 `mlx_whisper`；
-- `SpeakerProvider` 保留已有标签，或读取仅包含 `Speaker_N` 中性标签的 diarization map；
-- `AnalysisProvider` 的首个实现通过 `codex app-server --stdio` 使用本机 runtime 生成结构化语义分析，不读取或复制登录令牌。
+- `SpeakerProvider` 默认使用本地 `pyannote/speaker-diarization-community-1` 自动生成中性 `Speaker_N` 标签，也可读取已有 diarization map；
+- `AnalysisProvider` 的首个实现通过官方 `openai-codex==0.144.4` Python SDK 使用 Codex app-server runtime，不读取或复制登录令牌。
 
-Codex runtime 负责登录、模型执行、运行时管理、重试和 structured output；ArcheOS 只提交 AnalysisProvider 输入输出契约并消费已完成结果。ArcheOS 不启动或重启 daemon，不管理 token，不选择模型，也不修补非法模型输出。
+Codex SDK/runtime 负责登录状态、app-server 生命周期、模型执行、运行时管理和 structured output；ArcheOS 只提交 AnalysisProvider 输入输出契约并消费已完成结果。ArcheOS 不管理 token、不选择模型、不实现重试，也不修补非法模型输出。
+
+建议使用 Python 3.13 的独立虚拟环境安装固定的 M1 runtime 依赖，并单独安装转写工具：
+
+```bash
+python3.13 -m venv .venv
+source .venv/bin/activate
+python3 -m pip install -r requirements.txt
+python3 -m pip install mlx-whisper
+```
+
+`openai-codex` 会安装匹配的 Codex runtime，并复用本机现有 Codex 登录状态。ArcheOS 不发起登录，也不接触 OAuth/token 文件。
+
+自动 speaker diarization 首次使用前，需要：
+
+1. 在 Hugging Face 接受 [`pyannote/speaker-diarization-community-1`](https://huggingface.co/pyannote/speaker-diarization-community-1) 的访问条件；
+2. 通过本机 Hugging Face CLI 执行 `hf auth login` 配置访问权限；
+3. 首次运行时下载模型到标准 Hugging Face 本地缓存。
+
+模型下载后的推理在本机执行。ArcheOS 不保存、打印或提交 Hugging Face access token，并在未显式设置时默认使用 `PYANNOTE_METRICS_ENABLED=0`。
 
 ```bash
 python3 -m archeos process 01_inbox/discussion.m4a --language zh
 ```
 
-首次运行可能需要由 `mlx_whisper` 下载指定模型。也可以使用已有 Whisper JSON、speaker map 或 schema-compliant analysis JSON 进行可重复处理和诊断：
+首次运行可能需要由 `mlx_whisper` 和 pyannote 下载模型。也可以使用已有 Whisper JSON、speaker map 或 schema-compliant analysis JSON 进行可重复处理和诊断；提供 `--speaker-map` 时不会运行自动 diarization：
 
 ```bash
 python3 -m archeos process 01_inbox/discussion.m4a \
@@ -135,6 +154,8 @@ speaker map 使用转写片段编号，只接受中性标签，不执行 Person 
   ]
 }
 ```
+
+自动 diarization 只在某个 speaker 对 transcript segment 具有明确、占多数的正时间重叠时赋值。相同 overlap、无明显主导或无有效 overlap 时保留未知 speaker；缺少可用时间戳且没有 speaker map 时会给出可操作错误。M1 不执行声纹、voice embedding、Person 匹配或真实身份推断。
 
 每个来源会生成确定性的 `source_id`，输出位于 `02_processing/<source_id>/`：
 

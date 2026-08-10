@@ -130,6 +130,14 @@ class FailingAnalysisProvider:
         raise RuntimeError("runtime unavailable")
 
 
+class FailingSpeakerProvider:
+    name = "failing-speakers"
+
+    def attribute(self, audio: Path, transcript: Transcript) -> Transcript:
+        del audio, transcript
+        raise RuntimeError("diarization unavailable")
+
+
 def write_silent_wav(path: Path) -> None:
     with wave.open(str(path), "wb") as audio:
         audio.setnchannels(1)
@@ -183,6 +191,17 @@ class PipelineTest(unittest.TestCase):
                 ["decision", "requirement", "action"],
             )
             self.assertEqual(notes[0]["source_evidence"][0]["segment"], 1)
+            self.assertEqual(notes[0]["source_evidence"][0]["speaker"], "Speaker_1")
+            self.assertEqual(notes[0]["source_evidence"][0]["start"], "00:00:00.000")
+            self.assertEqual(notes[0]["source_evidence"][0]["end"], "00:00:02.000")
+            self.assertEqual(
+                notes[0]["source_evidence"][0]["excerpt"],
+                "我们决定先验证通用流程，同时要求保留上下文。",
+            )
+            self.assertEqual(
+                notes[0]["source_evidence"][0]["source_id"],
+                manifest["source"]["id"],
+            )
             self.assertEqual(notes[1]["source_evidence"][0]["segment"], 1)
             self.assertEqual(
                 [evidence["segment"] for evidence in notes[2]["source_evidence"]],
@@ -265,6 +284,22 @@ class PipelineTest(unittest.TestCase):
                     StubTranscriptionProvider(),
                     StubSpeakerProvider(),
                     FailingAnalysisProvider(),
+                )
+            self.assertFalse(output.exists())
+
+    def test_diarization_failure_does_not_create_partial_package(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            audio = root / "discussion.wav"
+            write_silent_wav(audio)
+            output = root / "out"
+            with self.assertRaisesRegex(ProcessingError, "diarization unavailable"):
+                process_audio(
+                    audio,
+                    output,
+                    StubTranscriptionProvider(),
+                    FailingSpeakerProvider(),
+                    StubAnalysisProvider(),
                 )
             self.assertFalse(output.exists())
 

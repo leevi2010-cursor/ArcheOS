@@ -4,9 +4,10 @@ import argparse
 from pathlib import Path
 
 from .analysis import FileAnalysisProvider
-from .codex_app_server import CodexAppServerAnalysisProvider
+from .codex_app_server import CodexAnalysisProvider
 from .pipeline import ProcessingError, process_audio
-from .speakers import FileSpeakerProvider, PreserveSpeakerProvider
+from .pyannote_speakers import PyannoteSpeakerProvider
+from .speakers import FileSpeakerProvider
 from .transcription import FileTranscriptionProvider, MlxWhisperTranscriptionProvider
 
 
@@ -64,12 +65,12 @@ def main(argv: list[str] | None = None) -> int:
     speaker_provider = (
         FileSpeakerProvider(args.speaker_map)
         if args.speaker_map
-        else PreserveSpeakerProvider()
+        else PyannoteSpeakerProvider()
     )
     analysis_provider = (
         FileAnalysisProvider(args.analysis_file)
         if args.analysis_file
-        else CodexAppServerAnalysisProvider()
+        else CodexAnalysisProvider()
     )
     try:
         package = process_audio(

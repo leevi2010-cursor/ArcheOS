@@ -10,5 +10,6 @@
 02_processing/*/
 
 # Python runtime artifacts
+.venv/
 __pycache__/
 *.py[cod]
