@@ -167,6 +167,11 @@ atomic_notes.jsonl
 residue.md
 ```
 
+`manifest.json` 同时报告语义条目数和去重后的证据片段数：
+`atomic_notes` / `atomic_note_segments`、`residue_items` / `residue_segments`。
+若同一片段同时支持 Atomic Note 和 Residue，`digestion_coverage.overlap_segments`
+会记录该重叠，因此始终可以按“Atomic Note 片段数 + Residue 片段数 - 重叠片段数”核对已覆盖片段总数。
+
 同一来源已有处理包时，CLI 会停止而不是覆盖。分析可以从一个转写片段提取多条原子信息，也可以用多个片段共同支持一条原子信息；歧义、冲突、上下文不足或证据不足的信息进入 residue。所有生成信息保持 `proposed` / `awaiting_human_review` 状态。
 
 运行自动化测试：

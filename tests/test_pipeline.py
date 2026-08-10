@@ -142,6 +142,24 @@ class IncompleteAnalysisProvider:
         )
 
 
+class OverlappingAnalysisProvider:
+    name = "overlapping-analysis"
+
+    def analyze(self, transcript: Transcript) -> AnalysisResult:
+        result = StubAnalysisProvider().analyze(transcript)
+        return AnalysisResult(
+            result.meeting_summary,
+            result.atomic_notes,
+            (
+                ResidueItem(
+                    (1, 2, 3),
+                    "第一段仍有部分上下文无法安全吸收。",
+                    "人工复核后可能补充原子信息的适用范围。",
+                ),
+            ),
+        )
+
+
 class FailingSpeakerProvider:
     name = "failing-speakers"
 
@@ -191,7 +209,13 @@ class PipelineTest(unittest.TestCase):
             self.assertFalse(manifest["speaker_attribution"]["identity_matching"])
             self.assertEqual(
                 manifest["counts"],
-                {"transcript_segments": 4, "atomic_notes": 3, "residue_items": 1},
+                {
+                    "transcript_segments": 4,
+                    "atomic_notes": 3,
+                    "atomic_note_segments": 2,
+                    "residue_items": 1,
+                    "residue_segments": 2,
+                },
             )
 
             notes = [
@@ -274,8 +298,36 @@ class PipelineTest(unittest.TestCase):
                     "total_segments": 4,
                     "accounted_segments": 4,
                     "unaccounted_segments": 0,
+                    "overlap_segments": 0,
                 },
             )
+            self.assertEqual(
+                manifest["counts"]["atomic_note_segments"]
+                + manifest["counts"]["residue_segments"]
+                - manifest["digestion_coverage"]["overlap_segments"],
+                manifest["digestion_coverage"]["accounted_segments"],
+            )
+
+    def test_reports_overlapping_atomic_note_and_residue_segments(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            audio = root / "discussion.wav"
+            write_silent_wav(audio)
+
+            package = process_audio(
+                audio,
+                root / "out",
+                StubTranscriptionProvider(),
+                StubSpeakerProvider(),
+                OverlappingAnalysisProvider(),
+                processed_at=FIXED_TIME,
+            )
+            manifest = json.loads((package / "manifest.json").read_text())
+
+            self.assertEqual(manifest["counts"]["atomic_note_segments"], 2)
+            self.assertEqual(manifest["counts"]["residue_segments"], 3)
+            self.assertEqual(manifest["digestion_coverage"]["overlap_segments"], 1)
+            self.assertEqual(manifest["digestion_coverage"]["accounted_segments"], 4)
 
     def test_missing_digestion_coverage_fails_closed(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

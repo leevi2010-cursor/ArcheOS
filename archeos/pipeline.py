@@ -112,20 +112,30 @@ def _digestion_coverage(
         for index, segment in enumerate(transcript.segments, start=1)
         if segment.text.strip()
     }
-    accounted = {
+    atomic_note_segments = {
         reference
-        for item in (*analysis.atomic_notes, *analysis.residue)
+        for item in analysis.atomic_notes
         for reference in item.evidence_segments
         if reference in expected
     }
+    residue_segments = {
+        reference
+        for item in analysis.residue
+        for reference in item.evidence_segments
+        if reference in expected
+    }
+    accounted = atomic_note_segments | residue_segments
     unaccounted = sorted(expected - accounted)
     if unaccounted:
         references = ", ".join(str(reference) for reference in unaccounted)
         raise ValueError(f"unaccounted transcript segments: {references}")
     return {
         "total_segments": len(expected),
+        "atomic_note_segments": len(atomic_note_segments),
+        "residue_segments": len(residue_segments),
         "accounted_segments": len(accounted),
         "unaccounted_segments": 0,
+        "overlap_segments": len(atomic_note_segments & residue_segments),
     }
 
 
@@ -333,9 +343,19 @@ def process_audio(
         "counts": {
             "transcript_segments": len(transcript.segments),
             "atomic_notes": len(analysis.atomic_notes),
+            "atomic_note_segments": digestion_coverage["atomic_note_segments"],
             "residue_items": len(analysis.residue),
+            "residue_segments": digestion_coverage["residue_segments"],
         },
-        "digestion_coverage": digestion_coverage,
+        "digestion_coverage": {
+            key: digestion_coverage[key]
+            for key in (
+                "total_segments",
+                "accounted_segments",
+                "unaccounted_segments",
+                "overlap_segments",
+            )
+        },
         "review": {
             "status": "awaiting_human_review",
             "automatic_core_write": False,
