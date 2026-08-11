@@ -5,199 +5,159 @@
 本文件只定义 ArcheOS 的阶段演化顺序，不承担单个开发任务的实现规格。
 
 - `AGENTS.md`：定义 Agent 的工作规则与权威关系。
-- `docs/architecture/CONCEPTS.md`：定义 Core 概念的唯一权威词典。
+- `docs/architecture/CONCEPTS.md`：定义 Core 概念。
+- `docs/product/INFORMATION_GOVERNANCE.md`：定义信息吸收、自动更新与人工判断的产品规则。
 - 本 `ROADMAP.md`：定义长期阶段顺序。
 - GitHub Issue：定义当前一次开发必须交付什么；复杂 Issue 可以内嵌 Architect 批准的 Implementation Plan 与 Test Cases。
-- Durable Spec / ADR：仅在某个稳定契约或架构决策需要被多个 Issue 复用时建立。
+- Durable Spec / ADR：仅在稳定契约或架构决策需要跨多个 Issue 复用时建立。
 
 ---
 
 ## M0 — 治理与基础结构（已完成）
 
-目标：建立最小且统一的系统治理方式。
-
-交付：
-
-- `AGENTS.md` 治理规则；
-- 信息生命周期目录；
-- 系统文档目录；
-- `Issue → Approved Plan / Tests → 实现 → PR → 审核` 的协作协议；
-- 概念治理机制：优先复用已有概念，新增概念必须先进入权威文档。
+目标：建立统一的系统治理、信息目录与 Issue → Approved Plan / Tests → 实现 → PR → 审核协作方式。
 
 ---
 
 ## M1 — 通用音频信息消化（已完成）
 
-目标：证明 ArcheOS 能把一段未知业务领域的音频，从混乱输入转化为可人工审核的信息包。
-
-第一版输入：
-
-- 会议录音；
-- 通话录音；
-- 工作讨论；
-- 头脑风暴；
-- 其他本地音频。
+目标：把未知业务领域的本地音频转化为可追溯的 Processing 包。
 
 核心流程：
 
-**录音 → 转写 → Speaker Attribution → 上下文保留 → 原子信息候选 + 残渣 → 人工审核**
+**录音 → 转写 → Speaker Attribution → 上下文保留 → Atomic Information Candidates + Residue**
 
-交付：
-
-- `transcript` 保存原始转写；
-- `meeting_summary` 保存整体上下文；
-- `atomic_notes` 保存可独立审查、可追溯的信息候选；
-- `residue` 保存当前无法安全吸收的信息，并作为信息消化健康度的反馈；
-- 自动中性 Speaker diarization；
-- Codex model-backed semantic analysis；
-- 全 transcript digestion coverage fail-closed；
-- 源文件不可变、隐私数据不进入 public repo。
-
-实现：GitHub Issue #4 / PR #5。
+已实现：GitHub Issue #4 / PR #5。
 
 ---
 
-## M2 — 人工确认与结构化世界模型（当前）
+## M2 — 长期 Information + Structured World Model（当前）
 
-目标：让经过人工确认的信息，从“候选信息”安全进入长期可追溯的 Information + World Model，而不因业务术语变化破坏身份和历史。
+目标：让 Processing 产出的信息进入长期 Note，并在受治理的边界下持续更新 Structured World Model。
 
-M2 使用 `docs/architecture/CONCEPTS.md` 与 ADR-003 的统一模型：
+长期方向：
 
 ```text
 Atomic Information Candidate
         ↓
-Human Confirmation
+Durable Note
         ↓
-       Note
-        ↓ supports / concerns
-Object + Role + Relationship + Lifecycle + Name
+Information Digestion / Governance
+        ↓
+Object + Name + Role + Lifecycle + Relationship
         ↓
 Structured World Model
+        ↓
+Object Context
 ```
 
-### M2-A — Object Identity & Role Foundation
+### M2-A — World Model Foundation
 
-目标：建立稳定的身份和关系基础，不把业务名词固化成彼此平行的底层实体类型。
+目标：建立稳定 Object identity、Name/Role/Lifecycle 历史、Relationship Graph 与 Object Resolver。
 
-需要实现/验证：
+实现 authority：Issue #6 / PR #7。
 
-- stable `Object` identity；
-- mutable `Name` / aliases / name history；
-- multi-role `RoleAssignment`；
-- Role history；
-- `Lifecycle` 与 Role 分离；
-- typed `Relationship` graph；
-- Object Resolver / read model 的最小读取边界；
-- `Note` 与 Object 分离。
+关键原则：
 
-当前已接受 Roles：
+- Object ID 稳定；
+- Name / Role 可以演化；
+- Lifecycle 与 Role 分离；
+- Core 保存 Graph；
+- Person / Company / Project / BusinessLine 等通过 Role 表达，不建立平行 base entity。
 
-- `person`
-- `company`
-- `brand`
-- `project`
-- `business_line`
-- `event`
-- `goal`
-- `decision`
+### M2-B1 — Durable Note + Automatic Ingestion
 
-真实验收场景至少覆盖：
+目标：把 contract-valid Atomic Information Candidate 自动吸收为长期 Note，不要求逐条人工审核。
 
-- “私享国际家具”可以同时具有 company / brand Role；
-- “展厅经营”是 ongoing business_line；
-- “海丝金融中心家具采购”是 bounded project；
-- 如果一个 Object 从 project 被重新理解为 business_line，Object ID 不变；
-- “内部产品库”等长期维护对象可以按需升格为 Object，而普通陈述继续保持 Note。
+需要实现：
 
-### M2-B — Human Confirmation & Absorption
+- stable Note identity；
+- append-only Note revisions；
+- Evidence / context / confidence / source provenance 保留；
+- processing candidate → Note 的幂等导入；
+- NoteStore 抽象；
+- JSONL 作为第一版正式存储 adapter；
+- 私有 Note 数据不进入 public Git；
+- 默认 processing workflow 可以进入 Note ingestion，不再以 per-note human review 作为强制 gate。
 
-目标：定义并实现候选信息的确认、修改、拒绝、不确定保留和安全吸收。
+本阶段不解释 Note 对 World Model 的影响。
 
-需要解决：
+### M2-B2 — Note → World Model Digestion & Governance
 
-- candidate → confirm / edit / reject / uncertain；
-- confirmed candidate → durable Note；
-- Note 如何提出 Object 创建/匹配建议；
-- Note 如何提出 Role、Relationship、Lifecycle 更新建议；
-- 多来源冲突如何保留而不是覆盖；
-- 所有结构化变化如何保留来源、Evidence 和历史；
-- 人工确认前不得自动改变 durable World Model。
+目标：让 Note 结合当前 Structured World Model，判断它是补充、更新还是冲突，并按 `INFORMATION_GOVERNANCE.md` 执行。
 
-### M2-C — Human Read Model / View Foundation
+需要实现：
 
-目标：让稳定 ID 的机器模型可以自然地向人展示，同时不把展示结构变成 Core 真相。
+- Note → existing Object 的保守识别与绑定；
+- 补充信息自动吸收；
+- 目标明确、Evidence 足够、无冲突且低风险的已有 Object 更新可以自动执行；
+- 新建 Object、删除 Object、冲突、Object/Relationship 不确定等情况请求人类判断；
+- 人类判断可以通过 prompt / conversation adapter 完成，不要求正式前端；
+- 所有面向人的审核内容使用通俗业务语言；
+- Object 创建与删除遵守孤立对象保护；
+- 自动与人工变更都保留 Note/Evidence/历史与执行结果；
+- 业务治理位于 Store/Repository 之上，不写死在 SQLite/JSONL adapter。
 
-需要支持的架构边界：
+### M2-B3 — Object Context
+
+目标：为后续 Domain Agent 提供一个统一、可追溯、有限边界的长期上下文读取入口。
+
+输入一个 Object 后，能够组装：
 
 ```text
-Core Graph
-  → Projection / View Model
-  → Renderer
+Object
++ current Name / Role / Lifecycle
++ Relationships + neighbor Objects
++ related Notes
++ Evidence
++ relevant history / recent changes
+        ↓
+   Object Context
 ```
 
-优先 View：
+要求：
 
-- Object Profile；
-- 向阳生长树；
-- Relationship Graph；
-- Timeline；
-- Decision View（可先定义读取边界，完整能力在 M4）。
+- 只依赖 NoteStore / WorldModelRepository 等稳定 contract；
+- 不直接绑定 JSONL 或 SQLite；
+- 输出有明确数量边界和 completeness / truncation 信息；
+- 不引入新的业务 ontology；
+- 不需要 LLM、vector database 或正式 UI。
 
-M2 不要求一次完成正式前端。HTML 图文可以作为早期 renderer / prototype，但 Core Graph 与 View Definition 才是可复用基础。
+### M2-C — Human View（后置）
+
+Object Profile、向阳生长树、Relationship Graph、Timeline 等人类展示能力暂不阻塞 M2-B1～B3。
+
+Core 保持：
+
+```text
+Structured World Model
+  → Projection / View Model
+  → Presentation
+```
+
+前端和 HTML renderer 在长期数据闭环稳定后再进入实现。
 
 ---
 
-## M3 — Domain Agent（领域解释）
+## M3 — Domain Agent
 
-目标：在通用信息消化和 Structured World Model 之上增加业务领域的专门理解，而不污染 ArcheOS Core。
+目标：在 Note、Structured World Model 与 Object Context 之上增加销售、品牌、项目等领域解释能力，而不污染 Core。
 
-候选领域：
+候选：Sales Agent、Brand Agent、Project Agent。
 
-- Sales Agent：客户需求、担忧、决策信号、销售表现、下一步跟进；
-- Brand Agent：品牌定位、目标客户、价值主张、差异化、待验证假设；
-- Project Agent：项目状态、风险、阻塞、下一步行动。
-
-原则：
-
-- Domain Agent 使用 Core 已产生的上下文、Note 和 Structured World Model；
-- Domain Agent 可以生成领域报告或提出 World Model 更新建议；
-- 不为每一种录音重新实现一套独立的信息处理 Pipeline；
-- 领域业务词优先复用 Name / Role / Relationship / Note / View，不自动升级为新 Core 概念。
+Domain Agent 优先读取 Object Context，而不是各自重新扫描全部原始资料。
 
 ---
 
 ## M4 — 决策与反馈闭环
 
-目标：让结构化信息真正参与决策，并通过行动结果反过来更新系统。
-
-核心链路：
-
-**Goal → Decision → Action → Feedback**
-
-需要解决：
-
-- Goal Role 的具体行为语义；
-- 哪些 Note / Object / Relationship 支持或反对某项判断；
-- Decision 如何记录依据；
-- Action 与 Feedback 如何连接 World Model 和后续决策。
-
-`goal` 和 `decision` 已经是 Object 可承担的 Role；M4 重点设计行为、依据与反馈闭环，不重新建立平行 Goal/Decision 对象体系。
+目标：让结构化信息参与 Goal → Decision → Action → Feedback，并保留依据与结果反馈。
 
 ---
 
 ## M5 — 多格式输入
 
-目标：把已经验证过的 Core Processing 扩展到更多输入格式。
-
-候选输入：
-
-- PDF；
-- 图片；
-- PPT；
-- 视频；
-- 其他文档与外部信息源。
-
-原则：新增输入格式只扩展“如何进入 Processing”，不复制新的对象体系、决策体系或生命周期。
+目标：把已经验证的 Processing 能力扩展到 PDF、图片、PPT、视频等输入格式，不复制新的对象体系或生命周期。
 
 ---
 
@@ -209,9 +169,11 @@ ArcheOS 始终沿一条主线演化：
 
 并遵守：
 
-1. Core 概念以 `docs/architecture/CONCEPTS.md` 为准；
-2. 优先复用已有概念，不因为新业务场景新增平行概念；
-3. Object ID 稳定，Name / Role / View 可以演化；
-4. Core 保存 Graph，人类可通过多个 View 理解同一份数据；
-5. 先用真实数据验证当前阶段，再进入下一阶段；
-6. 不因为未来可能需要某个能力，就提前建设完整框架。
+1. Core 概念以 `CONCEPTS.md` 为准；
+2. 产品行为规则以 `INFORMATION_GOVERNANCE.md` 为准；
+3. 优先复用已有概念，不建立平行模型；
+4. Object ID 稳定，Name / Role / View 可以演化；
+5. Note 与 World Model 分层，历史与 Evidence 不丢失；
+6. 存储 adapter 可替换，不让业务规则依赖 SQLite / JSONL；
+7. 先用真实数据验证当前阶段，再进入下一阶段；
+8. 不因为未来可能需要某个能力，就提前建设完整框架。
