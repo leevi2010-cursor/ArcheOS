@@ -9,7 +9,7 @@
 - Always preserve traceability to the raw source in `01_inbox/`.
 - Processing may transcribe, summarize, extract, classify, and preserve context.
 - Atomic Information Candidates remain processing-stage artifacts until they satisfy the downstream information contract. A per-item human review is not inherently required.
-- Contract-valid Atomic Information may be automatically ingested into durable `Note` records when the current approved workflow implements that path.
+- Contract-valid Atomic Information Candidates may be automatically ingested as durable `Atomic Information` when the current approved workflow implements that path.
 - Processing must not directly mutate the Structured World Model. Object/Name/Role/Relationship/Lifecycle changes follow `docs/product/INFORMATION_GOVERNANCE.md`.
 - Do not write directly to downstream directories unless the current Issue explicitly implements the corresponding approved ingestion workflow.
 - Never silently discard information that cannot be safely interpreted or atomized. Preserve it as Residue with source evidence, the reason it was not absorbed, and uncertainty or possible future value.
