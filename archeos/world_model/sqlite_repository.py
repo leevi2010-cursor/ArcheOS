@@ -11,6 +11,7 @@ from typing import Self
 
 from .models import (
     ALLOWED_ROLES,
+    ApplyReceiptRecord,
     LifecycleRecord,
     NameAssignment,
     ObjectRecord,
@@ -178,6 +179,12 @@ class SQLiteWorldModelRepository:
                 ON relationships(from_object_id);
             CREATE INDEX IF NOT EXISTS relationships_to_object_id
                 ON relationships(to_object_id);
+
+            CREATE TABLE IF NOT EXISTS apply_receipts (
+                apply_id TEXT PRIMARY KEY,
+                payload TEXT NOT NULL CHECK (length(trim(payload)) > 0),
+                created_at TEXT NOT NULL
+            );
             """
         )
 
@@ -244,6 +251,31 @@ class SQLiteWorldModelRepository:
                 (clean_status, now, object_id),
             )
         return self.get_object(object_id)
+
+    def get_apply_receipt(self, apply_id: str) -> ApplyReceiptRecord | None:
+        clean_apply_id = _non_empty(apply_id, "apply_id")
+        row = self._connection.execute(
+            "SELECT * FROM apply_receipts WHERE apply_id = ?", (clean_apply_id,)
+        ).fetchone()
+        if row is None:
+            return None
+        return ApplyReceiptRecord(row["apply_id"], row["payload"], row["created_at"])
+
+    def put_apply_receipt(self, apply_id: str, payload: str) -> ApplyReceiptRecord:
+        clean_apply_id = _non_empty(apply_id, "apply_id")
+        clean_payload = _non_empty(payload, "payload")
+        existing = self.get_apply_receipt(clean_apply_id)
+        if existing is not None:
+            if existing.payload != clean_payload:
+                raise ValueError(f"apply receipt identity collision: {clean_apply_id}")
+            return existing
+        now = _utc_now()
+        with self._write_scope():
+            self._connection.execute(
+                "INSERT INTO apply_receipts VALUES (?, ?, ?)",
+                (clean_apply_id, clean_payload, now),
+            )
+        return ApplyReceiptRecord(clean_apply_id, clean_payload, now)
 
     def rename_object(self, object_id: str, name: str) -> NameAssignment:
         clean_name = _non_empty(name, "name")

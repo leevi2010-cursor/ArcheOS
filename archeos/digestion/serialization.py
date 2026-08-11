@@ -128,6 +128,7 @@ def proposal_to_dict(proposal: ChangeProposal) -> dict[str, object]:
         "resolved_object_ids": list(proposal.resolved_object_ids),
         "rationale": proposal.rationale,
         "supporting_evidence_refs": list(proposal.supporting_evidence_refs),
+        "claim_summary": proposal.claim_summary,
         "before_state_fingerprint": proposal.before_state_fingerprint,
         "interpretation_fingerprint": proposal.interpretation_fingerprint,
         "human_review": {
@@ -161,7 +162,7 @@ def proposal_from_dict(value: object, field: str = "proposal") -> ChangeProposal
         "created_at",
         "decided_at",
     }
-    if set(value) != expected:
+    if set(value) not in {frozenset(expected), frozenset((*expected, "claim_summary"))}:
         raise ValueError(f"{field} does not match the Change Proposal schema")
     raw_operations = value["proposed_operations"]
     if not isinstance(raw_operations, list) or not raw_operations:
@@ -222,6 +223,9 @@ def proposal_from_dict(value: object, field: str = "proposal") -> ChangeProposal
         status=_text(value["status"], f"{field}.status"),
         created_at=_text(value["created_at"], f"{field}.created_at"),
         decided_at=_optional_text(value["decided_at"], f"{field}.decided_at"),
+        claim_summary=_optional_text(
+            value.get("claim_summary"), f"{field}.claim_summary"
+        ),
     )
     validate_proposal(proposal, field)
     return proposal
@@ -246,6 +250,7 @@ def validate_proposal(proposal: ChangeProposal, field: str = "proposal") -> None
         raise ValueError(f"{field}.proposed_operations must not be empty")
     for index, operation in enumerate(proposal.proposed_operations, start=1):
         validate_operation(operation, f"{field}.proposed_operations[{index}]")
+    _optional_text(proposal.claim_summary, f"{field}.claim_summary")
 
 
 def journal_to_dict(record: ChangeJournalRecord) -> dict[str, object]:

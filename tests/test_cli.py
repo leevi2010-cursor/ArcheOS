@@ -212,6 +212,7 @@ class CliTest(unittest.TestCase):
                         "evidence_sufficient": True,
                         "conflict": False,
                         "ambiguous": False,
+                        "claim": None,
                     }
                 ),
                 encoding="utf-8",

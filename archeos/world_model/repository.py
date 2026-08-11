@@ -5,6 +5,7 @@ from contextlib import AbstractContextManager
 from typing import Protocol
 
 from .models import (
+    ApplyReceiptRecord,
     LifecycleRecord,
     NameAssignment,
     ObjectRecord,
@@ -32,6 +33,10 @@ class WorldModelRepository(Protocol):
     def list_objects(self) -> tuple[ObjectRecord, ...]: ...
 
     def set_object_status(self, object_id: str, status: str) -> ObjectRecord: ...
+
+    def get_apply_receipt(self, apply_id: str) -> ApplyReceiptRecord | None: ...
+
+    def put_apply_receipt(self, apply_id: str, payload: str) -> ApplyReceiptRecord: ...
 
     def rename_object(self, object_id: str, name: str) -> NameAssignment: ...
 

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from ..atomic_information import AtomicInformationRevision
+from ..atomic_information import AtomicInformationRevision, ClaimAttribution
 from ..world_model import ObjectReadModel
 
 OPERATION_KINDS = frozenset(
@@ -47,6 +47,7 @@ class InterpretationResult:
     evidence_sufficient: bool
     conflict: bool
     ambiguous: bool
+    claim: ClaimAttribution | None = None
 
 
 @dataclass(frozen=True)
@@ -54,6 +55,7 @@ class DigestionWorldState:
     resolved_objects: tuple[ObjectReadModel, ...]
     unmatched_concerns: tuple[str, ...]
     ambiguous_concerns: tuple[str, ...]
+    related_atomic_information: tuple[AtomicInformationRevision, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -80,6 +82,7 @@ class ChangeProposal:
     status: str
     created_at: str
     decided_at: str | None
+    claim_summary: str | None = None
 
 
 @dataclass(frozen=True)

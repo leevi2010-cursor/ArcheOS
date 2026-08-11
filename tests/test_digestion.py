@@ -5,14 +5,21 @@ import hashlib
 import json
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 
 import archeos.atomic_information.jsonl_store as atomic_store_adapter
 import archeos.world_model.sqlite_repository as world_model_adapter
 from archeos.atomic_information import (
     AtomicInformationRevision,
+    ClaimAttribution,
     EvidenceRecord,
     IngestionResult,
+    JsonlAtomicInformationStore,
+)
+from archeos.atomic_information.models import (
+    atomic_information_revision_from_dict,
+    atomic_information_revision_to_dict,
 )
 from archeos.digestion import (
     AtomicInformationDigestionService,
@@ -24,7 +31,11 @@ from archeos.digestion import (
     JsonlChangeProposalStore,
     WorldModelOperation,
 )
-from archeos.world_model import ObjectResolver, SQLiteWorldModelRepository
+from archeos.world_model import (
+    ALLOWED_RELATIONSHIPS,
+    ObjectResolver,
+    SQLiteWorldModelRepository,
+)
 
 
 class FakeInterpretationProvider:
@@ -33,10 +44,12 @@ class FakeInterpretationProvider:
     def __init__(self, result: InterpretationResult | Exception) -> None:
         self.result = result
         self.calls = 0
+        self.world_states: list[DigestionWorldState] = []
 
     def interpret(self, atomic_information, current_world_state):
-        del atomic_information, current_world_state
+        del atomic_information
         self.calls += 1
+        self.world_states.append(current_world_state)
         if isinstance(self.result, Exception):
             raise self.result
         return self.result
@@ -47,6 +60,7 @@ def interpretation(
     evidence_sufficient: bool = True,
     conflict: bool = False,
     ambiguous: bool = False,
+    claim: ClaimAttribution | None = None,
 ) -> InterpretationResult:
     return InterpretationResult(
         operations=operations,
@@ -54,6 +68,25 @@ def interpretation(
         evidence_sufficient=evidence_sufficient,
         conflict=conflict,
         ambiguous=ambiguous,
+        claim=claim,
+    )
+
+
+def claim(
+    identifier: str,
+    *,
+    stance: str = "assert",
+    claimant_object_id: str | None = None,
+    label: str | None = "Speaker_1",
+    attribution_confidence: float | None = 0.8,
+) -> ClaimAttribution:
+    return ClaimAttribution(
+        claimant_object_id=claimant_object_id,
+        claimant_source_id=f"source-{identifier}",
+        claimant_label=label,
+        stance=stance,
+        claimed_at="2026-08-11T00:00:01+00:00",
+        attribution_confidence=attribution_confidence,
     )
 
 
@@ -140,6 +173,45 @@ class MemoryAtomicInformationStore:
         return tuple(items[-1] for items in self.revisions.values())
 
 
+class FailOnceChangeJournal:
+    def __init__(self, inner: JsonlChangeJournal) -> None:
+        self.inner = inner
+        self.failures_remaining = 1
+
+    def append(self, record):
+        if self.failures_remaining:
+            self.failures_remaining -= 1
+            raise OSError("synthetic journal write failure")
+        return self.inner.append(record)
+
+    def get(self, change_id):
+        return self.inner.get(change_id)
+
+    def list_changes(self):
+        return self.inner.list_changes()
+
+
+class FailOnceProposalStore:
+    def __init__(self, inner: JsonlChangeProposalStore) -> None:
+        self.inner = inner
+        self.failures_remaining = 1
+
+    def add_pending(self, proposal):
+        return self.inner.add_pending(proposal)
+
+    def get(self, proposal_id):
+        return self.inner.get(proposal_id)
+
+    def list_pending(self):
+        return self.inner.list_pending()
+
+    def update(self, proposal):
+        if self.failures_remaining:
+            self.failures_remaining -= 1
+            raise OSError("synthetic proposal write failure")
+        return self.inner.update(proposal)
+
+
 class DigestionTest(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary_directory = tempfile.TemporaryDirectory()
@@ -172,6 +244,132 @@ class DigestionTest(unittest.TestCase):
         item = atomic_information(identifier, *concerns)
         self.atomic_store.ingest_batch((item,))
         return item
+
+    def test_legacy_atomic_information_without_claim_reads_as_none(self) -> None:
+        item = atomic_information("legacy-claimless", "Legacy", strict_identity=True)
+        payload = atomic_information_revision_to_dict(item)
+        payload.pop("claim")
+
+        legacy_path = self.root / "legacy-atomic-information.jsonl"
+        legacy_path.write_text(json.dumps(payload) + "\n", encoding="utf-8")
+
+        parsed = atomic_information_revision_from_dict(payload)
+
+        self.assertIsNone(parsed.claim)
+        self.assertIsNone(
+            JsonlAtomicInformationStore(legacy_path)
+            .get_current(item.atomic_information_id)
+            .claim
+        )
+
+    def test_claim_enrichment_supports_all_stances_and_is_idempotent(self) -> None:
+        for stance in ("assert", "deny", "uncertain"):
+            with self.subTest(stance=stance):
+                identifier = f"atomic-claim-{stance}"
+                self.ingest(identifier, "Unresolved Claimant")
+                service = self.service(
+                    interpretation(
+                        WorldModelOperation(kind="no_structural_change"),
+                        claim=claim(identifier, stance=stance),
+                    )
+                )
+
+                first = service.digest(identifier)
+                second = service.digest(identifier)
+                history = self.atomic_store.list_revisions(identifier)
+
+                self.assertEqual(first.status, "automatic")
+                self.assertEqual(second.status, "already_processed")
+                self.assertEqual(len(history), 2)
+                self.assertIsNone(history[0].claim)
+                self.assertEqual(history[1].claim.stance, stance)
+                self.assertIsNone(history[1].claim.claimant_object_id)
+                self.assertEqual(self.repository.list_objects(), ())
+
+    def test_claim_enrichment_round_trips_in_jsonl_revision_history(self) -> None:
+        initial = atomic_information("claim-jsonl", "JSONL Claim", strict_identity=True)
+        store = JsonlAtomicInformationStore(self.root / "claim-history.jsonl")
+        store.ingest_batch((initial,))
+        enriched = replace(
+            initial,
+            revision_number=2,
+            revision_id=f"{initial.atomic_information_id}-r0002",
+            revision_reason="claim_enrichment",
+            claim=claim("claim-jsonl", stance="uncertain"),
+        )
+
+        store.append_revision(enriched)
+
+        history = store.list_revisions(initial.atomic_information_id)
+        self.assertIsNone(history[0].claim)
+        self.assertEqual(history[1].claim, enriched.claim)
+
+    def test_claimant_object_id_requires_unique_existing_object(self) -> None:
+        claimant = self.repository.create_object("Synthetic Speaker", roles=("person",))
+        self.ingest("atomic-claimant", "Synthetic Speaker")
+
+        result = self.service(
+            interpretation(
+                WorldModelOperation(kind="no_structural_change"),
+                claim=claim("atomic-claimant", claimant_object_id=claimant.object_id),
+            )
+        ).digest("atomic-claimant")
+
+        self.assertEqual(
+            result.atomic_information.claim.claimant_object_id, claimant.object_id
+        )
+        self.assertEqual(len(self.repository.list_objects()), 1)
+
+    def test_opposing_claims_coexist_and_block_world_model_change(self) -> None:
+        target = self.repository.create_object("Claim Conflict Target")
+        statement = "The approved budget is twenty units."
+        first = replace(
+            atomic_information("atomic-claim-assert", "Claim Conflict Target"),
+            statement=statement,
+        )
+        self.atomic_store.ingest_batch((first,))
+        self.service(
+            interpretation(
+                WorldModelOperation(kind="no_structural_change"),
+                claim=claim("atomic-claim-assert", stance="assert"),
+            )
+        ).digest(first.atomic_information_id)
+
+        second = replace(
+            atomic_information("atomic-claim-deny", "Claim Conflict Target"),
+            statement=statement,
+        )
+        self.atomic_store.ingest_batch((second,))
+        service = self.service(
+            interpretation(
+                WorldModelOperation(
+                    kind="add_role",
+                    target_object_id=target.object_id,
+                    role="project",
+                ),
+                claim=claim("atomic-claim-deny", stance="deny"),
+            )
+        )
+        result = service.digest(second.atomic_information_id)
+
+        self.assertEqual(result.status, "pending")
+        self.assertEqual(self.repository.list_roles(target.object_id), ())
+        self.assertEqual(
+            self.atomic_store.get_current(first.atomic_information_id).claim.stance,
+            "assert",
+        )
+        self.assertEqual(
+            self.atomic_store.get_current(second.atomic_information_id).claim.stance,
+            "deny",
+        )
+        proposal = self.proposals.get(result.proposal_id)
+        self.assertIn("Speaker_1主张", proposal.claim_summary)
+        self.assertIn("Speaker_1否认", proposal.claim_summary)
+        world_state = service.interpretation_provider.world_states[0]
+        self.assertEqual(
+            world_state.related_atomic_information[0].atomic_information_id,
+            first.atomic_information_id,
+        )
 
     def test_unique_current_and_historical_names_bind_stable_object(self) -> None:
         record = self.repository.create_object("Synthetic Operations")
@@ -289,7 +487,7 @@ class DigestionTest(unittest.TestCase):
         role = self.repository.list_roles(record.object_id, active_only=True)[0]
         self.assertEqual(result.status, "automatic")
         self.assertEqual(role.source_atomic_information_id, "atomic-role")
-        self.assertEqual(role.confidence, 0.9)
+        self.assertIsNone(role.confidence)
         self.assertEqual(self.proposals.list_pending(), ())
 
     def test_unapproved_role_is_never_written(self) -> None:
@@ -363,6 +561,100 @@ class DigestionTest(unittest.TestCase):
         ).digest("atomic-unclear-link")
         self.assertEqual(pending.status, "pending")
         self.assertEqual(len(self.repository.list_relationships()), 1)
+
+    def test_all_approved_relationships_are_directional_and_confidence_free(
+        self,
+    ) -> None:
+        self.assertEqual(
+            ALLOWED_RELATIONSHIPS,
+            {
+                "part_of",
+                "member_of",
+                "responsible_for",
+                "depends_on",
+                "related_to",
+            },
+        )
+        for index, relation in enumerate(sorted(ALLOWED_RELATIONSHIPS), start=1):
+            first = self.repository.create_object(f"Relation Source {index}")
+            second = self.repository.create_object(f"Relation Target {index}")
+            identifier = f"atomic-relation-{index}"
+            self.ingest(
+                identifier,
+                f"Relation Source {index}",
+                f"Relation Target {index}",
+            )
+
+            result = self.service(
+                interpretation(
+                    WorldModelOperation(
+                        kind="create_relationship",
+                        target_object_id=first.object_id,
+                        secondary_object_id=second.object_id,
+                        relation=relation,
+                    ),
+                    claim=claim(identifier, attribution_confidence=0.99),
+                )
+            ).digest(identifier)
+
+            self.assertEqual(result.status, "automatic")
+            self.assertEqual(
+                result.atomic_information.claim.attribution_confidence,
+                0.99,
+            )
+            stored = self.repository.list_relationships(object_id=first.object_id)[0]
+            self.assertEqual(stored.from_object_id, first.object_id)
+            self.assertEqual(stored.to_object_id, second.object_id)
+            self.assertEqual(stored.relation, relation)
+            self.assertIsNone(stored.confidence)
+            self.assertFalse(
+                any(
+                    item.from_object_id == second.object_id
+                    and item.to_object_id == first.object_id
+                    for item in self.repository.list_relationships(
+                        object_id=second.object_id
+                    )
+                )
+            )
+
+    def test_unapproved_relationship_cannot_be_applied(self) -> None:
+        first = self.repository.create_object("Unsupported Relation Source")
+        second = self.repository.create_object("Unsupported Relation Target")
+        self.ingest(
+            "atomic-unsupported-relation",
+            "Unsupported Relation Source",
+            "Unsupported Relation Target",
+        )
+        service = self.service(
+            interpretation(
+                WorldModelOperation(
+                    kind="create_relationship",
+                    target_object_id=first.object_id,
+                    secondary_object_id=second.object_id,
+                    relation="supports",
+                )
+            )
+        )
+        pending = service.digest("atomic-unsupported-relation")
+
+        self.assertEqual(pending.status, "pending")
+        with self.assertRaisesRegex(ValueError, "not approved"):
+            service.decide(pending.proposal_id, "approve")
+        self.assertEqual(self.repository.list_relationships(), ())
+
+    def test_information_only_claim_does_not_create_relationship_object(self) -> None:
+        self.ingest("atomic-work-description", "One-time photo editing")
+
+        result = self.service(
+            interpretation(
+                WorldModelOperation(kind="no_structural_change"),
+                claim=claim("atomic-work-description"),
+            )
+        ).digest("atomic-work-description")
+
+        self.assertEqual(result.status, "automatic")
+        self.assertEqual(self.repository.list_objects(), ())
+        self.assertEqual(self.repository.list_relationships(), ())
 
     def test_retry_is_idempotent_and_safe_auto_has_no_proposal(self) -> None:
         record = self.repository.create_object("Retry Target")
@@ -495,6 +787,126 @@ class DigestionTest(unittest.TestCase):
         self.assertEqual(
             set(ObjectResolver(self.repository).resolve(record.object_id).roles),
             {"brand", "project"},
+        )
+
+    def test_stale_atomic_information_revision_blocks_approval(self) -> None:
+        record = self.repository.create_object(
+            "Stale Information Target", roles=("project",)
+        )
+        self.ingest("atomic-stale-information", "Stale Information Target")
+        service = self.service(
+            interpretation(
+                WorldModelOperation(
+                    kind="end_role",
+                    target_object_id=record.object_id,
+                    role="project",
+                )
+            )
+        )
+        pending = service.digest("atomic-stale-information")
+        current = self.atomic_store.get_current("atomic-stale-information")
+        self.atomic_store.append_revision(
+            replace(
+                current,
+                revision_number=current.revision_number + 1,
+                revision_id=(
+                    f"{current.atomic_information_id}-"
+                    f"r{current.revision_number + 1:04d}"
+                ),
+                revision_reason="synthetic_correction",
+            )
+        )
+
+        with self.assertRaisesRegex(ValueError, "Atomic Information changed"):
+            service.decide(pending.proposal_id, "approve")
+        self.assertEqual(
+            ObjectResolver(self.repository).resolve(record.object_id).roles,
+            ("project",),
+        )
+
+    def test_apply_receipt_recovers_after_journal_write_failure(self) -> None:
+        self.ingest("atomic-crash-journal", "Crash Recovery Object")
+        inner_journal = self.journal
+        self.journal = FailOnceChangeJournal(inner_journal)
+        service = self.service(
+            interpretation(
+                WorldModelOperation(
+                    kind="new_object",
+                    name="Crash Recovery Object",
+                    role="project",
+                )
+            )
+        )
+        pending = service.digest("atomic-crash-journal")
+
+        with self.assertRaisesRegex(OSError, "journal write failure"):
+            service.decide(pending.proposal_id, "approve")
+        self.assertEqual(len(self.repository.list_objects()), 1)
+        self.assertEqual(self.proposals.get(pending.proposal_id).status, "pending")
+
+        self.repository.close()
+        self.repository = SQLiteWorldModelRepository(self.root / "world.sqlite3")
+        service = self.service(
+            interpretation(
+                WorldModelOperation(
+                    kind="new_object",
+                    name="Crash Recovery Object",
+                    role="project",
+                )
+            )
+        )
+
+        recovered = service.decide(pending.proposal_id, "approve")
+
+        self.assertEqual(recovered.status, "approved")
+        self.assertEqual(len(self.repository.list_objects()), 1)
+        self.assertEqual(len(inner_journal.list_changes()), 1)
+        created = self.repository.list_objects()[0]
+        self.assertIn(
+            created.object_id,
+            self.atomic_store.get_current("atomic-crash-journal").related_object_ids,
+        )
+
+    def test_apply_receipt_recovers_after_proposal_write_failure(self) -> None:
+        record = self.repository.create_object(
+            "Crash Proposal Target", roles=("project",)
+        )
+        self.ingest("atomic-crash-proposal", "Crash Proposal Target")
+        inner_proposals = self.proposals
+        self.proposals = FailOnceProposalStore(inner_proposals)
+        service = self.service(
+            interpretation(
+                WorldModelOperation(
+                    kind="end_role",
+                    target_object_id=record.object_id,
+                    role="project",
+                )
+            )
+        )
+        pending = service.digest("atomic-crash-proposal")
+
+        with self.assertRaisesRegex(OSError, "proposal write failure"):
+            service.decide(pending.proposal_id, "approve")
+        self.assertEqual(
+            self.repository.list_roles(record.object_id, active_only=True), ()
+        )
+        self.assertEqual(inner_proposals.get(pending.proposal_id).status, "pending")
+
+        recovered = service.decide(pending.proposal_id, "approve")
+
+        self.assertEqual(recovered.status, "approved")
+        self.assertEqual(
+            self.repository.list_roles(record.object_id, active_only=True), ()
+        )
+        self.assertEqual(
+            len(
+                [
+                    item
+                    for item in self.journal.list_changes()
+                    if item.operation == "end_role"
+                ]
+            ),
+            1,
         )
 
     def test_new_object_and_relationship_apply_in_one_approved_plan(self) -> None:
@@ -635,6 +1047,7 @@ class CodexDigestionProviderTest(unittest.TestCase):
                 "evidence_sufficient": True,
                 "conflict": False,
                 "ambiguous": False,
+                "claim": None,
             }
         )
         observed: dict[str, object] = {}
@@ -676,7 +1089,13 @@ class CodexDigestionProviderTest(unittest.TestCase):
         self.assertEqual(observed["thread"]["sandbox"], "read-only")
         self.assertTrue(observed["thread"]["ephemeral"])
         self.assertEqual(observed["run"]["sandbox"], "read-only")
-        self.assertIn("output_schema", observed["run"])
+        schema = observed["run"]["output_schema"]
+        self.assertIn("claim", schema["required"])
+        relation_schema = schema["properties"]["operations"]["items"]["properties"][
+            "relation"
+        ]
+        self.assertEqual(set(relation_schema["enum"]), {*ALLOWED_RELATIONSHIPS, None})
+        self.assertIn("related_atomic_information", observed["prompt"])
 
 
 if __name__ == "__main__":

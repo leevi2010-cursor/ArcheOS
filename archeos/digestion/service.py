@@ -6,8 +6,18 @@ from collections.abc import Callable
 from dataclasses import asdict, replace
 from datetime import datetime, timezone
 
-from ..atomic_information import AtomicInformationRevision, AtomicInformationStore
-from ..world_model import ALLOWED_ROLES, ObjectResolver, WorldModelRepository
+from ..atomic_information import (
+    AtomicInformationRevision,
+    AtomicInformationStore,
+    ClaimAttribution,
+)
+from ..atomic_information.models import claim_to_dict, validate_claim_attribution
+from ..world_model import (
+    ALLOWED_RELATIONSHIPS,
+    ALLOWED_ROLES,
+    ObjectResolver,
+    WorldModelRepository,
+)
 from .contracts import (
     AtomicInformationInterpretationProvider,
     ChangeJournal,
@@ -23,7 +33,14 @@ from .models import (
     InterpretationResult,
     WorldModelOperation,
 )
-from .serialization import operation_to_dict, validate_operation
+from .serialization import (
+    journal_from_dict,
+    journal_to_dict,
+    operation_to_dict,
+    validate_operation,
+)
+
+MAX_RELATED_INFORMATION = 20
 
 
 def _utc_now() -> str:
@@ -70,23 +87,41 @@ class AtomicInformationDigestionService:
         resolved_ids, unmatched, ambiguous = self._match_concerns(
             atomic_information.raw_concerns
         )
+        related_information = self._related_information(
+            resolved_ids, atomic_information.atomic_information_id
+        )
         world_state = DigestionWorldState(
             resolved_objects=tuple(
                 self.resolver.resolve(object_id) for object_id in resolved_ids
             ),
             unmatched_concerns=unmatched,
             ambiguous_concerns=ambiguous,
+            related_atomic_information=related_information,
         )
         interpretation = self.interpretation_provider.interpret(
             atomic_information, world_state
         )
         self._validate_interpretation(interpretation)
+        self._validate_claim_enrichment(
+            interpretation.claim, atomic_information, resolved_ids
+        )
         interpretation_fingerprint = self._interpretation_fingerprint(interpretation)
 
-        atomic_information, binding_change_ids = self._bind_resolved_objects(
-            atomic_information,
-            resolved_ids,
-            interpretation_fingerprint,
+        claim_update_conflict = (
+            atomic_information.claim is not None
+            and interpretation.claim is not None
+            and atomic_information.claim != interpretation.claim
+        )
+        atomic_information, binding_change_ids, information_changed = (
+            self._enrich_and_bind(
+                atomic_information,
+                resolved_ids,
+                None if claim_update_conflict else interpretation.claim,
+                interpretation_fingerprint,
+            )
+        )
+        claim_conflict = claim_update_conflict or self._has_claim_conflict(
+            atomic_information, related_information
         )
         before_state_fingerprint = self._before_state_fingerprint(
             self._relevant_existing_ids(resolved_ids, interpretation.operations)
@@ -97,6 +132,7 @@ class AtomicInformationDigestionService:
             resolved_ids,
             unmatched,
             ambiguous,
+            claim_conflict,
         ):
             proposal = self._create_proposal(
                 atomic_information,
@@ -104,6 +140,8 @@ class AtomicInformationDigestionService:
                 interpretation_fingerprint,
                 resolved_ids,
                 before_state_fingerprint,
+                related_information,
+                claim_conflict,
             )
             return DigestionResult(
                 atomic_information=atomic_information,
@@ -120,12 +158,13 @@ class AtomicInformationDigestionService:
             proposal_id=None,
             expected_before_state=before_state_fingerprint,
             resolved_ids=resolved_ids,
+            expected_atomic_revision_id=atomic_information.revision_id,
         )
         return DigestionResult(
             atomic_information=atomic_information,
             status=(
                 "automatic"
-                if binding_change_ids or operation_change_ids
+                if information_changed or binding_change_ids or operation_change_ids
                 else "already_processed"
             ),
             change_ids=(*binding_change_ids, *operation_change_ids),
@@ -181,14 +220,18 @@ class AtomicInformationDigestionService:
                 proposal_id=decided.proposal_id,
             )
 
-        relevant_ids = self._relevant_existing_ids(
-            proposal.resolved_object_ids,
-            proposal.proposed_operations,
+        apply_id = self._apply_identity(
+            proposal.atomic_information_revision_id,
+            proposal.interpretation_fingerprint,
+            "human_approved",
+            proposal.proposal_id,
         )
-        current_fingerprint = self._before_state_fingerprint(relevant_ids)
-        if current_fingerprint != proposal.before_state_fingerprint:
+        if (
+            current_information.revision_id != proposal.atomic_information_revision_id
+            and self.world_model_repository.get_apply_receipt(apply_id) is None
+        ):
             raise ValueError(
-                "The underlying business information changed; review this suggestion again."
+                "Atomic Information changed; run digestion and review again."
             )
         change_ids = self._apply_operations(
             current_information,
@@ -198,6 +241,7 @@ class AtomicInformationDigestionService:
             proposal_id=proposal.proposal_id,
             expected_before_state=proposal.before_state_fingerprint,
             resolved_ids=proposal.resolved_object_ids,
+            expected_atomic_revision_id=proposal.atomic_information_revision_id,
         )
         current_information = self.atomic_information_store.get_current(
             proposal.atomic_information_id
@@ -205,6 +249,12 @@ class AtomicInformationDigestionService:
         self.proposal_store.update(
             replace(proposal, status="approved", decided_at=self.clock())
         )
+        if not change_ids:
+            change_ids = tuple(
+                item.change_id
+                for item in self.change_journal.list_changes()
+                if item.proposal_id == proposal.proposal_id
+            )
         return DigestionResult(
             atomic_information=current_information,
             status="approved",
@@ -237,17 +287,83 @@ class AtomicInformationDigestionService:
                 ambiguous.append(concern)
         return tuple(sorted(resolved)), tuple(unmatched), tuple(ambiguous)
 
-    def _bind_resolved_objects(
+    def _related_information(
+        self,
+        resolved_ids: tuple[str, ...],
+        current_atomic_information_id: str,
+    ) -> tuple[AtomicInformationRevision, ...]:
+        if not resolved_ids:
+            return ()
+        targets = set(resolved_ids)
+        related = tuple(
+            item
+            for item in self.atomic_information_store.list_atomic_information()
+            if item.atomic_information_id != current_atomic_information_id
+            and targets.intersection(item.related_object_ids)
+        )
+        return tuple(
+            sorted(
+                related,
+                key=lambda item: (item.created_at, item.atomic_information_id),
+                reverse=True,
+            )[:MAX_RELATED_INFORMATION]
+        )
+
+    @staticmethod
+    def _has_claim_conflict(
+        atomic_information: AtomicInformationRevision,
+        related_information: tuple[AtomicInformationRevision, ...],
+    ) -> bool:
+        claim = atomic_information.claim
+        if claim is None or claim.stance == "uncertain":
+            return False
+        opposing = {"assert": "deny", "deny": "assert"}
+        statement = _normalize_name(atomic_information.statement)
+        return any(
+            item.claim is not None
+            and item.claim.stance == opposing[claim.stance]
+            and _normalize_name(item.statement) == statement
+            for item in related_information
+        )
+
+    def _validate_claim_enrichment(
+        self,
+        claim: ClaimAttribution | None,
+        atomic_information: AtomicInformationRevision,
+        resolved_ids: tuple[str, ...],
+    ) -> None:
+        if claim is None:
+            return
+        validate_claim_attribution(claim, "interpretation.claim")
+        if claim.claimant_source_id not in {
+            item.source_id for item in atomic_information.source_evidence
+        }:
+            raise ValueError(
+                "interpretation.claim.claimant_source_id must reference Evidence"
+            )
+        if (
+            claim.claimant_object_id is not None
+            and claim.claimant_object_id not in resolved_ids
+        ):
+            raise ValueError(
+                "interpretation.claim.claimant_object_id must be uniquely resolved"
+            )
+
+    def _enrich_and_bind(
         self,
         atomic_information: AtomicInformationRevision,
         resolved_ids: tuple[str, ...],
+        claim: ClaimAttribution | None,
         interpretation_fingerprint: str,
-    ) -> tuple[AtomicInformationRevision, tuple[str, ...]]:
+    ) -> tuple[AtomicInformationRevision, tuple[str, ...], bool]:
         related_ids = tuple(
             sorted(set(atomic_information.related_object_ids) | set(resolved_ids))
         )
-        if related_ids == atomic_information.related_object_ids:
-            return atomic_information, ()
+        enriched_claim = atomic_information.claim or claim
+        binding_changed = related_ids != atomic_information.related_object_ids
+        claim_changed = enriched_claim != atomic_information.claim
+        if not binding_changed and not claim_changed:
+            return atomic_information, (), False
         revised = replace(
             atomic_information,
             revision_number=atomic_information.revision_number + 1,
@@ -256,10 +372,19 @@ class AtomicInformationDigestionService:
                 f"r{atomic_information.revision_number + 1:04d}"
             ),
             related_object_ids=related_ids,
+            claim=enriched_claim,
             created_at=self.clock(),
-            revision_reason="object_binding",
+            revision_reason=(
+                "claim_enrichment_and_object_binding"
+                if binding_changed and claim_changed
+                else "object_binding"
+                if binding_changed
+                else "claim_enrichment"
+            ),
         )
         self.atomic_information_store.append_revision(revised)
+        if not binding_changed:
+            return revised, (), True
         change_id = _digest_id(
             "change",
             revised.revision_id,
@@ -285,7 +410,7 @@ class AtomicInformationDigestionService:
                     error_code=None,
                 )
             )
-        return revised, (change_id,)
+        return revised, (change_id,), True
 
     def _requires_human_judgment(
         self,
@@ -293,12 +418,14 @@ class AtomicInformationDigestionService:
         resolved_ids: tuple[str, ...],
         unmatched: tuple[str, ...],
         ambiguous: tuple[str, ...],
+        claim_conflict: bool,
     ) -> bool:
         if (
             interpretation.conflict
             or interpretation.ambiguous
             or not interpretation.evidence_sufficient
             or ambiguous
+            or claim_conflict
         ):
             return True
         structural = tuple(
@@ -342,7 +469,7 @@ class AtomicInformationDigestionService:
                 operation.target_object_id in resolved
                 and operation.secondary_object_id in resolved
                 and operation.target_object_id != operation.secondary_object_id
-                and operation.relation == "related_to"
+                and operation.relation in ALLOWED_RELATIONSHIPS
             )
         return False
 
@@ -391,37 +518,68 @@ class AtomicInformationDigestionService:
         proposal_id: str | None,
         expected_before_state: str,
         resolved_ids: tuple[str, ...],
+        expected_atomic_revision_id: str,
     ) -> tuple[str, ...]:
-        relevant_ids = self._relevant_existing_ids(resolved_ids, operations)
-        if self._before_state_fingerprint(relevant_ids) != expected_before_state:
-            raise ValueError(
-                "The underlying business information changed; review this suggestion again."
-            )
         actionable = tuple(
             operation
             for operation in operations
             if operation.kind != "no_structural_change"
         )
-        pending: list[tuple[str, WorldModelOperation]] = []
+        planned: list[tuple[str, WorldModelOperation]] = []
         for index, operation in enumerate(actionable, start=1):
             change_id = _digest_id(
                 "change",
-                atomic_information.revision_id,
+                expected_atomic_revision_id,
                 interpretation_fingerprint,
                 str(index),
                 operation.kind,
             )
-            existing = self.change_journal.get(change_id)
-            if existing is None:
-                pending.append((change_id, operation))
+            planned.append((change_id, operation))
 
-        if not pending:
+        if not planned:
             return ()
+
+        apply_id = self._apply_identity(
+            expected_atomic_revision_id,
+            interpretation_fingerprint,
+            mode,
+            proposal_id,
+        )
+        receipt = self.world_model_repository.get_apply_receipt(apply_id)
+        expected_change_ids = tuple(change_id for change_id, _ in planned)
+        if receipt is not None:
+            records, created_object_ids = self._parse_apply_receipt(receipt.payload)
+            if tuple(item.change_id for item in records) != expected_change_ids:
+                raise ValueError("apply receipt does not match the requested change")
+            return self._finalize_apply_receipt(records, created_object_ids)
+
+        current_information = self.atomic_information_store.get_current(
+            atomic_information.atomic_information_id
+        )
+        if current_information.revision_id != expected_atomic_revision_id:
+            raise ValueError(
+                "Atomic Information changed; run digestion and review again."
+            )
+        relevant_ids = self._relevant_existing_ids(resolved_ids, operations)
+        if self._before_state_fingerprint(relevant_ids) != expected_before_state:
+            raise ValueError(
+                "The underlying business information changed; review this suggestion again."
+            )
+
+        existing_records = tuple(
+            self.change_journal.get(change_id) for change_id, _ in planned
+        )
+        if all(existing_records):
+            return ()
+        if any(existing_records):
+            raise ValueError("Change Journal is incomplete and has no apply receipt")
 
         affected_by_change: list[tuple[str, tuple[str, ...]]] = []
         created_object_ids: list[str] = []
+        now = self.clock()
+        records: list[ChangeJournalRecord] = []
         with self.world_model_repository.transaction():
-            for change_id, operation in pending:
+            for change_id, operation in planned:
                 affected, created_object_id = self._apply_operation(
                     operation,
                     atomic_information,
@@ -430,31 +588,107 @@ class AtomicInformationDigestionService:
                 affected_by_change.append((change_id, affected))
                 if created_object_id is not None:
                     created_object_ids.append(created_object_id)
-
-        for object_id in created_object_ids:
-            self._bind_new_object(atomic_information, object_id)
-
-        now = self.clock()
-        for (change_id, operation), (_, affected) in zip(
-            pending, affected_by_change, strict=True
-        ):
-            self.change_journal.append(
-                ChangeJournalRecord(
-                    change_id=change_id,
-                    atomic_information_id=atomic_information.atomic_information_id,
-                    atomic_information_revision_id=atomic_information.revision_id,
-                    operation=operation.kind,
-                    resolved_object_ids=affected,
-                    interpretation_fingerprint=interpretation_fingerprint,
-                    mode=mode,
-                    proposal_id=proposal_id,
-                    status="applied",
-                    created_at=now,
-                    applied_at=now,
-                    error_code=None,
+            for (change_id, operation), (_, affected) in zip(
+                planned, affected_by_change, strict=True
+            ):
+                records.append(
+                    ChangeJournalRecord(
+                        change_id=change_id,
+                        atomic_information_id=atomic_information.atomic_information_id,
+                        atomic_information_revision_id=expected_atomic_revision_id,
+                        operation=operation.kind,
+                        resolved_object_ids=affected,
+                        interpretation_fingerprint=interpretation_fingerprint,
+                        mode=mode,
+                        proposal_id=proposal_id,
+                        status="applied",
+                        created_at=now,
+                        applied_at=now,
+                        error_code=None,
+                    )
                 )
+            payload = json.dumps(
+                {
+                    "version": 1,
+                    "records": [journal_to_dict(item) for item in records],
+                    "created_object_ids": created_object_ids,
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
             )
-        return tuple(change_id for change_id, _ in pending)
+            self.world_model_repository.put_apply_receipt(apply_id, payload)
+
+        return self._finalize_apply_receipt(tuple(records), tuple(created_object_ids))
+
+    @staticmethod
+    def _apply_identity(
+        atomic_information_revision_id: str,
+        interpretation_fingerprint: str,
+        mode: str,
+        proposal_id: str | None,
+    ) -> str:
+        return _digest_id(
+            "apply",
+            atomic_information_revision_id,
+            interpretation_fingerprint,
+            mode,
+            proposal_id or "automatic",
+        )
+
+    @staticmethod
+    def _parse_apply_receipt(
+        payload: str,
+    ) -> tuple[tuple[ChangeJournalRecord, ...], tuple[str, ...]]:
+        try:
+            value = json.loads(payload)
+        except json.JSONDecodeError as exc:
+            raise ValueError("apply receipt is not valid JSON") from exc
+        if not isinstance(value, dict) or set(value) != {
+            "version",
+            "records",
+            "created_object_ids",
+        }:
+            raise ValueError("apply receipt does not match its schema")
+        if value["version"] != 1 or not isinstance(value["records"], list):
+            raise ValueError("apply receipt version or records are invalid")
+        created_object_ids = value["created_object_ids"]
+        if not isinstance(created_object_ids, list) or any(
+            not isinstance(item, str) or not item.strip() for item in created_object_ids
+        ):
+            raise ValueError("apply receipt created Object identities are invalid")
+        return (
+            tuple(
+                journal_from_dict(item, f"apply receipt record[{index}]")
+                for index, item in enumerate(value["records"], start=1)
+            ),
+            tuple(created_object_ids),
+        )
+
+    def _finalize_apply_receipt(
+        self,
+        records: tuple[ChangeJournalRecord, ...],
+        created_object_ids: tuple[str, ...],
+    ) -> tuple[str, ...]:
+        if not records:
+            raise ValueError("apply receipt must contain at least one change")
+        current = self.atomic_information_store.get_current(
+            records[0].atomic_information_id
+        )
+        missing_binding = any(
+            object_id not in current.related_object_ids
+            for object_id in created_object_ids
+        )
+        missing_journal = any(
+            self.change_journal.get(record.change_id) is None for record in records
+        )
+        if not missing_binding and not missing_journal:
+            return ()
+        for object_id in created_object_ids:
+            self._bind_new_object(current, object_id)
+        for record in records:
+            self.change_journal.append(record)
+        return tuple(record.change_id for record in records)
 
     def _apply_operation(
         self,
@@ -482,7 +716,7 @@ class AtomicInformationDigestionService:
                     source_atomic_information_id=(
                         atomic_information.atomic_information_id
                     ),
-                    confidence=atomic_information.confidence,
+                    confidence=None,
                 )
             return (target,), None
         if operation.kind == "end_role":
@@ -534,18 +768,18 @@ class AtomicInformationDigestionService:
             secondary = operation.secondary_object_id
             if secondary is None:
                 raise ValueError("A second business record is required.")
-            if operation.relation != "related_to":
+            if operation.relation not in ALLOWED_RELATIONSHIPS:
                 raise ValueError("The suggested business relationship is not approved.")
-            existing = self._find_related_to(target, secondary)
+            existing = self._find_relationship(target, operation.relation, secondary)
             if existing is None:
                 self.world_model_repository.create_relationship(
                     target,
-                    "related_to",
+                    operation.relation,
                     secondary,
                     source_atomic_information_id=(
                         atomic_information.atomic_information_id
                     ),
-                    confidence=atomic_information.confidence,
+                    confidence=None,
                 )
             return tuple(sorted((target, secondary))), None
         if operation.kind == "end_relationship":
@@ -586,24 +820,26 @@ class AtomicInformationDigestionService:
                 ).object_id
             affected = [created_object_id]
             if operation.secondary_object_id is not None:
-                if operation.relation != "related_to":
+                if operation.relation not in ALLOWED_RELATIONSHIPS:
                     raise ValueError(
                         "The suggested business relationship is not approved."
                     )
                 if (
-                    self._find_related_to(
-                        created_object_id, operation.secondary_object_id
+                    self._find_relationship(
+                        created_object_id,
+                        operation.relation,
+                        operation.secondary_object_id,
                     )
                     is None
                 ):
                     self.world_model_repository.create_relationship(
                         created_object_id,
-                        "related_to",
+                        operation.relation,
                         operation.secondary_object_id,
                         source_atomic_information_id=(
                             atomic_information.atomic_information_id
                         ),
-                        confidence=atomic_information.confidence,
+                        confidence=None,
                     )
                 affected.append(operation.secondary_object_id)
             needs_binding = (
@@ -671,19 +907,16 @@ class AtomicInformationDigestionService:
             )
         )
 
-    def _find_related_to(self, first: str, second: str):
+    def _find_relationship(self, first: str, relation: str, second: str):
         return next(
             (
                 item
                 for item in self.world_model_repository.list_relationships(
                     object_id=first, active_only=True
                 )
-                if item.relation == "related_to"
-                and {
-                    item.from_object_id,
-                    item.to_object_id,
-                }
-                == {first, second}
+                if item.relation == relation
+                and item.from_object_id == first
+                and item.to_object_id == second
             ),
             None,
         )
@@ -701,6 +934,8 @@ class AtomicInformationDigestionService:
         interpretation_fingerprint: str,
         resolved_ids: tuple[str, ...],
         before_state_fingerprint: str,
+        related_information: tuple[AtomicInformationRevision, ...],
+        claim_conflict: bool,
     ) -> ChangeProposal:
         operations = interpretation.operations or (
             WorldModelOperation(kind="unresolved"),
@@ -709,6 +944,11 @@ class AtomicInformationDigestionService:
             "proposal",
             atomic_information.revision_id,
             interpretation_fingerprint,
+        )
+        claim_summary = self._claim_summary(
+            atomic_information,
+            related_information,
+            include_related=claim_conflict or interpretation.conflict,
         )
         proposal = ChangeProposal(
             proposal_id=proposal_id,
@@ -721,11 +961,12 @@ class AtomicInformationDigestionService:
             before_state_fingerprint=before_state_fingerprint,
             interpretation_fingerprint=interpretation_fingerprint,
             human_review=self._human_review(
-                atomic_information, interpretation, operations
+                atomic_information, interpretation, operations, claim_summary
             ),
             status="pending",
             created_at=self.clock(),
             decided_at=None,
+            claim_summary=claim_summary,
         )
         return self.proposal_store.add_pending(proposal)
 
@@ -734,6 +975,7 @@ class AtomicInformationDigestionService:
         atomic_information: AtomicInformationRevision,
         interpretation: InterpretationResult,
         operations: tuple[WorldModelOperation, ...],
+        claim_summary: str | None,
     ) -> HumanReviewContent:
         kinds = {operation.kind for operation in operations}
         if interpretation.conflict or "conflict" in kinds:
@@ -751,6 +993,8 @@ class AtomicInformationDigestionService:
 
         recommendation = self._recommendation(operations)
         evidence = "；".join(self._evidence_refs(atomic_information))
+        if claim_summary:
+            evidence = f"{claim_summary}；{evidence}"
         isolated = any(
             operation.kind == "new_object" and operation.secondary_object_id is None
             for operation in operations
@@ -768,6 +1012,35 @@ class AtomicInformationDigestionService:
             evidence=evidence,
             consequences=consequences,
         )
+
+    @staticmethod
+    def _claim_summary(
+        atomic_information: AtomicInformationRevision,
+        related_information: tuple[AtomicInformationRevision, ...],
+        *,
+        include_related: bool,
+    ) -> str | None:
+        items = (
+            (atomic_information, *related_information)
+            if include_related
+            else (atomic_information,)
+        )
+        summaries: list[str] = []
+        for item in items:
+            if item.claim is None:
+                continue
+            claimant = (
+                item.claim.claimant_label
+                or item.claim.claimant_source_id
+                or "未标明来源"
+            )
+            stance = {
+                "assert": "主张",
+                "deny": "否认",
+                "uncertain": "表示不确定",
+            }[item.claim.stance]
+            summaries.append(f"{claimant}{stance}：{item.statement}")
+        return "；".join(summaries) if summaries else None
 
     def _recommendation(self, operations: tuple[WorldModelOperation, ...]) -> str:
         descriptions: list[str] = []
@@ -868,6 +1141,11 @@ class AtomicInformationDigestionService:
             "evidence_sufficient": interpretation.evidence_sufficient,
             "conflict": interpretation.conflict,
             "ambiguous": interpretation.ambiguous,
+            "claim": (
+                None
+                if interpretation.claim is None
+                else claim_to_dict(interpretation.claim)
+            ),
         }
         canonical = json.dumps(
             payload,
