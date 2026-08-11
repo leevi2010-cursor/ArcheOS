@@ -35,7 +35,7 @@ Information 层承载：
 
 ```text
 Atomic Information Candidate
-Note
+Atomic Information
 Evidence
 Residue
 ```
@@ -43,11 +43,13 @@ Residue
 其中：
 
 - Candidate 来自 Processing；
-- Note 是长期原子信息；
+- Atomic Information 是进入长期 Information 层的原子信息；
 - Evidence 提供来源追溯；
 - Residue 保留当前无法安全结构化的内容。
 
-Candidate 如何进入 Note、Note 如何修订等运行规则由 `INFORMATION_GOVERNANCE.md` 定义，不在架构文档重复定义。
+Candidate 如何进入 Atomic Information、Atomic Information 如何修订等运行规则由 `INFORMATION_GOVERNANCE.md` 定义，不在架构文档重复定义。
+
+`Note` 不再作为 Core 信息概念使用。
 
 ---
 
@@ -65,7 +67,7 @@ Object
 
 Object ── Relationship ── Object
 
-Note ── concerns / supports ── World Model
+Atomic Information ── concerns / supports ── World Model
 ```
 
 核心结构原则：
@@ -75,7 +77,7 @@ Note ── concerns / supports ── World Model
 - Name 与身份分离；
 - Lifecycle 与 Role 分离；
 - Relationship 形成 Graph；
-- Note 与 Object 保持信息层 / 世界模型层分离；
+- Atomic Information 与 Object 保持 Information Layer / World Model Layer 分离；
 - 来源与历史可以跨层追溯。
 
 具体概念定义见 `CONCEPTS.md`。
@@ -84,11 +86,11 @@ Note ── concerns / supports ── World Model
 
 ## 5. Information Digestion / Governance Boundary
 
-Note 与 World Model 之间需要一个独立的“信息消化与治理层”。
+Atomic Information 与 World Model 之间需要一个独立的“信息消化与治理层”。
 
 它负责：
 
-- 识别 Note 涉及哪些已有 Object；
+- 识别 Atomic Information 涉及哪些已有 Object；
 - 判断新信息对现有长期认知的影响；
 - 发现冲突或歧义；
 - 决定是自动执行还是请求人类判断；
@@ -97,12 +99,12 @@ Note 与 World Model 之间需要一个独立的“信息消化与治理层”�
 架构位置：
 
 ```text
-Note / Evidence
-     ↓
+Atomic Information / Evidence
+          ↓
 Interpretation + Governance
-     ↓
+          ↓
 World Model Change Service
-     ↓
+          ↓
 WorldModelRepository
 ```
 
@@ -129,35 +131,47 @@ JSONL | SQLite | future database
 - JSONL 可以作为正式存储 Adapter；
 - SQLite 可以作为第一版本地 World Model Adapter；
 - 未来可以增加其他数据库；
-- 更换存储方式不改变 Object、Note、Role、Relationship 等语义；
+- 更换存储方式不改变 Object、Atomic Information、Role、Relationship 等语义；
 - 更换存储方式也不改变信息吸收和审核规则；
 - 避免无治理的双写导致多个事实源分叉。
 
 ---
 
-## 7. Object Resolver 与 Object Context
+## 7. Object Resolver 与 Context Builder
 
 ### 7.1 Object Resolver
 
 内部关系使用稳定 `object_id`；读取时通过 Object Resolver 获得当前名称、Role、status、Lifecycle 等人类可读信息。
 
-这样 Object 改名或 Role 调整，不需要修改所有 Note、Relationship 或 View 中的引用。
+这样 Object 改名或 Role 调整，不需要修改所有 Atomic Information、Relationship 或 View 中的引用。
 
-### 7.2 Object Context
+Object Resolver 是基础读取能力，不负责组装完整业务上下文。
 
-在进入 Domain Agent 前，ArcheOS 应提供统一上下文组装能力：
+### 7.2 Context Builder
+
+在进入 Domain Agent 和 Human View 前，ArcheOS 提供统一的 `Context Builder` 作为上下文读取与组装能力。
+
+Context Builder 根据调用目的和范围，从同一份长期数据中构建**有限边界、可追溯、明确说明完整性与截断情况**的 Context Bundle。
+
+第一版优先实现 Object-scoped Context：
 
 ```text
 Object
 + Name / Role / Lifecycle
 + Relationships
-+ related Notes
++ related Atomic Information
 + Evidence / history
         ↓
-   Object Context
+   Context Builder
+        ↓
+   Context Bundle
 ```
 
-Sales Agent、Brand Agent、Project Agent 等优先消费统一 Object Context，而不是各自重新扫描全部原始资料。
+`Object Context` 不作为新的一级架构概念存在；它只是 `Context Builder(scope = Object)` 的第一种使用范围。
+
+未来 Goal、业务问题、经营态势、Agent 对话等上下文需求继续复用同一个 Context Builder，不为每种用途建立平行的 `*ContextBuilder` 概念。
+
+Sales Agent、Brand Agent、Project Agent 以及未来 View 优先消费统一 Context Builder 输出，而不是各自重新扫描全部原始资料。
 
 ---
 
@@ -196,12 +210,12 @@ Sales Agent、Brand Agent、Project Agent 等是 Core 之上的领域解释能�
 它们读取：
 
 - Processing 产物；
-- Note；
+- Atomic Information；
 - Structured World Model；
-- Object Context；
+- Context Builder 输出；
 - View Model。
 
-它们可以产生领域报告、判断和更新建议，但不能因为领域术语新增平行 Core 对象体系。
+它们可以产生领域报告、判断和更新建议，但不能因为领域术语新增平行 Core 对象体系，也不应各自创建一套独立 Context Builder。
 
 ---
 
@@ -214,11 +228,11 @@ M2 当前推进顺序：
 ```text
 M2-A  World Model foundation
   ↓
-M2-B1 Durable Note + automatic ingestion
+M2-B1 Durable Atomic Information + automatic ingestion
   ↓
-M2-B2 Note → World Model digestion / governance
+M2-B2 Atomic Information → World Model digestion / governance
   ↓
-M2-B3 Object Context assembly
+M2-B3 Context Builder — Object-scoped v1
 ```
 
 前端 Human View 延后到上述核心链路稳定之后。
