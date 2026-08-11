@@ -94,12 +94,21 @@ class ContextAdapterIntegrationTest(unittest.TestCase):
                 claimed_at="2026-08-11T00:00:00Z",
                 attribution_confidence=0.9,
             )
+            second_claim = ClaimAttribution(
+                claimant_object_id=incoming.object_id,
+                claimant_source_id="source-claim-2",
+                claimant_label="Synthetic Incoming",
+                stance="deny",
+                claimed_at="2026-08-11T00:00:00Z",
+                attribution_confidence=0.8,
+            )
             no_claim = revision("source-none", "candidate-none", "2026-08-11T00:00:01Z", (root.object_id,))
             claimed = revision("source-claim", "candidate-claim", "2026-08-11T00:00:02Z", (root.object_id, outgoing.object_id), claim=claim)
-            multi_first = revision("source-multi", "candidate-multi", "2026-08-11T00:00:03Z", (root.object_id,))
-            multi_current = revision("source-multi", "candidate-multi", "2026-08-11T00:00:04Z", (root.object_id,), revision_number=2)
+            second_claimed = revision("source-claim-2", "candidate-claim-2", "2026-08-11T00:00:03Z", (root.object_id, incoming.object_id), claim=second_claim)
+            multi_first = revision("source-multi", "candidate-multi", "2026-08-11T00:00:04Z", (root.object_id,))
+            multi_current = revision("source-multi", "candidate-multi", "2026-08-11T00:00:05Z", (root.object_id,), revision_number=2)
             information_store = JsonlAtomicInformationStore(information_path)
-            information_store.ingest_batch((no_claim, claimed, multi_first))
+            information_store.ingest_batch((no_claim, claimed, second_claimed, multi_first))
             information_store.append_revision(multi_current)
 
             journal_store = JsonlChangeJournal(journal_path)
@@ -138,6 +147,11 @@ class ContextAdapterIntegrationTest(unittest.TestCase):
                     repository.list_objects(),
                     repository.list_relationships(active_only=False),
                 )
+                before_artifacts = {
+                    "atomic_information": information_path.read_bytes(),
+                    "change_journal": journal_path.read_bytes(),
+                    "change_proposals": proposal_path.read_bytes(),
+                }
                 builder = ContextBuilder(
                     repository,
                     ObjectResolver(repository),
@@ -153,12 +167,22 @@ class ContextAdapterIntegrationTest(unittest.TestCase):
                     repository.list_objects(),
                     repository.list_relationships(active_only=False),
                 )
+                after_artifacts = {
+                    "atomic_information": information_path.read_bytes(),
+                    "change_journal": journal_path.read_bytes(),
+                    "change_proposals": proposal_path.read_bytes(),
+                }
 
             self.assertEqual(asdict(first), asdict(second))
             self.assertEqual(before_world, after_world)
+            self.assertEqual(before_artifacts, after_artifacts)
             self.assertEqual({item.direction for item in first.relationships}, {"incoming", "outgoing"})
-            self.assertEqual(len(first.atomic_information), 3)
+            self.assertEqual(len(first.atomic_information), 4)
             self.assertEqual(first.atomic_information[0].revision_count, 2)
+            self.assertEqual(
+                {item.claim.stance for item in first.atomic_information if item.claim},
+                {"assert", "deny"},
+            )
             self.assertEqual({item.mode for item in first.recent_changes}, {"automatic", "human_approved"})
             self.assertEqual({item.status for item in first.pending_judgments}, {"pending", "deferred"})
             self.assertTrue(first.metadata.complete)
