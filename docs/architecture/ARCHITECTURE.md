@@ -41,7 +41,9 @@ Processing 把输入转化为可理解、可追溯的中间产物。音频 M1 �
 - Atomic Information Candidate；
 - Residue。
 
-当来源中能够明确判断声明主体与立场时，Processing / 后续 B2 可以把 Claim attribution 补充进 Atomic Information；Claimant 尚未解析成 Object 时，可以继续使用 Source / speaker 归因，不强制创建 Person Object。
+第一版不要求重新修改 M1 Candidate contract 来承载 Claim。B2 可以结合 Atomic Information 的 statement、Evidence、Source / speaker attribution 补充 Claim，并通过同一 `atomic_information_id` 的新 revision 长期保存。未来若真实数据证明 Processing 阶段直接产出 Claim 更合适，再单独调整 Candidate contract。
+
+Claimant 尚未解析成 Object 时，可以继续使用 Source / speaker 归因，不强制创建 Person Object。
 
 会议纪要和 Residue 是 Processing 辅助产物，不建立平行生命周期。
 
