@@ -1,0 +1,111 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1800" height="1180" viewBox="0 0 1800 1180">
+  <defs>
+    <marker id="arrow" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto" markerUnits="strokeWidth"><path d="M0,0 L0,6 L9,3 z" fill="#334155"/></marker>
+    <style>
+      .title{font:700 34px Arial,'Microsoft YaHei',sans-serif;fill:#0f172a}.subtitle{font:16px Arial,'Microsoft YaHei',sans-serif;fill:#475569}.h{font:700 20px Arial,'Microsoft YaHei',sans-serif;fill:#0f172a}.t{font:16px Arial,'Microsoft YaHei',sans-serif;fill:#334155}.s{font:14px Arial,'Microsoft YaHei',sans-serif;fill:#475569}.xs{font:13px Arial,'Microsoft YaHei',sans-serif;fill:#64748b}.source{fill:#fefce8;stroke:#ca8a04;stroke-width:2.3}.implemented{fill:#ecfdf5;stroke:#059669;stroke-width:2.3}.progress{fill:#eff6ff;stroke:#2563eb;stroke-width:2.3}.planned{fill:#eff6ff;stroke:#2563eb;stroke-width:2.3;stroke-dasharray:10 7}.canonical{fill:#f5f3ff;stroke:#7c3aed;stroke-width:2.3}.external{fill:#f8fafc;stroke:#64748b;stroke-width:2.3}.legacy{fill:#fff7ed;stroke:#ea580c;stroke-width:2.3}.group{fill:#ffffff;stroke:#cbd5e1;stroke-width:2}.arrow{stroke:#334155;stroke-width:2.2;fill:none;marker-end:url(#arrow)}.dash{stroke:#2563eb;stroke-width:2.2;stroke-dasharray:8 6;fill:none;marker-end:url(#arrow)}.return{stroke:#7c3aed;stroke-width:2;stroke-dasharray:7 5;fill:none;marker-end:url(#arrow)}
+    </style>
+  </defs>
+  <rect width="1800" height="1180" fill="#f8fafc"/>
+  <text x="55" y="58" class="title">向阳经营系统 v0.2.0 — 数据流</text>
+  <text x="55" y="88" class="subtitle">从原始来源 → Atomic Information → 受治理 World Model → Context Builder → Agent / 人类 → Decision / Feedback</text>
+
+  <!-- lane headings -->
+  <text x="70" y="140" class="h">A. Input &amp; Processing</text>
+  <text x="445" y="140" class="h">B. Long-term Information</text>
+  <text x="840" y="140" class="h">C. Digestion &amp; World Model</text>
+  <text x="1290" y="140" class="h">D. Context / Consumption</text>
+
+  <!-- Lane A -->
+  <rect x="65" y="165" width="300" height="75" rx="14" class="source"/>
+  <text x="123" y="198" class="t">1. 原始来源</text><text x="104" y="223" class="s">录音 / 文档 / 邮件 / 图片 / 外部输入</text>
+
+  <rect x="65" y="285" width="300" height="105" rx="14" class="implemented"/>
+  <text x="117" y="319" class="h">2. Processing（M1）</text><text x="100" y="349" class="s">Transcription / Speaker Attribution</text><text x="100" y="373" class="s">Semantic Analysis / coverage fail-closed</text>
+
+  <rect x="65" y="435" width="300" height="145" rx="14" class="implemented"/>
+  <text x="104" y="468" class="h">3. Processing Package</text><text x="100" y="498" class="s">transcript</text><text x="100" y="522" class="s">meeting summary</text><text x="100" y="546" class="s">Atomic Information Candidates</text><text x="100" y="570" class="s">Residue + Evidence</text>
+
+  <path d="M215 240 L215 285" class="arrow"/>
+  <path d="M215 390 L215 435" class="arrow"/>
+
+  <!-- Lane B -->
+  <rect x="430" y="210" width="330" height="110" rx="14" class="progress"/>
+  <text x="478" y="244" class="h">4. Contract Validation（B1）</text><text x="468" y="275" class="s">验证 candidate / Evidence / provenance</text><text x="468" y="300" class="s">不要求逐条人工审核</text>
+
+  <rect x="430" y="375" width="330" height="150" rx="14" class="canonical"/>
+  <text x="483" y="410" class="h">5. Atomic Information Store</text><text x="470" y="441" class="s">stable atomic_information_id</text><text x="470" y="466" class="s">append-only revisions</text><text x="470" y="491" class="s">Evidence / context / confidence</text><text x="470" y="516" class="s">initial related_object_ids = []</text>
+
+  <rect x="430" y="575" width="330" height="90" rx="14" class="progress"/>
+  <text x="487" y="609" class="t">6. Idempotency / History</text><text x="466" y="636" class="s">重复来源不重复；来源碰撞 fail closed</text>
+
+  <path d="M365 505 C400 505 395 265 430 265" class="arrow"/>
+  <path d="M595 320 L595 375" class="arrow"/>
+  <path d="M595 525 L595 575" class="arrow"/>
+
+  <!-- Lane C -->
+  <rect x="820" y="185" width="350" height="115" rx="14" class="planned"/>
+  <text x="883" y="219" class="h">7. Object Matching / Interpretation</text><text x="855" y="250" class="s">已有 Object 精确识别</text><text x="855" y="275" class="s">判断：补充 / 更新 / 冲突 / 歧义</text>
+
+  <rect x="820" y="350" width="350" height="125" rx="14" class="planned"/>
+  <text x="885" y="384" class="h">8. Governance Decision</text><text x="855" y="416" class="s">清楚 + 无冲突 + 低风险 → 自动</text><text x="855" y="442" class="s">新建 / 删除 / 冲突 / 不确定 → 人类</text>
+
+  <rect x="790" y="530" width="170" height="100" rx="14" class="planned"/>
+  <text x="823" y="565" class="t">9A. Auto</text><text x="815" y="592" class="s">安全自动更新</text><text x="815" y="614" class="s">保留来源历史</text>
+
+  <rect x="1010" y="530" width="190" height="100" rx="14" class="planned"/>
+  <text x="1035" y="565" class="t">9B. Human</text><text x="1037" y="592" class="s">自然业务语言审核</text><text x="1037" y="614" class="s">批准 / 拒绝 / 延后</text>
+
+  <rect x="820" y="690" width="350" height="110" rx="14" class="planned"/>
+  <text x="879" y="724" class="h">10. World Model Change Service</text><text x="855" y="755" class="s">应用前重新读取并校验当前状态</text><text x="855" y="779" class="s">多个操作尽量 all-or-none</text>
+
+  <rect x="820" y="855" width="350" height="150" rx="14" class="canonical"/>
+  <text x="895" y="890" class="h">11. Structured World Model</text><text x="855" y="922" class="s">Object + Name + Role + Lifecycle</text><text x="855" y="948" class="s">Relationship Graph</text><text x="855" y="974" class="s">source_atomic_information_id / history</text><text x="855" y="998" class="s">M2-A 基础已实现</text>
+
+  <rect x="820" y="1050" width="350" height="75" rx="14" class="planned"/>
+  <text x="897" y="1081" class="t">12. Change Journal</text><text x="858" y="1107" class="s">auto / human / result / evidence / idempotency</text>
+
+  <path d="M760 450 C790 450 790 242 820 242" class="dash"/>
+  <path d="M995 300 L995 350" class="dash"/>
+  <path d="M995 475 L875 530" class="dash"/>
+  <path d="M995 475 L1105 530" class="dash"/>
+  <path d="M875 630 C875 660 930 660 930 690" class="dash"/>
+  <path d="M1105 630 C1105 660 1060 660 1060 690" class="dash"/>
+  <path d="M995 800 L995 855" class="dash"/>
+  <path d="M1060 800 C1130 835 1130 1040 1080 1050" class="dash"/>
+
+  <!-- Lane D -->
+  <rect x="1260" y="205" width="420" height="130" rx="14" class="planned"/>
+  <text x="1372" y="240" class="h">13. Context Builder（B3）</text><text x="1300" y="272" class="s">读取 Atomic Information + World Model + Evidence + Changes</text><text x="1300" y="297" class="s">bounded / traceable / completeness / truncation</text><text x="1300" y="322" class="s">Object-scoped v1；未来扩 scope，不复制 Builder</text>
+
+  <rect x="1260" y="390" width="420" height="105" rx="14" class="planned"/>
+  <text x="1375" y="425" class="t">14. Context Bundle</text><text x="1300" y="456" class="s">当前对象状态 + 关系 + Atomic Information + Evidence + recent changes</text><text x="1300" y="480" class="s">只读，不成为第二份 Core Truth</text>
+
+  <rect x="1260" y="555" width="420" height="125" rx="14" class="external"/>
+  <text x="1368" y="590" class="h">15. Agent / Human</text><text x="1300" y="621" class="s">ChatGPT / Codex / Hermes / Domain Agents</text><text x="1300" y="646" class="s">业务对话 / 报告 / Human Views</text><text x="1300" y="670" class="s">面向人类只展示业务语言</text>
+
+  <rect x="1260" y="745" width="420" height="110" rx="14" class="planned"/>
+  <text x="1370" y="779" class="h">16. Decision / Action（M4）</text><text x="1300" y="811" class="s">基于 Context 形成判断、决策、行动</text><text x="1300" y="835" class="s">Decision / Action 保留依据</text>
+
+  <rect x="1260" y="920" width="420" height="105" rx="14" class="planned"/>
+  <text x="1392" y="955" class="h">17. Feedback</text><text x="1300" y="987" class="s">行动结果重新成为现实输入 / Source</text><text x="1300" y="1011" class="s">进入下一轮信息消化并修正长期认知</text>
+
+  <path d="M1170 930 C1210 930 1210 270 1260 270" class="return"/>
+  <path d="M760 450 C1040 450 1100 270 1260 270" class="return"/>
+  <path d="M1470 335 L1470 390" class="dash"/>
+  <path d="M1470 495 L1470 555" class="dash"/>
+  <path d="M1470 680 L1470 745" class="dash"/>
+  <path d="M1470 855 L1470 920" class="dash"/>
+  <path d="M1260 972 C1180 972 1210 1085 1170 1085" class="dash"/>
+  <path d="M1260 972 C1200 1045 550 1125 215 240" class="dash"/>
+
+  <!-- Migration lane/footer -->
+  <rect x="65" y="735" width="620" height="135" rx="16" class="legacy"/>
+  <text x="105" y="770" class="h">Legacy Migration（B3 后开始）</text><text x="105" y="802" class="s">Tolaria Notes / 旧向阳经营系统 → 显式 Migration Adapter</text><text x="105" y="828" class="s">映射到 Source / Atomic Information / Object / Relationship</text><text x="105" y="854" class="s">不长期双写；完成验证后旧系统进入 read-only archive</text>
+  <path d="M685 805 C740 805 750 450 820 450" class="dash"/>
+  <path d="M685 830 C760 830 700 450 595 450" class="dash"/>
+
+  <rect x="60" y="1050" width="650" height="75" rx="16" class="group"/>
+  <text x="92" y="1080" class="h">信息守恒与治理规则</text><text x="92" y="1108" class="s">无法安全结构化的内容进入 Residue；没有 silent drop。自动更新和人工判断都必须保留 Evidence 与历史。</text>
+
+  <text x="60" y="1160" class="xs">主生命周期：Input → Processing → Atomic Information → Structured Object → Decision → Feedback。JSONL / SQLite 是存储 Adapter，不是领域模型。</text>
+</svg>
