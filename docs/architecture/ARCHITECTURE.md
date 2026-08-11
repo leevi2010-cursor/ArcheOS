@@ -6,50 +6,54 @@ ArcheOS 只保留一条主生命周期：
 
 **Input → Processing → Atomic Information → Structured Object → Decision → Feedback**
 
-任何新增能力都必须说明自己服务于这条主线的哪一个阶段，不建立同义或平行生命周期。
+任何新增能力都必须说明自己服务于这条主线的哪一阶段，不建立同义或平行生命周期。
 
-其中 `Structured Object` 表示进入长期结构化世界模型的阶段，不意味着系统采用一组互斥的 `Person / Company / Project` 基础表。ArcheOS 的核心概念定义以 `docs/architecture/CONCEPTS.md` 为唯一权威词典。
+`Structured Object` 表示进入长期结构化世界模型的阶段，不意味着系统采用互斥的 Person / Company / Project 基础表。
 
-## 2. 五个核心阶段
+核心概念定义以 `docs/architecture/CONCEPTS.md` 为准；信息吸收和长期认知更新的业务规则以 `docs/product/INFORMATION_GOVERNANCE.md` 为准。
 
-### 2.1 Input
+---
 
-接收原始信息，例如音频、PDF、图片、PPT、视频等。
+## 2. Input 与 Processing
 
-原始输入必须保持不可修改并可追溯。
+Input 接收音频、PDF、图片、PPT、视频等原始信息。原始输入保持不可修改并可追溯。
 
-### 2.2 Processing
+Processing 把输入转化为可理解、可追溯的中间产物。音频 M1 已支持：
 
-负责把原始输入转化为可理解、可审查的中间产物。
+- transcript；
+- meeting summary；
+- atomic information candidates；
+- residue。
 
-音频第一版产生：
+会议纪要和 Residue 是 Processing 辅助产物，不建立平行生命周期。
 
-- transcript：原始转写；
-- meeting summary：整体上下文保留；
-- atomic information candidates：原子信息候选；
-- residue：当前无法安全吸收的信息。
+---
 
-会议纪要和残渣属于 Processing 的辅助产物，不是新的核心对象层，也不是平行生命周期。
+## 3. Information Layer
 
-### 2.3 Atomic Information / Note
+Information 层承载：
 
-形成最小的、可独立追溯的信息单元。
+```text
+Atomic Information Candidate
+Note
+Evidence
+Residue
+```
 
-每个原子信息至少需要保存：
+其中：
 
-- statement；
-- source evidence；
-- context；
-- confidence / uncertainty；
-- 可能关联的 Object。
+- Candidate 来自 Processing；
+- Note 是长期原子信息；
+- Evidence 提供来源追溯；
+- Residue 保留当前无法安全结构化的内容。
 
-M2 起，符合信息契约的 Atomic Information Candidate 可以自动吸收为 durable `Note`，不要求逐条人工审核。
+Candidate 如何进入 Note、Note 如何修订等运行规则由 `INFORMATION_GOVERNANCE.md` 定义，不在架构文档重复定义。
 
-Note 属于 Information 层。后续修改必须保留历史，不允许静默覆盖旧版本。
+---
 
-### 2.4 Structured Object / World Model
+## 4. Structured World Model
 
-ArcheOS 采用：
+长期 World Model 使用：
 
 ```text
 Object
@@ -61,123 +65,117 @@ Object
 
 Object ── Relationship ── Object
 
-Note ── concerns / supports ── Object / Name / Role / Relationship / Lifecycle
+Note ── concerns / supports ── World Model
 ```
 
-核心原则：
+核心结构原则：
 
-- `Object` 是长期稳定身份；
-- `Role` 是 Object 当前或某段时间的业务解释，不是身份；
-- `Name` 是面向人的可变标签，不是内部外键；
-- `Lifecycle` 描述时间、结束和完成特征，与 Role 分离；
-- `Relationship` 把 Object 组成 Graph；
-- `Note` 属于 Information 层，不与 Object 混成同一实体；
-- 多来源信息可以逐步更新同一 World Model，但必须保留 Note、Evidence、来源和历史。
+- Object 提供稳定身份；
+- Role 与身份分离；
+- Name 与身份分离；
+- Lifecycle 与 Role 分离；
+- Relationship 形成 Graph；
+- Note 与 Object 保持信息层 / 世界模型层分离；
+- 来源与历史可以跨层追溯。
 
-当前已接受 Role：
+具体概念定义见 `CONCEPTS.md`。
 
-- `person`
-- `company`
-- `brand`
-- `project`
-- `business_line`
-- `event`
-- `goal`
-- `decision`
+---
 
-例如：
+## 5. Information Digestion / Governance Boundary
+
+Note 与 World Model 之间需要一个独立的“信息消化与治理层”。
+
+它负责：
+
+- 识别 Note 涉及哪些已有 Object；
+- 判断新信息对现有长期认知的影响；
+- 发现冲突或歧义；
+- 决定是自动执行还是请求人类判断；
+- 在执行后保留来源、Evidence 与历史。
+
+架构位置：
 
 ```text
-私享国际家具
-  Object A
-  roles: company + brand
-
-展厅经营
-  Object B
-  role: business_line
-  lifecycle: ongoing
-
-海丝金融中心家具采购
-  Object C
-  role: project
-  lifecycle: bounded
+Note / Evidence
+     ↓
+Interpretation + Governance
+     ↓
+World Model Change Service
+     ↓
+WorldModelRepository
 ```
 
-如果“展厅经营”过去被理解为 Project，后来调整为 Business Line，Object ID 不变，只修改 Role 及历史。
+**业务规则不写在 Repository 内。**
 
-### 2.5 World Model Change Boundary
+哪些情况可以自动执行、哪些情况必须由人类判断，以 `docs/product/INFORMATION_GOVERNANCE.md` 为唯一长期规则来源。
 
-Note 可以自动吸收，但改变长期世界结构需要更严格的治理。
+---
 
-系统在读取一条新 Note 并关联已有 Object 时，应区分：
+## 6. Persistence Boundary
 
-```text
-新增信息
-  → 与已有认知相容
-  → 自动关联 / 保留
-
-需要更新
-  → 新信息说明 Name / Role / Relationship / Lifecycle 等长期认知需要调整
-  → 形成变更建议
-
-存在冲突
-  → 新旧信息无法安全同时成立
-  → 不静默覆盖，交给人类判断
-```
-
-新建、删除或修改 Object，以及修改 Name / Role / Relationship / Lifecycle，都属于 World Model Change。当前原则是：先形成可解释的建议，获得人类授权后再执行。
-
-审核可以直接通过 AI 对话或 prompt 完成，不依赖专门审核前端。
-
-Object 删除还需要检查业务关系安全：不应因为删除一个 Object，使仍需保留的其他 Object 因失去唯一有效联系而意外成为孤立对象。
-
-### 2.6 Decision
-
-结构化信息最终用于支持目标下的判断、决策与行动，并由行动结果形成反馈。
-
-`goal` 与 `decision` 当前已经被定义为 Object 可承担的 Role，但更完整的 Goal → Decision → Action → Feedback 行为模型仍在进入对应里程碑时逐步实现，不提前增加平行 ontology。
-
-## 3. Persistence Boundary
-
-ArcheOS 的领域语义不能绑定某一种数据库。
+ArcheOS 的领域语义和业务规则不能绑定某一种数据库。
 
 ```text
-Information / World Model Contracts
-            ↓
-Repository / Store Interface
-            ↓
+Domain Contracts
+      ↓
+Repository / Store Interfaces
+      ↓
 JSONL | SQLite | future database
 ```
 
-原则：
+因此：
 
-- JSONL 可以是正式存储方式之一；
-- SQLite 可以是第一版本地 World Model 实现；
-- 未来可以替换或增加其他数据库；
-- 更换存储方式不能改变 Object、Note、Role、Relationship、Lifecycle、Name 的业务语义；
-- 审核和业务规则应位于 Repository/Store 之上，而不是写死在 SQLite adapter 内。
+- JSONL 可以作为正式存储 Adapter；
+- SQLite 可以作为第一版本地 World Model Adapter；
+- 未来可以增加其他数据库；
+- 更换存储方式不改变 Object、Note、Role、Relationship 等语义；
+- 更换存储方式也不改变信息吸收和审核规则；
+- 避免无治理的双写导致多个事实源分叉。
 
-## 4. Core Graph 与 Human View
+---
 
-ArcheOS Core 保存的是 Graph，而不是强制唯一目录树。
+## 7. Object Resolver 与 Object Context
+
+### 7.1 Object Resolver
+
+内部关系使用稳定 `object_id`；读取时通过 Object Resolver 获得当前名称、Role、status、Lifecycle 等人类可读信息。
+
+这样 Object 改名或 Role 调整，不需要修改所有 Note、Relationship 或 View 中的引用。
+
+### 7.2 Object Context
+
+在进入 Domain Agent 前，ArcheOS 应提供统一上下文组装能力：
 
 ```text
-Object + Role + Relationship + Lifecycle + Name
-                ↓
-        Structured World Model
-                ↓
-          Projection / View
-                ↓
-             View Model
-                ↓
- HTML / Markdown / React / Mobile / AI UI
+Object
++ Name / Role / Lifecycle
++ Relationships
++ related Notes
++ Evidence / history
+        ↓
+   Object Context
 ```
 
-### 4.1 View
+Sales Agent、Brand Agent、Project Agent 等优先消费统一 Object Context，而不是各自重新扫描全部原始资料。
 
-`View` 是人类观察同一份 Core 数据的一种投影，不是新的 Core Object。
+---
 
-未来可以包含：
+## 8. Core Graph 与 Human View
+
+Core 保存 Graph，而不是强制唯一目录树。
+
+```text
+Structured World Model
+        ↓
+Projection / View
+        ↓
+View Model
+        ↓
+Presentation
+```
+
+未来可以有：
 
 - Object Profile；
 - 向阳生长树；
@@ -185,110 +183,42 @@ Object + Role + Relationship + Lifecycle + Name
 - Timeline；
 - Decision View。
 
-例如“向阳生长树”可以把同一 Graph 投影为：
+树只是 View，不是 Core 唯一真实父子结构。
 
-```text
-私享国际家具
-├─ 展厅经营 [business_line]
-│  ├─ 产品库
-│  └─ 销售工具
-└─ 海丝金融中心家具采购 [project]
-```
+面向人的页面、AI 提示和审核问题必须遵循 `INFORMATION_GOVERNANCE.md` 中的人类表达规则；架构层只定义 Presentation 边界，不重复业务文案规则。
 
-这棵树只是一种 View，不是 Core 中唯一真实的父子关系。
+---
 
-### 4.2 Object Resolver
+## 9. Domain Agent
 
-内部关系使用 `object_id`，展示层通过 Object Resolver / Read Model 获取：
+Sales Agent、Brand Agent、Project Agent 等是 Core 之上的领域解释能力，不建立新的 Input → Processing → Object 生命周期。
 
-- current name；
-- display role；
-- aliases；
-- status；
-- 其他人类可读信息。
-
-因此 Object 改名或 Role 调整，不需要修改所有 Note、Relationship 或 View 中的引用。
-
-### 4.3 Presentation 与业务语言
-
-HTML、Markdown、AI 对话或其他前端只是 Presentation。
-
-Core Data 才是权威，HTML 不应成为关系和对象定义的唯一存储位置。
-
-所有面向人的内容都必须使用通俗的业务语言，包括：
-
-- 页面标题和说明；
-- AI 提示和问题；
-- 审核请求；
-- 冲突与风险说明；
-- 报告、建议与错误提示。
-
-默认读者是一位普通大学本科毕业生，不要求理解 `object_id`、schema、foreign key、repository、graph edge、mutation、adapter 等内部技术概念。
-
-系统内部可以保持精确的技术表示，但在人类界面必须翻译为：发生了什么、为什么重要、依据是什么、需要做什么选择、选择后会有什么业务后果。
-
-例如内部动作可能是：
-
-```text
-add_role(obj_x, business_line)
-```
-
-面向人类应表达为：
-
-> 系统发现“展厅经营”更像一项持续经营的业务，而不是一个有明确结束时间的项目。是否将它调整为“业务线”？原有历史记录会保留。
-
-## 5. Domain Agent 的位置
-
-Sales Agent、Brand Agent、Project Agent 等领域能力不是新的核心层。
-
-它们是建立在 Core 之上的领域解释能力，可以读取：
+它们读取：
 
 - Processing 产物；
-- Atomic Information / Note；
+- Note；
 - Structured World Model；
-- 面向用途的 View Model。
+- Object Context；
+- View Model。
 
-然后产生：
+它们可以产生领域报告、判断和更新建议，但不能因为领域术语新增平行 Core 对象体系。
 
-- 领域报告；
-- 领域判断；
-- 对 Note、Name、Role、Relationship、Lifecycle、Decision 等的更新建议。
+---
 
-Domain Agent 不应该为自己的领域重新创建一套 Input → Processing → Object 生命周期，也不应该因为业务术语增加新的 Core 基础对象类型。
+## 10. 当前阶段
 
-## 6. 概念治理
+M1 已完成通用音频信息消化。
 
-所有架构和实现应先查阅 `docs/architecture/CONCEPTS.md`。
-
-规则：
-
-1. 能复用已有概念时，不新增概念；
-2. 不建立同义或平行模型；
-3. 新业务词优先作为 Name、Role、Relationship、Note 或 View 表达；
-4. 只有已有概念确实不足时，才通过架构决策新增概念；
-5. 新增概念必须同步更新 `CONCEPTS.md` 后才能进入实现。
-
-## 7. 当前实现边界
-
-M1 已完成通用音频信息消化：
-
-**音频 → 转写 → Speaker Attribution → 会议纪要 → 原子信息候选 + 残渣**
-
-PR #5 已合并到 `main`。
-
-M2-A 正在建立稳定 World Model 基础：
-
-**Object / Name / Role / Lifecycle / Relationship + Resolver + Repository contract**
-
-M2 后续进入：
+M2 当前推进顺序：
 
 ```text
-Atomic Information Candidate
-  → automatic durable Note ingestion
-  → existing Object interpretation
-  → compatible addition / update / conflict detection
-  → governed World Model change when needed
-  → human authorization for structural changes
+M2-A  World Model foundation
+  ↓
+M2-B1 Durable Note + automatic ingestion
+  ↓
+M2-B2 Note → World Model digestion / governance
+  ↓
+M2-B3 Object Context assembly
 ```
 
-前端 Human View 暂后，优先完成自动 Note、受控 World Model Change 与后续统一上下文能力。长期阶段顺序以 `docs/development/ROADMAP.md` 为准。
+前端 Human View 延后到上述核心链路稳定之后。
