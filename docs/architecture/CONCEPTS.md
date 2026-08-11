@@ -160,6 +160,12 @@ Relationship 可以包含：
 
 ArcheOS 的 World Model 因此天然可以形成 Graph，而不是只能形成一棵唯一目录树。
 
+### 当前已接受的通用 Relationship
+
+- `related_to`：表示两个 Object 之间存在明确、值得长期保留的业务联系，但当前没有必要或还没有足够依据定义更具体的 Relationship 语义。
+
+`related_to` 是刻意保持宽泛的关系，不表示隶属、所有权、责任、因果或其他更具体含义。以后如果某类更具体的 Relationship 被正式定义，可以新增更精确的关系，而不改变两个 Object 的身份。
+
 ---
 
 ## 8. Note
