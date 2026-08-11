@@ -33,14 +33,14 @@
 
 ## M2 — 长期 Information + Structured World Model（当前）
 
-目标：让 Processing 产出的信息进入长期 Note，并在受治理的边界下持续更新 Structured World Model。
+目标：让 Processing 产出的信息进入长期 Atomic Information，并在受治理的边界下持续更新 Structured World Model。
 
 长期方向：
 
 ```text
 Atomic Information Candidate
         ↓
-Durable Note
+Durable Atomic Information
         ↓
 Information Digestion / Governance
         ↓
@@ -48,7 +48,7 @@ Object + Name + Role + Lifecycle + Relationship
         ↓
 Structured World Model
         ↓
-Object Context
+Context Builder
 ```
 
 ### M2-A — World Model Foundation
@@ -65,59 +65,63 @@ Object Context
 - Core 保存 Graph；
 - Person / Company / Project / BusinessLine 等通过 Role 表达，不建立平行 base entity。
 
-### M2-B1 — Durable Note + Automatic Ingestion
+### M2-B1 — Durable Atomic Information + Automatic Ingestion
 
-目标：把 contract-valid Atomic Information Candidate 自动吸收为长期 Note，不要求逐条人工审核。
+目标：把 contract-valid Atomic Information Candidate 自动吸收为长期 Atomic Information，不要求逐条人工审核。
 
 需要实现：
 
-- stable Note identity；
-- append-only Note revisions；
+- stable Atomic Information identity；
+- append-only Atomic Information revisions；
 - Evidence / context / confidence / source provenance 保留；
-- processing candidate → Note 的幂等导入；
-- NoteStore 抽象；
+- processing candidate → Atomic Information 的幂等导入；
+- AtomicInformationStore 抽象；
 - JSONL 作为第一版正式存储 adapter；
-- 私有 Note 数据不进入 public Git；
-- 默认 processing workflow 可以进入 Note ingestion，不再以 per-note human review 作为强制 gate。
+- 私有 Atomic Information 数据不进入 public Git；
+- 默认 processing workflow 可以进入 Atomic Information ingestion，不再以 per-item human review 作为强制 gate。
 
-本阶段不解释 Note 对 World Model 的影响。
+本阶段不解释 Atomic Information 对 World Model 的影响。
 
-### M2-B2 — Note → World Model Digestion & Governance
+### M2-B2 — Atomic Information → World Model Digestion & Governance
 
-目标：让 Note 结合当前 Structured World Model，判断它是补充、更新还是冲突，并按 `INFORMATION_GOVERNANCE.md` 执行。
+目标：让 Atomic Information 结合当前 Structured World Model，判断它是补充、更新还是冲突，并按 `INFORMATION_GOVERNANCE.md` 执行。
 
 需要实现：
 
-- Note → existing Object 的保守识别与绑定；
+- Atomic Information → existing Object 的保守识别与绑定；
 - 补充信息自动吸收；
 - 目标明确、Evidence 足够、无冲突且低风险的已有 Object 更新可以自动执行；
 - 新建 Object、删除 Object、冲突、Object/Relationship 不确定等情况请求人类判断；
 - 人类判断可以通过 prompt / conversation adapter 完成，不要求正式前端；
 - 所有面向人的审核内容使用通俗业务语言；
 - Object 创建与删除遵守孤立对象保护；
-- 自动与人工变更都保留 Note/Evidence/历史与执行结果；
+- 自动与人工变更都保留 Atomic Information / Evidence / 历史与执行结果；
 - 业务治理位于 Store/Repository 之上，不写死在 SQLite/JSONL adapter。
 
-### M2-B3 — Object Context
+### M2-B3 — Context Builder — Object-scoped v1
 
-目标：为后续 Domain Agent 提供一个统一、可追溯、有限边界的长期上下文读取入口。
+目标：为后续 Domain Agent 和 Human View 提供统一、可追溯、有限边界的上下文读取入口。
 
-输入一个 Object 后，能够组装：
+第一版以 Object 为 scope，能够组装：
 
 ```text
 Object
 + current Name / Role / Lifecycle
 + Relationships + neighbor Objects
-+ related Notes
++ related Atomic Information
 + Evidence
 + relevant history / recent changes
         ↓
-   Object Context
+   Context Builder
+        ↓
+   Context Bundle
 ```
 
 要求：
 
-- 只依赖 NoteStore / WorldModelRepository 等稳定 contract；
+- 复用统一 `Context Builder` 概念，不建立平行的 Object Context / Agent Context / Business Context Builder；
+- 第一版只是 `scope = Object`；
+- 只依赖 AtomicInformationStore / WorldModelRepository 等稳定 contract；
 - 不直接绑定 JSONL 或 SQLite；
 - 输出有明确数量边界和 completeness / truncation 信息；
 - 不引入新的业务 ontology；
@@ -141,11 +145,11 @@ Structured World Model
 
 ## M3 — Domain Agent
 
-目标：在 Note、Structured World Model 与 Object Context 之上增加销售、品牌、项目等领域解释能力，而不污染 Core。
+目标：在 Atomic Information、Structured World Model 与 Context Builder 之上增加销售、品牌、项目等领域解释能力，而不污染 Core。
 
 候选：Sales Agent、Brand Agent、Project Agent。
 
-Domain Agent 优先读取 Object Context，而不是各自重新扫描全部原始资料。
+Domain Agent 优先读取 Context Builder 输出，而不是各自重新扫描全部原始资料或建立新的 Context Builder。
 
 ---
 
@@ -173,7 +177,8 @@ ArcheOS 始终沿一条主线演化：
 2. 产品行为规则以 `INFORMATION_GOVERNANCE.md` 为准；
 3. 优先复用已有概念，不建立平行模型；
 4. Object ID 稳定，Name / Role / View 可以演化；
-5. Note 与 World Model 分层，历史与 Evidence 不丢失；
+5. Atomic Information 与 World Model 分层，历史与 Evidence 不丢失；
 6. 存储 adapter 可替换，不让业务规则依赖 SQLite / JSONL；
-7. 先用真实数据验证当前阶段，再进入下一阶段；
-8. 不因为未来可能需要某个能力，就提前建设完整框架。
+7. Context Builder 是统一上下文组装能力，不为不同消费者建立平行 Context 概念；
+8. 先用真实数据验证当前阶段，再进入下一阶段；
+9. 不因为未来可能需要某个能力，就提前建设完整框架。
