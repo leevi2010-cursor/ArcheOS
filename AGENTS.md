@@ -9,6 +9,19 @@ This repository contains two distinct layers:
 
 Agents must keep these layers separate. Processing a recording or document is not authorization to redesign ArcheOS.
 
+## GitHub 写作语言
+
+凡 Agent 写入 GitHub 的人类可读内容，统一遵循以下规则：
+
+1. **中文为主，英文为辅。** Issue、PR 描述、PR Review、评论、架构文档、说明文档、提交说明等正文优先使用中文。
+2. 英文仅用于代码标识符、API / CLI、类名、字段名、文件名、标准技术术语，以及确有必要的简短双语补充。
+3. 不写英文主导的长篇正文；能够用中文准确表达时，不重复附上一整段英文版本。
+4. 除中文和必要英文外，不使用其他语言撰写 GitHub 正文。
+5. 代码、配置、协议关键字以及第三方原始名称保持其正式拼写，不为满足语言规则强行翻译标识符。
+6. 面向普通业务用户的文字仍同时遵循 `docs/product/INFORMATION_GOVERNANCE.md` 的业务语言规则。
+
+本规则约束 Architect、Executor 及其他后续 Agent 的 GitHub 写入；历史内容不要求为了统一语言而单独重写。
+
 ## Roles
 
 - **Product owner (user):** provides business context and local sample data, makes product decisions, and accepts or rejects delivered results.
