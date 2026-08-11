@@ -98,7 +98,7 @@ Agent 记忆是治理后信息的一种使用方式，而不是独立的事实�
 
 ## M1 通用音频处理
 
-仓库提供一个最小 Python CLI，将 `.m4a`、`.mp3` 或 `.wav` 音频转换为 Processing 包，并把符合契约的 Atomic Information Candidate 自动吸收为本地 durable Note。运行环境需要 `ffmpeg`、`mlx_whisper`、官方 Codex Python SDK 和本地 pyannote 模型；不会修改原始音频，也不会自动修改 `04_core/` World Model 或决策层。
+仓库提供一个最小 Python CLI，将 `.m4a`、`.mp3` 或 `.wav` 音频转换为 Processing 包，并把符合契约的 Atomic Information Candidate 自动吸收为本地 durable Atomic Information。运行环境需要 `ffmpeg`、`mlx_whisper`、官方 Codex Python SDK 和本地 pyannote 模型；不会修改原始音频，也不会自动修改 `04_core/` World Model 或决策层。
 
 处理链分为三个可替换边界：
 
@@ -163,28 +163,28 @@ speaker map 使用转写片段编号，只接受中性标签，不执行 Person 
 manifest.json
 transcript.md
 meeting_summary.md
-atomic_notes.jsonl
+atomic_information_candidates.jsonl
 residue.md
 ```
 
 `manifest.json` 同时报告语义条目数和去重后的证据片段数：
-`atomic_notes` / `atomic_note_segments`、`residue_items` / `residue_segments`。
-若同一片段同时支持 Atomic Note 和 Residue，`digestion_coverage.overlap_segments`
-会记录该重叠，因此始终可以按“Atomic Note 片段数 + Residue 片段数 - 重叠片段数”核对已覆盖片段总数。
+`atomic_information_candidates` / `atomic_information_candidate_segments`、`residue_items` / `residue_segments`。
+若同一片段同时支持 Atomic Information Candidate 和 Residue，`digestion_coverage.overlap_segments`
+会记录该重叠，因此始终可以按“Atomic Information Candidate 片段数 + Residue 片段数 - 重叠片段数”核对已覆盖片段总数。
 
-同一来源已有处理包时，CLI 会停止而不是覆盖。分析可以从一个转写片段提取多条原子信息，也可以用多个片段共同支持一条原子信息；歧义、冲突、上下文不足或证据不足的信息进入 residue。新 Processing 包使用 schema `1.1` 和 `candidate` 状态，明确区分自动 Note ingestion 与受治理的 World Model write。
+同一来源已有处理包时，CLI 会停止而不是覆盖。分析可以从一个转写片段提取多条 Atomic Information Candidate，也可以用多个片段共同支持一条 Candidate；歧义、冲突、上下文不足或证据不足的信息进入 residue。新 Processing 包使用 schema `1.1` 和 `candidate` 状态，明确区分自动 Atomic Information ingestion 与受治理的 World Model write。
 
-## M2-B1 Durable Note
+## M2-B1 Durable Atomic Information
 
-正常 `process` 命令会在五个 Processing artifacts 成功落盘后，把 contract-valid candidates 作为 revision 1 自动写入本地 `03_notes/notes.jsonl`。Note ID 由来源和 candidate ID 确定性生成；精确重试不会产生重复记录，来源内容发生变化时会 fail closed。原始 `concerns` 作为文本保留，M2-B1 不将其解释为 Object ID，也不执行任何 World Model 写入。
+正常 `process` 命令会在五个 Processing artifacts 成功落盘后，把 contract-valid candidates 作为 revision 1 自动写入本地 `03_information/atomic_information.jsonl`。`atomic_information_id` 由来源和 candidate ID 确定性生成；精确重试不会产生重复记录，来源内容发生变化时会 fail closed。原始 `concerns` 作为文本保留，M2-B1 不将其解释为 Object ID，也不执行任何 World Model 写入。
 
 可以使用手动命令安全重试或导入已有 M1 schema `1.0` 包：
 
 ```bash
-python3 -m archeos note ingest 02_processing/<source_id>
+python3 -m archeos information ingest 02_processing/<source_id>
 ```
 
-开发和测试可以通过 `process --note-store <path>` 或 `note --store <path> ingest ...` 覆盖默认 Note store。实际 Note 数据位于 Git 忽略的 `03_notes/**`；测试只使用合成数据和临时目录。
+开发和测试可以通过 `process --information-store <path>` 或 `information --store <path> ingest ...` 覆盖默认 Atomic Information store。实际 Atomic Information 数据位于 Git 忽略的 `03_information/**`；测试只使用合成数据和临时目录。读取旧 M1 schema `1.0` 包时仅兼容其历史 artifact 文件名；不会保留任何旧领域类型、ID、CLI 或存储路径别名。
 
 ## M2-A 本地 World Model
 

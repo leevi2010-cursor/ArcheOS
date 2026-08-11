@@ -8,7 +8,7 @@ from pathlib import Path
 
 from .analysis import FileAnalysisProvider
 from .codex_app_server import CodexAnalysisProvider
-from .notes import JsonlNoteStore, ingest_processing_package
+from .atomic_information import JsonlAtomicInformationStore, ingest_processing_package
 from .pipeline import ProcessingError, process_audio
 from .pyannote_speakers import PyannoteSpeakerProvider
 from .speakers import FileSpeakerProvider
@@ -16,7 +16,7 @@ from .transcription import FileTranscriptionProvider, MlxWhisperTranscriptionPro
 from .world_model import ObjectResolver, SQLiteWorldModelRepository
 
 DEFAULT_WORLD_MODEL_DATABASE = Path("04_core/archeos.sqlite3")
-DEFAULT_NOTE_STORE = Path("03_notes/notes.jsonl")
+DEFAULT_ATOMIC_INFORMATION_STORE = Path("03_information/atomic_information.jsonl")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -55,23 +55,31 @@ def build_parser() -> argparse.ArgumentParser:
         help="Use an existing schema-compliant analysis JSON instead of Codex.",
     )
     process.add_argument(
-        "--note-store",
+        "--information-store",
         type=Path,
-        default=DEFAULT_NOTE_STORE,
-        help="Durable Note JSONL path (default: 03_notes/notes.jsonl).",
+        default=DEFAULT_ATOMIC_INFORMATION_STORE,
+        help=(
+            "Durable Atomic Information JSONL path "
+            "(default: 03_information/atomic_information.jsonl)."
+        ),
     )
 
-    notes = subparsers.add_parser(
-        "note", help="Ingest and inspect durable local Notes."
+    information = subparsers.add_parser(
+        "information", help="Ingest durable local Atomic Information."
     )
-    notes.add_argument(
+    information.add_argument(
         "--store",
         type=Path,
-        default=DEFAULT_NOTE_STORE,
-        help="Durable Note JSONL path (default: 03_notes/notes.jsonl).",
+        default=DEFAULT_ATOMIC_INFORMATION_STORE,
+        help=(
+            "Durable Atomic Information JSONL path "
+            "(default: 03_information/atomic_information.jsonl)."
+        ),
     )
-    note_commands = notes.add_subparsers(dest="note_command", required=True)
-    ingest = note_commands.add_parser(
+    information_commands = information.add_subparsers(
+        dest="information_command", required=True
+    )
+    ingest = information_commands.add_parser(
         "ingest", help="Ingest a processing package idempotently."
     )
     ingest.add_argument("processing_package", type=Path)
@@ -145,11 +153,11 @@ def _process_command(args: argparse.Namespace) -> int:
     try:
         result = ingest_processing_package(
             package,
-            JsonlNoteStore(args.note_store),
+            JsonlAtomicInformationStore(args.information_store),
         )
     except (OSError, TypeError, ValueError) as exc:
         print(f"error: processing package created at {package}")
-        print(f"error: durable Note ingestion failed: {exc}")
+        print(f"error: durable Atomic Information ingestion failed: {exc}")
         return 1
 
     print(package)
@@ -162,13 +170,15 @@ def _process_command(args: argparse.Namespace) -> int:
     return 0
 
 
-def _note_command(args: argparse.Namespace) -> int:
-    if args.note_command != "ingest":  # pragma: no cover - argparse enforces this
+def _information_command(args: argparse.Namespace) -> int:
+    if (
+        args.information_command != "ingest"
+    ):  # pragma: no cover - argparse enforces this
         return 2
     try:
         result = ingest_processing_package(
             args.processing_package,
-            JsonlNoteStore(args.store),
+            JsonlAtomicInformationStore(args.store),
         )
     except (OSError, TypeError, ValueError) as exc:
         print(f"error: {exc}")
@@ -210,6 +220,6 @@ def main(argv: list[str] | None = None) -> int:
         return _process_command(args)
     if args.command == "object":
         return _object_command(args)
-    if args.command == "note":
-        return _note_command(args)
+    if args.command == "information":
+        return _information_command(args)
     return 2  # pragma: no cover - argparse enforces this

@@ -34,7 +34,7 @@ def analysis_payload() -> dict[str, object]:
             "unresolved_questions": ["旧方案指哪个版本？"],
             "next_actions": [],
         },
-        "atomic_notes": [
+        "atomic_information_candidates": [
             {
                 "statement": "Speaker_1 决定验证流程。",
                 "semantic_type": "decision",
@@ -97,7 +97,9 @@ class CodexAnalysisProviderTest(unittest.TestCase):
     def test_uses_official_sdk_surface_with_required_boundaries(self) -> None:
         result = CodexAnalysisProvider(sdk_loader=sdk_loader).analyze(transcript())
 
-        self.assertEqual(result.atomic_notes[0].evidence_segments, (1,))
+        self.assertEqual(
+            result.atomic_information_candidates[0].evidence_segments, (1,)
+        )
         self.assertEqual(result.residue[0].evidence_segments, (2,))
         thread_kwargs = FakeCodex.instance.thread_kwargs
         self.assertIsNotNone(thread_kwargs)

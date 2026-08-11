@@ -8,11 +8,11 @@ from ..analysis import SEMANTIC_TYPES
 from .models import (
     EvidenceRecord,
     IngestionResult,
-    NoteRevision,
+    AtomicInformationRevision,
     evidence_from_dict,
     evidence_to_dict,
 )
-from .store import NoteStore
+from .store import AtomicInformationStore
 
 
 def _non_empty(value: object, field: str) -> str:
@@ -21,7 +21,7 @@ def _non_empty(value: object, field: str) -> str:
     return value
 
 
-def _manifest_source_id(package: Path) -> str:
+def _manifest(package: Path) -> tuple[str, str]:
     manifest_path = package / "manifest.json"
     try:
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
@@ -33,12 +33,13 @@ def _manifest_source_id(package: Path) -> str:
         raise ValueError(f"invalid processing manifest: {exc.msg}") from exc
     if not isinstance(manifest, dict):
         raise TypeError("processing manifest must be an object")
-    if manifest.get("schema_version") not in {"1.0", "1.1"}:
+    schema_version = manifest.get("schema_version")
+    if schema_version not in {"1.0", "1.1"}:
         raise ValueError("unsupported processing schema version")
     source = manifest.get("source")
     if not isinstance(source, dict):
         raise TypeError("processing manifest source must be an object")
-    return _non_empty(source.get("id"), "manifest.source.id")
+    return schema_version, _non_empty(source.get("id"), "manifest.source.id")
 
 
 def _strings(value: object, field: str) -> tuple[str, ...]:
@@ -85,18 +86,20 @@ def _fingerprint(
     return hashlib.sha256(canonical.encode()).hexdigest()
 
 
-def _note_id(source_id: str, candidate_id: str) -> str:
+def _atomic_information_id(source_id: str, candidate_id: str) -> str:
     origin = f"{source_id}\0{candidate_id}".encode()
-    return f"note_{hashlib.sha256(origin).hexdigest()[:32]}"
+    return f"atomic_info_{hashlib.sha256(origin).hexdigest()[:32]}"
 
 
 def _parse_candidate(
     payload: object,
     *,
     source_id: str,
+    artifact_name: str,
+    expected_status: str,
     line_number: int,
-) -> NoteRevision:
-    field = f"atomic_notes.jsonl line {line_number}"
+) -> AtomicInformationRevision:
+    field = f"{artifact_name} line {line_number}"
     if not isinstance(payload, dict):
         raise TypeError(f"{field} must be an object")
     expected = {
@@ -130,14 +133,14 @@ def _parse_candidate(
     ):
         raise ValueError(f"{field}.confidence must be between 0 and 1")
     status = payload["status"]
-    if status not in {"proposed", "candidate"}:
-        raise ValueError(f"{field}.status must be proposed or candidate")
+    if status != expected_status:
+        raise ValueError(f"{field}.status must be {expected_status}")
     created_at = _non_empty(payload["processing_time"], f"{field}.processing_time")
-    note_id = _note_id(source_id, candidate_id)
-    return NoteRevision(
-        note_id=note_id,
+    atomic_information_id = _atomic_information_id(source_id, candidate_id)
+    return AtomicInformationRevision(
+        atomic_information_id=atomic_information_id,
         revision_number=1,
-        revision_id=f"{note_id}-r0001",
+        revision_id=f"{atomic_information_id}-r0001",
         origin_source_id=source_id,
         origin_candidate_id=candidate_id,
         origin_fingerprint=_fingerprint(
@@ -160,37 +163,54 @@ def _parse_candidate(
     )
 
 
-def _load_candidates(package: Path, source_id: str) -> tuple[NoteRevision, ...]:
-    path = package / "atomic_notes.jsonl"
+def _load_candidates(
+    package: Path,
+    schema_version: str,
+    source_id: str,
+) -> tuple[AtomicInformationRevision, ...]:
+    if schema_version == "1.0":
+        artifact_name = "atomic_notes.jsonl"
+        expected_status = "proposed"
+    else:
+        artifact_name = "atomic_information_candidates.jsonl"
+        expected_status = "candidate"
+    path = package / artifact_name
     try:
         source = path.open(encoding="utf-8")
     except FileNotFoundError as exc:
-        raise ValueError(f"atomic-note artifact not found: {path}") from exc
-    revisions: list[NoteRevision] = []
+        raise ValueError(
+            f"Atomic Information Candidate artifact not found: {path}"
+        ) from exc
+    revisions: list[AtomicInformationRevision] = []
     with source:
         for line_number, line in enumerate(source, start=1):
             if not line.strip():
-                raise ValueError(f"atomic_notes.jsonl line {line_number} is blank")
+                raise ValueError(f"{artifact_name} line {line_number} is blank")
             try:
                 payload = json.loads(line)
             except json.JSONDecodeError as exc:
                 raise ValueError(
-                    f"invalid atomic_notes.jsonl line {line_number}: {exc.msg}"
+                    f"invalid {artifact_name} line {line_number}: {exc.msg}"
                 ) from exc
             revisions.append(
                 _parse_candidate(
                     payload,
                     source_id=source_id,
+                    artifact_name=artifact_name,
+                    expected_status=expected_status,
                     line_number=line_number,
                 )
             )
     return tuple(revisions)
 
 
-def ingest_processing_package(package: Path, store: NoteStore) -> IngestionResult:
+def ingest_processing_package(
+    package: Path,
+    store: AtomicInformationStore,
+) -> IngestionResult:
     package = Path(package).expanduser().resolve()
     if not package.is_dir():
         raise ValueError(f"processing package not found: {package}")
-    source_id = _manifest_source_id(package)
-    revisions = _load_candidates(package, source_id)
+    schema_version, source_id = _manifest(package)
+    revisions = _load_candidates(package, schema_version, source_id)
     return store.ingest_batch(revisions)

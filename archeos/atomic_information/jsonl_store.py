@@ -8,18 +8,20 @@ from pathlib import Path
 
 from .models import (
     IngestionResult,
-    NoteRevision,
-    note_revision_from_dict,
-    note_revision_to_dict,
-    validate_note_revision,
+    AtomicInformationRevision,
+    atomic_information_revision_from_dict,
+    atomic_information_revision_to_dict,
+    validate_atomic_information_revision,
 )
 
 
-class JsonlNoteStore:
+class JsonlAtomicInformationStore:
     def __init__(self, path: Path) -> None:
         self.path = Path(path).expanduser()
 
-    def ingest_batch(self, revisions: Sequence[NoteRevision]) -> IngestionResult:
+    def ingest_batch(
+        self, revisions: Sequence[AtomicInformationRevision]
+    ) -> IngestionResult:
         candidates = tuple(revisions)
         existing_revisions = self._read_all()
         by_origin = {
@@ -27,15 +29,19 @@ class JsonlNoteStore:
             for item in existing_revisions
             if item.revision_number == 1
         }
-        by_note_id = {item.note_id for item in existing_revisions}
+        by_atomic_information_id = {
+            item.atomic_information_id for item in existing_revisions
+        }
         batch_origins: set[tuple[str, str]] = set()
-        created: list[NoteRevision] = []
+        created: list[AtomicInformationRevision] = []
         existing = 0
 
         for index, candidate in enumerate(candidates, start=1):
-            validate_note_revision(candidate, f"candidate[{index}]")
+            validate_atomic_information_revision(candidate, f"candidate[{index}]")
             if candidate.revision_number != 1:
-                raise ValueError("batch ingestion accepts only initial Note revisions")
+                raise ValueError(
+                    "batch ingestion accepts only initial Atomic Information revisions"
+                )
             origin = (candidate.origin_source_id, candidate.origin_candidate_id)
             if origin in batch_origins:
                 raise ValueError(f"duplicate origin candidate in batch: {origin[1]}")
@@ -44,7 +50,7 @@ class JsonlNoteStore:
             stored = by_origin.get(origin)
             if stored is not None:
                 if (
-                    stored.note_id != candidate.note_id
+                    stored.atomic_information_id != candidate.atomic_information_id
                     or stored.origin_fingerprint != candidate.origin_fingerprint
                 ):
                     raise ValueError(
@@ -52,9 +58,12 @@ class JsonlNoteStore:
                     )
                 existing += 1
                 continue
-            if candidate.note_id in by_note_id:
-                raise ValueError(f"Note identity collision: {candidate.note_id}")
-            by_note_id.add(candidate.note_id)
+            if candidate.atomic_information_id in by_atomic_information_id:
+                raise ValueError(
+                    "Atomic Information identity collision: "
+                    f"{candidate.atomic_information_id}"
+                )
+            by_atomic_information_id.add(candidate.atomic_information_id)
             created.append(candidate)
 
         if created:
@@ -63,66 +72,92 @@ class JsonlNoteStore:
             created=len(created),
             existing=existing,
             failed=0,
-            note_ids=tuple(item.note_id for item in candidates),
+            atomic_information_ids=tuple(
+                item.atomic_information_id for item in candidates
+            ),
         )
 
-    def get_current(self, note_id: str) -> NoteRevision:
-        revisions = self.list_revisions(note_id)
+    def get_current(self, atomic_information_id: str) -> AtomicInformationRevision:
+        revisions = self.list_revisions(atomic_information_id)
         if not revisions:
-            raise ValueError(f"Note not found: {note_id}")
+            raise ValueError(f"Atomic Information not found: {atomic_information_id}")
         return revisions[-1]
 
-    def list_revisions(self, note_id: str) -> tuple[NoteRevision, ...]:
-        return tuple(item for item in self._read_all() if item.note_id == note_id)
+    def list_revisions(
+        self, atomic_information_id: str
+    ) -> tuple[AtomicInformationRevision, ...]:
+        return tuple(
+            item
+            for item in self._read_all()
+            if item.atomic_information_id == atomic_information_id
+        )
 
-    def append_revision(self, revision: NoteRevision) -> NoteRevision:
-        validate_note_revision(revision)
+    def append_revision(
+        self, revision: AtomicInformationRevision
+    ) -> AtomicInformationRevision:
+        validate_atomic_information_revision(revision)
         existing = self._read_all()
-        history = tuple(item for item in existing if item.note_id == revision.note_id)
+        history = tuple(
+            item
+            for item in existing
+            if item.atomic_information_id == revision.atomic_information_id
+        )
         if not history:
-            raise ValueError(f"Note not found: {revision.note_id}")
+            raise ValueError(
+                f"Atomic Information not found: {revision.atomic_information_id}"
+            )
         current = history[-1]
         if revision.revision_number != current.revision_number + 1:
-            raise ValueError("Note revision number must follow the current revision")
+            raise ValueError(
+                "Atomic Information revision number must follow the current revision"
+            )
         if (
             revision.origin_source_id != current.origin_source_id
             or revision.origin_candidate_id != current.origin_candidate_id
             or revision.origin_fingerprint != current.origin_fingerprint
         ):
-            raise ValueError("Note revision cannot change immutable origin provenance")
+            raise ValueError(
+                "Atomic Information revision cannot change immutable origin provenance"
+            )
         self._write_all((*existing, revision))
         return revision
 
-    def list_notes(self) -> tuple[NoteRevision, ...]:
-        current: dict[str, NoteRevision] = {}
+    def list_atomic_information(self) -> tuple[AtomicInformationRevision, ...]:
+        current: dict[str, AtomicInformationRevision] = {}
         order: list[str] = []
         for revision in self._read_all():
-            if revision.note_id not in current:
-                order.append(revision.note_id)
-            current[revision.note_id] = revision
-        return tuple(current[note_id] for note_id in order)
+            if revision.atomic_information_id not in current:
+                order.append(revision.atomic_information_id)
+            current[revision.atomic_information_id] = revision
+        return tuple(current[atomic_information_id] for atomic_information_id in order)
 
-    def _read_all(self) -> tuple[NoteRevision, ...]:
+    def _read_all(self) -> tuple[AtomicInformationRevision, ...]:
         if not self.path.exists():
             return ()
-        revisions: list[NoteRevision] = []
+        revisions: list[AtomicInformationRevision] = []
         seen_revision_ids: set[str] = set()
         seen_origins: set[tuple[str, str]] = set()
         last_revision: dict[str, int] = {}
         with self.path.open(encoding="utf-8") as source:
             for line_number, line in enumerate(source, start=1):
                 if not line.strip():
-                    raise ValueError(f"corrupted Note store: blank line {line_number}")
+                    raise ValueError(
+                        f"corrupted Atomic Information store: blank line {line_number}"
+                    )
                 try:
                     payload = json.loads(line)
                 except json.JSONDecodeError as exc:
                     raise ValueError(
-                        f"corrupted Note store at line {line_number}: {exc.msg}"
+                        "corrupted Atomic Information store at line "
+                        f"{line_number}: {exc.msg}"
                     ) from exc
-                revision = note_revision_from_dict(payload, f"line {line_number}")
+                revision = atomic_information_revision_from_dict(
+                    payload, f"line {line_number}"
+                )
                 if revision.revision_id in seen_revision_ids:
                     raise ValueError(
-                        f"corrupted Note store: duplicate revision {revision.revision_id}"
+                        "corrupted Atomic Information store: duplicate revision "
+                        f"{revision.revision_id}"
                     )
                 origin = (
                     revision.origin_source_id,
@@ -130,17 +165,20 @@ class JsonlNoteStore:
                 )
                 if revision.revision_number == 1 and origin in seen_origins:
                     raise ValueError(
-                        "corrupted Note store: duplicate origin candidate "
+                        "corrupted Atomic Information store: duplicate origin candidate "
                         f"{revision.origin_candidate_id}"
                     )
-                expected = last_revision.get(revision.note_id, 0) + 1
+                expected = last_revision.get(revision.atomic_information_id, 0) + 1
                 if revision.revision_number != expected:
                     raise ValueError(
-                        f"corrupted Note store: non-contiguous revision for {revision.note_id}"
+                        "corrupted Atomic Information store: non-contiguous revision for "
+                        f"{revision.atomic_information_id}"
                     )
                 if expected > 1:
                     first = next(
-                        item for item in revisions if item.note_id == revision.note_id
+                        item
+                        for item in revisions
+                        if item.atomic_information_id == revision.atomic_information_id
                     )
                     if (
                         revision.origin_source_id != first.origin_source_id
@@ -148,15 +186,16 @@ class JsonlNoteStore:
                         or revision.origin_fingerprint != first.origin_fingerprint
                     ):
                         raise ValueError(
-                            f"corrupted Note store: changed origin for {revision.note_id}"
+                            "corrupted Atomic Information store: changed origin for "
+                            f"{revision.atomic_information_id}"
                         )
                 seen_revision_ids.add(revision.revision_id)
                 seen_origins.add(origin)
-                last_revision[revision.note_id] = revision.revision_number
+                last_revision[revision.atomic_information_id] = revision.revision_number
                 revisions.append(revision)
         return tuple(revisions)
 
-    def _write_all(self, revisions: Sequence[NoteRevision]) -> None:
+    def _write_all(self, revisions: Sequence[AtomicInformationRevision]) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         temporary_path: Path | None = None
         try:
@@ -172,7 +211,7 @@ class JsonlNoteStore:
                 for revision in revisions:
                     target.write(
                         json.dumps(
-                            note_revision_to_dict(revision),
+                            atomic_information_revision_to_dict(revision),
                             ensure_ascii=False,
                             separators=(",", ":"),
                         )

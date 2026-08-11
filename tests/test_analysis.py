@@ -19,7 +19,7 @@ def valid_payload() -> dict[str, object]:
             "unresolved_questions": ["证据是否充分？"],
             "next_actions": [],
         },
-        "atomic_notes": [
+        "atomic_information_candidates": [
             {
                 "statement": "需要验证通用处理能力。",
                 "semantic_type": "requirement",
@@ -42,23 +42,25 @@ def valid_payload() -> dict[str, object]:
 class AnalysisSchemaTest(unittest.TestCase):
     def test_accepts_cross_segment_evidence(self) -> None:
         result = parse_analysis(valid_payload(), segment_count=3)
-        self.assertEqual(result.atomic_notes[0].evidence_segments, (1, 2))
+        self.assertEqual(
+            result.atomic_information_candidates[0].evidence_segments, (1, 2)
+        )
 
     def test_rejects_out_of_range_evidence(self) -> None:
         payload = copy.deepcopy(valid_payload())
-        payload["atomic_notes"][0]["evidence_segments"] = [4]  # type: ignore[index]
+        payload["atomic_information_candidates"][0]["evidence_segments"] = [4]  # type: ignore[index]
         with self.assertRaisesRegex(ValueError, "invalid segment reference"):
             parse_analysis(payload, segment_count=3)
 
     def test_rejects_duplicate_evidence_references(self) -> None:
         payload = copy.deepcopy(valid_payload())
-        payload["atomic_notes"][0]["evidence_segments"] = [1, 1]  # type: ignore[index]
+        payload["atomic_information_candidates"][0]["evidence_segments"] = [1, 1]  # type: ignore[index]
         with self.assertRaisesRegex(ValueError, "invalid segment reference"):
             parse_analysis(payload, segment_count=3)
 
     def test_rejects_empty_concerns(self) -> None:
         payload = copy.deepcopy(valid_payload())
-        payload["atomic_notes"][0]["concerns"] = []  # type: ignore[index]
+        payload["atomic_information_candidates"][0]["concerns"] = []  # type: ignore[index]
         with self.assertRaisesRegex(ValueError, "concerns must not be empty"):
             parse_analysis(payload, segment_count=3)
 

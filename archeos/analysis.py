@@ -35,7 +35,7 @@ class MeetingSummary:
 
 
 @dataclass(frozen=True)
-class AtomicNoteCandidate:
+class AtomicInformationCandidate:
     statement: str
     semantic_type: str
     concerns: tuple[str, ...]
@@ -54,7 +54,7 @@ class ResidueItem:
 @dataclass(frozen=True)
 class AnalysisResult:
     meeting_summary: MeetingSummary
-    atomic_notes: tuple[AtomicNoteCandidate, ...]
+    atomic_information_candidates: tuple[AtomicInformationCandidate, ...]
     residue: tuple[ResidueItem, ...]
 
 
@@ -75,7 +75,7 @@ def analysis_schema() -> dict[str, object]:
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "type": "object",
         "additionalProperties": False,
-        "required": ["meeting_summary", "atomic_notes", "residue"],
+        "required": ["meeting_summary", "atomic_information_candidates", "residue"],
         "properties": {
             "meeting_summary": {
                 "type": "object",
@@ -103,7 +103,7 @@ def analysis_schema() -> dict[str, object]:
                     "next_actions": string_array,
                 },
             },
-            "atomic_notes": {
+            "atomic_information_candidates": {
                 "type": "array",
                 "items": {
                     "type": "object",
@@ -175,17 +175,27 @@ def _segment_refs(value: object, field: str, segment_count: int) -> tuple[int, .
     if not isinstance(value, list) or not value:
         raise ValueError(f"analysis field {field} must contain segment references")
     if any(not isinstance(item, int) or isinstance(item, bool) for item in value):
-        raise ValueError(f"analysis field {field} contains a non-integer segment reference")
+        raise ValueError(
+            f"analysis field {field} contains a non-integer segment reference"
+        )
     refs = tuple(value)
-    if len(set(refs)) != len(refs) or any(ref < 1 or ref > segment_count for ref in refs):
-        raise ValueError(f"analysis field {field} contains an invalid segment reference")
+    if len(set(refs)) != len(refs) or any(
+        ref < 1 or ref > segment_count for ref in refs
+    ):
+        raise ValueError(
+            f"analysis field {field} contains an invalid segment reference"
+        )
     return refs
 
 
 def parse_analysis(payload: object, *, segment_count: int) -> AnalysisResult:
     if not isinstance(payload, dict):
         raise ValueError("analysis result must be an object")
-    _require_keys(payload, {"meeting_summary", "atomic_notes", "residue"}, "root")
+    _require_keys(
+        payload,
+        {"meeting_summary", "atomic_information_candidates", "residue"},
+        "root",
+    )
     summary_data = payload.get("meeting_summary")
     if not isinstance(summary_data, dict):
         raise ValueError("analysis result must contain meeting_summary")
@@ -233,13 +243,17 @@ def parse_analysis(payload: object, *, segment_count: int) -> AnalysisResult:
         ),
     )
 
-    raw_notes = payload.get("atomic_notes")
-    if not isinstance(raw_notes, list):
-        raise ValueError("analysis result atomic_notes must be an array")
-    notes: list[AtomicNoteCandidate] = []
-    for index, item in enumerate(raw_notes, start=1):
+    raw_candidates = payload.get("atomic_information_candidates")
+    if not isinstance(raw_candidates, list):
+        raise ValueError(
+            "analysis result atomic_information_candidates must be an array"
+        )
+    candidates: list[AtomicInformationCandidate] = []
+    for index, item in enumerate(raw_candidates, start=1):
         if not isinstance(item, dict):
-            raise ValueError(f"atomic_notes[{index}] must be an object")
+            raise ValueError(
+                f"atomic_information_candidates[{index}] must be an object"
+            )
         _require_keys(
             item,
             {
@@ -250,37 +264,49 @@ def parse_analysis(payload: object, *, segment_count: int) -> AnalysisResult:
                 "context",
                 "confidence",
             },
-            f"atomic_notes[{index}]",
+            f"atomic_information_candidates[{index}]",
         )
         semantic_type = _non_empty(
-            item.get("semantic_type"), f"atomic_notes[{index}].semantic_type"
+            item.get("semantic_type"),
+            f"atomic_information_candidates[{index}].semantic_type",
         )
         if semantic_type not in SEMANTIC_TYPES:
-            raise ValueError(f"atomic_notes[{index}] has an invalid semantic_type")
+            raise ValueError(
+                f"atomic_information_candidates[{index}] has an invalid semantic_type"
+            )
         confidence = item.get("confidence")
         if (
             not isinstance(confidence, (int, float))
             or isinstance(confidence, bool)
             or not 0 <= confidence <= 1
         ):
-            raise ValueError(f"atomic_notes[{index}].confidence must be between 0 and 1")
-        concerns = _strings(item.get("concerns"), f"atomic_notes[{index}].concerns")
+            raise ValueError(
+                f"atomic_information_candidates[{index}].confidence must be between 0 and 1"
+            )
+        concerns = _strings(
+            item.get("concerns"),
+            f"atomic_information_candidates[{index}].concerns",
+        )
         if not concerns:
-            raise ValueError(f"atomic_notes[{index}].concerns must not be empty")
-        notes.append(
-            AtomicNoteCandidate(
+            raise ValueError(
+                f"atomic_information_candidates[{index}].concerns must not be empty"
+            )
+        candidates.append(
+            AtomicInformationCandidate(
                 statement=_non_empty(
-                    item.get("statement"), f"atomic_notes[{index}].statement"
+                    item.get("statement"),
+                    f"atomic_information_candidates[{index}].statement",
                 ),
                 semantic_type=semantic_type,
                 concerns=concerns,
                 evidence_segments=_segment_refs(
                     item.get("evidence_segments"),
-                    f"atomic_notes[{index}].evidence_segments",
+                    f"atomic_information_candidates[{index}].evidence_segments",
                     segment_count,
                 ),
                 context=_non_empty(
-                    item.get("context"), f"atomic_notes[{index}].context"
+                    item.get("context"),
+                    f"atomic_information_candidates[{index}].context",
                 ),
                 confidence=float(confidence),
             )
@@ -319,7 +345,7 @@ def parse_analysis(payload: object, *, segment_count: int) -> AnalysisResult:
                 ),
             )
         )
-    return AnalysisResult(summary, tuple(notes), tuple(residue))
+    return AnalysisResult(summary, tuple(candidates), tuple(residue))
 
 
 class FileAnalysisProvider:

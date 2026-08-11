@@ -19,8 +19,8 @@ class EvidenceRecord:
 
 
 @dataclass(frozen=True)
-class NoteRevision:
-    note_id: str
+class AtomicInformationRevision:
+    atomic_information_id: str
     revision_number: int
     revision_id: str
     origin_source_id: str
@@ -42,7 +42,7 @@ class IngestionResult:
     created: int
     existing: int
     failed: int
-    note_ids: tuple[str, ...]
+    atomic_information_ids: tuple[str, ...]
 
 
 def _non_empty(value: object, field: str) -> str:
@@ -107,13 +107,13 @@ def evidence_to_dict(evidence: EvidenceRecord) -> dict[str, object]:
     }
 
 
-def note_revision_from_dict(
-    value: object, field: str = "note revision"
-) -> NoteRevision:
+def atomic_information_revision_from_dict(
+    value: object, field: str = "atomic information revision"
+) -> AtomicInformationRevision:
     if not isinstance(value, dict):
         raise TypeError(f"{field} must be an object")
     expected = {
-        "note_id",
+        "atomic_information_id",
         "revision_number",
         "revision_id",
         "origin_source_id",
@@ -130,7 +130,9 @@ def note_revision_from_dict(
         "revision_reason",
     }
     if set(value) != expected:
-        raise ValueError(f"{field} does not match the Note revision schema")
+        raise ValueError(
+            f"{field} does not match the Atomic Information revision schema"
+        )
 
     revision_number = value["revision_number"]
     if (
@@ -153,8 +155,10 @@ def note_revision_from_dict(
     if not isinstance(raw_evidence, list) or not raw_evidence:
         raise ValueError(f"{field}.source_evidence must not be empty")
 
-    revision = NoteRevision(
-        note_id=_non_empty(value["note_id"], f"{field}.note_id"),
+    revision = AtomicInformationRevision(
+        atomic_information_id=_non_empty(
+            value["atomic_information_id"], f"{field}.atomic_information_id"
+        ),
         revision_number=revision_number,
         revision_id=_non_empty(value["revision_id"], f"{field}.revision_id"),
         origin_source_id=_non_empty(
@@ -187,14 +191,16 @@ def note_revision_from_dict(
             value["revision_reason"], f"{field}.revision_reason"
         ),
     )
-    validate_note_revision(revision, field)
+    validate_atomic_information_revision(revision, field)
     return revision
 
 
-def note_revision_to_dict(revision: NoteRevision) -> dict[str, object]:
-    validate_note_revision(revision)
+def atomic_information_revision_to_dict(
+    revision: AtomicInformationRevision,
+) -> dict[str, object]:
+    validate_atomic_information_revision(revision)
     return {
-        "note_id": revision.note_id,
+        "atomic_information_id": revision.atomic_information_id,
         "revision_number": revision.revision_number,
         "revision_id": revision.revision_id,
         "origin_source_id": revision.origin_source_id,
@@ -214,28 +220,35 @@ def note_revision_to_dict(revision: NoteRevision) -> dict[str, object]:
     }
 
 
-def validate_note_revision(
-    revision: NoteRevision, field: str = "note revision"
+def validate_atomic_information_revision(
+    revision: AtomicInformationRevision,
+    field: str = "atomic information revision",
 ) -> None:
-    if not isinstance(revision, NoteRevision):
-        raise TypeError(f"{field} must be a NoteRevision")
+    if not isinstance(revision, AtomicInformationRevision):
+        raise TypeError(f"{field} must be an AtomicInformationRevision")
     if (
         not isinstance(revision.revision_number, int)
         or isinstance(revision.revision_number, bool)
         or revision.revision_number < 1
     ):
         raise ValueError(f"{field}.revision_number must be positive")
-    expected_note_id = (
-        "note_"
+    expected_atomic_information_id = (
+        "atomic_info_"
         + hashlib.sha256(
             f"{revision.origin_source_id}\0{revision.origin_candidate_id}".encode()
         ).hexdigest()[:32]
     )
-    if revision.note_id != expected_note_id:
-        raise ValueError(f"{field}.note_id does not match its immutable origin")
-    expected_revision_id = f"{revision.note_id}-r{revision.revision_number:04d}"
+    if revision.atomic_information_id != expected_atomic_information_id:
+        raise ValueError(
+            f"{field}.atomic_information_id does not match its immutable origin"
+        )
+    expected_revision_id = (
+        f"{revision.atomic_information_id}-r{revision.revision_number:04d}"
+    )
     if revision.revision_id != expected_revision_id:
-        raise ValueError(f"{field}.revision_id does not match its Note revision")
+        raise ValueError(
+            f"{field}.revision_id does not match its Atomic Information revision"
+        )
     if not re.fullmatch(r"[0-9a-f]{64}", revision.origin_fingerprint):
         raise ValueError(f"{field}.origin_fingerprint must be a SHA-256 hex digest")
     for name, value in (

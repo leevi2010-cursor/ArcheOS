@@ -10,7 +10,7 @@ from unittest.mock import Mock, patch
 
 from archeos.cli import main
 from archeos.codex_app_server import CodexAnalysisProvider
-from archeos.notes import IngestionResult
+from archeos.atomic_information import IngestionResult
 from archeos.pyannote_speakers import PyannoteSpeakerProvider
 
 
@@ -46,6 +46,11 @@ class CliTest(unittest.TestCase):
         self.assertEqual(speaker_provider.speaker_map, Path("speakers.json"))
         self.assertEqual(analysis_provider.analysis_file, Path("analysis.json"))
         self.assertEqual(ingest_processing_package.call_count, 1)
+        store = ingest_processing_package.call_args.args[1]
+        self.assertEqual(
+            store.path,
+            Path("03_information/atomic_information.jsonl"),
+        )
 
     @patch("archeos.cli.ingest_processing_package")
     @patch("archeos.cli.process_audio")

@@ -20,7 +20,7 @@ ARTIFACTS = (
     "manifest.json",
     "transcript.md",
     "meeting_summary.md",
-    "atomic_notes.jsonl",
+    "atomic_information_candidates.jsonl",
     "residue.md",
 )
 
@@ -112,9 +112,9 @@ def _digestion_coverage(
         for index, segment in enumerate(transcript.segments, start=1)
         if segment.text.strip()
     }
-    atomic_note_segments = {
+    atomic_information_candidate_segments = {
         reference
-        for item in analysis.atomic_notes
+        for item in analysis.atomic_information_candidates
         for reference in item.evidence_segments
         if reference in expected
     }
@@ -124,18 +124,22 @@ def _digestion_coverage(
         for reference in item.evidence_segments
         if reference in expected
     }
-    accounted = atomic_note_segments | residue_segments
+    accounted = atomic_information_candidate_segments | residue_segments
     unaccounted = sorted(expected - accounted)
     if unaccounted:
         references = ", ".join(str(reference) for reference in unaccounted)
         raise ValueError(f"unaccounted transcript segments: {references}")
     return {
         "total_segments": len(expected),
-        "atomic_note_segments": len(atomic_note_segments),
+        "atomic_information_candidate_segments": len(
+            atomic_information_candidate_segments
+        ),
         "residue_segments": len(residue_segments),
         "accounted_segments": len(accounted),
         "unaccounted_segments": 0,
-        "overlap_segments": len(atomic_note_segments & residue_segments),
+        "overlap_segments": len(
+            atomic_information_candidate_segments & residue_segments
+        ),
     }
 
 
@@ -219,28 +223,30 @@ Participants: {participants}
 """
 
 
-def _atomic_notes_jsonl(
+def _atomic_information_candidates_jsonl(
     source: dict[str, object],
     transcript: Transcript,
     analysis: AnalysisResult,
 ) -> str:
-    notes: list[str] = []
-    for index, note in enumerate(analysis.atomic_notes, start=1):
+    candidates: list[str] = []
+    for index, candidate in enumerate(analysis.atomic_information_candidates, start=1):
         payload = {
             "id": f"{source['id']}-{index:04d}",
-            "statement": note.statement,
-            "semantic_type": note.semantic_type,
-            "concerns": list(note.concerns),
+            "statement": candidate.statement,
+            "semantic_type": candidate.semantic_type,
+            "concerns": list(candidate.concerns),
             "source_evidence": _evidence(
-                str(source["id"]), transcript.segments, note.evidence_segments
+                str(source["id"]),
+                transcript.segments,
+                candidate.evidence_segments,
             ),
-            "context": note.context,
-            "confidence": note.confidence,
+            "context": candidate.context,
+            "confidence": candidate.confidence,
             "processing_time": source["processed_at"],
             "status": "candidate",
         }
-        notes.append(json.dumps(payload, ensure_ascii=False))
-    return "\n".join(notes) + ("\n" if notes else "")
+        candidates.append(json.dumps(payload, ensure_ascii=False))
+    return "\n".join(candidates) + ("\n" if candidates else "")
 
 
 def _residue_markdown(
@@ -346,8 +352,12 @@ def process_audio(
         "artifacts": list(ARTIFACTS),
         "counts": {
             "transcript_segments": len(transcript.segments),
-            "atomic_notes": len(analysis.atomic_notes),
-            "atomic_note_segments": digestion_coverage["atomic_note_segments"],
+            "atomic_information_candidates": len(
+                analysis.atomic_information_candidates
+            ),
+            "atomic_information_candidate_segments": digestion_coverage[
+                "atomic_information_candidate_segments"
+            ],
             "residue_items": len(analysis.residue),
             "residue_segments": digestion_coverage["residue_segments"],
         },
@@ -361,7 +371,7 @@ def process_audio(
             )
         },
         "downstream": {
-            "note_ingestion": "automatic_after_contract_validation",
+            "atomic_information_ingestion": ("automatic_after_contract_validation"),
             "world_model_write": "governed",
         },
     }
@@ -378,8 +388,9 @@ def process_audio(
         (staging / "meeting_summary.md").write_text(
             _summary_markdown(analysis), encoding="utf-8"
         )
-        (staging / "atomic_notes.jsonl").write_text(
-            _atomic_notes_jsonl(source, transcript, analysis), encoding="utf-8"
+        (staging / "atomic_information_candidates.jsonl").write_text(
+            _atomic_information_candidates_jsonl(source, transcript, analysis),
+            encoding="utf-8",
         )
         (staging / "residue.md").write_text(
             _residue_markdown(source_id, transcript, analysis), encoding="utf-8"

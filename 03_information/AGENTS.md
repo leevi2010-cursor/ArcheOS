@@ -4,8 +4,6 @@
 
 This directory contains durable Atomic Information that is eligible for reuse by ArcheOS and for later interpretation against the Structured World Model.
 
-The active M2-B1 implementation is responsible for moving the durable local path from the legacy `03_notes/` name to the canonical Information-layer path. `Note` is no longer a Core concept.
-
 ## Rules
 
 - An `Atomic Information` item represents one independently traceable information statement, not a mixed paragraph of unrelated claims.

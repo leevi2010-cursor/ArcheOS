@@ -42,7 +42,7 @@ class WorldModelRepository(Protocol):
         object_id: str,
         role: str,
         *,
-        source_note_id: str | None = None,
+        source_atomic_information_id: str | None = None,
         confidence: float | None = None,
     ) -> RoleAssignment: ...
 
@@ -79,7 +79,7 @@ class WorldModelRepository(Protocol):
         relation: str,
         to_object_id: str,
         *,
-        source_note_id: str | None = None,
+        source_atomic_information_id: str | None = None,
         confidence: float | None = None,
     ) -> RelationshipRecord: ...
 
