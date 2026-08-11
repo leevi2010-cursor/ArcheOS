@@ -246,8 +246,13 @@ class ContextBuilderTests(unittest.TestCase):
         self.assertEqual(self.build().recent_changes[0].change_id, "c1")
 
     def test_27_human_change(self):
+        self.journal.records = (ChangeJournalRecord("c1", "ai-1", "ai-1-r1", "rename", ("root",), "i", "human_approved", "p1", "applied", "2026-01-01", "2026-01-01", None),)
+        self.assertEqual(self.build().recent_changes[0].mode, "human_approved")
+
+    def test_27b_invalid_change_mode_fails_closed(self):
         self.journal.records = (ChangeJournalRecord("c1", "ai-1", "ai-1-r1", "rename", ("root",), "i", "human", "p1", "applied", "2026-01-01", "2026-01-01", None),)
-        self.assertEqual(self.build().recent_changes[0].mode, "human")
+        with self.assertRaises(ValueError):
+            self.build()
 
     def test_28_unrelated_change_excluded(self):
         self.journal.records = (change("c1", resolved=("other",)),)
@@ -312,6 +317,16 @@ class ContextBuilderTests(unittest.TestCase):
     def test_42_any_section_reason(self):
         self.world.relationships = tuple(relation(f"r{i}", "root", "related_to", "b") for i in range(2))
         self.assertIn("relationships_limit", self.build(max_relationships=1).metadata.incomplete_reasons)
+
+    def test_42b_evidence_metadata_only_covers_included_information(self):
+        self.atomic_store.revisions = (
+            atomic("ai-1", "2026-01-02", evidence_count=1),
+            atomic("ai-2", "2026-01-01", evidence_count=3),
+        )
+        bundle = self.build(max_atomic_information=1, max_evidence_per_information=2)
+        self.assertEqual([item.atomic_information_id for item in bundle.atomic_information], ["ai-1"])
+        self.assertEqual(bundle.metadata.evidence_truncated_atomic_information_ids, ())
+        self.assertEqual(bundle.metadata.incomplete_reasons, ("atomic_information_limit",))
 
     def test_43_no_truncation_complete(self):
         self.assertTrue(self.build().metadata.complete)

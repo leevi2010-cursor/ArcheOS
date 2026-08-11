@@ -332,6 +332,8 @@ def _context_command(args: argparse.Namespace) -> int:
     if args.context_command != "build":  # pragma: no cover - argparse enforces this
         return 2
     try:
+        if not args.database.is_file():
+            raise ValueError(f"World Model database does not exist: {args.database}")
         with SQLiteWorldModelRepository(args.database) as repository:
             bundle = ContextBuilder(
                 repository,

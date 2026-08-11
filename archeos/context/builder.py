@@ -53,15 +53,17 @@ class ContextBuilder:
         root_model = self.object_resolver.resolve(request.object_id)
         root = self._root(root_model)
 
-        relationship_items = self._relationships(root_model, request)
-        all_atomic = self._atomic_information(root_model, request)
-        atomic_items = all_atomic[0]
-        evidence_truncated_ids = all_atomic[1]
+        relationship_items = self._relationships(root_model)
+        current_atomic, current_atomic_map = self._atomic_information(root_model)
+        selected_atomic = current_atomic[: request.max_atomic_information]
+        atomic_items, evidence_truncated_ids = self._atomic_items(
+            selected_atomic, request
+        )
         all_changes = self._changes(root_model.object_id)
-        all_pending = self._pending(root_model.object_id, all_atomic[2])
+        all_pending = self._pending(root_model.object_id, current_atomic_map)
 
         relationships = relationship_items[: request.max_relationships]
-        atomic_information = atomic_items[: request.max_atomic_information]
+        atomic_information = atomic_items
         recent_changes = all_changes[: request.max_changes]
         pending_judgments = all_pending[: request.max_pending_judgments]
 
@@ -70,7 +72,7 @@ class ContextBuilder:
                 len(relationship_items), len(relationships)
             ),
             "atomic_information": self._coverage(
-                len(atomic_items), len(atomic_information)
+                len(current_atomic), len(atomic_information)
             ),
             "recent_changes": self._coverage(len(all_changes), len(recent_changes)),
             "pending_judgments": self._coverage(
@@ -129,7 +131,6 @@ class ContextBuilder:
     def _relationships(
         self,
         root: ObjectReadModel,
-        request: ContextRequest,
     ) -> tuple[ContextRelationshipItem, ...]:
         items: list[ContextRelationshipItem] = []
         for relationship in self.world_model_repository.list_relationships(
@@ -188,12 +189,7 @@ class ContextBuilder:
     def _atomic_information(
         self,
         root: ObjectReadModel,
-        request: ContextRequest,
-    ) -> tuple[
-        tuple[ContextAtomicInformationItem, ...],
-        tuple[str, ...],
-        dict[str, AtomicInformationRevision],
-    ]:
+    ) -> tuple[tuple[AtomicInformationRevision, ...], dict[str, AtomicInformationRevision]]:
         current = tuple(
             item
             for item in self.atomic_information_store.list_atomic_information()
@@ -206,6 +202,13 @@ class ContextBuilder:
                 reverse=True,
             )
         )
+        return current, {item.atomic_information_id: item for item in current}
+
+    def _atomic_items(
+        self,
+        current: tuple[AtomicInformationRevision, ...],
+        request: ContextRequest,
+    ) -> tuple[tuple[ContextAtomicInformationItem, ...], tuple[str, ...]]:
         items: list[ContextAtomicInformationItem] = []
         evidence_truncated: list[str] = []
         for item in current:
@@ -236,9 +239,7 @@ class ContextBuilder:
                     created_at=item.created_at,
                 )
             )
-        return tuple(items), tuple(evidence_truncated), {
-            item.atomic_information_id: item for item in current
-        }
+        return tuple(items), tuple(evidence_truncated)
 
     def _changes(self, root_object_id: str) -> tuple[ContextChangeItem, ...]:
         records = self.change_journal.list_changes()
@@ -246,6 +247,8 @@ class ContextBuilder:
         for record in records:
             if record.status not in {"applied", "failed"}:
                 raise ValueError(f"unsupported Change Journal status: {record.status}")
+            if record.mode not in {"automatic", "human_approved"}:
+                raise ValueError(f"unsupported Change Journal mode: {record.mode}")
             if record.status != "applied" or root_object_id not in record.resolved_object_ids:
                 continue
             items.append(

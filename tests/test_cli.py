@@ -281,6 +281,7 @@ class CliTest(unittest.TestCase):
                 ])
             self.assertEqual(result, 1)
             self.assertIn("error:", output.getvalue())
+            self.assertFalse(database.exists())
 
 
 if __name__ == "__main__":
