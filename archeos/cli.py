@@ -8,6 +8,7 @@ from pathlib import Path
 
 from .analysis import FileAnalysisProvider
 from .codex_app_server import CodexAnalysisProvider
+from .atomic_information import JsonlAtomicInformationStore, ingest_processing_package
 from .pipeline import ProcessingError, process_audio
 from .pyannote_speakers import PyannoteSpeakerProvider
 from .speakers import FileSpeakerProvider
@@ -15,6 +16,7 @@ from .transcription import FileTranscriptionProvider, MlxWhisperTranscriptionPro
 from .world_model import ObjectResolver, SQLiteWorldModelRepository
 
 DEFAULT_WORLD_MODEL_DATABASE = Path("04_core/archeos.sqlite3")
+DEFAULT_ATOMIC_INFORMATION_STORE = Path("03_information/atomic_information.jsonl")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -52,6 +54,35 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         help="Use an existing schema-compliant analysis JSON instead of Codex.",
     )
+    process.add_argument(
+        "--information-store",
+        type=Path,
+        default=DEFAULT_ATOMIC_INFORMATION_STORE,
+        help=(
+            "Durable Atomic Information JSONL path "
+            "(default: 03_information/atomic_information.jsonl)."
+        ),
+    )
+
+    information = subparsers.add_parser(
+        "information", help="Ingest durable local Atomic Information."
+    )
+    information.add_argument(
+        "--store",
+        type=Path,
+        default=DEFAULT_ATOMIC_INFORMATION_STORE,
+        help=(
+            "Durable Atomic Information JSONL path "
+            "(default: 03_information/atomic_information.jsonl)."
+        ),
+    )
+    information_commands = information.add_subparsers(
+        dest="information_command", required=True
+    )
+    ingest = information_commands.add_parser(
+        "ingest", help="Ingest a processing package idempotently."
+    )
+    ingest.add_argument("processing_package", type=Path)
 
     objects = subparsers.add_parser(
         "object", help="Create and inspect local World Model Objects."
@@ -119,7 +150,40 @@ def _process_command(args: argparse.Namespace) -> int:
         print(f"error: {exc}")
         return 1
 
+    try:
+        result = ingest_processing_package(
+            package,
+            JsonlAtomicInformationStore(args.information_store),
+        )
+    except (OSError, TypeError, ValueError) as exc:
+        print(f"error: processing package created at {package}")
+        print(f"error: durable Atomic Information ingestion failed: {exc}")
+        return 1
+
     print(package)
+    print(
+        json.dumps(
+            asdict(result),
+            ensure_ascii=False,
+        )
+    )
+    return 0
+
+
+def _information_command(args: argparse.Namespace) -> int:
+    if (
+        args.information_command != "ingest"
+    ):  # pragma: no cover - argparse enforces this
+        return 2
+    try:
+        result = ingest_processing_package(
+            args.processing_package,
+            JsonlAtomicInformationStore(args.store),
+        )
+    except (OSError, TypeError, ValueError) as exc:
+        print(f"error: {exc}")
+        return 1
+    print(json.dumps(asdict(result), ensure_ascii=False, indent=2))
     return 0
 
 
@@ -156,4 +220,6 @@ def main(argv: list[str] | None = None) -> int:
         return _process_command(args)
     if args.command == "object":
         return _object_command(args)
+    if args.command == "information":
+        return _information_command(args)
     return 2  # pragma: no cover - argparse enforces this

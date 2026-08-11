@@ -98,7 +98,7 @@ class SQLiteWorldModelRepository:
                 role TEXT NOT NULL CHECK (role IN ({allowed_roles})),
                 valid_from TEXT NOT NULL,
                 valid_to TEXT,
-                source_note_id TEXT,
+                source_atomic_information_id TEXT,
                 confidence REAL CHECK (
                     confidence IS NULL OR (confidence >= 0 AND confidence <= 1)
                 )
@@ -137,7 +137,7 @@ class SQLiteWorldModelRepository:
                     REFERENCES objects(object_id) ON DELETE RESTRICT,
                 valid_from TEXT NOT NULL,
                 valid_to TEXT,
-                source_note_id TEXT,
+                source_atomic_information_id TEXT,
                 confidence REAL CHECK (
                     confidence IS NULL OR (confidence >= 0 AND confidence <= 1)
                 )
@@ -253,12 +253,14 @@ class SQLiteWorldModelRepository:
         object_id: str,
         role: str,
         *,
-        source_note_id: str | None = None,
+        source_atomic_information_id: str | None = None,
         confidence: float | None = None,
     ) -> RoleAssignment:
         self.get_object(object_id)
         clean_role = self._validate_role(role)
-        clean_source_note_id = _optional_text(source_note_id, "source_note_id")
+        clean_source_atomic_information_id = _optional_text(
+            source_atomic_information_id, "source_atomic_information_id"
+        )
         clean_confidence = _validate_confidence(confidence)
         active = self._connection.execute(
             """
@@ -283,7 +285,7 @@ class SQLiteWorldModelRepository:
                     object_id,
                     clean_role,
                     now,
-                    clean_source_note_id,
+                    clean_source_atomic_information_id,
                     clean_confidence,
                 ),
             )
@@ -294,7 +296,7 @@ class SQLiteWorldModelRepository:
             clean_role,
             now,
             None,
-            clean_source_note_id,
+            clean_source_atomic_information_id,
             clean_confidence,
         )
 
@@ -411,13 +413,15 @@ class SQLiteWorldModelRepository:
         relation: str,
         to_object_id: str,
         *,
-        source_note_id: str | None = None,
+        source_atomic_information_id: str | None = None,
         confidence: float | None = None,
     ) -> RelationshipRecord:
         self.get_object(from_object_id)
         self.get_object(to_object_id)
         clean_relation = _non_empty(relation, "relation")
-        clean_source_note_id = _optional_text(source_note_id, "source_note_id")
+        clean_source_atomic_information_id = _optional_text(
+            source_atomic_information_id, "source_atomic_information_id"
+        )
         clean_confidence = _validate_confidence(confidence)
         relationship_id = _identifier("rel")
         now = _utc_now()
@@ -433,7 +437,7 @@ class SQLiteWorldModelRepository:
                     clean_relation,
                     to_object_id,
                     now,
-                    clean_source_note_id,
+                    clean_source_atomic_information_id,
                     clean_confidence,
                 ),
             )
@@ -444,7 +448,7 @@ class SQLiteWorldModelRepository:
             to_object_id,
             now,
             None,
-            clean_source_note_id,
+            clean_source_atomic_information_id,
             clean_confidence,
         )
 
@@ -526,7 +530,7 @@ class SQLiteWorldModelRepository:
             row["role"],
             row["valid_from"],
             row["valid_to"],
-            row["source_note_id"],
+            row["source_atomic_information_id"],
             row["confidence"],
         )
 
@@ -553,6 +557,6 @@ class SQLiteWorldModelRepository:
             row["to_object_id"],
             row["valid_from"],
             row["valid_to"],
-            row["source_note_id"],
+            row["source_atomic_information_id"],
             row["confidence"],
         )

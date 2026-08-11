@@ -10,13 +10,16 @@ from pathlib import Path
 
 from archeos.analysis import (
     AnalysisResult,
-    AtomicNoteCandidate,
+    AtomicInformationCandidate,
     MeetingSummary,
     ResidueItem,
 )
+from archeos.atomic_information import (
+    JsonlAtomicInformationStore,
+    ingest_processing_package,
+)
 from archeos.pipeline import ARTIFACTS, ProcessingError, process_audio
 from archeos.transcription import Transcript, TranscriptSegment
-
 
 FIXED_TIME = datetime(2026, 8, 10, 12, 0, tzinfo=timezone.utc)
 
@@ -86,8 +89,8 @@ class StubAnalysisProvider:
                 unresolved_questions=("旧方案具体指哪个版本？",),
                 next_actions=("由 Speaker_2 进行人工复核。",),
             ),
-            atomic_notes=(
-                AtomicNoteCandidate(
+            atomic_information_candidates=(
+                AtomicInformationCandidate(
                     "团队决定先验证通用流程。",
                     "decision",
                     ("通用流程",),
@@ -95,7 +98,7 @@ class StubAnalysisProvider:
                     "讨论同时强调保留上下文。",
                     0.94,
                 ),
-                AtomicNoteCandidate(
+                AtomicInformationCandidate(
                     "通用流程必须保留上下文。",
                     "requirement",
                     ("通用流程", "上下文"),
@@ -103,7 +106,7 @@ class StubAnalysisProvider:
                     "该要求与流程验证决定同时提出。",
                     0.91,
                 ),
-                AtomicNoteCandidate(
+                AtomicInformationCandidate(
                     "团队决定验证流程并安排人工复核。",
                     "action",
                     ("团队", "人工复核"),
@@ -137,7 +140,7 @@ class IncompleteAnalysisProvider:
         result = StubAnalysisProvider().analyze(transcript)
         return AnalysisResult(
             result.meeting_summary,
-            result.atomic_notes,
+            result.atomic_information_candidates,
             (),
         )
 
@@ -149,7 +152,7 @@ class OverlappingAnalysisProvider:
         result = StubAnalysisProvider().analyze(transcript)
         return AnalysisResult(
             result.meeting_summary,
-            result.atomic_notes,
+            result.atomic_information_candidates,
             (
                 ResidueItem(
                     (1, 2, 3),
@@ -193,58 +196,81 @@ class PipelineTest(unittest.TestCase):
             root = Path(temp)
             audio = root / "讨论.wav"
             write_silent_wav(audio)
-            before = (audio.stat().st_mtime_ns, hashlib.sha256(audio.read_bytes()).hexdigest())
+            before = (
+                audio.stat().st_mtime_ns,
+                hashlib.sha256(audio.read_bytes()).hexdigest(),
+            )
 
             package = run_pipeline(audio, root / "02_processing")
 
             self.assertEqual(set(ARTIFACTS), {item.name for item in package.iterdir()})
-            after = (audio.stat().st_mtime_ns, hashlib.sha256(audio.read_bytes()).hexdigest())
+            after = (
+                audio.stat().st_mtime_ns,
+                hashlib.sha256(audio.read_bytes()).hexdigest(),
+            )
             self.assertEqual(before, after)
 
             manifest = json.loads((package / "manifest.json").read_text())
             self.assertEqual(manifest["artifacts"], list(ARTIFACTS))
-            self.assertEqual(manifest["review"]["status"], "awaiting_human_review")
-            self.assertFalse(manifest["review"]["automatic_core_write"])
-            self.assertEqual(manifest["speaker_attribution"]["provider"], "stub-speakers")
+            self.assertEqual(manifest["schema_version"], "1.1")
+            self.assertEqual(
+                manifest["downstream"],
+                {
+                    "atomic_information_ingestion": (
+                        "automatic_after_contract_validation"
+                    ),
+                    "world_model_write": "governed",
+                },
+            )
+            self.assertNotIn("review", manifest)
+            self.assertEqual(
+                manifest["speaker_attribution"]["provider"], "stub-speakers"
+            )
             self.assertFalse(manifest["speaker_attribution"]["identity_matching"])
             self.assertEqual(
                 manifest["counts"],
                 {
                     "transcript_segments": 4,
-                    "atomic_notes": 3,
-                    "atomic_note_segments": 2,
+                    "atomic_information_candidates": 3,
+                    "atomic_information_candidate_segments": 2,
                     "residue_items": 1,
                     "residue_segments": 2,
                 },
             )
 
-            notes = [
+            candidates = [
                 json.loads(line)
-                for line in (package / "atomic_notes.jsonl").read_text().splitlines()
+                for line in (package / "atomic_information_candidates.jsonl")
+                .read_text()
+                .splitlines()
             ]
+            self.assertTrue(all(item["status"] == "candidate" for item in candidates))
             self.assertEqual(
-                [note["semantic_type"] for note in notes],
+                [item["semantic_type"] for item in candidates],
                 ["decision", "requirement", "action"],
             )
-            self.assertEqual(notes[0]["source_evidence"][0]["segment"], 1)
-            self.assertEqual(notes[0]["source_evidence"][0]["speaker"], "Speaker_1")
-            self.assertEqual(notes[0]["source_evidence"][0]["start"], "00:00:00.000")
-            self.assertEqual(notes[0]["source_evidence"][0]["end"], "00:00:02.000")
+            self.assertEqual(candidates[0]["source_evidence"][0]["segment"], 1)
             self.assertEqual(
-                notes[0]["source_evidence"][0]["excerpt"],
+                candidates[0]["source_evidence"][0]["speaker"], "Speaker_1"
+            )
+            self.assertEqual(
+                candidates[0]["source_evidence"][0]["start"], "00:00:00.000"
+            )
+            self.assertEqual(candidates[0]["source_evidence"][0]["end"], "00:00:02.000")
+            self.assertEqual(
+                candidates[0]["source_evidence"][0]["excerpt"],
                 "我们决定先验证通用流程，同时要求保留上下文。",
             )
             self.assertEqual(
-                notes[0]["source_evidence"][0]["source_id"],
+                candidates[0]["source_evidence"][0]["source_id"],
                 manifest["source"]["id"],
             )
-            self.assertEqual(notes[1]["source_evidence"][0]["segment"], 1)
+            self.assertEqual(candidates[1]["source_evidence"][0]["segment"], 1)
             self.assertEqual(
-                [evidence["segment"] for evidence in notes[2]["source_evidence"]],
+                [evidence["segment"] for evidence in candidates[2]["source_evidence"]],
                 [1, 4],
             )
-            self.assertTrue(all(note["concerns"] for note in notes))
-            self.assertTrue(all(note["status"] == "proposed" for note in notes))
+            self.assertTrue(all(item["concerns"] for item in candidates))
 
             transcript = (package / "transcript.md").read_text()
             self.assertIn("Speaker_1", transcript)
@@ -265,7 +291,33 @@ class PipelineTest(unittest.TestCase):
             residue = (package / "residue.md").read_text()
             self.assertIn("这个结论引用了旧方案。", residue)
             self.assertIn("指代不明确", residue)
-            self.assertFalse((root / "03_notes").exists())
+            self.assertFalse((root / "03_information").exists())
+            self.assertFalse((root / "04_core").exists())
+            self.assertFalse((root / "05_decisions").exists())
+
+    def test_generated_package_is_ingestible_as_durable_information(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            audio = root / "synthetic.wav"
+            write_silent_wav(audio)
+            package = run_pipeline(audio, root / "02_processing")
+            store = JsonlAtomicInformationStore(
+                root / "03_information" / "atomic_information.jsonl"
+            )
+
+            result = ingest_processing_package(package, store)
+
+            self.assertEqual(result.created, 3)
+            self.assertEqual(len(store.list_atomic_information()), 3)
+            self.assertTrue(
+                all(
+                    item.revision_number == 1
+                    for item in store.list_atomic_information()
+                )
+            )
+            self.assertTrue(
+                all(item.source_evidence for item in store.list_atomic_information())
+            )
             self.assertFalse((root / "04_core").exists())
             self.assertFalse((root / "05_decisions").exists())
 
@@ -302,13 +354,13 @@ class PipelineTest(unittest.TestCase):
                 },
             )
             self.assertEqual(
-                manifest["counts"]["atomic_note_segments"]
+                manifest["counts"]["atomic_information_candidate_segments"]
                 + manifest["counts"]["residue_segments"]
                 - manifest["digestion_coverage"]["overlap_segments"],
                 manifest["digestion_coverage"]["accounted_segments"],
             )
 
-    def test_reports_overlapping_atomic_note_and_residue_segments(self) -> None:
+    def test_reports_overlapping_candidate_and_residue_segments(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             audio = root / "discussion.wav"
@@ -324,7 +376,9 @@ class PipelineTest(unittest.TestCase):
             )
             manifest = json.loads((package / "manifest.json").read_text())
 
-            self.assertEqual(manifest["counts"]["atomic_note_segments"], 2)
+            self.assertEqual(
+                manifest["counts"]["atomic_information_candidate_segments"], 2
+            )
             self.assertEqual(manifest["counts"]["residue_segments"], 3)
             self.assertEqual(manifest["digestion_coverage"]["overlap_segments"], 1)
             self.assertEqual(manifest["digestion_coverage"]["accounted_segments"], 4)

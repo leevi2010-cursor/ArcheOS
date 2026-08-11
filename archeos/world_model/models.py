@@ -41,7 +41,7 @@ class RoleAssignment:
     role: str
     valid_from: str
     valid_to: str | None
-    source_note_id: str | None
+    source_atomic_information_id: str | None
     confidence: float | None
 
 
@@ -66,7 +66,7 @@ class RelationshipRecord:
     to_object_id: str
     valid_from: str
     valid_to: str | None
-    source_note_id: str | None
+    source_atomic_information_id: str | None
     confidence: float | None
 
 

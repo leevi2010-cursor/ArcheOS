@@ -4,6 +4,8 @@
 01_inbox/**
 !01_inbox/AGENTS.md
 02_processing/*/
+03_information/**
+!03_information/AGENTS.md
 04_core/**
 !04_core/AGENTS.md
 

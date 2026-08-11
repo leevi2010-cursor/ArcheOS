@@ -228,20 +228,23 @@ class WorldModelRepositoryTest(unittest.TestCase):
         role = self.repository.add_role(
             source.object_id,
             "project",
-            source_note_id="note_test_fixture",
+            source_atomic_information_id="atomic_info_test_fixture",
             confidence=0.75,
         )
         relationship = self.repository.create_relationship(
             source.object_id,
             "test_fixture_relation",
             target.object_id,
-            source_note_id="note_test_fixture",
+            source_atomic_information_id="atomic_info_test_fixture",
             confidence=0.6,
         )
 
-        self.assertEqual(role.source_note_id, "note_test_fixture")
+        self.assertEqual(role.source_atomic_information_id, "atomic_info_test_fixture")
         self.assertEqual(role.confidence, 0.75)
-        self.assertEqual(relationship.source_note_id, "note_test_fixture")
+        self.assertEqual(
+            relationship.source_atomic_information_id,
+            "atomic_info_test_fixture",
+        )
         self.assertEqual(relationship.confidence, 0.6)
 
     def test_rename_does_not_change_relationship_ids_and_resolution(self) -> None:
