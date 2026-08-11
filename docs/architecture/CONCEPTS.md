@@ -37,7 +37,7 @@ Information 层主要包含：
 
 Information 描述“我们知道了什么”，不等同于长期世界中的 Object。
 
-`Note` **不是 ArcheOS Core 的正式概念**。如果未来产品中出现“笔记 / Note”功能，它可以作为面向人的业务或展示名称，但不应与 `Atomic Information` 建立一套平行的长期信息模型。
+`Note` **不是 ArcheOS Core 的正式概念**。在旧系统、历史文件或人类界面中遇到 `Note` 时，可以把它识别为 `Atomic Information` 的旧称或展示名称，但不得因此建立独立的 Note 模型、Store、ID 或生命周期。
 
 ---
 
@@ -391,14 +391,14 @@ A、B、C 之间的业务联系通过 Relationship 表达。
 
 ## 19. 概念别名与收敛规则
 
-ArcheOS 使用一个 canonical 概念体系。别名只帮助识别旧资料和不同系统的说法，不拥有独立定义。
+ArcheOS 使用一个 canonical 概念体系。别名只帮助识别旧资料和不同系统的说法，不拥有独立定义，也不得在新代码中形成兼容类或平行存储模型。
 
-| Canonical 概念 | 可识别别名 | 收敛规则 |
+| Canonical 概念 | 可识别旧称 / 别名 | 收敛规则 |
 | --- | --- | --- |
 | Object | Entity、Business Object、业务对象 | 都表示需要稳定身份的可引用对象；数据库 `entity` 只是实现名称 |
 | Relationship | Relation、业务关系 | `Edge` 只作为图存储实现术语；超链接不自动成为 Relationship |
 | Name | Label、Display Name、名称 | 都不承担 Object 身份 |
-| Note | Atomic Note、Durable Atomic Information、已确认 Semantic Unit | 表示已经进入长期 Information 层的原子信息 |
+| Atomic Information | Atomic Note、Note、Durable Atomic Information、已确认 Semantic Unit | 都收敛为长期 Information 层的 Atomic Information；新代码不建立 Note 模型 |
 | Atomic Information Candidate | Atomic Information Unit Candidate、Semantic Unit Candidate | 表示尚处于 Processing 的原子信息候选 |
 | Evidence | Evidence Ref、Citation | 作为来源依据；精确片段使用 Evidence Fragment |
 | Structured World Model | Core、World Model、长期结构化认知 | 都指 Object / Name / Role / Lifecycle / Relationship 的组合，不是新 Object |
@@ -409,7 +409,7 @@ ArcheOS 使用一个 canonical 概念体系。别名只帮助识别旧资料和�
 
 以下泛化词不得单独成为新 Core 概念：
 
-- `Semantic Object`：若指稳定事物，使用 Object；若指一条意义，使用 Candidate 或 Note。
+- `Semantic Object`：若指稳定事物，使用 Object；若指一条意义，使用 Atomic Information Candidate 或 Atomic Information。
 - `Candidate`：只表示某类内容尚未晋升的状态，必须说明是 Object、Information、Relationship、Revision 还是 Action 的候选。
 - `Artifact`：必须说明是原始 Source、Derived Artifact，还是 World Model 中具有稳定身份的业务产物。
 - `Record`：必须说明记录的业务语义，不能用它回避概念定义。
@@ -448,7 +448,7 @@ Source Object 属于 Information / Evidence 边界，不等于 World Model Objec
 
 `Evidence Fragment` 是 Source Object 或 Derived Artifact 中可精确读回的位置，例如页码、时间段、表格行或文本片段。
 
-Evidence Fragment 负责回答“依据在原文哪里”；Candidate / Note 负责回答“这段依据表达了什么”。一个 Fragment 可以支持多条信息，一条信息也可以引用多个 Fragment。
+Evidence Fragment 负责回答“依据在原文哪里”；Atomic Information Candidate / Atomic Information 负责回答“这段依据表达了什么”。一个 Fragment 可以支持多条信息，一条信息也可以引用多个 Fragment。
 
 ### Processing Run
 
@@ -456,11 +456,11 @@ Evidence Fragment 负责回答“依据在原文哪里”；Candidate / Note 负
 
 ### Change Proposal
 
-`Change Proposal` 是基于 Candidate / Note 建议修改长期 World Model 或正式业务记录的受控提案。它不是 Decision，也不是已经执行的事实。
+`Change Proposal` 是基于 Atomic Information Candidate / Atomic Information 建议修改长期 World Model 或正式业务记录的受控提案。它不是 Decision，也不是已经执行的事实。
 
 ### Feedback
 
-`Feedback` 是行动或写入后重新获得的现实状态和结果，用于修正下一轮 Note、判断、Decision 或行为。
+`Feedback` 是行动或写入后重新获得的现实状态和结果，用于修正下一轮 Atomic Information、判断、Decision 或行为。
 
 ---
 
@@ -476,7 +476,7 @@ Evidence Fragment 负责回答“依据在原文哪里”；Candidate / Note 负
 
 `Goal` 是希望达到、并可用于判断行动方向的结果状态。
 
-- 一次性提到的目标可以先作为 Note 的 semantic type；
+- 一次性提到的目标可以先作为 Atomic Information 的 semantic type；
 - 需要长期责任、状态、关系和复盘时，建立 Object 并赋予 `goal` Role。
 - `Vision` 是更长期的 Goal 层级；`Objective` 作为 Goal 别名，不新增概念。
 
@@ -556,7 +556,7 @@ Module 可以由确定性代码、Agent 或二者组合实现；是否调用模�
 | Freshness | 数据或版本是否仍满足当前时效要求 |
 | Signal | Module 向环境发布、供其他消费者关注的信息或变化提示 |
 | Event | Object 状态或 Relationship 发生的可识别变化 |
-| Consumption Receipt | 某消费者已经处理某条 Signal / Note 的记录 |
+| Consumption Receipt | 某消费者已经处理某条 Signal / Atomic Information 的记录 |
 | Decision Receipt | 人对候选作出接受、拒绝、补证或延后选择的记录 |
 | Audit Event | 系统发生受控动作的不可变审计记录 |
 | Readback | 写入后从权威来源重新读取并核对的验证动作 |
