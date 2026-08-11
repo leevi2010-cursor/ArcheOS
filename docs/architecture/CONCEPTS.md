@@ -15,6 +15,13 @@
 
 `ARCHITECTURE.md` 说明这些概念如何组成系统；ADR 记录关键架构决策；GitHub Issue 定义当前要实现什么；`AGENTS.md` 约束 Agent 如何使用这些权威来源。
 
+当其他项目、历史文档或旧系统的概念与本文件冲突时：
+
+- 新设计和跨系统映射以本文件为准；
+- 旧系统在完成受控迁移前继续保留自己的运行权威，不得只改名称冒充迁移完成；
+- 本文件已定义的概念必须优先复用，别名不得再次发展成平行模型；
+- 本文件未定义、且只服务某一业务领域的概念，先进入该项目的 `docs/domain/CONCEPTS.md`，不得直接升级为通用概念。
+
 ---
 
 ## 2. Information
@@ -24,11 +31,13 @@
 Information 层主要包含：
 
 - `Atomic Information Candidate`
-- `Note`
+- `Atomic Information`
 - `Evidence`
 - `Residue`
 
 Information 描述“我们知道了什么”，不等同于长期世界中的 Object。
+
+`Note` **不是 ArcheOS Core 的正式概念**。在旧系统、历史文件或人类界面中遇到 `Note` 时，可以把它识别为 `Atomic Information` 的旧称或展示名称，但不得因此建立独立的 Note 模型、Store、ID 或生命周期。
 
 ---
 
@@ -44,7 +53,7 @@ Object 可以：
 - 同时拥有多个 Role；
 - 拥有 Lifecycle；
 - 与多个其他 Object 建立 Relationship；
-- 被多个 Note 描述或引用。
+- 被多个 Atomic Information 描述或引用。
 
 示例：
 
@@ -53,7 +62,7 @@ Object 可以：
 - 海丝金融中心家具采购；
 - 一个需要长期维护的内部产品库。
 
-一个普通描述、观点或事实本身不是 Object，例如“SKU 很重要”属于 Note。
+一个普通描述、观点或事实本身不是 Object，例如“SKU 很重要”属于 Atomic Information。
 
 ---
 
@@ -168,13 +177,13 @@ ArcheOS 的 World Model 因此天然可以形成 Graph，而不是只能形成�
 
 ---
 
-## 8. Note
+## 8. Atomic Information
 
-`Note` 是一个**可独立追溯的长期原子信息记录**。
+`Atomic Information` 是一个**可独立理解、可独立追溯的长期原子信息单元**。
 
-Note 属于 Information 层，不是 Object，也不是 Object 的 Role。
+Atomic Information 属于 Information 层，不是 Object，也不是 Object 的 Role。
 
-一个 Note 可以包含：
+一条 Atomic Information 可以包含：
 
 - statement；
 - semantic type；
@@ -184,27 +193,29 @@ Note 属于 Information 层，不是 Object，也不是 Object 的 Role。
 - confidence / uncertainty；
 - 来源和版本信息。
 
-Note 可以描述一个或多个 Object，也可以独立存在。
+Atomic Information 可以描述一个或多个 Object，也可以在尚未完成 Object 绑定时独立存在。
 
-Note 与 Object 的区别：
+Atomic Information 与 Object 的区别：
 
 ```text
-Object = 被长期引用的“东西”
-Note   = 关于这些东西的一条“信息”
+Object              = 被长期引用的“东西”
+Atomic Information  = 关于这些东西的一条最小长期信息
 ```
+
+Atomic Information 的后续修订仍属于同一条长期信息身份，并通过 Revision / 历史记录表达变化；Revision 是实现和历史结构，不是新的 Core 概念。
 
 ---
 
 ## 9. Atomic Information Candidate
 
-`Atomic Information Candidate` 是 Processing 阶段产生的、尚未进入长期 Note 层的原子信息候选。
+`Atomic Information Candidate` 是 Processing 阶段产生的、尚未进入长期 Atomic Information 层的原子信息候选。
 
-它与 Note 的主要区别是所处生命周期阶段：
+它与 durable Atomic Information 的主要区别是所处生命周期阶段：
 
 ```text
 Processing
   → Atomic Information Candidate
-  → Note
+  → Atomic Information
 ```
 
 候选信息仍应保留 statement、Evidence、context、confidence / uncertainty 等可追溯信息。
@@ -225,9 +236,9 @@ source
 → excerpt
 ```
 
-Evidence 与 Note 不同：
+Evidence 与 Atomic Information 不同：
 
-- Note 表示“系统记录了什么信息”；
+- Atomic Information 表示“系统记录了什么信息”；
 - Evidence 表示“这条信息依据什么来源”。
 
 ---
@@ -262,7 +273,7 @@ Object
 
 它不是需要单独创建 ID 的 Object，而是一个架构层概念。
 
-Note / Evidence 描述和支撑 World Model；World Model 表达 ArcheOS 对长期经营世界的结构化认知。
+Atomic Information / Evidence 描述和支撑 World Model；World Model 表达 ArcheOS 对长期经营世界的结构化认知。
 
 ---
 
@@ -375,3 +386,235 @@ lifecycle: bounded
 ```
 
 A、B、C 之间的业务联系通过 Relationship 表达。
+
+---
+
+## 19. 概念别名与收敛规则
+
+ArcheOS 使用一个 canonical 概念体系。别名只帮助识别旧资料和不同系统的说法，不拥有独立定义，也不得在新代码中形成兼容类或平行存储模型。
+
+| Canonical 概念 | 可识别旧称 / 别名 | 收敛规则 |
+| --- | --- | --- |
+| Object | Entity、Business Object、业务对象 | 都表示需要稳定身份的可引用对象；数据库 `entity` 只是实现名称 |
+| Relationship | Relation、业务关系 | `Edge` 只作为图存储实现术语；超链接不自动成为 Relationship |
+| Name | Label、Display Name、名称 | 都不承担 Object 身份 |
+| Atomic Information | Atomic Note、Note、Durable Atomic Information、已确认 Semantic Unit | 都收敛为长期 Information 层的 Atomic Information；新代码不建立 Note 模型 |
+| Atomic Information Candidate | Atomic Information Unit Candidate、Semantic Unit Candidate | 表示尚处于 Processing 的原子信息候选 |
+| Evidence | Evidence Ref、Citation | 作为来源依据；精确片段使用 Evidence Fragment |
+| Structured World Model | Core、World Model、长期结构化认知 | 都指 Object / Name / Role / Lifecycle / Relationship 的组合，不是新 Object |
+| View | Operating View、业务视图 | 只负责观察与组织，不成为 Core Truth |
+| View Model | Read Model、Projection Result | 是给展示层读取的数据结构，不是长期权威 |
+| Business Line | Operation、经营主线、长期经营责任 | 表达持续经营，不使用“长期 Project”建立第二套 Project 语义 |
+| Todo | Action Item、执行待办 | 表达 Issue 下的具体动作；Task 是否映射为 Issue 或 Todo 取决于是否需要独立追踪 |
+
+以下泛化词不得单独成为新 Core 概念：
+
+- `Semantic Object`：若指稳定事物，使用 Object；若指一条意义，使用 Atomic Information Candidate 或 Atomic Information。
+- `Candidate`：只表示某类内容尚未晋升的状态，必须说明是 Object、Information、Relationship、Revision 还是 Action 的候选。
+- `Artifact`：必须说明是原始 Source、Derived Artifact，还是 World Model 中具有稳定身份的业务产物。
+- `Record`：必须说明记录的业务语义，不能用它回避概念定义。
+
+---
+
+## 20. 信息生命周期补充概念
+
+ArcheOS 的 canonical 生命周期仍是：
+
+```text
+Input → Processing → Atomic Information → Structured Object → Decision → Feedback
+```
+
+以下概念用于精确描述各阶段，不新增平行生命周期。
+
+### Inbox
+
+`Inbox` 是尚未完成来源登记的临时输入区。内容可能重复、无效、缺少权限或无法处理，因此不是长期事实权威。
+
+### Source Object
+
+`Source Object` 是已经登记、可稳定引用的原始来源身份，例如一份文件、录音、邮件或外部系统记录。
+
+Source Object 属于 Information / Evidence 边界，不等于 World Model Object。它至少能够指向原始内容位置、内容摘要、来源、权限范围和接收记录。
+
+### Intake Receipt
+
+`Intake Receipt` 记录某个来源在何时、通过何种渠道被系统接收。相同内容从不同渠道重复到达时，可以共享 Source Object，同时保留多份 Intake Receipt。
+
+### Derived Artifact
+
+`Derived Artifact` 是从 Source Object 经处理产生的转写、摘要、解析结果或其他中间产物。它不得覆盖原始来源，并应保留 Processing Run 与版本来路。
+
+### Evidence Fragment
+
+`Evidence Fragment` 是 Source Object 或 Derived Artifact 中可精确读回的位置，例如页码、时间段、表格行或文本片段。
+
+Evidence Fragment 负责回答“依据在原文哪里”；Atomic Information Candidate / Atomic Information 负责回答“这段依据表达了什么”。一个 Fragment 可以支持多条信息，一条信息也可以引用多个 Fragment。
+
+### Processing Run
+
+`Processing Run` 是一次可审计的处理尝试，记录输入版本、处理器、模型或工具版本、开始和结束时间、结果与失败状态。它是运行来路，不是业务 Object。
+
+### Change Proposal
+
+`Change Proposal` 是基于 Atomic Information Candidate / Atomic Information 建议修改长期 World Model 或正式业务记录的受控提案。它不是 Decision，也不是已经执行的事实。
+
+### Feedback
+
+`Feedback` 是行动或写入后重新获得的现实状态和结果，用于修正下一轮 Atomic Information、判断、Decision 或行为。
+
+---
+
+## 21. 经营与项目治理概念
+
+这些概念用于组织经营推进。它们可以通过 Object、Role、Lifecycle、Relationship 和 View 实现，但业务含义保持一致。
+
+### Workspace
+
+`Workspace` 是长期存在的经营、权限和数据隔离范围。Workspace 可以围绕公司、店铺、个人或其他经营主体建立，但它本身不等于 Company、Store 或 Domain。
+
+### Goal
+
+`Goal` 是希望达到、并可用于判断行动方向的结果状态。
+
+- 一次性提到的目标可以先作为 Atomic Information 的 semantic type；
+- 需要长期责任、状态、关系和复盘时，建立 Object 并赋予 `goal` Role。
+- `Vision` 是更长期的 Goal 层级；`Objective` 作为 Goal 别名，不新增概念。
+
+### Roadmap
+
+`Roadmap` 是 Workspace 基于 Goal、现实、资产、约束和 Decision 形成的长期路径 View。它不是 Project 内部必须存在的层级，也不作为独立 Core 身份重复保存底层对象。
+
+### Project
+
+`Project` 是为了明确成果组织、具有完成条件并可以结束的工作。在 World Model 中使用 Object + `project` Role + bounded Lifecycle 表达。
+
+### Business Line
+
+`Business Line` 是没有预设结束时间的持续经营责任。在 World Model 中使用 Object + `business_line` Role + ongoing Lifecycle 表达。
+
+### Milestone
+
+`Milestone` 是 Project 或 Roadmap 中可验收的阶段成果，不是普通任务清单。
+
+### Issue
+
+`Issue` 是需要独立负责人、状态、证据、验收或 Decision 的事项包。Incident、Risk、Blocker、Decision Request、Work Order 和 Task 可以作为 Issue 的 kind，而不是建立平行推进层级。
+
+### Todo
+
+`Todo` 是 Issue 下具体、可执行、可完成的小动作。无需独立治理和证据链的 Task 映射为 Todo；需要独立追踪的 Task 映射为 Issue。
+
+推荐推进关系：
+
+```text
+长期经营：Workspace → Roadmap → Milestone → Issue → Todo
+有限交付：Project   → Milestone → Issue → Todo
+```
+
+---
+
+## 22. 系统设计概念
+
+### System、Subsystem、Module、Component
+
+```text
+System → Subsystem → Module → Component
+```
+
+- `System`：在明确边界内，由人、规则、数据、软件和工具协同实现持续目标的整体。
+- `Subsystem`：System 内具有相对独立责任的结构分区。
+- `Module`：高内聚、接口明确、可独立测试和版本化的主责结构单元。
+- `Component`：Module 内实现部分责任的结构单元。
+
+### Business Process、Function、Action
+
+```text
+Business Process → Function → Action
+```
+
+- `Business Process`：业务从触发到结果的完整行为链。
+- `Function`：系统能够完成的业务能力；人类页面可以显示为“系统能力”或 `Capability`。
+- `Action`：Function 对现实或系统状态产生的具体行为。
+
+结构维度与行为维度不得混用。流程阶段不是 Domain，Function 不是顶层流程，Module 也不是业务步骤。
+
+### Cell-like Module
+
+`Cell-like Module / 类细胞模块` 是 Module 采用的闭环运行 Pattern，不是新的结构层级。`闭环单元`、`类细胞单元`统一映射为“采用类细胞运行模式的 Module”。
+
+Module 可以由确定性代码、Agent 或二者组合实现；是否调用模型不改变 Module 身份。
+
+---
+
+## 23. 运行、治理与反馈概念
+
+| 概念 | 定义 |
+| --- | --- |
+| State | 对象或 Module 在某时点的业务或内部状态 |
+| Status | 某治理或执行生命周期中的受控标签 |
+| Health | 对某 Module 或来源能否正常履责的评价 |
+| Freshness | 数据或版本是否仍满足当前时效要求 |
+| Signal | Module 向环境发布、供其他消费者关注的信息或变化提示 |
+| Event | Object 状态或 Relationship 发生的可识别变化 |
+| Consumption Receipt | 某消费者已经处理某条 Signal / Atomic Information 的记录 |
+| Decision Receipt | 人对候选作出接受、拒绝、补证或延后选择的记录 |
+| Audit Event | 系统发生受控动作的不可变审计记录 |
+| Readback | 写入后从权威来源重新读取并核对的验证动作 |
+
+State、Status、Lifecycle、Health、Freshness 不得互相替代。Signal、Feedback、Receipt、Audit Event 也不得统一称为一个泛化“回执”。
+
+### Constitution、Principle、Policy、Protocol、Pattern
+
+- `Constitution`：最高层、稳定、跨任务的治理基线。
+- `Principle`：用于判断取舍的稳定原则。
+- `Policy`：某一明确范围内版本化、可执行的业务参数和约束。
+- `Protocol`：跨任务可复用的交互、判断、门禁与流转规则。
+- `Pattern`：反复问题对应的可复用解决结构。
+
+这些概念不能统一叫“规则”。Policy 不承载通用方法，Protocol 不写死单一业务参数，Pattern 不替代 Module。
+
+---
+
+## 24. Asset、Artifact、Product 与 System
+
+- `Asset` 是某个 Goal 语境下，可被复用并产生收益或降低风险的 View / 角色，不是互斥的根 Object 类型。
+- `Artifact` 是被创建或维护、具有稳定身份的产物 Object。
+- `Product` 是 Artifact 面向用户和价值交换时的业务 Role / Classification。
+- `System` 是实现持续目标的结构整体或 Artifact 的功能 Classification。
+
+同一个软件 Artifact 可以同时被理解为 Product 和 System，并在某个 Goal 下进入 Asset View；这不应创建三个重复 Object。
+
+`Deliverable` 表示 Project / Milestone 承诺交付的 Artifact 或结果；`Result / Outcome` 表示行动后的现实业务状态。交付文档不等于获得业务结果。
+
+---
+
+## 25. 领域概念扩展
+
+当本文件不能表达某个项目的真实业务含义时，允许新增领域概念，但必须先保留在项目范围内。
+
+每个需要扩展概念的项目使用：
+
+```text
+<project-root>/docs/domain/CONCEPTS.md
+```
+
+领域概念文档中的每个概念至少说明：
+
+- canonical 名称与中文名称；
+- 定义；
+- 不表示什么；
+- 别名和旧说法；
+- 与 ArcheOS 通用概念的关系；
+- 适用 Domain / Workspace / Project；
+- 至少一个真实例子；
+- 当前状态：Candidate / Approved / Deprecated；
+- 来源、owner 和复盘条件。
+
+领域概念不得：
+
+- 重定义本文件已有概念；
+- 因方便写代码而新增名词；
+- 自动传播到其他项目；
+- 自动晋升为通用概念。
+
+当同一领域概念在多个项目或 Domain 中稳定复用、且现有通用概念确实无法承载时，可以提出通用概念修订。晋升必须更新本文件并形成 ADR / Decision；晋升完成后，原领域文档保留别名、来源和迁移映射。

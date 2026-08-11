@@ -1,0 +1,100 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1800" height="1220" viewBox="0 0 1800 1220">
+  <defs>
+    <marker id="arrow" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto" markerUnits="strokeWidth"><path d="M0,0 L0,6 L9,3 z" fill="#334155"/></marker>
+    <style>
+      .title{font:700 34px Arial,'Microsoft YaHei',sans-serif;fill:#0f172a}.subtitle{font:16px Arial,'Microsoft YaHei',sans-serif;fill:#475569}.h{font:700 21px Arial,'Microsoft YaHei',sans-serif;fill:#0f172a}.t{font:16px Arial,'Microsoft YaHei',sans-serif;fill:#334155}.s{font:14px Arial,'Microsoft YaHei',sans-serif;fill:#475569}.xs{font:13px Arial,'Microsoft YaHei',sans-serif;fill:#64748b}.implemented{fill:#ecfdf5;stroke:#059669;stroke-width:2.5}.progress{fill:#eff6ff;stroke:#2563eb;stroke-width:2.5}.planned{fill:#eff6ff;stroke:#2563eb;stroke-width:2.5;stroke-dasharray:10 7}.canonical{fill:#f5f3ff;stroke:#7c3aed;stroke-width:2.5}.external{fill:#f8fafc;stroke:#64748b;stroke-width:2.2}.legacy{fill:#fff7ed;stroke:#ea580c;stroke-width:2.5}.group{fill:#ffffff;stroke:#cbd5e1;stroke-width:2}.arrow{stroke:#334155;stroke-width:2.2;fill:none;marker-end:url(#arrow)}.dasharrow{stroke:#2563eb;stroke-width:2.2;stroke-dasharray:8 6;fill:none;marker-end:url(#arrow)}.read{stroke:#7c3aed;stroke-width:2;stroke-dasharray:6 5;fill:none;marker-end:url(#arrow)}
+    </style>
+  </defs>
+  <rect width="1800" height="1220" fill="#f8fafc"/>
+  <text x="60" y="58" class="title">向阳经营系统 v0.2.0 — 系统架构</text>
+  <text x="60" y="88" class="subtitle">Sunward Operating System · ArcheOS 重构工程 · M2 Target Architecture · 2026-08-11</text>
+
+  <rect x="1135" y="25" width="600" height="92" rx="14" class="group"/>
+  <line x1="1160" y1="53" x2="1205" y2="53" stroke="#059669" stroke-width="3"/><text x="1218" y="59" class="xs">已实现</text>
+  <line x1="1300" y1="53" x2="1345" y2="53" stroke="#2563eb" stroke-width="3"/><text x="1358" y="59" class="xs">正在实现</text>
+  <line x1="1452" y1="53" x2="1497" y2="53" stroke="#2563eb" stroke-width="3" stroke-dasharray="8 6"/><text x="1510" y="59" class="xs">已规划</text>
+  <line x1="1600" y1="53" x2="1645" y2="53" stroke="#ea580c" stroke-width="3"/><text x="1658" y="59" class="xs">迁移来源</text>
+  <line x1="1160" y1="83" x2="1205" y2="83" stroke="#7c3aed" stroke-width="3"/><text x="1218" y="89" class="xs">长期权威数据 / 持久化</text>
+
+  <!-- Consumers -->
+  <rect x="60" y="145" width="1680" height="150" rx="18" class="group"/>
+  <text x="88" y="180" class="h">A. 人类体验与 Agent 消费层</text>
+  <rect x="100" y="205" width="310" height="62" rx="13" class="external"/>
+  <text x="158" y="231" class="t">ChatGPT / Codex / Hermes</text><text x="166" y="253" class="s">外部 Agent / 开发与协作入口</text>
+  <rect x="450" y="205" width="300" height="62" rx="13" class="planned"/>
+  <text x="526" y="231" class="t">Domain Agents</text><text x="501" y="253" class="s">Sales / Brand / Project · M3</text>
+  <rect x="790" y="205" width="300" height="62" rx="13" class="planned"/>
+  <text x="858" y="231" class="t">业务对话 / Copilot</text><text x="839" y="253" class="s">面向人类只使用业务语言</text>
+  <rect x="1130" y="205" width="300" height="62" rx="13" class="planned"/>
+  <text x="1208" y="231" class="t">Human Views</text><text x="1177" y="253" class="s">Object Profile / 向阳生长树</text>
+  <rect x="1470" y="205" width="230" height="62" rx="13" class="planned"/>
+  <text x="1520" y="231" class="t">Decision / Action</text><text x="1517" y="253" class="s">M4 闭环入口</text>
+
+  <!-- Context/read -->
+  <rect x="60" y="330" width="1680" height="165" rx="18" class="group"/>
+  <text x="88" y="366" class="h">B. Context / Read Layer</text>
+  <rect x="110" y="392" width="520" height="75" rx="14" class="planned"/>
+  <text x="240" y="420" class="h">Context Builder</text>
+  <text x="164" y="446" class="s">统一组装 bounded / traceable context；Object-scoped v1 是第一种 scope（Issue #11）</text>
+  <rect x="680" y="392" width="340" height="75" rx="14" class="implemented"/>
+  <text x="778" y="420" class="t">Object Resolver</text><text x="727" y="446" class="s">stable ID → 当前 Name / Role / Lifecycle</text>
+  <rect x="1070" y="392" width="300" height="75" rx="14" class="planned"/>
+  <text x="1156" y="420" class="t">Projection / View Model</text><text x="1133" y="446" class="s">同一 Core 的不同人类观察视角</text>
+  <rect x="1420" y="392" width="270" height="75" rx="14" class="planned"/>
+  <text x="1495" y="420" class="t">Search / Query Scope</text><text x="1462" y="446" class="s">未来扩展，不另造 Context 概念</text>
+
+  <!-- Governance -->
+  <rect x="60" y="530" width="1680" height="235" rx="18" class="group"/>
+  <text x="88" y="566" class="h">C. Information Digestion &amp; Governance</text>
+  <rect x="105" y="595" width="310" height="125" rx="15" class="planned"/>
+  <text x="165" y="627" class="h">Interpretation</text><text x="138" y="657" class="s">Atomic Information → Object 匹配</text><text x="138" y="681" class="s">补充 / 更新 / 冲突 / 歧义</text><text x="138" y="705" class="s">模型只提出结构化解释，不直接写数据</text>
+  <rect x="455" y="595" width="310" height="125" rx="15" class="planned"/>
+  <text x="522" y="627" class="h">Governance Decision</text><text x="485" y="657" class="s">清楚、无冲突、低风险 → 自动</text><text x="485" y="681" class="s">新建 / 删除 / 冲突 / 不确定 → 人</text><text x="485" y="705" class="s">规则权威：INFORMATION_GOVERNANCE</text>
+  <rect x="805" y="595" width="310" height="125" rx="15" class="planned"/>
+  <text x="870" y="627" class="h">Human Judgment</text><text x="845" y="657" class="s">approve / reject / defer</text><text x="845" y="681" class="s">解释发现、依据、选择与业务后果</text><text x="845" y="705" class="s">不暴露 schema / mutation / DB 术语</text>
+  <rect x="1155" y="595" width="280" height="125" rx="15" class="planned"/>
+  <text x="1207" y="627" class="h">Change Service</text><text x="1190" y="657" class="s">重新读取当前状态并校验</text><text x="1190" y="681" class="s">受治理地调用 World Model primitives</text><text x="1190" y="705" class="s">历史不覆盖</text>
+  <rect x="1475" y="595" width="220" height="125" rx="15" class="planned"/>
+  <text x="1520" y="627" class="h">Change Journal</text><text x="1505" y="657" class="s">auto / human</text><text x="1505" y="681" class="s">依据 / 结果 / 幂等</text><text x="1505" y="705" class="s">append-only audit</text>
+
+  <!-- Canonical data -->
+  <rect x="60" y="800" width="1680" height="250" rx="18" class="group"/>
+  <text x="88" y="836" class="h">D. 长期 Information + Structured World Model</text>
+  <rect x="105" y="865" width="450" height="145" rx="16" class="progress"/>
+  <text x="150" y="899" class="h">Atomic Information（M2-B1）</text>
+  <text x="150" y="931" class="t">Atomic Information Revision</text><text x="150" y="958" class="s">statement / semantic type / concerns / confidence</text><text x="150" y="982" class="s">Evidence refs / related Object IDs / history</text>
+  <rect x="600" y="865" width="600" height="145" rx="16" class="implemented"/>
+  <text x="650" y="899" class="h">Structured World Model（M2-A）</text>
+  <text x="650" y="932" class="t">Object + Name + Role + Lifecycle</text><text x="650" y="960" class="t">Object ── Relationship ── Object</text><text x="650" y="988" class="s">稳定 object_id；Name / Role / Lifecycle / Relationship 保留历史</text>
+  <rect x="1245" y="865" width="450" height="145" rx="16" class="implemented"/>
+  <text x="1292" y="899" class="h">Source / Processing / Evidence</text>
+  <text x="1290" y="931" class="t">01_inbox → 02_processing</text><text x="1290" y="958" class="s">Transcript / Summary / Candidate / Residue</text><text x="1290" y="982" class="s">source → segment → speaker → time → excerpt</text>
+
+  <!-- Persistence and migration -->
+  <rect x="60" y="1085" width="1680" height="100" rx="18" class="group"/>
+  <text x="88" y="1118" class="h">E. Persistence Adapters &amp; Migration Boundary</text>
+  <rect x="110" y="1133" width="360" height="36" rx="10" class="canonical"/><text x="178" y="1157" class="s">JSONL · Atomic Information Store（B1）</text>
+  <rect x="510" y="1133" width="330" height="36" rx="10" class="canonical"/><text x="579" y="1157" class="s">SQLite · World Model Repository</text>
+  <rect x="880" y="1133" width="270" height="36" rx="10" class="planned"/><text x="929" y="1157" class="s">Future DB Adapters</text>
+  <rect x="1190" y="1133" width="500" height="36" rx="10" class="legacy"/><text x="1270" y="1157" class="s">Tolaria / 旧向阳经营系统 → Migration Adapter（B3 后）</text>
+
+  <!-- Arrows -->
+  <path d="M940 267 L940 392" class="dasharrow"/>
+  <path d="M260 267 C260 320 370 335 370 392" class="dasharrow"/>
+  <path d="M1280 392 L1280 300" class="dasharrow"/>
+  <path d="M370 467 L370 830 L330 865" class="read"/>
+  <path d="M850 467 L850 865" class="read"/>
+  <path d="M370 865 L370 720 L260 720" class="dasharrow"/>
+  <path d="M415 658 L455 658" class="dasharrow"/>
+  <path d="M765 658 L805 658" class="dasharrow"/>
+  <path d="M765 690 C930 770 1130 760 1270 720" class="dasharrow"/>
+  <path d="M1115 658 L1155 658" class="dasharrow"/>
+  <path d="M1435 658 L1475 658" class="dasharrow"/>
+  <path d="M1295 720 L990 865" class="dasharrow"/>
+  <path d="M1510 865 C1510 820 580 820 330 865" class="dasharrow"/>
+  <path d="M330 1010 L330 1133" class="arrow"/>
+  <path d="M900 1010 L675 1133" class="arrow"/>
+  <path d="M1440 1133 C1420 1085 1370 1055 1340 1010" class="dasharrow"/>
+
+  <text x="80" y="1208" class="xs">关键不变量：Core Identity ≠ Role ≠ Name ≠ View；Atomic Information ≠ Object；Context Builder 只读并组装上下文；存储 Adapter 不承载业务治理规则。</text>
+</svg>

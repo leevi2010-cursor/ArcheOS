@@ -16,24 +16,24 @@
 
 ---
 
-## 2. Atomic Information → Note
+## 2. Atomic Information Candidate → Atomic Information
 
-符合信息契约的 Atomic Information 可以自动进入长期 Note，不要求逐条人工审核。
+符合信息契约的 Atomic Information Candidate 可以自动进入长期 Atomic Information，不要求逐条人工审核。
 
 要求：
 
 - 保留来源和 Evidence；
 - 保留 context 与 confidence / uncertainty；
 - 重复处理同一信息时应避免无意义重复；
-- Note 后续修订不得静默覆盖历史，应保留版本或等价的可追溯历史。
+- Atomic Information 后续修订不得静默覆盖历史，应保留版本或等价的可追溯历史。
 
 不满足信息契约、Evidence 不完整或处理失败的内容，不应通过人工“确认一下”来掩盖质量问题；应回到 Processing / Residue / failure 边界处理。
 
 ---
 
-## 3. Note 与已有 Object 的消化
+## 3. Atomic Information 与已有 Object 的消化
 
-新 Note 涉及已有 Object 时，系统先判断业务影响：
+新的 Atomic Information 涉及已有 Object 时，系统先判断业务影响：
 
 ### 3.1 补充
 
@@ -82,7 +82,7 @@
 - 新建 Object；
 - 删除 Object；
 - 新旧可信信息发生冲突；
-- 无法确定新 Note 对应哪个已有 Object；
+- 无法确定新的 Atomic Information 对应哪个已有 Object；
 - Relationship 的对象或业务含义不确定；
 - 新增或调整 Role 时，无法清楚说明它与对象当前业务上下文、现有关系的联系；
 - 变更可能使仍需保留的 Object 变成孤立对象；
@@ -112,7 +112,7 @@ ArcheOS 应尽量避免创建没有业务联系的孤立 Object。
 
 删除前检查：
 
-- 是否仍有重要 Note / Evidence /历史依赖这个 Object；
+- 是否仍有重要 Atomic Information / Evidence / 历史依赖这个 Object；
 - 删除后是否会让其他仍需保留的 Object 因失去唯一有效联系而变成孤立对象；
 - 是否需要先建立新的业务关系，或一起处理相关 Object。
 
