@@ -100,25 +100,7 @@ Context artifacts and Residue support this lifecycle but do not create parallel 
 
 ## Core domain model
 
-The canonical model is defined in `docs/architecture/CONCEPTS.md` and currently includes:
-
-- `Object`
-- `Role`
-- `Relationship`
-- `Lifecycle`
-- `Name`
-- `Note`
-- `Atomic Information Candidate`
-- `Evidence`
-- `Residue`
-- `Structured World Model`
-- `Projection`
-- `View`
-- `View Model`
-- `Presentation`
-- `Object Resolver`
-
-Current accepted Roles include `person`, `company`, `brand`, `project`, `business_line`, `event`, `goal`, and `decision`.
+`docs/architecture/CONCEPTS.md` is the sole current authority for canonical concepts and accepted Role vocabulary. Read it on demand; do not copy its current list into this file.
 
 Do not reintroduce Person / Company / Project / BusinessLine / Event / Goal / Decision as mutually exclusive base persistence types.
 
