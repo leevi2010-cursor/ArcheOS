@@ -7,8 +7,9 @@ from dataclasses import asdict
 from pathlib import Path
 
 from .analysis import FileAnalysisProvider
-from .codex_app_server import CodexAnalysisProvider
 from .atomic_information import JsonlAtomicInformationStore, ingest_processing_package
+from .codex_app_server import CodexAnalysisProvider
+from .context import ContextBuilder, ContextRequest
 from .digestion import (
     AtomicInformationDigestionService,
     BusinessLanguageHumanJudgmentPort,
@@ -168,6 +169,31 @@ def build_parser() -> argparse.ArgumentParser:
     )
     decide.add_argument("proposal_id")
     decide.add_argument("decision", choices=("approve", "reject", "defer"))
+
+    context = subparsers.add_parser(
+        "context", help="Build a read-only bounded context for an Object."
+    )
+    context.add_argument(
+        "--database", type=Path, default=DEFAULT_WORLD_MODEL_DATABASE
+    )
+    context.add_argument(
+        "--information-store", type=Path, default=DEFAULT_ATOMIC_INFORMATION_STORE
+    )
+    context.add_argument(
+        "--proposal-store", type=Path, default=DEFAULT_CHANGE_PROPOSAL_STORE
+    )
+    context.add_argument("--journal", type=Path, default=DEFAULT_CHANGE_JOURNAL)
+    context_commands = context.add_subparsers(dest="context_command", required=True)
+    context_build = context_commands.add_parser(
+        "build", help="Build a bounded Context Bundle."
+    )
+    context_build.add_argument("--scope", required=True, choices=("object",))
+    context_build.add_argument("object_id")
+    context_build.add_argument("--max-relationships", type=int, default=50)
+    context_build.add_argument("--max-information", type=int, default=50)
+    context_build.add_argument("--max-changes", type=int, default=50)
+    context_build.add_argument("--max-pending", type=int, default=20)
+    context_build.add_argument("--max-evidence", type=int, default=5)
     return parser
 
 
@@ -302,6 +328,35 @@ def _digest_command(args: argparse.Namespace) -> int:
     return 0
 
 
+def _context_command(args: argparse.Namespace) -> int:
+    if args.context_command != "build":  # pragma: no cover - argparse enforces this
+        return 2
+    try:
+        with SQLiteWorldModelRepository(args.database) as repository:
+            bundle = ContextBuilder(
+                repository,
+                ObjectResolver(repository),
+                JsonlAtomicInformationStore(args.information_store),
+                JsonlChangeJournal(args.journal),
+                JsonlChangeProposalStore(args.proposal_store),
+            ).build(
+                ContextRequest(
+                    scope=args.scope,
+                    object_id=args.object_id,
+                    max_relationships=args.max_relationships,
+                    max_atomic_information=args.max_information,
+                    max_changes=args.max_changes,
+                    max_pending_judgments=args.max_pending,
+                    max_evidence_per_information=args.max_evidence,
+                )
+            )
+    except (OSError, RuntimeError, sqlite3.Error, TypeError, ValueError) as exc:
+        print(f"error: {exc}")
+        return 1
+    print(json.dumps(asdict(bundle), ensure_ascii=False, indent=2))
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     if args.command == "process":
@@ -312,4 +367,6 @@ def main(argv: list[str] | None = None) -> int:
         return _information_command(args)
     if args.command == "digest":
         return _digest_command(args)
+    if args.command == "context":
+        return _context_command(args)
     return 2  # pragma: no cover - argparse enforces this

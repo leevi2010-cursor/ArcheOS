@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-import json
 import hashlib
+import json
 import tempfile
 import unittest
 from contextlib import redirect_stdout
@@ -9,14 +9,14 @@ from io import StringIO
 from pathlib import Path
 from unittest.mock import Mock, patch
 
-from archeos.cli import main
-from archeos.codex_app_server import CodexAnalysisProvider
 from archeos.atomic_information import (
     AtomicInformationRevision,
     EvidenceRecord,
     IngestionResult,
     JsonlAtomicInformationStore,
 )
+from archeos.cli import main
+from archeos.codex_app_server import CodexAnalysisProvider
 from archeos.pyannote_speakers import PyannoteSpeakerProvider
 from archeos.world_model import SQLiteWorldModelRepository
 
@@ -247,6 +247,40 @@ class CliTest(unittest.TestCase):
                 )
             self.assertFalse(proposal_path.exists())
             self.assertTrue(journal_path.exists())
+
+    def test_context_build_cli_smoke(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            database = root / "world.sqlite3"
+            information = root / "information.jsonl"
+            proposals = root / "proposals.jsonl"
+            journal = root / "journal.jsonl"
+            with SQLiteWorldModelRepository(database) as repository:
+                record = repository.create_object("CLI Context Target")
+            output = StringIO()
+            with redirect_stdout(output):
+                result = main([
+                    "context", "--database", str(database),
+                    "--information-store", str(information),
+                    "--proposal-store", str(proposals), "--journal", str(journal),
+                    "build", "--scope", "object", record.object_id,
+                ])
+            payload = json.loads(output.getvalue())
+            self.assertEqual(result, 0)
+            self.assertEqual(payload["root"]["object_id"], record.object_id)
+            self.assertEqual(payload["metadata"]["complete"], True)
+
+    def test_context_build_cli_invalid_root_returns_error(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            database = Path(temp) / "world.sqlite3"
+            output = StringIO()
+            with redirect_stdout(output):
+                result = main([
+                    "context", "--database", str(database), "build",
+                    "--scope", "object", "missing",
+                ])
+            self.assertEqual(result, 1)
+            self.assertIn("error:", output.getvalue())
 
 
 if __name__ == "__main__":

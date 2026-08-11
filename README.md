@@ -221,6 +221,16 @@ python3 -m archeos digest decide <proposal_id> approve
 
 默认解释器通过官方 Codex SDK 使用 read-only、deny-all、ephemeral structured-output runtime。开发、测试和可重复诊断可用 `digest information ... --interpretation-file <path>` 提供结构化解释；该路径不需要网络。默认本地记录位于 Git 忽略的 `03_information/change_proposals.jsonl` 与 `03_information/change_journal.jsonl`，World Model 仍使用 `04_core/archeos.sqlite3`。
 
+## M2-B3 统一 Context Builder
+
+Context Builder 只读地组合一个 Object 的当前 World Model、直接 Relationship、已绑定的当前 Atomic Information、已应用变更和未决（`pending` / `deferred`）Proposal；不会调用模型、访问网络、写入任何 store，也不会递归展开 Relationship。默认边界由 `ContextRequest` 校验，超出边界时在 metadata 中报告覆盖范围和原因。
+
+```bash
+python3 -m archeos context build --scope object <object_id>
+```
+
+可用 `--max-relationships`、`--max-information`、`--max-changes`、`--max-pending` 和 `--max-evidence` 调整正整数上限。输出为 JSON Context Bundle；未知 Object、存储损坏或不满足 resolver 不变量时命令以非零状态失败，不输出部分上下文。
+
 运行自动化测试：
 
 ```bash
