@@ -209,9 +209,9 @@ relationship 与 lifecycle 的基础操作由 repository contract 提供，并�
 
 M2-B2 以显式命令把 durable Atomic Information / optional Claim 解释为对现有 World Model 的受治理变更。Claim enrichment 作为同一 `atomic_information_id` 的新 revision 保存，可保留已解析或尚未解析的 claimant、`assert / deny / uncertain` stance 与归因置信度；旧 B1 记录缺少 Claim 时继续读取为 `claim=None`。确定性名称匹配只使用当前或历史 Name，并只做空格和大小写归一化；唯一精确匹配可以绑定稳定 Object ID，歧义不会猜测，无匹配不会自动新建 Object。
 
-安全、明确且证据充分的既有 Object 更新可以自动执行。Relationship 只接受 `part_of / member_of / responsible_for / depends_on / related_to`，并保留方向。新建、删除、Claim 冲突、歧义、关系不确定及 Role/Relationship 重解释会生成轻量 Change Proposal，等待人类批准、拒绝或稍后决定。所有实际变更进入 append-only Change Journal；Atomic Information、Claim、Evidence 与 World Model 历史均保留。Atomic Information extraction confidence 和 Claim attribution confidence 不会被复制为 World Model truth confidence。
+安全、明确且证据充分的既有 Object 更新可以自动执行。Relationship 只接受 `part_of / member_of / responsible_for / depends_on / related_to`，并保留方向。新建、删除、Claim 冲突、歧义、关系不确定及 Role/Relationship 重解释会生成轻量 Change Proposal，等待人类批准、拒绝或稍后决定；`deferred` 仍属于未决状态，之后可以批准或拒绝。provider 上下文保持最多 20 条，但 Claim 冲突的自动执行安全门会扫描全部相关 current Atomic Information。已有 Claim 的人工修订以同一 Atomic Information 的新 revision 保存，不会出现只改 Proposal 状态的无效果批准。所有实际变更进入 append-only Change Journal；Atomic Information、Claim、Evidence 与 World Model 历史均保留。Atomic Information extraction confidence 和 Claim attribution confidence 不会被复制为 World Model truth confidence。
 
-批准前会同时检查 World Model before-state 与 Atomic Information revision。SQLite transaction 内的 apply receipt 会记录已经真正提交的结构变更；若后续 Atomic Information binding、Change Journal 或 Proposal JSONL 写入失败，重试只补齐缺失记录，不会重复创建、删除或结束结构。B2 不会自动跟在 B1 ingestion 后运行。
+批准前会同时检查 World Model before-state 与 Atomic Information revision。SQLite transaction 内的 apply receipt 会记录已经真正提交的结构变更；自动重试会在再次调用 interpretation provider 前扫描并补齐旧 receipt，人工批准一旦已有 receipt 就不能再改成拒绝或稍后决定。若后续 Atomic Information binding、Change Journal 或 Proposal JSONL 写入失败，重试只补齐缺失记录，不会重复创建、删除或结束结构。B2 不会自动跟在 B1 ingestion 后运行。
 
 ```bash
 python3 -m archeos digest information <atomic_information_id>

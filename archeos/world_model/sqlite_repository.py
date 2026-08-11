@@ -261,6 +261,15 @@ class SQLiteWorldModelRepository:
             return None
         return ApplyReceiptRecord(row["apply_id"], row["payload"], row["created_at"])
 
+    def list_apply_receipts(self) -> tuple[ApplyReceiptRecord, ...]:
+        rows = self._connection.execute(
+            "SELECT * FROM apply_receipts ORDER BY rowid"
+        ).fetchall()
+        return tuple(
+            ApplyReceiptRecord(row["apply_id"], row["payload"], row["created_at"])
+            for row in rows
+        )
+
     def put_apply_receipt(self, apply_id: str, payload: str) -> ApplyReceiptRecord:
         clean_apply_id = _non_empty(apply_id, "apply_id")
         clean_payload = _non_empty(payload, "payload")

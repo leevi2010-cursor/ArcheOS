@@ -202,8 +202,8 @@ class FailOnceProposalStore:
     def get(self, proposal_id):
         return self.inner.get(proposal_id)
 
-    def list_pending(self):
-        return self.inner.list_pending()
+    def list_unresolved(self):
+        return self.inner.list_unresolved()
 
     def update(self, proposal):
         if self.failures_remaining:
@@ -371,6 +371,132 @@ class DigestionTest(unittest.TestCase):
             first.atomic_information_id,
         )
 
+    def test_claim_conflict_outside_provider_window_still_blocks_auto_change(
+        self,
+    ) -> None:
+        target = self.repository.create_object("Bounded Claim Target")
+        statement = "The bounded decision is approved."
+        oldest = replace(
+            atomic_information("atomic-related-00", "Bounded Claim Target"),
+            statement=statement,
+            related_object_ids=(target.object_id,),
+            claim=claim("atomic-related-00", stance="assert"),
+            created_at="2026-08-11T00:00:00+00:00",
+        )
+        self.atomic_store.ingest_batch((oldest,))
+        for index in range(1, 21):
+            item = replace(
+                atomic_information(
+                    f"atomic-related-{index:02d}", "Bounded Claim Target"
+                ),
+                related_object_ids=(target.object_id,),
+                created_at=f"2026-08-11T00:{index:02d}:00+00:00",
+            )
+            self.atomic_store.ingest_batch((item,))
+        current = replace(
+            atomic_information("atomic-related-current", "Bounded Claim Target"),
+            statement=statement,
+            created_at="2026-08-11T00:21:00+00:00",
+        )
+        self.atomic_store.ingest_batch((current,))
+        service = self.service(
+            interpretation(
+                WorldModelOperation(
+                    kind="add_role",
+                    target_object_id=target.object_id,
+                    role="project",
+                ),
+                claim=claim("atomic-related-current", stance="deny"),
+            )
+        )
+
+        result = service.digest(current.atomic_information_id)
+
+        bounded = service.interpretation_provider.world_states[0]
+        self.assertEqual(len(bounded.related_atomic_information), 20)
+        self.assertNotIn(
+            oldest.atomic_information_id,
+            {item.atomic_information_id for item in bounded.related_atomic_information},
+        )
+        self.assertEqual(result.status, "pending")
+        self.assertEqual(self.repository.list_roles(target.object_id), ())
+        proposal = self.proposals.get(result.proposal_id)
+        self.assertIn("Speaker_1主张", proposal.claim_summary)
+        self.assertIn("Speaker_1否认", proposal.claim_summary)
+
+    def test_existing_claim_correction_is_applied_as_new_approved_revision(
+        self,
+    ) -> None:
+        initial = replace(
+            atomic_information("atomic-claim-correction", "Claim Correction"),
+            claim=claim("atomic-claim-correction", stance="assert"),
+        )
+        self.atomic_store.ingest_batch((initial,))
+        proposed_claim = claim("atomic-claim-correction", stance="deny")
+        service = self.service(
+            interpretation(
+                WorldModelOperation(kind="no_structural_change"),
+                claim=proposed_claim,
+            )
+        )
+        pending = service.digest(initial.atomic_information_id)
+
+        self.assertEqual(
+            self.atomic_store.get_current(initial.atomic_information_id).claim.stance,
+            "assert",
+        )
+        proposal = self.proposals.get(pending.proposal_id)
+        self.assertEqual(proposal.proposed_claim, proposed_claim)
+        self.assertIn("建议修订归因", proposal.claim_summary)
+
+        approved = service.decide(pending.proposal_id, "approve")
+        repeated = service.decide(pending.proposal_id, "approve")
+        history = self.atomic_store.list_revisions(initial.atomic_information_id)
+
+        self.assertEqual(approved.status, "approved")
+        self.assertEqual(repeated.status, "approved")
+        self.assertEqual(len(history), 2)
+        self.assertEqual(history[0].claim.stance, "assert")
+        self.assertEqual(history[1].claim.stance, "deny")
+        self.assertEqual(history[1].revision_reason, "human_approved_claim_correction")
+
+    def test_applied_claim_correction_cannot_be_rejected_after_status_failure(
+        self,
+    ) -> None:
+        initial = replace(
+            atomic_information("atomic-claim-status-crash", "Claim Status Crash"),
+            claim=claim("atomic-claim-status-crash", stance="assert"),
+        )
+        self.atomic_store.ingest_batch((initial,))
+        result = interpretation(
+            WorldModelOperation(kind="no_structural_change"),
+            claim=claim("atomic-claim-status-crash", stance="deny"),
+        )
+        pending = self.service(result).digest(initial.atomic_information_id)
+        inner_proposals = self.proposals
+        self.proposals = FailOnceProposalStore(inner_proposals)
+        service = self.service(result)
+
+        with self.assertRaisesRegex(OSError, "proposal write failure"):
+            service.decide(pending.proposal_id, "approve")
+        self.assertEqual(
+            self.atomic_store.get_current(initial.atomic_information_id).claim.stance,
+            "deny",
+        )
+        self.assertEqual(inner_proposals.get(pending.proposal_id).status, "pending")
+
+        with self.assertRaisesRegex(ValueError, "Claim correction"):
+            service.decide(pending.proposal_id, "reject")
+        with self.assertRaisesRegex(ValueError, "Claim correction"):
+            service.decide(pending.proposal_id, "defer")
+
+        recovered = service.decide(pending.proposal_id, "approve")
+
+        self.assertEqual(recovered.status, "approved")
+        self.assertEqual(
+            len(self.atomic_store.list_revisions(initial.atomic_information_id)), 2
+        )
+
     def test_unique_current_and_historical_names_bind_stable_object(self) -> None:
         record = self.repository.create_object("Synthetic Operations")
         self.ingest("atomic-current", "  SYNTHETIC   operations ")
@@ -406,7 +532,7 @@ class DigestionTest(unittest.TestCase):
 
         self.assertEqual(result.status, "pending")
         self.assertEqual(result.atomic_information.related_object_ids, ())
-        self.assertEqual(len(self.proposals.list_pending()), 1)
+        self.assertEqual(len(self.proposals.list_unresolved()), 1)
         self.assertEqual(
             {item.object_id for item in self.repository.list_objects()},
             {first.object_id, second.object_id},
@@ -488,7 +614,7 @@ class DigestionTest(unittest.TestCase):
         self.assertEqual(result.status, "automatic")
         self.assertEqual(role.source_atomic_information_id, "atomic-role")
         self.assertIsNone(role.confidence)
-        self.assertEqual(self.proposals.list_pending(), ())
+        self.assertEqual(self.proposals.list_unresolved(), ())
 
     def test_unapproved_role_is_never_written(self) -> None:
         record = self.repository.create_object("Unsupported Role")
@@ -675,7 +801,7 @@ class DigestionTest(unittest.TestCase):
         self.assertEqual(second.status, "already_processed")
         self.assertEqual(len(self.repository.list_roles(record.object_id)), 1)
         self.assertEqual(len(self.journal.list_changes()), journal_count)
-        self.assertEqual(self.proposals.list_pending(), ())
+        self.assertEqual(self.proposals.list_unresolved(), ())
 
     def test_conflict_creates_pending_without_changing_old_state(self) -> None:
         record = self.repository.create_object("Conflict Target", roles=("project",))
@@ -743,6 +869,41 @@ class DigestionTest(unittest.TestCase):
                 self.atomic_store.list_revisions(identifier), initial_history
             )
         self.assertEqual(self.repository.list_objects(), before_objects)
+
+    def test_deferred_proposal_remains_unresolved_then_can_be_decided(self) -> None:
+        for suffix, final_decision, expected_status in (
+            ("approve", "approve", "approved"),
+            ("reject", "reject", "rejected"),
+        ):
+            identifier = f"atomic-deferred-{suffix}"
+            self.ingest(identifier, f"Deferred {suffix}")
+            service = self.service(
+                interpretation(
+                    WorldModelOperation(
+                        kind="new_object",
+                        name=f"Deferred {suffix}",
+                        role="project",
+                    )
+                )
+            )
+            pending = service.digest(identifier)
+
+            deferred = service.decide(pending.proposal_id, "defer")
+
+            self.assertEqual(deferred.status, "deferred")
+            self.assertIsNone(self.proposals.get(pending.proposal_id).decided_at)
+            self.assertIn(
+                pending.proposal_id,
+                {item.proposal_id for item in service.list_pending()},
+            )
+
+            decided = service.decide(pending.proposal_id, final_decision)
+
+            self.assertEqual(decided.status, expected_status)
+            self.assertNotIn(
+                pending.proposal_id,
+                {item.proposal_id for item in service.list_pending()},
+            )
 
     def test_human_review_uses_business_language_without_raw_jargon(self) -> None:
         self.ingest("atomic-language", "Independent Item")
@@ -867,6 +1028,48 @@ class DigestionTest(unittest.TestCase):
             self.atomic_store.get_current("atomic-crash-journal").related_object_ids,
         )
 
+    def test_automatic_receipt_recovers_before_changed_provider_output(self) -> None:
+        record = self.repository.create_object("Automatic Crash Target")
+        initial = replace(
+            atomic_information("atomic-auto-crash", "Automatic Crash Target"),
+            related_object_ids=(record.object_id,),
+        )
+        self.atomic_store.ingest_batch((initial,))
+        inner_journal = self.journal
+        self.journal = FailOnceChangeJournal(inner_journal)
+        first_service = self.service(
+            interpretation(
+                WorldModelOperation(
+                    kind="add_role",
+                    target_object_id=record.object_id,
+                    role="project",
+                )
+            )
+        )
+
+        with self.assertRaisesRegex(OSError, "journal write failure"):
+            first_service.digest("atomic-auto-crash")
+        self.assertEqual(
+            len(self.repository.list_roles(record.object_id, active_only=True)), 1
+        )
+        self.assertEqual(inner_journal.list_changes(), ())
+
+        self.repository.close()
+        self.repository = SQLiteWorldModelRepository(self.root / "world.sqlite3")
+        self.journal = inner_journal
+        second_service = self.service(
+            interpretation(WorldModelOperation(kind="no_structural_change"))
+        )
+
+        recovered = second_service.digest("atomic-auto-crash")
+
+        self.assertEqual(recovered.status, "automatic")
+        self.assertEqual(second_service.interpretation_provider.calls, 1)
+        self.assertEqual(len(inner_journal.list_changes()), 1)
+        self.assertEqual(
+            len(self.repository.list_roles(record.object_id, active_only=True)), 1
+        )
+
     def test_apply_receipt_recovers_after_proposal_write_failure(self) -> None:
         record = self.repository.create_object(
             "Crash Proposal Target", roles=("project",)
@@ -890,6 +1093,12 @@ class DigestionTest(unittest.TestCase):
         self.assertEqual(
             self.repository.list_roles(record.object_id, active_only=True), ()
         )
+        self.assertEqual(inner_proposals.get(pending.proposal_id).status, "pending")
+
+        with self.assertRaisesRegex(ValueError, "already committed"):
+            service.decide(pending.proposal_id, "reject")
+        with self.assertRaisesRegex(ValueError, "already committed"):
+            service.decide(pending.proposal_id, "defer")
         self.assertEqual(inner_proposals.get(pending.proposal_id).status, "pending")
 
         recovered = service.decide(pending.proposal_id, "approve")
@@ -978,7 +1187,7 @@ class DigestionTest(unittest.TestCase):
             self.service(RuntimeError("synthetic runtime unavailable")).digest(
                 "atomic-runtime"
             )
-        self.assertEqual(self.proposals.list_pending(), ())
+        self.assertEqual(self.proposals.list_unresolved(), ())
         self.assertEqual(self.journal.list_changes(), ())
         self.assertEqual(len(self.atomic_store.list_revisions("atomic-runtime")), 1)
 

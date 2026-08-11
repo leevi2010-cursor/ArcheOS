@@ -83,6 +83,7 @@ class ChangeProposal:
     created_at: str
     decided_at: str | None
     claim_summary: str | None = None
+    proposed_claim: ClaimAttribution | None = None
 
 
 @dataclass(frozen=True)

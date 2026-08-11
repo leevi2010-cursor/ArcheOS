@@ -1,5 +1,10 @@
 from __future__ import annotations
 
+from ..atomic_information.models import (
+    claim_from_dict,
+    claim_to_dict,
+    validate_claim_attribution,
+)
 from .models import (
     OPERATION_KINDS,
     PROPOSAL_STATUSES,
@@ -129,6 +134,11 @@ def proposal_to_dict(proposal: ChangeProposal) -> dict[str, object]:
         "rationale": proposal.rationale,
         "supporting_evidence_refs": list(proposal.supporting_evidence_refs),
         "claim_summary": proposal.claim_summary,
+        "proposed_claim": (
+            None
+            if proposal.proposed_claim is None
+            else claim_to_dict(proposal.proposed_claim)
+        ),
         "before_state_fingerprint": proposal.before_state_fingerprint,
         "interpretation_fingerprint": proposal.interpretation_fingerprint,
         "human_review": {
@@ -162,7 +172,8 @@ def proposal_from_dict(value: object, field: str = "proposal") -> ChangeProposal
         "created_at",
         "decided_at",
     }
-    if set(value) not in {frozenset(expected), frozenset((*expected, "claim_summary"))}:
+    optional = {"claim_summary", "proposed_claim"}
+    if not set(value).issubset(expected | optional) or not expected.issubset(value):
         raise ValueError(f"{field} does not match the Change Proposal schema")
     raw_operations = value["proposed_operations"]
     if not isinstance(raw_operations, list) or not raw_operations:
@@ -226,6 +237,11 @@ def proposal_from_dict(value: object, field: str = "proposal") -> ChangeProposal
         claim_summary=_optional_text(
             value.get("claim_summary"), f"{field}.claim_summary"
         ),
+        proposed_claim=(
+            None
+            if value.get("proposed_claim") is None
+            else claim_from_dict(value["proposed_claim"], f"{field}.proposed_claim")
+        ),
     )
     validate_proposal(proposal, field)
     return proposal
@@ -251,6 +267,8 @@ def validate_proposal(proposal: ChangeProposal, field: str = "proposal") -> None
     for index, operation in enumerate(proposal.proposed_operations, start=1):
         validate_operation(operation, f"{field}.proposed_operations[{index}]")
     _optional_text(proposal.claim_summary, f"{field}.claim_summary")
+    if proposal.proposed_claim is not None:
+        validate_claim_attribution(proposal.proposed_claim, f"{field}.proposed_claim")
 
 
 def journal_to_dict(record: ChangeJournalRecord) -> dict[str, object]:

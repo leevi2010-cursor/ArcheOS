@@ -81,15 +81,17 @@ class AtomicInformationDigestionService:
     def digest(self, atomic_information_id: str) -> DigestionResult:
         if self.interpretation_provider is None:
             raise RuntimeError("an interpretation provider is required for digestion")
+        recovered_change_ids = self._recover_automatic_receipts(atomic_information_id)
         atomic_information = self.atomic_information_store.get_current(
             atomic_information_id
         )
         resolved_ids, unmatched, ambiguous = self._match_concerns(
             atomic_information.raw_concerns
         )
-        related_information = self._related_information(
+        all_related_information = self._all_related_information(
             resolved_ids, atomic_information.atomic_information_id
         )
+        related_information = all_related_information[:MAX_RELATED_INFORMATION]
         world_state = DigestionWorldState(
             resolved_objects=tuple(
                 self.resolver.resolve(object_id) for object_id in resolved_ids
@@ -120,9 +122,10 @@ class AtomicInformationDigestionService:
                 interpretation_fingerprint,
             )
         )
-        claim_conflict = claim_update_conflict or self._has_claim_conflict(
-            atomic_information, related_information
+        conflicting_information = self._claim_conflicts(
+            atomic_information, all_related_information
         )
+        claim_conflict = claim_update_conflict or bool(conflicting_information)
         before_state_fingerprint = self._before_state_fingerprint(
             self._relevant_existing_ids(resolved_ids, interpretation.operations)
         )
@@ -140,13 +143,17 @@ class AtomicInformationDigestionService:
                 interpretation_fingerprint,
                 resolved_ids,
                 before_state_fingerprint,
-                related_information,
+                (
+                    conflicting_information
+                    if conflicting_information
+                    else related_information
+                ),
                 claim_conflict,
             )
             return DigestionResult(
                 atomic_information=atomic_information,
                 status=proposal.status,
-                change_ids=binding_change_ids,
+                change_ids=(*recovered_change_ids, *binding_change_ids),
                 proposal_id=proposal.proposal_id,
             )
 
@@ -164,20 +171,28 @@ class AtomicInformationDigestionService:
             atomic_information=atomic_information,
             status=(
                 "automatic"
-                if information_changed or binding_change_ids or operation_change_ids
+                if recovered_change_ids
+                or information_changed
+                or binding_change_ids
+                or operation_change_ids
                 else "already_processed"
             ),
-            change_ids=(*binding_change_ids, *operation_change_ids),
+            change_ids=(
+                *recovered_change_ids,
+                *binding_change_ids,
+                *operation_change_ids,
+            ),
             proposal_id=None,
         )
 
     def list_pending(self) -> tuple[ChangeProposal, ...]:
-        return self.proposal_store.list_pending()
+        """Return every unresolved proposal, including deferred proposals."""
+        return self.proposal_store.list_unresolved()
 
     def render_pending(self) -> tuple[str, ...]:
         return tuple(
             self.human_judgment.render(proposal)
-            for proposal in self.proposal_store.list_pending()
+            for proposal in self.proposal_store.list_unresolved()
         )
 
     def decide(self, proposal_id: str, decision: str) -> DigestionResult:
@@ -191,7 +206,28 @@ class AtomicInformationDigestionService:
         current_information = self.atomic_information_store.get_current(
             proposal.atomic_information_id
         )
-        if proposal.status != "pending":
+        apply_id = self._apply_identity(
+            proposal.atomic_information_revision_id,
+            proposal.interpretation_fingerprint,
+            "human_approved",
+            proposal.proposal_id,
+        )
+        receipt = self.world_model_repository.get_apply_receipt(apply_id)
+        claim_correction_applied = self._claim_correction_applied(
+            proposal, current_information
+        )
+
+        if receipt is not None:
+            if normalized != "approve":
+                raise ValueError(
+                    "The approved change was already committed and must be recovered."
+                )
+            if proposal.status == "rejected":
+                raise ValueError(
+                    "Change Proposal state conflicts with its committed approval."
+                )
+
+        if proposal.status in {"approved", "rejected"}:
             if proposal.status != requested_status:
                 raise ValueError("Change Proposal already has a different decision")
             return DigestionResult(
@@ -205,12 +241,24 @@ class AtomicInformationDigestionService:
                 proposal_id=proposal.proposal_id,
             )
 
+        if claim_correction_applied and normalized != "approve":
+            raise ValueError(
+                "The approved Claim correction was already applied and must be recovered."
+            )
+
         if normalized in {"reject", "defer"}:
+            if proposal.status == requested_status:
+                return DigestionResult(
+                    atomic_information=current_information,
+                    status=proposal.status,
+                    change_ids=(),
+                    proposal_id=proposal.proposal_id,
+                )
             decided = self.proposal_store.update(
                 replace(
                     proposal,
                     status=requested_status,
-                    decided_at=self.clock(),
+                    decided_at=None if normalized == "defer" else self.clock(),
                 )
             )
             return DigestionResult(
@@ -220,15 +268,10 @@ class AtomicInformationDigestionService:
                 proposal_id=decided.proposal_id,
             )
 
-        apply_id = self._apply_identity(
-            proposal.atomic_information_revision_id,
-            proposal.interpretation_fingerprint,
-            "human_approved",
-            proposal.proposal_id,
-        )
         if (
             current_information.revision_id != proposal.atomic_information_revision_id
-            and self.world_model_repository.get_apply_receipt(apply_id) is None
+            and receipt is None
+            and not claim_correction_applied
         ):
             raise ValueError(
                 "Atomic Information changed; run digestion and review again."
@@ -245,6 +288,9 @@ class AtomicInformationDigestionService:
         )
         current_information = self.atomic_information_store.get_current(
             proposal.atomic_information_id
+        )
+        current_information = self._apply_claim_correction(
+            proposal, current_information
         )
         self.proposal_store.update(
             replace(proposal, status="approved", decided_at=self.clock())
@@ -287,7 +333,7 @@ class AtomicInformationDigestionService:
                 ambiguous.append(concern)
         return tuple(sorted(resolved)), tuple(unmatched), tuple(ambiguous)
 
-    def _related_information(
+    def _all_related_information(
         self,
         resolved_ids: tuple[str, ...],
         current_atomic_information_id: str,
@@ -306,24 +352,25 @@ class AtomicInformationDigestionService:
                 related,
                 key=lambda item: (item.created_at, item.atomic_information_id),
                 reverse=True,
-            )[:MAX_RELATED_INFORMATION]
+            )
         )
 
     @staticmethod
-    def _has_claim_conflict(
+    def _claim_conflicts(
         atomic_information: AtomicInformationRevision,
         related_information: tuple[AtomicInformationRevision, ...],
-    ) -> bool:
+    ) -> tuple[AtomicInformationRevision, ...]:
         claim = atomic_information.claim
         if claim is None or claim.stance == "uncertain":
-            return False
+            return ()
         opposing = {"assert": "deny", "deny": "assert"}
         statement = _normalize_name(atomic_information.statement)
-        return any(
-            item.claim is not None
+        return tuple(
+            item
+            for item in related_information
+            if item.claim is not None
             and item.claim.stance == opposing[claim.stance]
             and _normalize_name(item.statement) == statement
-            for item in related_information
         )
 
     def _validate_claim_enrichment(
@@ -348,6 +395,48 @@ class AtomicInformationDigestionService:
             raise ValueError(
                 "interpretation.claim.claimant_object_id must be uniquely resolved"
             )
+
+    def _claim_correction_applied(
+        self,
+        proposal: ChangeProposal,
+        current_information: AtomicInformationRevision,
+    ) -> bool:
+        if proposal.proposed_claim is None:
+            return False
+        base_revision = next(
+            (
+                item
+                for item in self.atomic_information_store.list_revisions(
+                    proposal.atomic_information_id
+                )
+                if item.revision_id == proposal.atomic_information_revision_id
+            ),
+            None,
+        )
+        if base_revision is None or base_revision.claim == proposal.proposed_claim:
+            return False
+        return current_information.claim == proposal.proposed_claim
+
+    def _apply_claim_correction(
+        self,
+        proposal: ChangeProposal,
+        current_information: AtomicInformationRevision,
+    ) -> AtomicInformationRevision:
+        proposed_claim = proposal.proposed_claim
+        if proposed_claim is None or current_information.claim == proposed_claim:
+            return current_information
+        corrected = replace(
+            current_information,
+            revision_number=current_information.revision_number + 1,
+            revision_id=(
+                f"{current_information.atomic_information_id}-"
+                f"r{current_information.revision_number + 1:04d}"
+            ),
+            claim=proposed_claim,
+            created_at=self.clock(),
+            revision_reason="human_approved_claim_correction",
+        )
+        return self.atomic_information_store.append_revision(corrected)
 
     def _enrich_and_bind(
         self,
@@ -508,6 +597,21 @@ class AtomicInformationDigestionService:
             for field, value in proposed.items()
         )
 
+    def _recover_automatic_receipts(
+        self, atomic_information_id: str
+    ) -> tuple[str, ...]:
+        recovered: list[str] = []
+        for receipt in self.world_model_repository.list_apply_receipts():
+            records, created_object_ids = self._parse_apply_receipt(receipt.payload)
+            first = records[0]
+            if (
+                first.mode != "automatic"
+                or first.atomic_information_id != atomic_information_id
+            ):
+                continue
+            recovered.extend(self._finalize_apply_receipt(records, created_object_ids))
+        return tuple(dict.fromkeys(recovered))
+
     def _apply_operations(
         self,
         atomic_information: AtomicInformationRevision,
@@ -657,13 +761,23 @@ class AtomicInformationDigestionService:
             not isinstance(item, str) or not item.strip() for item in created_object_ids
         ):
             raise ValueError("apply receipt created Object identities are invalid")
-        return (
-            tuple(
-                journal_from_dict(item, f"apply receipt record[{index}]")
-                for index, item in enumerate(value["records"], start=1)
-            ),
-            tuple(created_object_ids),
+        records = tuple(
+            journal_from_dict(item, f"apply receipt record[{index}]")
+            for index, item in enumerate(value["records"], start=1)
         )
+        if not records:
+            raise ValueError("apply receipt must contain at least one change")
+        first = records[0]
+        if any(
+            item.atomic_information_id != first.atomic_information_id
+            or item.atomic_information_revision_id
+            != first.atomic_information_revision_id
+            or item.mode != first.mode
+            or item.proposal_id != first.proposal_id
+            for item in records[1:]
+        ):
+            raise ValueError("apply receipt records do not share one apply identity")
+        return records, tuple(created_object_ids)
 
     def _finalize_apply_receipt(
         self,
@@ -949,6 +1063,7 @@ class AtomicInformationDigestionService:
             atomic_information,
             related_information,
             include_related=claim_conflict or interpretation.conflict,
+            proposed_claim=interpretation.claim,
         )
         proposal = ChangeProposal(
             proposal_id=proposal_id,
@@ -967,6 +1082,7 @@ class AtomicInformationDigestionService:
             created_at=self.clock(),
             decided_at=None,
             claim_summary=claim_summary,
+            proposed_claim=interpretation.claim,
         )
         return self.proposal_store.add_pending(proposal)
 
@@ -1019,6 +1135,7 @@ class AtomicInformationDigestionService:
         related_information: tuple[AtomicInformationRevision, ...],
         *,
         include_related: bool,
+        proposed_claim: ClaimAttribution | None,
     ) -> str | None:
         items = (
             (atomic_information, *related_information)
@@ -1040,6 +1157,20 @@ class AtomicInformationDigestionService:
                 "uncertain": "表示不确定",
             }[item.claim.stance]
             summaries.append(f"{claimant}{stance}：{item.statement}")
+        if proposed_claim is not None and proposed_claim != atomic_information.claim:
+            claimant = (
+                proposed_claim.claimant_label
+                or proposed_claim.claimant_source_id
+                or "未标明来源"
+            )
+            stance = {
+                "assert": "主张",
+                "deny": "否认",
+                "uncertain": "表示不确定",
+            }[proposed_claim.stance]
+            summaries.append(
+                f"建议修订归因为{claimant}{stance}：{atomic_information.statement}"
+            )
         return "；".join(summaries) if summaries else None
 
     def _recommendation(self, operations: tuple[WorldModelOperation, ...]) -> str:

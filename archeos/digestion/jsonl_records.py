@@ -56,11 +56,11 @@ class JsonlChangeProposalStore:
             raise ValueError(f"Change Proposal not found: {proposal_id}")
         return proposal
 
-    def list_pending(self) -> tuple[ChangeProposal, ...]:
+    def list_unresolved(self) -> tuple[ChangeProposal, ...]:
         return tuple(
             proposal
             for proposal in self._latest(self._read_history()).values()
-            if proposal.status == "pending"
+            if proposal.status in {"pending", "deferred"}
         )
 
     def update(self, proposal: ChangeProposal) -> ChangeProposal:
@@ -71,10 +71,14 @@ class JsonlChangeProposalStore:
             raise ValueError(f"Change Proposal not found: {proposal.proposal_id}")
         if current == proposal:
             return current
-        if current.status != "pending":
+        if current.status not in {"pending", "deferred"}:
             raise ValueError("decided Change Proposal cannot be changed")
-        if proposal.status == "pending" or proposal.decided_at is None:
-            raise ValueError("Change Proposal decision must be final and timestamped")
+        if proposal.status not in {"deferred", "approved", "rejected"}:
+            raise ValueError("Change Proposal status transition is not supported")
+        if proposal.status == "deferred" and proposal.decided_at is not None:
+            raise ValueError("deferred Change Proposal must remain undecided")
+        if proposal.status in {"approved", "rejected"} and proposal.decided_at is None:
+            raise ValueError("Change Proposal decision must be timestamped")
         immutable_current = proposal_to_dict(current)
         immutable_new = proposal_to_dict(proposal)
         for field in immutable_current:
@@ -103,21 +107,46 @@ class JsonlChangeProposalStore:
                         f"{line_number}: {exc.msg}"
                     ) from exc
                 proposals.append(proposal_from_dict(payload, f"line {line_number}"))
-        latest = self._latest(tuple(proposals))
-        for proposal_id, current in latest.items():
+        for proposal_id in {item.proposal_id for item in proposals}:
             revisions = tuple(
                 item for item in proposals if item.proposal_id == proposal_id
             )
-            if len(revisions) > 2:
-                raise ValueError(
-                    f"corrupted Change Proposal store: too many states for {proposal_id}"
-                )
-            if len(revisions) == 2 and (
-                revisions[0].status != "pending" or current.status == "pending"
-            ):
+            if revisions[0].status != "pending" or revisions[0].decided_at is not None:
                 raise ValueError(
                     f"corrupted Change Proposal store: invalid decision history for {proposal_id}"
                 )
+            if any(
+                item.status in {"approved", "rejected"} and item.decided_at is None
+                for item in revisions
+            ):
+                raise ValueError(
+                    "corrupted Change Proposal store: final decision has no timestamp "
+                    f"for {proposal_id}"
+                )
+            for previous, current in zip(revisions, revisions[1:], strict=False):
+                if previous.status not in {
+                    "pending",
+                    "deferred",
+                } or current.status not in {
+                    "deferred",
+                    "approved",
+                    "rejected",
+                }:
+                    raise ValueError(
+                        "corrupted Change Proposal store: invalid decision history "
+                        f"for {proposal_id}"
+                    )
+                previous_payload = proposal_to_dict(previous)
+                current_payload = proposal_to_dict(current)
+                if any(
+                    previous_payload[field] != current_payload[field]
+                    for field in previous_payload
+                    if field not in {"status", "decided_at"}
+                ):
+                    raise ValueError(
+                        "corrupted Change Proposal store: immutable content changed "
+                        f"for {proposal_id}"
+                    )
         return tuple(proposals)
 
     @staticmethod
