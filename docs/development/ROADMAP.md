@@ -11,6 +11,8 @@
 - GitHub Issue：定义当前一次开发必须交付什么；复杂 Issue 可以内嵌 Architect 批准的 Implementation Plan 与 Test Cases。
 - Durable Spec / ADR：仅在稳定契约或架构决策需要跨多个 Issue 复用时建立。
 
+产品名称长期使用 **向阳经营系统（Sunward Operating System）**；`ArcheOS` 仅作为当前重构迁移阶段的工程 / 仓库代号。
+
 ---
 
 ## M0 — 治理与基础结构（已完成）
@@ -33,9 +35,9 @@
 
 ## M2 — 长期 Information + Structured World Model（当前）
 
-目标：让 Processing 产出的信息进入长期 Atomic Information，并在受治理的边界下持续更新 Structured World Model。
+目标：让 Processing 产出的信息进入长期 Atomic Information，并在受治理的边界下持续更新 Structured World Model，最终形成可被 Agent / Human View 统一读取的 Context。
 
-长期方向：
+主线只保留：
 
 ```text
 Atomic Information Candidate
@@ -44,18 +46,20 @@ Durable Atomic Information
         ↓
 Information Digestion / Governance
         ↓
-Object + Name + Role + Lifecycle + Relationship
-        ↓
 Structured World Model
         ↓
 Context Builder
+        ↓
+Real-world Validation
 ```
 
-### M2-A — World Model Foundation
+不因为旧向阳系统曾存在 Agent Contract、Proposal Queue、Review Center、MCP/HTTP 等能力，就把它们重新带回当前主线。
+
+### M2-A — World Model Foundation（已完成）
 
 目标：建立稳定 Object identity、Name/Role/Lifecycle 历史、Relationship Graph 与 Object Resolver。
 
-实现 authority：Issue #6 / PR #7。
+实现：Issue #6 / PR #7。
 
 关键原则：
 
@@ -67,89 +71,196 @@ Context Builder
 
 ### M2-B1 — Durable Atomic Information + Automatic Ingestion
 
+实现 authority：Issue #9。
+
 目标：把 contract-valid Atomic Information Candidate 自动吸收为长期 Atomic Information，不要求逐条人工审核。
 
 需要实现：
 
 - stable Atomic Information identity；
-- append-only Atomic Information revisions；
+- append-only revisions；
 - Evidence / context / confidence / source provenance 保留；
-- processing candidate → Atomic Information 的幂等导入；
-- AtomicInformationStore 抽象；
-- JSONL 作为第一版正式存储 adapter；
-- 私有 Atomic Information 数据不进入 public Git；
-- 默认 processing workflow 可以进入 Atomic Information ingestion，不再以 per-item human review 作为强制 gate。
+- 幂等导入与 origin collision fail-closed；
+- `AtomicInformationStore` 抽象；
+- JSONL 作为第一版正式 storage adapter；
+- 私有数据不进入 public Git；
+- normal processing workflow 可自动进入 durable ingestion。
 
 本阶段不解释 Atomic Information 对 World Model 的影响。
 
-### M2-B2 — Atomic Information → World Model Digestion & Governance
+### M2-B2 — Atomic Information → World Model Digestion & Lightweight Governance
 
-目标：让 Atomic Information 结合当前 Structured World Model，判断它是补充、更新还是冲突，并按 `INFORMATION_GOVERNANCE.md` 执行。
+实现 authority：Issue #10。
 
-需要实现：
+目标：判断长期 Atomic Information 对 World Model 的影响，并以最小治理闭环执行。
 
-- Atomic Information → existing Object 的保守识别与绑定；
-- 补充信息自动吸收；
-- 目标明确、Evidence 足够、无冲突且低风险的已有 Object 更新可以自动执行；
-- 新建 Object、删除 Object、冲突、Object/Relationship 不确定等情况请求人类判断；
-- 人类判断可以通过 prompt / conversation adapter 完成，不要求正式前端；
-- 所有面向人的审核内容使用通俗业务语言；
+```text
+Atomic Information
+        ↓
+补充 / 更新 / 冲突 / 不确定
+        ↓
+Governance
+   ├─ 安全且明确 → 自动执行
+   └─ 需要人判断 → Lightweight Change Proposal
+        ↓
+World Model Change
+        ↓
+Change Journal
+```
+
+原则：
+
+- safe automatic change **不创建 Proposal**；
+- Change Proposal 只为真正需要人判断的变化存在；
+- 新建 Object、删除 Object、冲突、身份/关系不确定需要人类判断；
+- 自动和人工批准的变化都进入 append-only Change Journal；
+- 人类判断可以通过 prompt / CLI 完成，不要求 Web Review Center；
+- 所有人类可见审核内容使用通俗业务语言；
 - Object 创建与删除遵守孤立对象保护；
-- 自动与人工变更都保留 Atomic Information / Evidence / 历史与执行结果；
-- 业务治理位于 Store/Repository 之上，不写死在 SQLite/JSONL adapter。
+- 不建设 Proposal Queue、通用 Agent Contract、MCP/HTTP、Web Review Center。
 
-### M2-B3 — Context Builder — Object-scoped v1
+### M2-B3 — Canonical Context Builder — Object scope v1
 
-目标：为后续 Domain Agent 和 Human View 提供统一、可追溯、有限边界的上下文读取入口。
+实现 authority：Issue #11。
 
-第一版以 Object 为 scope，能够组装：
+目标：建立一个统一、可追溯、有限边界的上下文读取能力。
+
+第一版：
+
+```text
+Context Builder
+scope = Object
+```
+
+Context Bundle 组装：
 
 ```text
 Object
 + current Name / Role / Lifecycle
-+ Relationships + neighbor Objects
-+ related Atomic Information
-+ Evidence
-+ relevant history / recent changes
-        ↓
-   Context Builder
-        ↓
-   Context Bundle
++ one-hop Relationships
++ related current Atomic Information
++ bounded Evidence
++ recent Change Journal
++ pending human judgments
++ completeness / truncation metadata
 ```
 
-要求：
+原则：
 
-- 复用统一 `Context Builder` 概念，不建立平行的 Object Context / Agent Context / Business Context Builder；
-- 第一版只是 `scope = Object`；
-- 只依赖 AtomicInformationStore / WorldModelRepository 等稳定 contract；
-- 不直接绑定 JSONL 或 SQLite；
-- 输出有明确数量边界和 completeness / truncation 信息；
-- 不引入新的业务 ontology；
-- 不需要 LLM、vector database 或正式 UI。
+- 只有一个 canonical Context Builder；
+- 不建立 Object Context / Agent Context / Business Context Builder 等平行概念；
+- bounded retrieval；
+- provenance-aware；
+- truncation/completeness 必须显式；
+- pending judgment 不能伪装成 fact；
+- read-only、deterministic、storage-independent；
+- 第一版无 LLM、vector ranking、recursive graph、Web UI。
+
+以后 Goal / question / business situation 等上下文需求继续扩展同一个 Context Builder。
+
+### M2-B4 — Real End-to-End Validation
+
+实现 authority：Issue #16。
+
+这是进入迁移和 Domain Agent 前的**阶段门槛**，不是新功能建设阶段。
+
+使用至少一段真实家具经营录音验证：
+
+```text
+Recording
+→ Processing
+→ Atomic Information
+→ B2 Digestion / Governance
+→ World Model
+→ Context Builder
+→ 人工与原 transcript 对照
+```
+
+重点检查：
+
+- 信息守恒；
+- Evidence / provenance；
+- Object resolution；
+- 自动更新 / human judgment 边界；
+- conflict / unresolved；
+- false structuralization；
+- Context completeness；
+- pending judgment 是否与 fact 分离。
+
+P0 信息丢失、P1 世界模型/治理错误阻止进入下一阶段。
+
+B4 不允许为了“让测试通过”而顺手新增 ontology、Web、Domain Agent 或大型基础设施。
 
 ### M2-C — Human View（后置）
 
-Object Profile、向阳生长树、Relationship Graph、Timeline 等人类展示能力暂不阻塞 M2-B1～B3。
+Object Profile、向阳生长树、Relationship Graph、Timeline 等人类展示能力继续后置，不阻塞 B1～B4、Migration Readiness 或首个 Domain Agent。
 
-Core 保持：
+长期读取边界保持：
 
 ```text
-Structured World Model
-  → Projection / View Model
+Canonical State
+  → Context Builder / Projection
+  → View Model
   → Presentation
 ```
 
-前端和 HTML renderer 在长期数据闭环稳定后再进入实现。
+未来 Human View 与 Domain Agent 应尽量消费同一 canonical state/read contracts，而不是建立第二份 read truth。
+
+### M2-D — Migration Readiness & Clean-cut Plan
+
+实现 authority：Issue #17。
+
+只在 B4 无 P0/P1 blocker 后开始。
+
+目标：盘点 Tolaria 与旧 `sunward-operating-system`，把旧资料/能力分成：
+
+```text
+KEEP
+IMPORT
+REBUILD
+RETIRE
+```
+
+核心迁移原则：
+
+- 旧系统只作为 migration source，不作为新架构权威；
+- 不长期 dual-read / dual-write；
+- 旧开发态 structured state 不因为存在就必须兼容；
+- Raw Source / Evidence / provenance 不可因 structured reset 被误删；
+- IMPORT/REBUILD 必须映射到现有 canonical concepts；
+- 缺失的真实业务语义交由 Architect 决策，不在 migration script 中偷偷造 schema；
+- 先形成版本化 inventory / mapping / cutover plan，再创建少量单向 Import Issues。
+
+旧系统真正值得借鉴的模式以“收敛后复用”为原则：
+
+- Context Builder bounded / provenance / truncation；
+- 真实数据作为阶段门槛；
+- clean-cut migration；
+- consequential change 的审计性。
+
+旧系统以下复杂度不自动继承：Proposal Queue、Web Review Center、Agent Contract、MCP/HTTP、D1 coexistence、长期 compatibility facade。
 
 ---
 
 ## M3 — Domain Agent
 
-目标：在 Atomic Information、Structured World Model 与 Context Builder 之上增加销售、品牌、项目等领域解释能力，而不污染 Core。
+M2-D readiness 完成后开始。
 
-候选：Sales Agent、Brand Agent、Project Agent。
+目标：在 Atomic Information、Structured World Model 与 Context Builder 之上增加领域解释能力，而不污染 Core。
 
-Domain Agent 优先读取 Context Builder 输出，而不是各自重新扫描全部原始资料或建立新的 Context Builder。
+第一条优先：**Sales Agent**。
+
+后续候选：Brand Agent、Project Agent。
+
+Domain Agent：
+
+- 优先读取 canonical Context Builder；
+- 不重新扫描全部 raw sources 作为常规路径；
+- 不各自建立 Context Builder；
+- 可以产生报告、判断、建议和需要治理的变更请求；
+- 不因为领域术语新增平行 Core ontology。
+
+至少一个真实 Domain Agent 工作流通过后，才具备正式 cutover 旧向阳写入路径的关键条件之一。
 
 ---
 
@@ -165,9 +276,31 @@ Domain Agent 优先读取 Context Builder 输出，而不是各自重新扫描�
 
 ---
 
+## 当前推荐顺序
+
+```text
+#9  M2-B1 Durable Atomic Information
+ ↓
+#10 M2-B2 Digestion + Lightweight Governance
+ ↓
+#11 M2-B3 Context Builder — Object scope v1
+ ↓
+#16 M2-B4 Real End-to-End Validation
+ ↓
+#17 M2-D Migration Readiness / Clean-cut Plan
+ ↓
+M3 Sales Agent
+ ↓
+单向 Imports / Cutover（按 Readiness 结果拆分）
+```
+
+Human View 可在核心链路稳定后并行进入，但不作为上述主线的前置依赖。
+
+---
+
 ## 演化总原则
 
-ArcheOS 始终沿一条主线演化：
+ArcheOS / 新向阳经营系统始终沿一条主线演化：
 
 **Input → Processing → Atomic Information → Structured Object → Decision → Feedback**
 
@@ -179,6 +312,9 @@ ArcheOS 始终沿一条主线演化：
 4. Object ID 稳定，Name / Role / View 可以演化；
 5. Atomic Information 与 World Model 分层，历史与 Evidence 不丢失；
 6. 存储 adapter 可替换，不让业务规则依赖 SQLite / JSONL；
-7. Context Builder 是统一上下文组装能力，不为不同消费者建立平行 Context 概念；
-8. 先用真实数据验证当前阶段，再进入下一阶段；
-9. 不因为未来可能需要某个能力，就提前建设完整框架。
+7. Change Proposal 只服务需要人类判断的变更，不成为所有写入的强制中间层；
+8. Change Journal 保留自动和人工变更的审计链，但不成为第二份事实源；
+9. Context Builder 是统一上下文组装能力，默认 bounded / provenance-aware / truncation-aware；
+10. 真实数据验收是阶段门槛，不以 synthetic tests 代替真实语义验证；
+11. 迁移采用 clean-cut / 单向导入，除非出现真实不可丢数据或外部消费者才重新讨论 compatibility；
+12. 不因为未来可能需要某个能力，就提前建设完整框架。
