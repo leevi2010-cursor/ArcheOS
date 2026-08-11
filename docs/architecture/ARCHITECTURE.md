@@ -1,5 +1,21 @@
 # ArcheOS 系统架构说明
 
+> 产品名称：**向阳经营系统（Sunward Operating System）**  
+> 当前工程 / 仓库代号：`ArcheOS`。ArcheOS 用于重构迁移阶段；完成替代后，对外仍使用“向阳经营系统”。
+
+## 当前版本化架构图
+
+当前目标架构版本：`v0.2.0`（M2 Target Architecture，2026-08-11）。
+
+- 系统架构图：`docs/architecture/diagrams/v0.2.0/system-architecture-v0.2.0.svg`
+- 数据流图：`docs/architecture/diagrams/v0.2.0/data-flow-v0.2.0.svg`
+- 版本说明：`docs/architecture/diagrams/v0.2.0/README.md`
+- 版本索引：`docs/architecture/diagrams/README.md`
+
+图是本架构文档的可视化表达；概念与产品规则仍分别以 `CONCEPTS.md` 和 `INFORMATION_GOVERNANCE.md` 为权威。
+
+---
+
 ## 1. 核心生命周期
 
 ArcheOS 只保留一条主生命周期：
