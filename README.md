@@ -205,6 +205,20 @@ python3 -m archeos object add-role <object_id> brand
 自动创建或修改 Object。Role 仅接受 `CONCEPTS.md` 已批准的 vocabulary；
 relationship 与 lifecycle 的基础操作由 repository contract 提供，并通过临时数据库测试。
 
+## M2-B2 受治理消化
+
+M2-B2 以显式命令把 durable Atomic Information 解释为对现有 World Model 的受治理变更。确定性名称匹配只使用当前或历史 Name，并只做空格和大小写归一化；唯一精确匹配可以绑定稳定 Object ID，歧义不会猜测，无匹配不会自动新建 Object。
+
+安全、明确且证据充分的既有 Object 更新可以自动执行。新建、删除、冲突、歧义、关系不确定及 Role/Relationship 重解释会生成轻量 Change Proposal，等待人类批准、拒绝或稍后决定。所有实际变更进入 append-only Change Journal；Atomic Information、Evidence 与 World Model 历史均保留。B2 不会自动跟在 B1 ingestion 后运行。
+
+```bash
+python3 -m archeos digest information <atomic_information_id>
+python3 -m archeos digest pending
+python3 -m archeos digest decide <proposal_id> approve
+```
+
+默认解释器通过官方 Codex SDK 使用 read-only、deny-all、ephemeral structured-output runtime。开发、测试和可重复诊断可用 `digest information ... --interpretation-file <path>` 提供结构化解释；该路径不需要网络。默认本地记录位于 Git 忽略的 `03_information/change_proposals.jsonl` 与 `03_information/change_journal.jsonl`，World Model 仍使用 `04_core/archeos.sqlite3`。
+
 运行自动化测试：
 
 ```bash

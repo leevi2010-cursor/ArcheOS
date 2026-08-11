@@ -66,6 +66,8 @@ class InboxPrivacyTest(unittest.TestCase):
         repository = Path(__file__).resolve().parents[1]
         private_paths = (
             "03_information/atomic_information.jsonl",
+            "03_information/change_proposals.jsonl",
+            "03_information/change_journal.jsonl",
             "03_information/nested/private-information.jsonl",
         )
 

@@ -9,6 +9,14 @@ from pathlib import Path
 from .analysis import FileAnalysisProvider
 from .codex_app_server import CodexAnalysisProvider
 from .atomic_information import JsonlAtomicInformationStore, ingest_processing_package
+from .digestion import (
+    AtomicInformationDigestionService,
+    BusinessLanguageHumanJudgmentPort,
+    CodexAtomicInformationInterpretationProvider,
+    FileAtomicInformationInterpretationProvider,
+    JsonlChangeJournal,
+    JsonlChangeProposalStore,
+)
 from .pipeline import ProcessingError, process_audio
 from .pyannote_speakers import PyannoteSpeakerProvider
 from .speakers import FileSpeakerProvider
@@ -17,6 +25,8 @@ from .world_model import ObjectResolver, SQLiteWorldModelRepository
 
 DEFAULT_WORLD_MODEL_DATABASE = Path("04_core/archeos.sqlite3")
 DEFAULT_ATOMIC_INFORMATION_STORE = Path("03_information/atomic_information.jsonl")
+DEFAULT_CHANGE_PROPOSAL_STORE = Path("03_information/change_proposals.jsonl")
+DEFAULT_CHANGE_JOURNAL = Path("03_information/change_journal.jsonl")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -116,6 +126,48 @@ def build_parser() -> argparse.ArgumentParser:
     )
     add_role.add_argument("object_id")
     add_role.add_argument("role")
+
+    digest = subparsers.add_parser(
+        "digest", help="Digest Atomic Information into the governed World Model."
+    )
+    digest.add_argument(
+        "--database",
+        type=Path,
+        default=DEFAULT_WORLD_MODEL_DATABASE,
+    )
+    digest.add_argument(
+        "--information-store",
+        type=Path,
+        default=DEFAULT_ATOMIC_INFORMATION_STORE,
+    )
+    digest.add_argument(
+        "--proposal-store",
+        type=Path,
+        default=DEFAULT_CHANGE_PROPOSAL_STORE,
+    )
+    digest.add_argument(
+        "--journal",
+        type=Path,
+        default=DEFAULT_CHANGE_JOURNAL,
+    )
+    digest_commands = digest.add_subparsers(dest="digest_command", required=True)
+    digest_information = digest_commands.add_parser(
+        "information", help="Interpret and digest one Atomic Information item."
+    )
+    digest_information.add_argument("atomic_information_id")
+    digest_information.add_argument(
+        "--interpretation-file",
+        type=Path,
+        help="Use deterministic structured interpretation JSON instead of Codex.",
+    )
+    digest_commands.add_parser(
+        "pending", help="Show pending decisions in business language."
+    )
+    decide = digest_commands.add_parser(
+        "decide", help="Approve, reject, or defer a pending suggestion."
+    )
+    decide.add_argument("proposal_id")
+    decide.add_argument("decision", choices=("approve", "reject", "defer"))
     return parser
 
 
@@ -214,6 +266,42 @@ def _object_command(args: argparse.Namespace) -> int:
     return 0
 
 
+def _digest_command(args: argparse.Namespace) -> int:
+    provider = None
+    if args.digest_command == "information":
+        provider = (
+            FileAtomicInformationInterpretationProvider(args.interpretation_file)
+            if args.interpretation_file
+            else CodexAtomicInformationInterpretationProvider()
+        )
+    try:
+        with SQLiteWorldModelRepository(args.database) as repository:
+            service = AtomicInformationDigestionService(
+                JsonlAtomicInformationStore(args.information_store),
+                repository,
+                ObjectResolver(repository),
+                provider,
+                JsonlChangeProposalStore(args.proposal_store),
+                JsonlChangeJournal(args.journal),
+                BusinessLanguageHumanJudgmentPort(),
+            )
+            if args.digest_command == "information":
+                result = service.digest(args.atomic_information_id)
+                print(json.dumps(asdict(result), ensure_ascii=False, indent=2))
+            elif args.digest_command == "pending":
+                rendered = service.render_pending()
+                print("\n\n".join(rendered) if rendered else "没有待决定的建议。")
+            elif args.digest_command == "decide":
+                result = service.decide(args.proposal_id, args.decision)
+                print(json.dumps(asdict(result), ensure_ascii=False, indent=2))
+            else:  # pragma: no cover - argparse enforces this
+                return 2
+    except (OSError, RuntimeError, sqlite3.Error, TypeError, ValueError) as exc:
+        print(f"error: {exc}")
+        return 1
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     if args.command == "process":
@@ -222,4 +310,6 @@ def main(argv: list[str] | None = None) -> int:
         return _object_command(args)
     if args.command == "information":
         return _information_command(args)
+    if args.command == "digest":
+        return _digest_command(args)
     return 2  # pragma: no cover - argparse enforces this

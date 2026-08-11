@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterable
+from contextlib import AbstractContextManager
 from typing import Protocol
 
 from .models import (
@@ -17,6 +18,8 @@ class WorldModelRepository(Protocol):
 
     def close(self) -> None: ...
 
+    def transaction(self) -> AbstractContextManager[None]: ...
+
     def create_object(
         self,
         name: str,
@@ -27,6 +30,8 @@ class WorldModelRepository(Protocol):
     def get_object(self, object_id: str) -> ObjectRecord: ...
 
     def list_objects(self) -> tuple[ObjectRecord, ...]: ...
+
+    def set_object_status(self, object_id: str, status: str) -> ObjectRecord: ...
 
     def rename_object(self, object_id: str, name: str) -> NameAssignment: ...
 
