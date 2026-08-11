@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import sqlite3
 import uuid
-from collections.abc import Iterable
+from collections.abc import Iterable, Iterator
+from contextlib import contextmanager
 from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
@@ -10,6 +11,7 @@ from typing import Self
 
 from .models import (
     ALLOWED_ROLES,
+    ApplyReceiptRecord,
     LifecycleRecord,
     NameAssignment,
     ObjectRecord,
@@ -55,6 +57,7 @@ class SQLiteWorldModelRepository:
         self._connection = sqlite3.connect(self.database)
         self._connection.row_factory = sqlite3.Row
         self._connection.execute("PRAGMA foreign_keys = ON")
+        self._transaction_depth = 0
         self.initialize()
 
     def __enter__(self) -> Self:
@@ -65,6 +68,32 @@ class SQLiteWorldModelRepository:
 
     def close(self) -> None:
         self._connection.close()
+
+    @contextmanager
+    def transaction(self) -> Iterator[None]:
+        outermost = self._transaction_depth == 0
+        if outermost:
+            self._connection.execute("BEGIN")
+        self._transaction_depth += 1
+        try:
+            yield
+        except Exception:
+            self._transaction_depth -= 1
+            if outermost:
+                self._connection.rollback()
+            raise
+        else:
+            self._transaction_depth -= 1
+            if outermost:
+                self._connection.commit()
+
+    @contextmanager
+    def _write_scope(self) -> Iterator[None]:
+        if self._transaction_depth:
+            yield
+            return
+        with self._connection:
+            yield
 
     def initialize(self) -> None:
         allowed_roles = ", ".join(f"'{role}'" for role in sorted(ALLOWED_ROLES))
@@ -150,6 +179,12 @@ class SQLiteWorldModelRepository:
                 ON relationships(from_object_id);
             CREATE INDEX IF NOT EXISTS relationships_to_object_id
                 ON relationships(to_object_id);
+
+            CREATE TABLE IF NOT EXISTS apply_receipts (
+                apply_id TEXT PRIMARY KEY,
+                payload TEXT NOT NULL CHECK (length(trim(payload)) > 0),
+                created_at TEXT NOT NULL
+            );
             """
         )
 
@@ -169,7 +204,7 @@ class SQLiteWorldModelRepository:
         object_id = _identifier("obj")
         name_assignment_id = _identifier("name")
         now = _utc_now()
-        with self._connection:
+        with self._write_scope():
             self._connection.execute(
                 "INSERT INTO objects VALUES (?, ?, ?, ?)",
                 (object_id, "active", now, now),
@@ -202,12 +237,61 @@ class SQLiteWorldModelRepository:
         ).fetchall()
         return tuple(self._object_record(row) for row in rows)
 
+    def set_object_status(self, object_id: str, status: str) -> ObjectRecord:
+        clean_status = _non_empty(status, "status")
+        if clean_status not in {"active", "deleted"}:
+            raise ValueError(f"unsupported object status: {clean_status}")
+        current = self.get_object(object_id)
+        if current.status == clean_status:
+            return current
+        now = _utc_now()
+        with self._write_scope():
+            self._connection.execute(
+                "UPDATE objects SET status = ?, updated_at = ? WHERE object_id = ?",
+                (clean_status, now, object_id),
+            )
+        return self.get_object(object_id)
+
+    def get_apply_receipt(self, apply_id: str) -> ApplyReceiptRecord | None:
+        clean_apply_id = _non_empty(apply_id, "apply_id")
+        row = self._connection.execute(
+            "SELECT * FROM apply_receipts WHERE apply_id = ?", (clean_apply_id,)
+        ).fetchone()
+        if row is None:
+            return None
+        return ApplyReceiptRecord(row["apply_id"], row["payload"], row["created_at"])
+
+    def list_apply_receipts(self) -> tuple[ApplyReceiptRecord, ...]:
+        rows = self._connection.execute(
+            "SELECT * FROM apply_receipts ORDER BY rowid"
+        ).fetchall()
+        return tuple(
+            ApplyReceiptRecord(row["apply_id"], row["payload"], row["created_at"])
+            for row in rows
+        )
+
+    def put_apply_receipt(self, apply_id: str, payload: str) -> ApplyReceiptRecord:
+        clean_apply_id = _non_empty(apply_id, "apply_id")
+        clean_payload = _non_empty(payload, "payload")
+        existing = self.get_apply_receipt(clean_apply_id)
+        if existing is not None:
+            if existing.payload != clean_payload:
+                raise ValueError(f"apply receipt identity collision: {clean_apply_id}")
+            return existing
+        now = _utc_now()
+        with self._write_scope():
+            self._connection.execute(
+                "INSERT INTO apply_receipts VALUES (?, ?, ?)",
+                (clean_apply_id, clean_payload, now),
+            )
+        return ApplyReceiptRecord(clean_apply_id, clean_payload, now)
+
     def rename_object(self, object_id: str, name: str) -> NameAssignment:
         clean_name = _non_empty(name, "name")
         self.get_object(object_id)
         assignment_id = _identifier("name")
         now = _utc_now()
-        with self._connection:
+        with self._write_scope():
             updated = self._connection.execute(
                 """
                 UPDATE object_names
@@ -274,7 +358,7 @@ class SQLiteWorldModelRepository:
 
         assignment_id = _identifier("role")
         now = _utc_now()
-        with self._connection:
+        with self._write_scope():
             self._connection.execute(
                 """
                 INSERT INTO role_assignments
@@ -314,7 +398,7 @@ class SQLiteWorldModelRepository:
             raise ValueError(f"active role not found: {clean_role}")
         assignment = self._role_assignment(row)
         now = _utc_now()
-        with self._connection:
+        with self._write_scope():
             self._connection.execute(
                 "UPDATE role_assignments SET valid_to = ? WHERE role_assignment_id = ?",
                 (now, assignment.role_assignment_id),
@@ -356,7 +440,7 @@ class SQLiteWorldModelRepository:
         )
         lifecycle_id = _identifier("life")
         now = _utc_now()
-        with self._connection:
+        with self._write_scope():
             self._connection.execute(
                 """
                 UPDATE object_lifecycles SET valid_to = ?
@@ -425,7 +509,7 @@ class SQLiteWorldModelRepository:
         clean_confidence = _validate_confidence(confidence)
         relationship_id = _identifier("rel")
         now = _utc_now()
-        with self._connection:
+        with self._write_scope():
             self._connection.execute(
                 """
                 INSERT INTO relationships
@@ -464,7 +548,7 @@ class SQLiteWorldModelRepository:
             raise ValueError(f"active relationship not found: {relationship_id}")
         relationship = self._relationship_record(row)
         now = _utc_now()
-        with self._connection:
+        with self._write_scope():
             self._connection.execute(
                 "UPDATE relationships SET valid_to = ? WHERE relationship_id = ?",
                 (now, relationship_id),

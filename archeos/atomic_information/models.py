@@ -18,6 +18,19 @@ class EvidenceRecord:
     excerpt: str
 
 
+CLAIM_STANCES = frozenset({"assert", "deny", "uncertain"})
+
+
+@dataclass(frozen=True)
+class ClaimAttribution:
+    claimant_object_id: str | None
+    claimant_source_id: str
+    claimant_label: str | None
+    stance: str
+    claimed_at: str | None
+    attribution_confidence: float | None
+
+
 @dataclass(frozen=True)
 class AtomicInformationRevision:
     atomic_information_id: str
@@ -35,6 +48,7 @@ class AtomicInformationRevision:
     confidence: float
     created_at: str
     revision_reason: str
+    claim: ClaimAttribution | None = None
 
 
 @dataclass(frozen=True)
@@ -107,6 +121,58 @@ def evidence_to_dict(evidence: EvidenceRecord) -> dict[str, object]:
     }
 
 
+def claim_from_dict(value: object, field: str) -> ClaimAttribution:
+    if not isinstance(value, dict):
+        raise TypeError(f"{field} must be an object")
+    expected = {
+        "claimant_object_id",
+        "claimant_source_id",
+        "claimant_label",
+        "stance",
+        "claimed_at",
+        "attribution_confidence",
+    }
+    if set(value) != expected:
+        raise ValueError(f"{field} does not match the Claim attribution schema")
+    attribution_confidence = value["attribution_confidence"]
+    if attribution_confidence is not None and (
+        not isinstance(attribution_confidence, (int, float))
+        or isinstance(attribution_confidence, bool)
+        or not 0 <= attribution_confidence <= 1
+    ):
+        raise ValueError(f"{field}.attribution_confidence must be between 0 and 1")
+    claim = ClaimAttribution(
+        claimant_object_id=_optional_text(
+            value["claimant_object_id"], f"{field}.claimant_object_id"
+        ),
+        claimant_source_id=_non_empty(
+            value["claimant_source_id"], f"{field}.claimant_source_id"
+        ),
+        claimant_label=_optional_text(
+            value["claimant_label"], f"{field}.claimant_label"
+        ),
+        stance=_non_empty(value["stance"], f"{field}.stance"),
+        claimed_at=_optional_text(value["claimed_at"], f"{field}.claimed_at"),
+        attribution_confidence=(
+            None if attribution_confidence is None else float(attribution_confidence)
+        ),
+    )
+    validate_claim_attribution(claim, field)
+    return claim
+
+
+def claim_to_dict(claim: ClaimAttribution) -> dict[str, object]:
+    validate_claim_attribution(claim)
+    return {
+        "claimant_object_id": claim.claimant_object_id,
+        "claimant_source_id": claim.claimant_source_id,
+        "claimant_label": claim.claimant_label,
+        "stance": claim.stance,
+        "claimed_at": claim.claimed_at,
+        "attribution_confidence": claim.attribution_confidence,
+    }
+
+
 def atomic_information_revision_from_dict(
     value: object, field: str = "atomic information revision"
 ) -> AtomicInformationRevision:
@@ -129,7 +195,7 @@ def atomic_information_revision_from_dict(
         "created_at",
         "revision_reason",
     }
-    if set(value) != expected:
+    if set(value) not in {frozenset(expected), frozenset((*expected, "claim"))}:
         raise ValueError(
             f"{field} does not match the Atomic Information revision schema"
         )
@@ -190,6 +256,11 @@ def atomic_information_revision_from_dict(
         revision_reason=_non_empty(
             value["revision_reason"], f"{field}.revision_reason"
         ),
+        claim=(
+            None
+            if value.get("claim") is None
+            else claim_from_dict(value["claim"], f"{field}.claim")
+        ),
     )
     validate_atomic_information_revision(revision, field)
     return revision
@@ -217,6 +288,7 @@ def atomic_information_revision_to_dict(
         "confidence": revision.confidence,
         "created_at": revision.created_at,
         "revision_reason": revision.revision_reason,
+        "claim": None if revision.claim is None else claim_to_dict(revision.claim),
     }
 
 
@@ -284,6 +356,33 @@ def validate_atomic_information_revision(
         or not 0 <= revision.confidence <= 1
     ):
         raise ValueError(f"{field}.confidence must be between 0 and 1")
+    if revision.claim is not None:
+        validate_claim_attribution(revision.claim, f"{field}.claim")
+        if revision.claim.claimant_source_id not in {
+            evidence.source_id for evidence in revision.source_evidence
+        }:
+            raise ValueError(
+                f"{field}.claim.claimant_source_id must reference source Evidence"
+            )
+
+
+def validate_claim_attribution(
+    claim: ClaimAttribution, field: str = "Claim attribution"
+) -> None:
+    if not isinstance(claim, ClaimAttribution):
+        raise TypeError(f"{field} must be a ClaimAttribution")
+    _optional_text(claim.claimant_object_id, f"{field}.claimant_object_id")
+    _non_empty(claim.claimant_source_id, f"{field}.claimant_source_id")
+    _optional_text(claim.claimant_label, f"{field}.claimant_label")
+    if claim.stance not in CLAIM_STANCES:
+        raise ValueError(f"{field}.stance is not supported")
+    _optional_text(claim.claimed_at, f"{field}.claimed_at")
+    if claim.attribution_confidence is not None and (
+        not isinstance(claim.attribution_confidence, (int, float))
+        or isinstance(claim.attribution_confidence, bool)
+        or not 0 <= claim.attribution_confidence <= 1
+    ):
+        raise ValueError(f"{field}.attribution_confidence must be between 0 and 1")
 
 
 def _validate_evidence(evidence: EvidenceRecord, field: str) -> None:

@@ -15,6 +15,17 @@ ALLOWED_ROLES = frozenset(
     }
 )
 
+ALLOWED_RELATIONSHIPS = frozenset(
+    {"part_of", "member_of", "responsible_for", "depends_on", "related_to"}
+)
+
+
+@dataclass(frozen=True)
+class ApplyReceiptRecord:
+    apply_id: str
+    payload: str
+    created_at: str
+
 
 @dataclass(frozen=True)
 class ObjectRecord:
