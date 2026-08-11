@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import argparse
+import json
+import sqlite3
+from dataclasses import asdict
 from pathlib import Path
 
 from .analysis import FileAnalysisProvider
@@ -9,6 +12,9 @@ from .pipeline import ProcessingError, process_audio
 from .pyannote_speakers import PyannoteSpeakerProvider
 from .speakers import FileSpeakerProvider
 from .transcription import FileTranscriptionProvider, MlxWhisperTranscriptionProvider
+from .world_model import ObjectResolver, SQLiteWorldModelRepository
+
+DEFAULT_WORLD_MODEL_DATABASE = Path("04_core/archeos.sqlite3")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -46,14 +52,43 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         help="Use an existing schema-compliant analysis JSON instead of Codex.",
     )
+
+    objects = subparsers.add_parser(
+        "object", help="Create and inspect local World Model Objects."
+    )
+    objects.add_argument(
+        "--database",
+        type=Path,
+        default=DEFAULT_WORLD_MODEL_DATABASE,
+        help="SQLite World Model path (default: 04_core/archeos.sqlite3).",
+    )
+    object_commands = objects.add_subparsers(dest="object_command", required=True)
+
+    create = object_commands.add_parser("create", help="Create a stable Object.")
+    create.add_argument("--name", required=True)
+    create.add_argument(
+        "--role",
+        action="append",
+        default=[],
+        help="Initial accepted Role; may be repeated.",
+    )
+
+    show = object_commands.add_parser("show", help="Resolve an Object for humans.")
+    show.add_argument("object_id")
+
+    rename = object_commands.add_parser("rename", help="Rename an Object.")
+    rename.add_argument("object_id")
+    rename.add_argument("--name", required=True)
+
+    add_role = object_commands.add_parser(
+        "add-role", help="Add an accepted Role to an Object."
+    )
+    add_role.add_argument("object_id")
+    add_role.add_argument("role")
     return parser
 
 
-def main(argv: list[str] | None = None) -> int:
-    args = build_parser().parse_args(argv)
-    if args.command != "process":  # pragma: no cover - argparse enforces this
-        return 2
-
+def _process_command(args: argparse.Namespace) -> int:
     transcriber = (
         FileTranscriptionProvider(args.transcript)
         if args.transcript
@@ -86,3 +121,39 @@ def main(argv: list[str] | None = None) -> int:
 
     print(package)
     return 0
+
+
+def _print_object(repository: SQLiteWorldModelRepository, object_id: str) -> None:
+    resolved = ObjectResolver(repository).resolve(object_id)
+    print(json.dumps(asdict(resolved), ensure_ascii=False, indent=2))
+
+
+def _object_command(args: argparse.Namespace) -> int:
+    try:
+        with SQLiteWorldModelRepository(args.database) as repository:
+            if args.object_command == "create":
+                record = repository.create_object(args.name, roles=tuple(args.role))
+            elif args.object_command == "show":
+                record = repository.get_object(args.object_id)
+            elif args.object_command == "rename":
+                repository.rename_object(args.object_id, args.name)
+                record = repository.get_object(args.object_id)
+            elif args.object_command == "add-role":
+                repository.add_role(args.object_id, args.role)
+                record = repository.get_object(args.object_id)
+            else:  # pragma: no cover - argparse enforces this
+                return 2
+            _print_object(repository, record.object_id)
+    except (sqlite3.Error, ValueError) as exc:
+        print(f"error: {exc}")
+        return 1
+    return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    if args.command == "process":
+        return _process_command(args)
+    if args.command == "object":
+        return _object_command(args)
+    return 2  # pragma: no cover - argparse enforces this

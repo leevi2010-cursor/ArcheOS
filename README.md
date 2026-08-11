@@ -174,6 +174,25 @@ residue.md
 
 同一来源已有处理包时，CLI 会停止而不是覆盖。分析可以从一个转写片段提取多条原子信息，也可以用多个片段共同支持一条原子信息；歧义、冲突、上下文不足或证据不足的信息进入 residue。所有生成信息保持 `proposed` / `awaiting_human_review` 状态。
 
+## M2-A 本地 World Model
+
+M2-A 使用标准库 SQLite 保存稳定 `Object` identity，并把 Name、Role、Lifecycle
+与 Relationship 分开建模。默认数据库是本地且被 Git 忽略的
+`04_core/archeos.sqlite3`；内部关系始终引用 opaque `object_id`，人工读取则通过
+resolver 同时看到当前名称和 active Roles。
+
+```bash
+python3 -m archeos object create --name "Synthetic Operations" \
+  --role business_line
+python3 -m archeos object show <object_id>
+python3 -m archeos object rename <object_id> --name "Renamed Operations"
+python3 -m archeos object add-role <object_id> brand
+```
+
+这些命令只提供本地开发和人工验证边界，不会从 Atomic Information Candidate
+自动创建或修改 Object。Role 仅接受 `CONCEPTS.md` 已批准的 vocabulary；
+relationship 与 lifecycle 的基础操作由 repository contract 提供，并通过临时数据库测试。
+
 运行自动化测试：
 
 ```bash
