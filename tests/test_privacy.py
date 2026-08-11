@@ -34,6 +34,34 @@ class InboxPrivacyTest(unittest.TestCase):
         self.assertEqual(private.returncode, 0)
         self.assertEqual(governance.returncode, 1)
 
+    def test_nested_core_data_is_ignored_but_governance_is_tracked(self) -> None:
+        repository = Path(__file__).resolve().parents[1]
+        private_paths = (
+            "04_core/archeos.sqlite3",
+            "04_core/nested/private.sqlite3",
+        )
+
+        for private_path in private_paths:
+            result = subprocess.run(
+                ["git", "check-ignore", "--quiet", "--no-index", private_path],
+                cwd=repository,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 0, private_path)
+
+        governance = subprocess.run(
+            [
+                "git",
+                "check-ignore",
+                "--quiet",
+                "--no-index",
+                "04_core/AGENTS.md",
+            ],
+            cwd=repository,
+            check=False,
+        )
+        self.assertEqual(governance.returncode, 1)
+
 
 if __name__ == "__main__":
     unittest.main()

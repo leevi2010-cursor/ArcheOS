@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+import tempfile
 import unittest
 from contextlib import redirect_stdout
 from io import StringIO
@@ -49,6 +51,71 @@ class CliTest(unittest.TestCase):
         analysis_provider = process_audio.call_args.args[4]
         self.assertIsInstance(speaker_provider, PyannoteSpeakerProvider)
         self.assertIsInstance(analysis_provider, CodexAnalysisProvider)
+
+    def test_object_commands_return_human_readable_world_model(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            database = Path(temp) / "world-model.sqlite3"
+
+            output = StringIO()
+            with redirect_stdout(output):
+                result = main(
+                    [
+                        "object",
+                        "--database",
+                        str(database),
+                        "create",
+                        "--name",
+                        "Synthetic Operations",
+                        "--role",
+                        "business_line",
+                    ]
+                )
+            created = json.loads(output.getvalue())
+            object_id = created["object_id"]
+            self.assertEqual(result, 0)
+            self.assertTrue(object_id.startswith("obj_"))
+            self.assertEqual(created["current_name"], "Synthetic Operations")
+            self.assertEqual(created["roles"], ["business_line"])
+
+            with redirect_stdout(StringIO()):
+                self.assertEqual(
+                    main(
+                        [
+                            "object",
+                            "--database",
+                            str(database),
+                            "rename",
+                            object_id,
+                            "--name",
+                            "Renamed Operations",
+                        ]
+                    ),
+                    0,
+                )
+                self.assertEqual(
+                    main(
+                        [
+                            "object",
+                            "--database",
+                            str(database),
+                            "add-role",
+                            object_id,
+                            "brand",
+                        ]
+                    ),
+                    0,
+                )
+
+            output = StringIO()
+            with redirect_stdout(output):
+                result = main(
+                    ["object", "--database", str(database), "show", object_id]
+                )
+            shown = json.loads(output.getvalue())
+            self.assertEqual(result, 0)
+            self.assertEqual(shown["object_id"], object_id)
+            self.assertEqual(shown["current_name"], "Renamed Operations")
+            self.assertEqual(shown["roles"], ["brand", "business_line"])
 
 
 if __name__ == "__main__":
