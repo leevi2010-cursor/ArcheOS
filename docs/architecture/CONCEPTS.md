@@ -32,10 +32,13 @@ Information 层主要包含：
 
 - `Atomic Information Candidate`
 - `Atomic Information`
+- `Claim`
 - `Evidence`
 - `Residue`
 
-Information 描述“我们知道了什么”，不等同于长期世界中的 Object。
+Information 描述“我们获得了什么信息”，不等同于长期世界中的 Object，也不等同于系统已经确认的 World Model 状态。
+
+Information Layer **允许彼此矛盾的 Atomic Information / Claim 并存**。保存“某人说过什么”或“某个来源表达了什么”，不意味着 ArcheOS 已经把该内容接受为当前事实。
 
 `Note` **不是 ArcheOS Core 的正式概念**。在旧系统、历史文件或人类界面中遇到 `Note` 时，可以把它识别为 `Atomic Information` 的旧称或展示名称，但不得因此建立独立的 Note 模型、Store、ID 或生命周期。
 
@@ -171,9 +174,25 @@ ArcheOS 的 World Model 因此天然可以形成 Graph，而不是只能形成�
 
 ### 当前已接受的通用 Relationship
 
-- `related_to`：表示两个 Object 之间存在明确、值得长期保留的业务联系，但当前没有必要或还没有足够依据定义更具体的 Relationship 语义。
+第一版只接受以下 5 种通用关系：
 
-`related_to` 是刻意保持宽泛的关系，不表示隶属、所有权、责任、因果或其他更具体含义。以后如果某类更具体的 Relationship 被正式定义，可以新增更精确的关系，而不改变两个 Object 的身份。
+- `part_of`：A 是 B 的长期组成部分。例如“产品库 part_of 展厅经营”。
+- `member_of`：A 是 B 组织范围中的成员。典型用于 Person 与 Company / Organization 之间的成员关系。
+- `responsible_for`：A 对 B 承担明确、持续或阶段性的业务责任。
+- `depends_on`：A 的运行、完成或有效性明确依赖 B。
+- `related_to`：A 与 B 存在明确、值得长期保留的业务联系，但当前没有必要或还没有足够依据定义更具体的 Relationship 语义。
+
+这些关系都要求两端已经是值得长期保持稳定身份的 Object。某段话中出现两个名词，不意味着必须为了建立 Relationship 而创建两个 Object。
+
+Relationship 的方向属于其语义。例如：
+
+```text
+产品库 → part_of → 展厅经营
+```
+
+读取或展示时可以把它反向表达为“展厅经营包含产品库”，但反向表达本身不是第二条 durable Relationship。除非未来存在独立业务含义，否则不要为了正反查询方便而重复保存 inverse Relationship。
+
+`related_to` 是刻意保持宽泛的兜底关系，不表示隶属、所有权、责任、因果或依赖。以后只有在真实数据反复证明现有 5 种关系不足时，才通过架构评审增加新的通用 Relationship 语义。
 
 ---
 
@@ -188,6 +207,7 @@ Atomic Information 属于 Information 层，不是 Object，也不是 Object 的
 - statement；
 - semantic type；
 - concerns / related Object IDs；
+- 可选 Claim；
 - Evidence；
 - context；
 - confidence / uncertainty；
@@ -202,7 +222,44 @@ Object              = 被长期引用的“东西”
 Atomic Information  = 关于这些东西的一条最小长期信息
 ```
 
+Atomic Information 的 `confidence` 默认表示系统对**信息提取 / 语义理解正确性**的置信程度，不自动表示 statement 在现实世界中的真实性概率。
+
 Atomic Information 的后续修订仍属于同一条长期信息身份，并通过 Revision / 历史记录表达变化；Revision 是实现和历史结构，不是新的 Core 概念。
+
+### Claim
+
+`Claim` 表示：**某个主体或某个来源对一条 statement 的声明立场**。
+
+Claim 属于 Information Layer，并作为 Atomic Information 的可选归因结构存在。第一版不为 Claim 建立独立 Object、独立 Store、独立 ID 或第二套生命周期。
+
+Claim 可以表达：
+
+- claimant：谁作出这个声明；若已解析为长期 Object，可引用 `claimant_object_id`；尚未解析时仍可通过 Source / speaker 等来源信息保留归因；
+- stance：声明立场，第一版使用 `assert` / `deny` / `uncertain`；
+- claimed_at：声明发生时间（若来源可确定）；
+- attribution confidence：系统对“是谁说的 / 是否正确归因”的置信度。
+
+Claim 不等于事实，也不等于 World Model 当前状态。
+
+例如：
+
+```text
+Atomic Information A
+statement: 客户预算约 20 万
+Claim:
+  claimant: 销售 A
+  stance: assert
+
+Atomic Information B
+statement: 客户预算至少 30 万
+Claim:
+  claimant: 设计师 B
+  stance: assert
+```
+
+A 与 B 可以同时长期保存，即使彼此冲突。冲突如何影响 World Model 属于 Information Digestion / Governance，而不是 Claim 定义本身。
+
+当多个主体独立表达同一内容时，优先保留各自可追溯的 Atomic Information / Claim，而不是为了减少记录而抹平不同来源。
 
 ---
 
@@ -218,7 +275,7 @@ Processing
   → Atomic Information
 ```
 
-候选信息仍应保留 statement、Evidence、context、confidence / uncertainty 等可追溯信息。
+候选信息仍应保留 statement、Evidence、context、confidence / uncertainty 等可追溯信息。若来源已经明确表达声明主体与立场，Candidate 可以携带 Claim candidate 信息，后续进入同一 Atomic Information 生命周期，而不是建立平行 Claim 生命周期。
 
 ---
 
@@ -239,7 +296,8 @@ source
 Evidence 与 Atomic Information 不同：
 
 - Atomic Information 表示“系统记录了什么信息”；
-- Evidence 表示“这条信息依据什么来源”。
+- Claim 表示“谁以什么立场表达了这条信息”；
+- Evidence 表示“这条信息和归因依据什么来源”。
 
 ---
 
@@ -273,7 +331,9 @@ Object
 
 它不是需要单独创建 ID 的 Object，而是一个架构层概念。
 
-Atomic Information / Evidence 描述和支撑 World Model；World Model 表达 ArcheOS 对长期经营世界的结构化认知。
+Atomic Information / Claim / Evidence 描述和支撑 World Model；World Model 表达 ArcheOS 对长期经营世界的**当前受治理认知**。
+
+Information Layer 可以保留相互矛盾的 Claim；World Model 不需要把每个 Claim 都复制成结构化事实。
 
 ---
 
@@ -399,6 +459,7 @@ ArcheOS 使用一个 canonical 概念体系。别名只帮助识别旧资料和�
 | Relationship | Relation、业务关系 | `Edge` 只作为图存储实现术语；超链接不自动成为 Relationship |
 | Name | Label、Display Name、名称 | 都不承担 Object 身份 |
 | Atomic Information | Atomic Note、Note、Durable Atomic Information、已确认 Semantic Unit | 都收敛为长期 Information 层的 Atomic Information；新代码不建立 Note 模型 |
+| Claim | Assertion、Statement Attribution、声明 | 表示某主体 / 来源对 Atomic Information statement 的声明立场；不建立独立事实层 |
 | Atomic Information Candidate | Atomic Information Unit Candidate、Semantic Unit Candidate | 表示尚处于 Processing 的原子信息候选 |
 | Evidence | Evidence Ref、Citation | 作为来源依据；精确片段使用 Evidence Fragment |
 | Structured World Model | Core、World Model、长期结构化认知 | 都指 Object / Name / Role / Lifecycle / Relationship 的组合，不是新 Object |
