@@ -24,11 +24,13 @@
 Information 层主要包含：
 
 - `Atomic Information Candidate`
-- `Note`
+- `Atomic Information`
 - `Evidence`
 - `Residue`
 
 Information 描述“我们知道了什么”，不等同于长期世界中的 Object。
+
+`Note` **不是 ArcheOS Core 的正式概念**。如果未来产品中出现“笔记 / Note”功能，它可以作为面向人的业务或展示名称，但不应与 `Atomic Information` 建立一套平行的长期信息模型。
 
 ---
 
@@ -44,7 +46,7 @@ Object 可以：
 - 同时拥有多个 Role；
 - 拥有 Lifecycle；
 - 与多个其他 Object 建立 Relationship；
-- 被多个 Note 描述或引用。
+- 被多个 Atomic Information 描述或引用。
 
 示例：
 
@@ -53,7 +55,7 @@ Object 可以：
 - 海丝金融中心家具采购；
 - 一个需要长期维护的内部产品库。
 
-一个普通描述、观点或事实本身不是 Object，例如“SKU 很重要”属于 Note。
+一个普通描述、观点或事实本身不是 Object，例如“SKU 很重要”属于 Atomic Information。
 
 ---
 
@@ -168,13 +170,13 @@ ArcheOS 的 World Model 因此天然可以形成 Graph，而不是只能形成�
 
 ---
 
-## 8. Note
+## 8. Atomic Information
 
-`Note` 是一个**可独立追溯的长期原子信息记录**。
+`Atomic Information` 是一个**可独立理解、可独立追溯的长期原子信息单元**。
 
-Note 属于 Information 层，不是 Object，也不是 Object 的 Role。
+Atomic Information 属于 Information 层，不是 Object，也不是 Object 的 Role。
 
-一个 Note 可以包含：
+一条 Atomic Information 可以包含：
 
 - statement；
 - semantic type；
@@ -184,27 +186,29 @@ Note 属于 Information 层，不是 Object，也不是 Object 的 Role。
 - confidence / uncertainty；
 - 来源和版本信息。
 
-Note 可以描述一个或多个 Object，也可以独立存在。
+Atomic Information 可以描述一个或多个 Object，也可以在尚未完成 Object 绑定时独立存在。
 
-Note 与 Object 的区别：
+Atomic Information 与 Object 的区别：
 
 ```text
-Object = 被长期引用的“东西”
-Note   = 关于这些东西的一条“信息”
+Object              = 被长期引用的“东西”
+Atomic Information  = 关于这些东西的一条最小长期信息
 ```
+
+Atomic Information 的后续修订仍属于同一条长期信息身份，并通过 Revision / 历史记录表达变化；Revision 是实现和历史结构，不是新的 Core 概念。
 
 ---
 
 ## 9. Atomic Information Candidate
 
-`Atomic Information Candidate` 是 Processing 阶段产生的、尚未进入长期 Note 层的原子信息候选。
+`Atomic Information Candidate` 是 Processing 阶段产生的、尚未进入长期 Atomic Information 层的原子信息候选。
 
-它与 Note 的主要区别是所处生命周期阶段：
+它与 durable Atomic Information 的主要区别是所处生命周期阶段：
 
 ```text
 Processing
   → Atomic Information Candidate
-  → Note
+  → Atomic Information
 ```
 
 候选信息仍应保留 statement、Evidence、context、confidence / uncertainty 等可追溯信息。
@@ -225,9 +229,9 @@ source
 → excerpt
 ```
 
-Evidence 与 Note 不同：
+Evidence 与 Atomic Information 不同：
 
-- Note 表示“系统记录了什么信息”；
+- Atomic Information 表示“系统记录了什么信息”；
 - Evidence 表示“这条信息依据什么来源”。
 
 ---
@@ -262,7 +266,7 @@ Object
 
 它不是需要单独创建 ID 的 Object，而是一个架构层概念。
 
-Note / Evidence 描述和支撑 World Model；World Model 表达 ArcheOS 对长期经营世界的结构化认知。
+Atomic Information / Evidence 描述和支撑 World Model；World Model 表达 ArcheOS 对长期经营世界的结构化认知。
 
 ---
 
