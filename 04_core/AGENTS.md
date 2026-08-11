@@ -10,7 +10,7 @@ The canonical model is defined in `docs/architecture/CONCEPTS.md` and uses stabl
 
 - Treat `Object` as the stable identity primitive. Do not recreate an Object because its Name or Role changes.
 - Do not introduce `PersonObject`, `ProjectObject`, `BusinessLineObject`, or other parallel base entity hierarchies.
-- Every material World Model change must remain traceable to supporting Note/Evidence or an explicit human decision where the product governance requires one.
+- Every material World Model change must remain traceable to supporting Atomic Information / Evidence or an explicit human decision where the product governance requires one.
 - Automatic updates and human-review boundaries are defined only by `docs/product/INFORMATION_GOVERNANCE.md`; do not invent local approval rules inside persistence code.
 - Prefer updating an existing authoritative Object over creating a duplicate.
 - When Object identity or Relationship meaning is uncertain, do not guess.
