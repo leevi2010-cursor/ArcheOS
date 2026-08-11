@@ -14,9 +14,9 @@ from archeos.analysis import (
     MeetingSummary,
     ResidueItem,
 )
+from archeos.notes import JsonlNoteStore, ingest_processing_package
 from archeos.pipeline import ARTIFACTS, ProcessingError, process_audio
 from archeos.transcription import Transcript, TranscriptSegment
-
 
 FIXED_TIME = datetime(2026, 8, 10, 12, 0, tzinfo=timezone.utc)
 
@@ -193,19 +193,34 @@ class PipelineTest(unittest.TestCase):
             root = Path(temp)
             audio = root / "讨论.wav"
             write_silent_wav(audio)
-            before = (audio.stat().st_mtime_ns, hashlib.sha256(audio.read_bytes()).hexdigest())
+            before = (
+                audio.stat().st_mtime_ns,
+                hashlib.sha256(audio.read_bytes()).hexdigest(),
+            )
 
             package = run_pipeline(audio, root / "02_processing")
 
             self.assertEqual(set(ARTIFACTS), {item.name for item in package.iterdir()})
-            after = (audio.stat().st_mtime_ns, hashlib.sha256(audio.read_bytes()).hexdigest())
+            after = (
+                audio.stat().st_mtime_ns,
+                hashlib.sha256(audio.read_bytes()).hexdigest(),
+            )
             self.assertEqual(before, after)
 
             manifest = json.loads((package / "manifest.json").read_text())
             self.assertEqual(manifest["artifacts"], list(ARTIFACTS))
-            self.assertEqual(manifest["review"]["status"], "awaiting_human_review")
-            self.assertFalse(manifest["review"]["automatic_core_write"])
-            self.assertEqual(manifest["speaker_attribution"]["provider"], "stub-speakers")
+            self.assertEqual(manifest["schema_version"], "1.1")
+            self.assertEqual(
+                manifest["downstream"],
+                {
+                    "note_ingestion": "automatic_after_contract_validation",
+                    "world_model_write": "governed",
+                },
+            )
+            self.assertNotIn("review", manifest)
+            self.assertEqual(
+                manifest["speaker_attribution"]["provider"], "stub-speakers"
+            )
             self.assertFalse(manifest["speaker_attribution"]["identity_matching"])
             self.assertEqual(
                 manifest["counts"],
@@ -222,6 +237,7 @@ class PipelineTest(unittest.TestCase):
                 json.loads(line)
                 for line in (package / "atomic_notes.jsonl").read_text().splitlines()
             ]
+            self.assertTrue(all(note["status"] == "candidate" for note in notes))
             self.assertEqual(
                 [note["semantic_type"] for note in notes],
                 ["decision", "requirement", "action"],
@@ -244,7 +260,6 @@ class PipelineTest(unittest.TestCase):
                 [1, 4],
             )
             self.assertTrue(all(note["concerns"] for note in notes))
-            self.assertTrue(all(note["status"] == "proposed" for note in notes))
 
             transcript = (package / "transcript.md").read_text()
             self.assertIn("Speaker_1", transcript)
@@ -266,6 +281,25 @@ class PipelineTest(unittest.TestCase):
             self.assertIn("这个结论引用了旧方案。", residue)
             self.assertIn("指代不明确", residue)
             self.assertFalse((root / "03_notes").exists())
+            self.assertFalse((root / "04_core").exists())
+            self.assertFalse((root / "05_decisions").exists())
+
+    def test_generated_package_is_ingestible_as_durable_notes(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            audio = root / "synthetic.wav"
+            write_silent_wav(audio)
+            package = run_pipeline(audio, root / "02_processing")
+            store = JsonlNoteStore(root / "03_notes" / "notes.jsonl")
+
+            result = ingest_processing_package(package, store)
+
+            self.assertEqual(result.created, 3)
+            self.assertEqual(len(store.list_notes()), 3)
+            self.assertTrue(
+                all(note.revision_number == 1 for note in store.list_notes())
+            )
+            self.assertTrue(all(note.source_evidence for note in store.list_notes()))
             self.assertFalse((root / "04_core").exists())
             self.assertFalse((root / "05_decisions").exists())
 

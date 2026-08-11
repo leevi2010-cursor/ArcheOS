@@ -13,8 +13,7 @@ from pathlib import Path
 from . import __version__
 from .analysis import AnalysisProvider, AnalysisResult
 from .speakers import SpeakerProvider
-from .transcription import Transcript, TranscriptSegment, TranscriptionProvider
-
+from .transcription import Transcript, TranscriptionProvider, TranscriptSegment
 
 SUPPORTED_AUDIO = {".m4a", ".mp3", ".wav"}
 ARTIFACTS = (
@@ -59,6 +58,7 @@ def _validate_audio(path: Path) -> None:
         ],
         capture_output=True,
         text=True,
+        check=False,
     )
     if result.returncode:
         detail = result.stderr.strip() or "no decodable audio stream"
@@ -180,7 +180,9 @@ def _bullets(items: tuple[str, ...], *, empty: str = "待人工确认") -> str:
 
 def _summary_markdown(analysis: AnalysisResult) -> str:
     summary = analysis.meeting_summary
-    participants = "、".join(summary.participants) if summary.participants else "待人工确认"
+    participants = (
+        "、".join(summary.participants) if summary.participants else "待人工确认"
+    )
     return f"""# Basic Information
 
 Topic: {summary.topic}
@@ -235,7 +237,7 @@ def _atomic_notes_jsonl(
             "context": note.context,
             "confidence": note.confidence,
             "processing_time": source["processed_at"],
-            "status": "proposed",
+            "status": "candidate",
         }
         notes.append(json.dumps(payload, ensure_ascii=False))
     return "\n".join(notes) + ("\n" if notes else "")
@@ -266,8 +268,10 @@ def _residue_markdown(
                     f"- Source segments: {refs}",
                     f"- Original excerpt: {_excerpt(transcript.segments, item.evidence_segments)}",
                     f"- Reason not absorbed: {item.reason_not_absorbed}",
-                    "- Possible future value or uncertainty: "
-                    f"{item.future_value_or_uncertainty}",
+                    (
+                        "- Possible future value or uncertainty: "
+                        f"{item.future_value_or_uncertainty}"
+                    ),
                     "",
                 ]
             )
@@ -322,7 +326,7 @@ def process_audio(
         "media_type": audio.suffix.lower().lstrip("."),
     }
     manifest = {
-        "schema_version": "1.0",
+        "schema_version": "1.1",
         "pipeline_version": __version__,
         "source": source,
         "transcription": {
@@ -356,9 +360,9 @@ def process_audio(
                 "overlap_segments",
             )
         },
-        "review": {
-            "status": "awaiting_human_review",
-            "automatic_core_write": False,
+        "downstream": {
+            "note_ingestion": "automatic_after_contract_validation",
+            "world_model_write": "governed",
         },
     }
 
