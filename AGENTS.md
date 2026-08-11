@@ -12,8 +12,8 @@ Agents must keep these layers separate. Processing a recording or document is no
 ## Roles
 
 - **Product owner (user):** provides business context and local sample data, makes product decisions, and accepts or rejects delivered results.
-- **Architect (ChatGPT):** maintains product direction, architecture, canonical concepts, implementation-ready Issues, test cases, and architecture reviews.
-- **Executor (Codex):** implements one approved GitHub Issue at a time. Codex may make local engineering choices inside the approved boundary but must not invent product models or durable concepts.
+- **Architect (ChatGPT):** maintains product direction, architecture, canonical concepts, durable product rules, implementation-ready Issues, test cases, and architecture reviews.
+- **Executor (Codex):** implements one approved GitHub Issue at a time. Codex may make local engineering choices inside the approved boundary but must not invent product models, durable concepts, or product behavior.
 
 ## Authority order
 
@@ -21,9 +21,10 @@ For implementation work, use these sources in this order:
 
 1. Applicable `AGENTS.md` guardrails.
 2. Current GitHub Issue, including approved plan and tests when present.
-3. `docs/architecture/CONCEPTS.md` for canonical Core concepts and semantic boundaries.
-4. Referenced architecture / ADR / durable specs.
-5. Executor implementation notes for repository-specific details only.
+3. `docs/architecture/CONCEPTS.md` for canonical concept definitions.
+4. `docs/product/INFORMATION_GOVERNANCE.md` for information absorption, World Model update, human-review, isolated-Object, and human-facing communication rules.
+5. Referenced architecture / ADR / durable specs.
+6. Executor implementation notes for repository-specific details only.
 
 If they conflict, stop the affected work and raise the conflict. Do not guess.
 
@@ -35,17 +36,18 @@ Before changing code or system documentation, the executor must:
 
 1. Identify the GitHub Issue being implemented.
 2. Read root and applicable nested `AGENTS.md` files.
-3. Read `docs/architecture/CONCEPTS.md` whenever the work touches Object, Role, Relationship, Lifecycle, Note, identity, naming, View, approval, or other domain semantics.
-4. Read durable documents referenced by the Issue.
-5. Inspect the current repository and perform a preflight.
-6. If the Issue contains an Architect-approved Implementation Plan, do not replace it. Verify that it is executable.
-7. If a concrete repository conflict makes the plan unexecutable, stop and report it.
-8. Otherwise implement the smallest complete solution within the Issue boundary.
-9. Run required automated tests and smoke tests.
-10. Open or update one PR with `Closes #<issue-number>`.
-11. Report changed areas, validation results, and unresolved risks.
+3. Read `docs/architecture/CONCEPTS.md` whenever the work touches domain semantics.
+4. Read `docs/product/INFORMATION_GOVERNANCE.md` whenever the work touches Note ingestion, Object updates, approval/escalation, Object creation/deletion, relationship safety, or human-facing prompts/messages.
+5. Read durable documents referenced by the Issue.
+6. Inspect the current repository and perform a preflight.
+7. If the Issue contains an Architect-approved Implementation Plan, do not replace it. Verify that it is executable.
+8. If a concrete repository conflict makes the plan unexecutable, stop and report it.
+9. Otherwise implement the smallest complete solution within the Issue boundary.
+10. Run required automated tests and smoke tests.
+11. Open or update one PR with `Closes #<issue-number>`.
+12. Report changed areas, validation results, and unresolved risks.
 
-Ordinary engineering choices inside the approved scope do not need product-owner approval. Architecture, lifecycle, canonical concepts, durable contracts, or explicit non-goals cannot be changed silently.
+Ordinary engineering choices inside approved scope do not need product-owner approval. Architecture, lifecycle, canonical concepts, durable product rules, or explicit non-goals cannot be changed silently.
 
 ## Concept governance
 
@@ -56,9 +58,17 @@ Agents must:
 1. Reuse concepts already defined in `docs/architecture/CONCEPTS.md` whenever possible.
 2. Avoid synonyms, parallel models, and business-specific Core concepts that duplicate an existing concept.
 3. Treat business terms as Name, Role, Relationship, Note, View, or presentation labels when sufficient.
-4. Never add a durable Object type, Role, Relationship semantic, lifecycle concept, or information concept merely because a feature needs a convenient noun.
+4. Never add a durable Object type, Role, Relationship semantic, Lifecycle concept, or Information concept merely because a feature needs a convenient noun.
 5. If existing concepts are genuinely insufficient, stop implementation and request an architecture change. `CONCEPTS.md` must be updated before implementation proceeds.
 6. Preserve stable Object identity and history when names or interpretations change.
+
+## Product-rule governance
+
+Business behavior is not defined in `CONCEPTS.md`.
+
+Reusable rules about how ArcheOS absorbs information, updates long-term understanding, escalates uncertainty, protects relationships, or communicates with humans belong in `docs/product/INFORMATION_GOVERNANCE.md` or another explicitly designated durable product-rule document.
+
+Do not duplicate those rules across Issues, adapters, prompts, or implementation modules. Issues may reference and test them, but must not create competing definitions.
 
 ## Issue and PR discipline
 
@@ -88,80 +98,25 @@ Context artifacts and Residue support this lifecycle but do not create parallel 
 - Real user/business data remains local and Git-ignored unless the product owner explicitly approves a sanitized fixture.
 - Never commit secrets, customer recordings, transcripts, private Object data, or credentials.
 
-## Atomic Information and Notes
-
-An Atomic Information Candidate is the smallest independently reviewable information statement generated during Processing. It preserves statement, concerns, Evidence, context, and uncertainty.
-
-M2 allows contract-valid Atomic Information Candidates to be **automatically ingested as durable Notes without per-note human approval**.
-
-Durable Notes preserve history. A correction or refinement creates a new revision or equivalent append-only history; it must not silently overwrite earlier Note state.
-
-When a Note is interpreted against existing Objects, distinguish:
-
-- **addition** — compatible new information;
-- **update** — existing long-term understanding should change;
-- **conflict** — new and existing trusted information cannot safely coexist.
-
-Compatible additions may be absorbed automatically.
-
-## World Model change governance
-
-World Model repositories expose persistence primitives. Risk/approval rules belong **above** persistence adapters so they apply equally to SQLite, JSONL, or future stores.
-
-ArcheOS uses **risk-based automation**, not blanket approval for every World Model change.
-
-### Safe automatic updates
-
-An update to an existing Object may execute automatically when all of these are true:
-
-- the target Object is unambiguous;
-- Evidence is sufficient;
-- the new information does not conflict with trusted existing information;
-- the business meaning is clear;
-- all Role / Relationship / Lifecycle concepts are already authorized by `CONCEPTS.md`;
-- no new Object must be created;
-- no Object is being deleted;
-- no still-relevant Object would become isolated;
-- no uncertain Relationship must be guessed.
-
-Automatic changes must still preserve Evidence, source, and history.
-
-### Human judgment required
-
-Escalate to a human when the system needs to:
-
-- create an Object;
-- delete an Object;
-- resolve a conflict between trusted information;
-- choose between multiple possible existing Objects;
-- infer an uncertain Relationship or its meaning;
-- add/reinterpret a Role whose connection to the Object's current business context is unclear;
-- perform a change that may leave a still-relevant Object isolated;
-- make a business trade-off rather than a straightforward evidence-backed update.
-
-Human judgment may happen through natural-language AI conversation; a dedicated approval UI is not required.
-
-## Isolated Object protection
-
-ArcheOS should avoid isolated Objects.
-
-- A new Object should normally be introduced together with a clear business relationship to existing Objects.
-- If no relationship can yet be established, the human must confirm why the Object is worth retaining separately.
-- Deleting an Object must not unintentionally leave another still-relevant Object with no effective relationship when the deleted Object was its only connection.
-- Deletion should preserve necessary history and traceability; physical deletion strategy is an implementation detail to be defined later.
-
 ## Core domain model
 
-The canonical model is:
+The canonical model is defined in `docs/architecture/CONCEPTS.md` and currently includes:
 
-- `Object` — stable identity;
-- `Role` — mutable/time-bound business interpretation;
-- `Relationship` — typed relationship between Objects;
-- `Lifecycle` — temporal/existence/completion characteristics, separate from Role;
-- `Name` — human-readable mutable label, never the identity key;
-- `Note` — durable information, separate from Object;
-- `Evidence` — traceability to source;
-- `View` / `View Model` — human-facing projections, not Core truth.
+- `Object`
+- `Role`
+- `Relationship`
+- `Lifecycle`
+- `Name`
+- `Note`
+- `Atomic Information Candidate`
+- `Evidence`
+- `Residue`
+- `Structured World Model`
+- `Projection`
+- `View`
+- `View Model`
+- `Presentation`
+- `Object Resolver`
 
 Current accepted Roles include `person`, `company`, `brand`, `project`, `business_line`, `event`, `goal`, and `decision`.
 
@@ -174,24 +129,14 @@ JSONL, SQLite, and future databases are persistence mechanisms, not domain conce
 - Business logic depends on stable repository/store contracts, not a concrete database.
 - JSONL may be a first-class storage adapter, not merely an export format.
 - SQLite may be the first local World Model adapter.
-- Replacing storage must not redefine Object, Note, Role, Relationship, Lifecycle, or Name semantics.
+- Replacing storage must not redefine domain semantics or product rules.
 - Avoid unmanaged dual writes that create competing authorities.
 
 ## Human-facing communication
 
-**Everything presented to a human must use clear business language rather than internal technical language.**
+Whenever a feature presents information to a business user, follow the human-facing communication rules in `docs/product/INFORMATION_GOVERNANCE.md`.
 
-This includes frontend pages, AI questions, approval requests, conflict explanations, warnings, reports, summaries, and recommendations.
-
-Design for a general university graduate who does not know ArcheOS internals. A human should understand:
-
-1. what the system learned or wants to change;
-2. why it matters in business terms;
-3. what evidence/context supports it;
-4. what choices are available;
-5. the practical consequence of each choice.
-
-Do not require business users to understand `object_id`, schema, foreign key, repository, graph edge, mutation, adapter, or database details. Translate internal actions into natural business language. Technical details may be shown only for debugging, audit, developer tools, or when explicitly requested.
+Internal technical detail may remain precise inside code and developer tools, but ordinary business users must not be required to understand ArcheOS implementation details.
 
 ## General behavior
 
@@ -199,7 +144,7 @@ Agents must:
 
 1. Prefer updating an existing authoritative document over creating a competing one.
 2. Avoid duplicate/synonymous concepts.
-3. Keep business meaning separate from implementation details.
+3. Keep concept definitions, product rules, architecture, and implementation details in their correct layers.
 4. Preserve traceability from source to output.
 5. Prefer the smallest complete vertical slice over a broad incomplete framework.
 6. Treat uncertainty explicitly rather than inventing identities, facts, or relationships.
