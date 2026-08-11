@@ -59,8 +59,10 @@ Agents must:
 2. Avoid synonyms, parallel models, and business-specific Core concepts that duplicate an existing concept.
 3. Treat business terms as Name, Role, Relationship, Note, View, or presentation labels when sufficient.
 4. Never add a durable Object type, Role, Relationship semantic, Lifecycle concept, or Information concept merely because a feature needs a convenient noun.
-5. If existing concepts are genuinely insufficient, stop implementation and request an architecture change. `CONCEPTS.md` must be updated before implementation proceeds.
-6. Preserve stable Object identity and history when names or interpretations change.
+5. When another system or project uses a conflicting definition, use `CONCEPTS.md` for new ArcheOS design and record an explicit mapping; do not silently rename or migrate the old system.
+6. If existing concepts are genuinely insufficient and the meaning is domain-specific, create or update that project's `docs/domain/CONCEPTS.md` before implementation. Domain concepts remain local and must not redefine common concepts.
+7. A domain concept may enter the common vocabulary only through an architecture review that updates `CONCEPTS.md` and records an ADR / Decision.
+8. Preserve stable Object identity and history when names or interpretations change.
 
 ## Product-rule governance
 
