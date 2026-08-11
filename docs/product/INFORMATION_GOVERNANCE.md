@@ -24,6 +24,7 @@
 
 - 保留来源和 Evidence；
 - 保留 context 与 confidence / uncertainty；
+- 能够明确识别声明主体 / 立场时，保留 Claim；
 - 重复处理同一信息时应避免无意义重复；
 - Atomic Information 后续修订不得静默覆盖历史，应保留版本或等价的可追溯历史。
 
@@ -31,68 +32,115 @@
 
 ---
 
-## 3. Atomic Information 与已有 Object 的消化
+## 3. Claim 治理
+
+Claim 表示“谁以什么立场表达了什么”，**不是系统已经确认的事实**。
+
+运行时遵循：
+
+- Claim 可以自动进入长期 Information Layer；
+- 相互矛盾的 Claim 可以同时长期保存，不为了得到唯一答案而覆盖或删除其中一条；
+- `Atomic Information.confidence` 默认表示信息提取 / 语义理解置信度，不是真实性概率；
+- Claim 的 attribution confidence 表示归因正确性的置信度，不是真实性概率；
+- 第一版不建立 claimant reputation / source authority 打分体系，不根据“这个人通常更可信”自动计算事实概率；
+- 如果 World Model 更新是否成立取决于“应该相信哪个 Claim”，必须进入冲突 / 人类判断，而不是模型自行选边；
+- Claimant 尚未解析为 Object 时，可以继续保留 Source / speaker 归因，不得为了归因方便自动创建 Person Object。
+
+Claim 可以成为 World Model 变化的依据之一，但是否写入 World Model 仍由后续消化、Evidence、冲突检查和安全更新规则决定。
+
+---
+
+## 4. Atomic Information 与已有 Object 的消化
 
 新的 Atomic Information 涉及已有 Object 时，系统先判断业务影响：
 
-### 3.1 补充
+### 4.1 补充
 
-新信息与当前认知相容，只是增加更多事实、背景或细节。
+新信息与当前认知相容，只是增加更多事实、背景、Claim 或细节。
 
-处理：**自动吸收。**
+处理：**自动吸收 Information；不需要为了“保存信息”强行修改 World Model。**
 
-### 3.2 更新
+### 4.2 更新
 
 新信息说明已有长期认知需要调整，例如名称、Role、Relationship 或 Lifecycle 的某项信息需要变化。
 
 处理：满足“安全自动更新”条件时可以自动执行；否则交给人类判断。
 
-### 3.3 冲突
+### 4.3 冲突
 
-新信息与已有可信信息无法安全同时成立。
+新信息、Claim 或 Evidence 与已有可信认知无法安全同时成立。
 
-处理：**不得静默覆盖，交给人类判断。**
+处理：**不得静默覆盖，保留所有来源并交给人类判断。**
 
 ---
 
-## 4. 安全自动更新
+## 5. 安全自动更新
 
 已有 Object 的更新在同时满足以下条件时可以自动执行：
 
 - 目标 Object 唯一且明确；
 - Evidence 足够；
-- 新信息与已有可信信息不冲突；
+- 新信息与已有可信信息 / Claim 不冲突；
 - 业务含义清楚，没有明显歧义；
 - 使用的是已经批准的 Role / Relationship / Lifecycle 语义；
 - 不需要创建新 Object；
 - 不涉及删除 Object；
 - 不会使仍需保留的 Object 变成孤立对象；
-- 不需要模型猜测一条不确定的 Relationship。
+- 不需要模型猜测一条不确定的 Relationship；
+- 如果信息带有 Claim，其结构变化不依赖尚未解决的“该相信谁”判断。
 
 例如：系统已经明确知道“展厅经营”是哪一个长期对象，新的可靠信息说明“9 月 1 日正式启动”，且与已有信息不冲突，可以直接补充其开始时间，不要求人类再次确认。
 
-自动更新仍必须保存来源、Evidence 和历史。
+自动更新仍必须保存来源、Evidence、Atomic Information / Claim 和历史。
 
 ---
 
-## 5. 必须交给人类判断的情况
+## 6. 必须交给人类判断的情况
 
 以下情况停止自动修改，并请求人类判断：
 
 - 新建 Object；
 - 删除 Object；
-- 新旧可信信息发生冲突；
+- 新旧可信信息或不同 Claim 发生冲突，且 World Model 更新依赖选择其中一方；
 - 无法确定新的 Atomic Information 对应哪个已有 Object；
 - Relationship 的对象或业务含义不确定；
 - 新增或调整 Role 时，无法清楚说明它与对象当前业务上下文、现有关系的联系；
 - 变更可能使仍需保留的 Object 变成孤立对象；
-- 涉及真正的业务取舍，而不是证据明确的信息更新。
+- 涉及真正的业务取舍，而不是证据明确的信息更新；
+- 需要比较不同 claimant / source 的可信度才能得出结论。
 
 人类判断可以直接通过 AI 对话或 prompt 完成，不要求专门审核前端。
 
 ---
 
-## 6. 新建 Object 与孤立对象
+## 7. Relationship 治理
+
+当前允许写入 World Model 的通用 Relationship 语义以 `CONCEPTS.md` 为唯一词汇权威。
+
+第一版只使用：
+
+```text
+part_of
+member_of
+responsible_for
+depends_on
+related_to
+```
+
+运行时要求：
+
+- 两端必须先解析到已有 Object；
+- 不为了建立关系而自动把普通名词升级成 Object；
+- 关系方向必须明确；
+- 不同时持久化一条关系及其纯查询意义上的反向副本；
+- 能用更具体已批准关系表达时，不应为了省事全部写成 `related_to`；
+- 现有词汇不足时保留 Atomic Information / Claim，并交由 Architect 判断是否需要扩展，不允许 Agent 临时发明新的 relation 值。
+
+后续是否增加 `supports`、`participates_in`、`serves` 等关系，以真实 B2 / B4 数据反复出现的需求为依据，不提前扩展。
+
+---
+
+## 8. 新建 Object 与孤立对象
 
 ArcheOS 应尽量避免创建没有业务联系的孤立 Object。
 
@@ -106,13 +154,13 @@ ArcheOS 应尽量避免创建没有业务联系的孤立 Object。
 
 ---
 
-## 7. 删除 Object 与关系安全
+## 9. 删除 Object 与关系安全
 
 删除 Object 必须由人类确认。
 
 删除前检查：
 
-- 是否仍有重要 Atomic Information / Evidence / 历史依赖这个 Object；
+- 是否仍有重要 Atomic Information / Claim / Evidence / 历史依赖这个 Object；
 - 删除后是否会让其他仍需保留的 Object 因失去唯一有效联系而变成孤立对象；
 - 是否需要先建立新的业务关系，或一起处理相关 Object。
 
@@ -122,7 +170,7 @@ ArcheOS 应尽量避免创建没有业务联系的孤立 Object。
 
 ---
 
-## 8. 面向人类的表达规则
+## 10. 面向人类的表达规则
 
 所有面向人类的内容必须使用**通俗业务语言**，而不是内部技术语言。
 
@@ -145,6 +193,8 @@ ArcheOS 应尽量避免创建没有业务联系的孤立 Object。
 4. 有哪些选择；
 5. 每个选择会有什么业务后果。
 
+当冲突来自不同 Claim 时，面向人类应说明“谁表达了什么、依据来自哪里、为什么目前不能安全合并”，而不是只显示内部冲突代码。
+
 例如内部动作可能是：
 
 ```text
@@ -160,7 +210,7 @@ add_role(business_line)
 
 ---
 
-## 9. 存储无关性
+## 11. 存储无关性
 
 上述业务规则不得写死在某一种数据库 Adapter 中。
 
@@ -168,7 +218,7 @@ add_role(business_line)
 
 - 自动更新边界一致；
 - 人工判断边界一致；
-- Evidence 与历史要求一致；
+- Claim / Evidence 与历史要求一致；
 - 孤立对象保护规则一致；
 - 人类表达规则一致。
 
