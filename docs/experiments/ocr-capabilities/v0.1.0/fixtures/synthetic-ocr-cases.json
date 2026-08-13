@@ -1,0 +1,12 @@
+{
+  "fixture_version": "0.1.0",
+  "classification": "synthetic_non_sensitive",
+  "cases": [
+    {"id": "mixed_print", "coverage": ["latin_print", "simplified_chinese_print", "simple_table"]},
+    {"id": "rotated_print", "coverage": ["orientation"]},
+    {"id": "low_contrast_print", "coverage": ["low_contrast"]},
+    {"id": "no_text", "coverage": ["no_text"]},
+    {"id": "invalid_input", "coverage": ["corrupt_or_unsupported"]}
+  ],
+  "data_handling": "No business material, person, organization, path, hash, credential, or OCR text result is stored in this fixture."
+}
