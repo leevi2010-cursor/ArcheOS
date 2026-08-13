@@ -131,6 +131,14 @@ JSONL, SQLite, and future databases are persistence mechanisms, not domain conce
 - Replacing storage must not redefine domain semantics or product rules.
 - Avoid unmanaged dual writes that create competing authorities.
 
+## 开源能力调查与复用治理
+
+开发或重构通用文件格式、协议、存储、解析、OCR、格式转换、表格或布局识别、模型能力前，必须在当前 Issue 或 ADR 中记录基于官方 GitHub 与官方文档的候选调查。调查至少覆盖许可证及传递性义务、稳定版本与维护迹象、安全记录、安装与模型体积、平台和 Apple Silicon 支持、本地 / 离线能力、默认及可选网络行为、结构化输出、Evidence locator 能力、确定性，以及损坏或恶意输入的 fail-closed 行为。
+
+不得仅依据 star 数或维护组织声誉选择方案。优先复用维护活跃、许可证清晰、可在隐私边界内本地运行、且能通过 Adapter 隔离的成熟实现。第三方 parser、converter、OCR、文档模型和服务必须位于 Adapter 后；其内部类型、ID、生命周期、置信语义及 preview 输出不得成为 ArcheOS Core 或 Evidence 权威。Markdown、CSV 等有损输出必须明确标注为可替换的派生表示。
+
+若决定自行实现同类基础能力，Issue 或 ADR 必须逐项说明现有成熟方案为何不能满足关键要求，并保存验证证据。缺少上述调查证据时，Executor 不得从零手写 PDF、Excel、OCR 或 Markdown parser。任何可能上传内容、首次下载模型、调用远程 API 或加载第三方插件的路径必须默认关闭；处理真实或敏感 Source 前，必须固定版本和 artifacts，并以网络禁用或等价证据验证离线执行。
+
 ## Human-facing communication
 
 Whenever a feature presents information to a business user, follow the human-facing communication rules in `docs/product/INFORMATION_GOVERNANCE.md`.
