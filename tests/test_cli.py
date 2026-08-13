@@ -20,6 +20,10 @@ from archeos.cli import main
 from archeos.codex_app_server import CodexAnalysisProvider
 from archeos.pipeline import ProcessingError
 from archeos.pyannote_speakers import PyannoteSpeakerProvider
+from archeos.representation_information import (
+    CodexRepresentationAnalysisProvider,
+    FileRepresentationAnalysisProvider,
+)
 from archeos.world_model import SQLiteWorldModelRepository
 
 
@@ -78,6 +82,39 @@ class CliTest(unittest.TestCase):
         analysis_provider = process_managed_audio.call_args.args[5]
         self.assertIsInstance(speaker_provider, PyannoteSpeakerProvider)
         self.assertIsInstance(analysis_provider, CodexAnalysisProvider)
+
+    @patch("archeos.cli.ingest_processing_package")
+    @patch("archeos.cli.RepresentationInformationService.extract")
+    def test_representation_extract_uses_codex_by_default_and_file_for_fixtures(
+        self,
+        extract: Mock,
+        ingest_processing_package: Mock,
+    ) -> None:
+        extract.return_value = Path("/tmp/representation-package")
+        ingest_processing_package.return_value = IngestionResult(0, 0, 0, ())
+        arguments = [
+            "information",
+            "--store",
+            "store.jsonl",
+            "extract",
+            "repr_" + "a" * 64,
+            "--managed-root",
+            "managed",
+            "--representation-root",
+            "representations",
+            "--output-root",
+            "information",
+        ]
+        with redirect_stdout(StringIO()):
+            self.assertEqual(main(arguments), 0)
+        default_provider = extract.call_args.args[-1]
+        self.assertIsInstance(default_provider, CodexRepresentationAnalysisProvider)
+
+        with redirect_stdout(StringIO()):
+            self.assertEqual(main([*arguments, "--analysis-file", "fixture.json"]), 0)
+        fixture_provider = extract.call_args.args[-1]
+        self.assertIsInstance(fixture_provider, FileRepresentationAnalysisProvider)
+        self.assertEqual(fixture_provider.path, Path("fixture.json"))
 
     def test_object_commands_return_human_readable_world_model(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

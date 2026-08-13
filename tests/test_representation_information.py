@@ -4,6 +4,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 from archeos.atomic_information import JsonlAtomicInformationStore, ingest_processing_package
 from archeos.representation import (
@@ -14,7 +15,9 @@ from archeos.representation import (
 )
 from archeos.representation.adapters import MarkdownRepresentationAdapter
 from archeos.representation_information import (
+    CodexRepresentationAnalysisProvider,
     RepresentationAnalysisResult,
+    RepresentationAnalysisUnit,
     RepresentationCandidateDraft,
     RepresentationInformationError,
     RepresentationInformationService,
@@ -92,6 +95,42 @@ class FailingProvider:
         raise RuntimeError("synthetic provider failure")
 
 
+class FakeCodexThread:
+    def __init__(self, response: str | None, error: Exception | None = None) -> None:
+        self.response = response
+        self.error = error
+        self.run_kwargs: dict[str, object] | None = None
+
+    def run(self, prompt: str, **kwargs: object) -> object:
+        if self.error:
+            raise self.error
+        self.run_kwargs = {"prompt": prompt, **kwargs}
+        return SimpleNamespace(final_response=self.response)
+
+
+class FakeCodex:
+    instance: "FakeCodex"
+    thread = FakeCodexThread(None)
+
+    def __init__(self) -> None:
+        self.thread_kwargs: dict[str, object] | None = None
+        FakeCodex.instance = self
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args: object) -> None:
+        return None
+
+    def thread_start(self, **kwargs: object) -> FakeCodexThread:
+        self.thread_kwargs = kwargs
+        return self.thread
+
+
+def codex_sdk_loader() -> tuple[type[object], object, object]:
+    return FakeCodex, "deny-all", "read-only"
+
+
 class MutatingProvider(CoveringProvider):
     name = "mutating"
 
@@ -165,6 +204,16 @@ class RepresentationInformationTest(unittest.TestCase):
                 self.assertEqual(manifest["counts"]["atomic_information_candidates"], candidates)
                 self.assertEqual(manifest["counts"]["unaccounted_eligible_units"], 0)
                 self.assertTrue(all(item["unit_id"].startswith("unit_") for item in manifest["units"]))
+                if candidates:
+                    evidence = json.loads(
+                        (package / "atomic_information_candidates.jsonl")
+                        .read_text(encoding="utf-8")
+                        .splitlines()[0]
+                    )["source_evidence"][0]
+                    self.assertEqual(evidence["representation_kind"], kind)
+                    if kind == "pdf_text":
+                        self.assertEqual(manifest["units"][0]["kind"], "pdf_text_block")
+                        self.assertEqual(evidence["representation_kind"], "pdf_text")
                 if kind == "image_structural_preflight":
                     self.assertEqual(manifest["counts"]["eligible_units"], 0)
                     self.assertEqual(
@@ -224,6 +273,63 @@ class RepresentationInformationTest(unittest.TestCase):
         with self.assertRaises(RepresentationInformationError):
             service.extract(representation.representation_id, MutatingProvider(managed_bytes))
         self.assertFalse((self.output_root / representation.representation_id).exists())
+
+    def test_codex_provider_uses_official_sdk_with_read_only_boundaries(self) -> None:
+        unit = RepresentationAnalysisUnit(
+            unit_id="unit_" + "a" * 64,
+            representation_id="repr_" + "b" * 64,
+            source_id="src_" + "c" * 32,
+            source_content_hash="sha256:" + "d" * 64,
+            representation_kind="pdf_text",
+            kind="pdf_text_block",
+            content="Synthetic unit.",
+            structured_value=None,
+            locator={"page": 1, "ordinal": 1},
+            context="PDF text block",
+            artifact_id="artifact_" + "e" * 64,
+            artifact_locator="artifacts/pages.json",
+            analysis_eligible=True,
+        )
+        FakeCodex.thread = FakeCodexThread(
+            json.dumps(
+                {
+                    "candidates": [
+                        {
+                            "statement": "Synthetic statement.",
+                            "semantic_type": "observation",
+                            "concerns": ["Synthetic"],
+                            "evidence_unit_ids": [unit.unit_id],
+                            "context": "Synthetic context.",
+                            "confidence": 0.9,
+                        }
+                    ],
+                    "residue": [],
+                }
+            )
+        )
+        result = CodexRepresentationAnalysisProvider(
+            sdk_loader=codex_sdk_loader
+        ).analyze((unit,))
+
+        self.assertEqual(result.candidates[0].evidence_unit_ids, (unit.unit_id,))
+        thread_kwargs = FakeCodex.instance.thread_kwargs
+        assert thread_kwargs is not None
+        self.assertEqual(thread_kwargs["approval_mode"], "deny-all")
+        self.assertEqual(thread_kwargs["sandbox"], "read-only")
+        self.assertTrue(thread_kwargs["ephemeral"])
+        self.assertIn("cwd", thread_kwargs)
+        self.assertIn("developer_instructions", thread_kwargs)
+        run_kwargs = FakeCodex.thread.run_kwargs
+        assert run_kwargs is not None
+        self.assertEqual(run_kwargs["sandbox"], "read-only")
+        self.assertIn("output_schema", run_kwargs)
+        self.assertIn("Every eligible unit", run_kwargs["prompt"])
+        self.assertNotIn(unit.source_id, run_kwargs["prompt"])
+
+    def test_codex_provider_rejects_invalid_structured_output(self) -> None:
+        FakeCodex.thread = FakeCodexThread("not json")
+        with self.assertRaisesRegex(RuntimeError, "invalid structured Representation output"):
+            CodexRepresentationAnalysisProvider(sdk_loader=codex_sdk_loader).analyze(())
 
     def test_synthetic_markdown_representation_smoke(self) -> None:
         external = self.root / "smoke.md"
