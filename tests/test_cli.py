@@ -306,7 +306,7 @@ class CliTest(unittest.TestCase):
                 )
             admitted = json.loads(output.getvalue())
             self.assertEqual(result, 0)
-            self.assertEqual(admitted["source_id"], source_id)
+            self.assertEqual(admitted["source"]["source_id"], source_id)
 
             output = StringIO()
             with redirect_stdout(output):

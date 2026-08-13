@@ -84,14 +84,6 @@ class ManagedSource:
     ingested_from: IngestedFrom | None = None
     verification_records: tuple[VerificationRecord, ...] = ()
     storage_replicas: tuple[StorageReplica, ...] = ()
-    # This is an admission response hint and is intentionally not persisted.
-    content_equivalent_source_ids: tuple[str, ...] = ()
-
-    @property
-    def source(self) -> ManagedSource:
-        """Compatibility convenience for callers expecting an admission result."""
-
-        return self
 
     def to_manifest_dict(self) -> dict[str, object]:
         payload: dict[str, object] = {
@@ -118,11 +110,21 @@ class ManagedSource:
         return payload
 
     def to_dict(self) -> dict[str, object]:
-        payload = self.to_manifest_dict()
-        payload["content_equivalent_source_ids"] = list(
-            self.content_equivalent_source_ids
-        )
-        return payload
+        return self.to_manifest_dict()
+
+
+@dataclass(frozen=True)
+class AdmissionResult:
+    """Technical result of one admission operation, separate from Source state."""
+
+    source: ManagedSource
+    content_equivalent_source_ids: tuple[str, ...]
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "source": self.source.to_dict(),
+            "content_equivalent_source_ids": list(self.content_equivalent_source_ids),
+        }
 
 
 @dataclass(frozen=True)

@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Mapping
 
 from .contracts import ManagedSourceRepository
-from .models import ManagedSource, RestoreResult, VerificationResult
+from .models import AdmissionResult, ManagedSource, RestoreResult, VerificationResult
 
 
 class ManagedSourceService:
@@ -21,7 +21,7 @@ class ManagedSourceService:
         *,
         source_id: str | None = None,
         metadata: Mapping[str, object] | None = None,
-    ) -> ManagedSource:
+    ) -> AdmissionResult:
         return self.repository.admit(Path(external_path), source_id, metadata)
 
     def show(self, source_id: str) -> ManagedSource:

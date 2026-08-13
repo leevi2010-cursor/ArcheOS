@@ -12,6 +12,7 @@ from .local_repository import (
     SourceValidationError,
 )
 from .models import (
+    AdmissionResult,
     IngestedFrom,
     ManagedSource,
     RestoreResult,
@@ -23,6 +24,7 @@ from .service import ManagedSourceService
 
 __all__ = [
     "AdmissionError",
+    "AdmissionResult",
     "IngestedFrom",
     "LocalManagedSourceRepository",
     "ManagedSource",

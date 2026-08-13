@@ -5,7 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Mapping, Protocol
 
-from .models import ManagedSource, RestoreResult, VerificationResult
+from .models import AdmissionResult, ManagedSource, RestoreResult, VerificationResult
 
 
 class ManagedSourceRepository(Protocol):
@@ -14,7 +14,7 @@ class ManagedSourceRepository(Protocol):
         external_path: Path,
         source_id: str | None = None,
         metadata: Mapping[str, object] | None = None,
-    ) -> ManagedSource: ...
+    ) -> AdmissionResult: ...
 
     def get(self, source_id: str) -> ManagedSource: ...
 

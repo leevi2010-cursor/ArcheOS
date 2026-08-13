@@ -13,14 +13,18 @@ import mimetypes
 import os
 import re
 import shutil
+import sys
 import tempfile
 import uuid
+from errno import EEXIST, ENOTEMPTY
+from ctypes import CDLL, c_char_p, c_int, get_errno
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Mapping
 
 from .models import (
     MANIFEST_SCHEMA_VERSION,
+    AdmissionResult,
     IngestedFrom,
     ManagedSource,
     RestoreResult,
@@ -35,6 +39,10 @@ SOURCE_ID_PATTERN = re.compile(r"^src_[0-9a-f]{32}$")
 HASH_PATTERN = re.compile(r"^sha256:[0-9a-f]{64}$")
 SOURCE_DIR_NAME = "sources"
 STAGING_DIR_NAME = ".staging"
+AT_FDCWD_DARWIN = -2
+AT_FDCWD_LINUX = -100
+RENAME_EXCL_DARWIN = 0x00000004
+RENAME_NOREPLACE_LINUX = 1
 
 
 class SourceError(RuntimeError):
@@ -95,6 +103,17 @@ def _validate_non_empty_string(value: object, field: str) -> str:
     return value.strip()
 
 
+def _validate_timestamp(value: object, field: str) -> str:
+    timestamp = _validate_non_empty_string(value, field)
+    try:
+        parsed = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise ManifestError(f"{field} must be an ISO-8601 timestamp") from exc
+    if parsed.tzinfo is None:
+        raise ManifestError(f"{field} must include a timezone")
+    return timestamp
+
+
 def _validate_size(value: object, field: str) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or value < 0:
         raise ManifestError(f"{field} must be a non-negative integer")
@@ -152,10 +171,58 @@ def _is_lexically_safe_locator(locator: object, source_id: str) -> bool:
     if not isinstance(locator, str) or not locator:
         return False
     path = Path(locator)
-    if path.is_absolute() or ".." in path.parts:
+    expected_parts = (SOURCE_DIR_NAME, source_id)
+    if (
+        path.is_absolute()
+        or ".." in path.parts
+        or len(path.parts) != 3
+        or path.parts[:2] != expected_parts
+    ):
         return False
-    expected_prefix = f"{SOURCE_DIR_NAME}/{source_id}/"
-    return locator.startswith(expected_prefix) and path.name.startswith("original")
+    return path.name.startswith("original")
+
+
+def _publish_directory_no_replace(staging_path: Path, final_path: Path) -> None:
+    """Publish a fully written Source directory without replacing a rival path."""
+
+    libc = CDLL(None, use_errno=True)
+    if sys.platform == "darwin":
+        rename_no_replace = libc.renameatx_np
+        directory_fd = AT_FDCWD_DARWIN
+        flag = RENAME_EXCL_DARWIN
+    elif sys.platform == "linux" and hasattr(libc, "renameat2"):
+        rename_no_replace = libc.renameat2
+        directory_fd = AT_FDCWD_LINUX
+        flag = RENAME_NOREPLACE_LINUX
+    else:
+        raise OSError("atomic no-replace directory publication is unavailable")
+    rename_no_replace.argtypes = (c_int, c_char_p, c_int, c_char_p, c_int)
+    rename_no_replace.restype = c_int
+    result = rename_no_replace(
+        directory_fd,
+        os.fsencode(staging_path),
+        directory_fd,
+        os.fsencode(final_path),
+        flag,
+    )
+    if result == 0:
+        return
+    error_number = get_errno()
+    if error_number in {EEXIST, ENOTEMPTY}:
+        raise FileExistsError(error_number, "Managed Source ID already exists", final_path)
+    raise OSError(error_number, "atomic Managed Source publication failed", final_path)
+
+
+def _publish_file_no_replace(staging_path: Path, target_path: Path) -> None:
+    """Atomically publish a regular file without ever replacing target_path."""
+
+    try:
+        os.link(staging_path, target_path, follow_symlinks=False)
+    except FileExistsError:
+        raise
+    except OSError:
+        raise
+    staging_path.unlink()
 
 
 class LocalManagedSourceRepository:
@@ -186,7 +253,7 @@ class LocalManagedSourceRepository:
         external_path: Path | str,
         source_id: str | None = None,
         metadata: Mapping[str, object] | None = None,
-    ) -> ManagedSource:
+    ) -> AdmissionResult:
         """Copy and publish one immutable Source, or cleanly fail closed."""
 
         source_path = Path(external_path)
@@ -199,8 +266,7 @@ class LocalManagedSourceRepository:
         media_type = self._media_type(metadata, filename_hint)
         observed_at = self.clock()
 
-        self.sources_root.mkdir(parents=True, exist_ok=True)
-        self.staging_root.mkdir(parents=True, exist_ok=True)
+        self._ensure_controlled_layout(create=True)
         staging_dir = Path(
             tempfile.mkdtemp(prefix="admit-", dir=str(self.staging_root))
         )
@@ -269,19 +335,19 @@ class LocalManagedSourceRepository:
                         status="verified",
                     ),
                 ),
-                content_equivalent_source_ids=equivalent_ids,
             )
             self._write_manifest(staging_dir / "manifest.json", source)
 
             final_dir = self.sources_root / provisional_id
-            if final_dir.exists() or final_dir.is_symlink():
-                raise SourceConflictError("Managed Source ID already exists")
             try:
-                os.rename(staging_dir, final_dir)
+                _publish_directory_no_replace(staging_dir, final_dir)
             except FileExistsError as exc:
                 raise SourceConflictError("Managed Source ID already exists") from exc
             published = True
-            return source
+            return AdmissionResult(
+                source=source,
+                content_equivalent_source_ids=equivalent_ids,
+            )
         except SourceError:
             raise
         except (OSError, ValueError, TypeError) as exc:
@@ -291,6 +357,9 @@ class LocalManagedSourceRepository:
                 shutil.rmtree(staging_dir, ignore_errors=True)
 
     def get(self, source_id: str) -> ManagedSource:
+        if not self.sources_root.exists():
+            raise SourceNotFoundError("Managed Source was not found")
+        self._ensure_controlled_layout()
         source_id = _validate_source_id(source_id)
         source_dir = self.sources_root / source_id
         manifest_path = source_dir / "manifest.json"
@@ -306,14 +375,12 @@ class LocalManagedSourceRepository:
     def list_sources(self) -> tuple[ManagedSource, ...]:
         if not self.sources_root.is_dir():
             return ()
+        self._ensure_controlled_layout()
         sources: list[ManagedSource] = []
         for source_dir in sorted(self.sources_root.iterdir(), key=lambda path: path.name):
             if not source_dir.is_dir() or source_dir.is_symlink():
                 continue
-            manifest_path = source_dir / "manifest.json"
-            if not manifest_path.exists():
-                continue
-            sources.append(self._read_manifest(manifest_path))
+            sources.append(self.get(source_dir.name))
         return tuple(sources)
 
     def verify(self, source_id: str) -> VerificationResult:
@@ -367,6 +434,7 @@ class LocalManagedSourceRepository:
     def restore(self, source_id: str, target_path: Path | str) -> RestoreResult:
         source = self.get(source_id)
         target = Path(target_path)
+        self._validate_restore_target(target)
         if os.path.lexists(target):
             raise SourceConflictError("restore target already exists; overwrite is disabled")
         if not target.parent.is_dir():
@@ -397,7 +465,7 @@ class LocalManagedSourceRepository:
             if restored_hash != source.content_hash or restored_size != source.size_bytes:
                 raise SourceIntegrityError("restored bytes failed hash or size verification")
             try:
-                os.rename(staging_path, target)
+                _publish_file_no_replace(staging_path, target)
             except FileExistsError as exc:
                 raise SourceConflictError(
                     "restore target appeared during restore; overwrite is disabled"
@@ -449,7 +517,13 @@ class LocalManagedSourceRepository:
         value = metadata.get("filename_hint", source_path.name)
         if not isinstance(value, str) or not value.strip():
             raise SourceValidationError("filename_hint must be a non-empty string")
-        return Path(value).name
+        filename_hint = value.strip()
+        if (
+            filename_hint in {".", ".."}
+            or Path(filename_hint).name != filename_hint
+        ):
+            raise SourceValidationError("filename_hint must be a filename, not a path")
+        return filename_hint
 
     def _media_type(self, metadata: Mapping[str, object], filename_hint: str) -> str:
         value = metadata.get("media_type")
@@ -476,11 +550,18 @@ class LocalManagedSourceRepository:
                 raise SourceValidationError("ingested_from.location must be non-empty")
             if not isinstance(timestamp, str) or not timestamp.strip():
                 raise SourceValidationError("ingested_from.observed_at must be non-empty")
+            if not isinstance(raw.get("may_be_missing", True), bool):
+                raise SourceValidationError("ingested_from.may_be_missing must be a boolean")
             return IngestedFrom(
                 location=location.strip(),
-                observed_at=timestamp.strip(),
-                record_status=str(raw.get("record_status", "historical_hint")),
-                may_be_missing=bool(raw.get("may_be_missing", True)),
+                observed_at=_validate_timestamp(
+                    timestamp, "ingested_from.observed_at"
+                ),
+                record_status=_validate_non_empty_string(
+                    raw.get("record_status", "historical_hint"),
+                    "ingested_from.record_status",
+                ),
+                may_be_missing=raw.get("may_be_missing", True),
             )
         try:
             location = source_path.absolute().as_uri()
@@ -497,8 +578,14 @@ class LocalManagedSourceRepository:
 
     @staticmethod
     def _write_manifest(path: Path, source: ManagedSource) -> None:
+        payload = source.to_manifest_dict()
+        round_tripped = LocalManagedSourceRepository._parse_manifest(
+            json.loads(json.dumps(payload))
+        )
+        if round_tripped != source:
+            raise ManifestError("Manifest round-trip does not preserve Managed Source")
         path.write_text(
-            json.dumps(source.to_manifest_dict(), ensure_ascii=False, indent=2) + "\n",
+            json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
             encoding="utf-8",
         )
 
@@ -508,10 +595,61 @@ class LocalManagedSourceRepository:
         managed_path = self.managed_root / source.managed_locator
         source_dir = self.sources_root / source.source_id
         try:
-            managed_path.relative_to(source_dir)
-        except ValueError as exc:
+            source_dir_real = source_dir.resolve(strict=True)
+            sources_root_real = self.sources_root.resolve(strict=True)
+            managed_parent_real = managed_path.parent.resolve(strict=True)
+            source_dir_real.relative_to(sources_root_real)
+        except (OSError, RuntimeError, ValueError) as exc:
             raise ManifestError("managed_locator is outside its Source directory") from exc
+        if managed_parent_real != source_dir_real:
+            raise ManifestError("managed_locator parent is not the controlled Source directory")
+        if managed_path.is_symlink():
+            raise ManifestError("managed_locator must not be a symlink")
         return managed_path
+
+    def _ensure_controlled_layout(self, *, create: bool = False) -> None:
+        if create:
+            self.sources_root.mkdir(parents=True, exist_ok=True)
+            self.staging_root.mkdir(parents=True, exist_ok=True)
+        if not self.sources_root.exists():
+            return
+        if self.sources_root.is_symlink() or self.staging_root.is_symlink():
+            raise SourceValidationError("Managed Source layout must not contain symlink roots")
+        try:
+            managed_root_real = self.managed_root.resolve(strict=True)
+            sources_root_real = self.sources_root.resolve(strict=True)
+        except (OSError, RuntimeError) as exc:
+            raise SourceValidationError("Managed Source layout cannot be resolved") from exc
+        if sources_root_real != managed_root_real / SOURCE_DIR_NAME:
+            raise SourceValidationError("Managed Source layout escaped its controlled root")
+        if self.staging_root.exists():
+            try:
+                staging_root_real = self.staging_root.resolve(strict=True)
+            except (OSError, RuntimeError) as exc:
+                raise SourceValidationError(
+                    "Managed Source staging root cannot be resolved"
+                ) from exc
+            if staging_root_real != managed_root_real / STAGING_DIR_NAME:
+                raise SourceValidationError(
+                    "Managed Source staging root escaped its controlled root"
+                )
+
+    def _validate_restore_target(self, target: Path) -> None:
+        if target.name in {"", ".", ".."}:
+            raise SourceValidationError("restore target must be a file path")
+        try:
+            target_parent_real = target.parent.resolve(strict=True)
+            managed_root_real = self.managed_root.resolve(strict=False)
+        except (OSError, RuntimeError) as exc:
+            raise SourceValidationError("restore target parent cannot be resolved") from exc
+        resolved_target = target_parent_real / target.name
+        try:
+            resolved_target.relative_to(managed_root_real)
+        except ValueError:
+            return
+        raise SourceValidationError(
+            "restore target must be outside the Managed Source root"
+        )
 
     def _read_manifest(self, path: Path) -> ManagedSource:
         try:
@@ -569,7 +707,7 @@ class LocalManagedSourceRepository:
         )
         if filename_hint in {".", ".."} or Path(filename_hint).name != filename_hint:
             raise ManifestError("filename_hint must be a basename")
-        archived_at = _validate_non_empty_string(
+        archived_at = _validate_timestamp(
             managed_payload.get("archived_at"), "archived_at"
         )
         availability = _validate_non_empty_string(
@@ -590,7 +728,7 @@ class LocalManagedSourceRepository:
                 raise ManifestError("ingested_from fields do not match the strict v1 schema")
             ingested_from = IngestedFrom(
                 location=_validate_non_empty_string(raw_ingested.get("location"), "ingested_from.location"),
-                observed_at=_validate_non_empty_string(raw_ingested.get("observed_at"), "ingested_from.observed_at"),
+                observed_at=_validate_timestamp(raw_ingested.get("observed_at"), "ingested_from.observed_at"),
                 record_status=_validate_non_empty_string(raw_ingested.get("record_status"), "ingested_from.record_status"),
                 may_be_missing=_validate_bool(raw_ingested.get("may_be_missing"), "ingested_from.may_be_missing"),
             )
@@ -634,7 +772,7 @@ class LocalManagedSourceRepository:
                 raise ManifestError(f"verification_records[{index}] is invalid")
             records.append(
                 VerificationRecord(
-                    verified_at=_validate_non_empty_string(raw.get("verified_at"), "verified_at"),
+                    verified_at=_validate_timestamp(raw.get("verified_at"), "verified_at"),
                     observed_content_hash=_validate_hash(raw.get("observed_content_hash"), "observed_content_hash"),
                     managed_content_hash=_validate_hash(raw.get("managed_content_hash"), "managed_content_hash"),
                     observed_size_bytes=_validate_size(raw.get("observed_size_bytes"), "observed_size_bytes"),
