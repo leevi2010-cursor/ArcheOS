@@ -362,6 +362,66 @@ class CliTest(unittest.TestCase):
             self.assertTrue(json.loads(output.getvalue())["verified"])
             self.assertEqual(target.read_bytes(), external.read_bytes())
 
+    def test_source_handoff_cli_write_and_show(self) -> None:
+        with tempfile.TemporaryDirectory(dir=Path.cwd()) as temp:
+            root = Path(temp)
+            external = root / "synthetic.txt"
+            external.write_bytes(b"synthetic handoff")
+            managed_root = root / "managed"
+            source_id = "src_" + "c" * 32
+
+            with redirect_stdout(StringIO()):
+                self.assertEqual(
+                    main(
+                        [
+                            "source",
+                            "admit",
+                            str(external),
+                            "--source-id",
+                            source_id,
+                            "--managed-root",
+                            str(managed_root),
+                        ]
+                    ),
+                    0,
+                )
+            output = StringIO()
+            with redirect_stdout(output):
+                self.assertEqual(
+                    main(
+                        [
+                            "source",
+                            "handoff",
+                            "write",
+                            source_id,
+                            "--managed-root",
+                            str(managed_root),
+                        ]
+                    ),
+                    0,
+                )
+            self.assertEqual(json.loads(output.getvalue())["status"], "written")
+
+            output = StringIO()
+            marker = external.with_name(f"{external.name}.archeos.md")
+            with redirect_stdout(output):
+                self.assertEqual(
+                    main(
+                        [
+                            "source",
+                            "handoff",
+                            "show",
+                            str(marker),
+                            "--managed-root",
+                            str(managed_root),
+                        ]
+                    ),
+                    0,
+                )
+            shown = json.loads(output.getvalue())
+            self.assertEqual(shown["marker"]["source_id"], source_id)
+            self.assertTrue(shown["source_verified"])
+
     def test_process_managed_source_synthetic_end_to_end_smoke(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
