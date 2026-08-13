@@ -16,6 +16,11 @@ class EvidenceRecord:
     start: str | None
     end: str | None
     excerpt: str
+    representation_id: str | None = None
+    representation_kind: str | None = None
+    artifact_id: str | None = None
+    unit_id: str | None = None
+    locator: str | None = None
 
 
 CLAIM_STANCES = frozenset({"assert", "deny", "uncertain"})
@@ -92,11 +97,24 @@ def evidence_from_dict(value: object, field: str) -> EvidenceRecord:
         "end",
         "excerpt",
     }
-    if set(value) != expected:
+    representation_expected = expected | {
+        "representation_id",
+        "representation_kind",
+        "artifact_id",
+        "unit_id",
+        "locator",
+    }
+    if set(value) != expected and set(value) != representation_expected:
         raise ValueError(f"{field} does not match the Evidence schema")
     segment = value["segment"]
     if not isinstance(segment, int) or isinstance(segment, bool) or segment < 1:
         raise ValueError(f"{field}.segment must be a positive integer")
+    representation_fields = set(value) == representation_expected
+    if representation_fields and not all(
+        isinstance(value[name], str) and value[name].strip()
+        for name in ("representation_id", "representation_kind", "artifact_id", "unit_id", "locator")
+    ):
+        raise ValueError(f"{field} Representation Evidence fields must be non-empty strings")
     return EvidenceRecord(
         source_id=_non_empty(value["source_id"], f"{field}.source_id"),
         artifact=_non_empty(value["artifact"], f"{field}.artifact"),
@@ -105,12 +123,21 @@ def evidence_from_dict(value: object, field: str) -> EvidenceRecord:
         start=_optional_text(value["start"], f"{field}.start"),
         end=_optional_text(value["end"], f"{field}.end"),
         excerpt=_non_empty(value["excerpt"], f"{field}.excerpt"),
+        representation_id=(
+            str(value["representation_id"]) if representation_fields else None
+        ),
+        representation_kind=(
+            str(value["representation_kind"]) if representation_fields else None
+        ),
+        artifact_id=str(value["artifact_id"]) if representation_fields else None,
+        unit_id=str(value["unit_id"]) if representation_fields else None,
+        locator=str(value["locator"]) if representation_fields else None,
     )
 
 
 def evidence_to_dict(evidence: EvidenceRecord) -> dict[str, object]:
     _validate_evidence(evidence, "Evidence")
-    return {
+    payload: dict[str, object] = {
         "source_id": evidence.source_id,
         "artifact": evidence.artifact,
         "segment": evidence.segment,
@@ -119,6 +146,17 @@ def evidence_to_dict(evidence: EvidenceRecord) -> dict[str, object]:
         "end": evidence.end,
         "excerpt": evidence.excerpt,
     }
+    if evidence.representation_id is not None:
+        payload.update(
+            {
+                "representation_id": evidence.representation_id,
+                "representation_kind": evidence.representation_kind,
+                "artifact_id": evidence.artifact_id,
+                "unit_id": evidence.unit_id,
+                "locator": evidence.locator,
+            }
+        )
+    return payload
 
 
 def claim_from_dict(value: object, field: str) -> ClaimAttribution:
@@ -400,3 +438,18 @@ def _validate_evidence(evidence: EvidenceRecord, field: str) -> None:
     _optional_text(evidence.start, f"{field}.start")
     _optional_text(evidence.end, f"{field}.end")
     _non_empty(evidence.excerpt, f"{field}.excerpt")
+    representation_values = (
+        evidence.representation_id,
+        evidence.representation_kind,
+        evidence.artifact_id,
+        evidence.unit_id,
+        evidence.locator,
+    )
+    if any(value is not None for value in representation_values):
+        if any(value is None for value in representation_values):
+            raise ValueError(f"{field} Representation Evidence fields must be complete")
+        for name, value in zip(
+            ("representation_id", "representation_kind", "artifact_id", "unit_id", "locator"),
+            representation_values,
+        ):
+            _non_empty(value, f"{field}.{name}")

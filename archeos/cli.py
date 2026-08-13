@@ -23,6 +23,11 @@ from .pipeline import ProcessingError, process_managed_audio
 from .pyannote_speakers import PyannoteSpeakerProvider
 from .representation import LocalRepresentationRepository, RepresentationError, RepresentationService
 from .representation.registry import production_adapter
+from .representation_information import (
+    FileRepresentationAnalysisProvider,
+    RepresentationInformationError,
+    RepresentationInformationService,
+)
 from .speakers import FileSpeakerProvider
 from .source import (
     HandoffMarkerService,
@@ -47,6 +52,7 @@ DEFAULT_CHANGE_PROPOSAL_STORE = Path("03_information/change_proposals.jsonl")
 DEFAULT_CHANGE_JOURNAL = Path("03_information/change_journal.jsonl")
 DEFAULT_MANAGED_SOURCE_ROOT = Path("01_inbox")
 DEFAULT_REPRESENTATION_ROOT = Path("02_processing/representations")
+DEFAULT_REPRESENTATION_INFORMATION_ROOT = Path("02_processing/information")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -153,6 +159,24 @@ def build_parser() -> argparse.ArgumentParser:
         "ingest", help="Ingest a processing package idempotently."
     )
     ingest.add_argument("processing_package", type=Path)
+    extract = information_commands.add_parser(
+        "extract", help="Extract one verified Representation into Atomic Information."
+    )
+    extract.add_argument("representation_id")
+    extract.add_argument(
+        "--managed-root", type=Path, default=DEFAULT_MANAGED_SOURCE_ROOT
+    )
+    extract.add_argument(
+        "--representation-root", type=Path, default=DEFAULT_REPRESENTATION_ROOT
+    )
+    extract.add_argument(
+        "--output-root", type=Path, default=DEFAULT_REPRESENTATION_INFORMATION_ROOT
+    )
+    extract.add_argument(
+        "--analysis-file", type=Path, required=True,
+        help="Development/testing only: deterministic read-only analysis fixture.",
+    )
+    extract.add_argument("--batch-size", type=int, default=100)
 
     objects = subparsers.add_parser(
         "object", help="Create and inspect local World Model Objects."
@@ -484,20 +508,41 @@ def _mcp_command(args: argparse.Namespace) -> int:
 
 
 def _information_command(args: argparse.Namespace) -> int:
-    if (
-        args.information_command != "ingest"
-    ):  # pragma: no cover - argparse enforces this
-        return 2
     try:
-        result = ingest_processing_package(
-            args.processing_package,
-            JsonlAtomicInformationStore(args.store),
-        )
-    except (OSError, TypeError, ValueError) as exc:
+        if args.information_command == "ingest":
+            result = ingest_processing_package(
+                args.processing_package,
+                JsonlAtomicInformationStore(args.store),
+            )
+            print(json.dumps(asdict(result), ensure_ascii=False, indent=2))
+            return 0
+        if args.information_command == "extract":
+            package = RepresentationInformationService(
+                LocalManagedSourceRepository(args.managed_root),
+                LocalRepresentationRepository(args.representation_root),
+                args.output_root,
+                batch_size=args.batch_size,
+            ).extract(
+                args.representation_id,
+                FileRepresentationAnalysisProvider(args.analysis_file),
+            )
+            result = ingest_processing_package(
+                package, JsonlAtomicInformationStore(args.store)
+            )
+            print(package)
+            print(json.dumps(asdict(result), ensure_ascii=False))
+            return 0
+        return 2  # pragma: no cover - argparse enforces this
+    except (
+        OSError,
+        RepresentationError,
+        RepresentationInformationError,
+        SourceError,
+        TypeError,
+        ValueError,
+    ) as exc:
         print(f"error: {exc}")
         return 1
-    print(json.dumps(asdict(result), ensure_ascii=False, indent=2))
-    return 0
 
 
 def _print_object(repository: SQLiteWorldModelRepository, object_id: str) -> None:

@@ -7,6 +7,10 @@ from pathlib import Path
 
 from ..analysis import SEMANTIC_TYPES
 from ..source.identity import require_managed_source_id
+from ..representation_information import (
+    PACKAGE_SCHEMA_VERSION,
+    validate_representation_information_package,
+)
 from .models import (
     EvidenceRecord,
     IngestionResult,
@@ -36,6 +40,13 @@ def _manifest(package: Path) -> tuple[str, str]:
     if not isinstance(manifest, dict):
         raise TypeError("processing manifest must be an object")
     schema_version = manifest.get("schema_version")
+    if schema_version == PACKAGE_SCHEMA_VERSION:
+        validated, _ = validate_representation_information_package(package)
+        source = validated["source"]
+        assert isinstance(source, dict)  # validated by the strict package reader
+        return schema_version, require_managed_source_id(
+            source["id"], field="manifest.source.id"
+        )
     if schema_version not in {"1.0", "1.1", "1.2"}:
         raise ValueError("unsupported processing schema version")
     source = manifest.get("source")
