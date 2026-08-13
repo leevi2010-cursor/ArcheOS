@@ -16,11 +16,12 @@ import shutil
 import sys
 import tempfile
 import uuid
+from contextlib import contextmanager
 from errno import EEXIST, ENOTEMPTY
 from ctypes import CDLL, c_char_p, c_int, get_errno
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Callable, Mapping
+from typing import Callable, Iterator, Mapping
 
 from .models import (
     MANIFEST_SCHEMA_VERSION,
@@ -430,6 +431,16 @@ class LocalManagedSourceRepository:
                 else "managed bytes do not match the immutable Manifest"
             ),
         )
+
+    @contextmanager
+    def materialize(self, source_id: str) -> Iterator[Path]:
+        """Expose verified local bytes for one bounded Processing operation."""
+
+        source = self.get(source_id)
+        managed_path = self._managed_path(source)
+        if not managed_path.is_file() or managed_path.is_symlink():
+            raise SourceIntegrityError("managed bytes are missing or not a regular file")
+        yield managed_path
 
     def restore(self, source_id: str, target_path: Path | str) -> RestoreResult:
         source = self.get(source_id)

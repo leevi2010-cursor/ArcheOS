@@ -95,6 +95,15 @@ class SourceTest(unittest.TestCase):
         source = self.source_from(self.repository().admit(path))
         self.assertEqual((self.managed_root / source.managed_locator).read_bytes(), path.read_bytes())
 
+    def test_materialize_exposes_only_the_verified_managed_snapshot(self) -> None:
+        path = self.external("synthetic.wav", b"managed bytes")
+        repository = self.repository()
+        source = self.source_from(repository.admit(path))
+
+        with repository.materialize(source.source_id) as materialized:
+            self.assertEqual(materialized.read_bytes(), b"managed bytes")
+            self.assertEqual(materialized, self.managed_root / source.managed_locator)
+
     # 6. Manifest fields are correct
     def test_06_manifest_contains_verified_size_hash_and_locator(self) -> None:
         path = self.external("sample.md", b"manifest")

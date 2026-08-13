@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import hashlib
+import inspect
 import json
 import tempfile
 import unittest
 import wave
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -18,10 +20,12 @@ from archeos.atomic_information import (
     JsonlAtomicInformationStore,
     ingest_processing_package,
 )
-from archeos.pipeline import ARTIFACTS, ProcessingError, process_audio
+from archeos.pipeline import ARTIFACTS, ProcessingError, process_managed_audio
+from archeos.source import ManagedSource, VerificationResult
 from archeos.transcription import Transcript, TranscriptSegment
 
 FIXED_TIME = datetime(2026, 8, 10, 12, 0, tzinfo=timezone.utc)
+SOURCE_ID = "src_" + "a" * 32
 
 
 class StubTranscriptionProvider:
@@ -133,6 +137,23 @@ class FailingAnalysisProvider:
         raise RuntimeError("runtime unavailable")
 
 
+class FailingTranscriptionProvider:
+    def transcribe(self, audio: Path) -> Transcript:
+        del audio
+        raise RuntimeError("transcription unavailable")
+
+
+class MutatingAnalysisProvider:
+    name = "mutating-analysis"
+
+    def __init__(self, audio: Path) -> None:
+        self.audio = audio
+
+    def analyze(self, transcript: Transcript) -> AnalysisResult:
+        self.audio.write_bytes(self.audio.read_bytes() + b"changed")
+        return StubAnalysisProvider().analyze(transcript)
+
+
 class IncompleteAnalysisProvider:
     name = "incomplete-analysis"
 
@@ -179,6 +200,78 @@ def write_silent_wav(path: Path) -> None:
         audio.writeframes(b"\x00\x00" * 1_600)
 
 
+class TestManagedSourceAccess:
+    def __init__(self, audio: Path, *, source_id: str = SOURCE_ID) -> None:
+        self.audio = audio
+        self.source = ManagedSource(
+            source_id=source_id,
+            content_hash=f"sha256:{hashlib.sha256(audio.read_bytes()).hexdigest()}",
+            size_bytes=audio.stat().st_size,
+            media_type="audio/wav",
+            filename_hint=audio.name,
+            managed_locator=f"sources/{source_id}/original.wav",
+            archived_at="2026-08-10T00:00:00Z",
+            availability="available",
+        )
+        self.closed = False
+
+    def get(self, source_id: str) -> ManagedSource:
+        if source_id != self.source.source_id:
+            raise RuntimeError("Managed Source was not found")
+        return self.source
+
+    def verify(self, source_id: str) -> VerificationResult:
+        source = self.get(source_id)
+        observed_hash = f"sha256:{hashlib.sha256(self.audio.read_bytes()).hexdigest()}"
+        observed_size = self.audio.stat().st_size
+        verified = (
+            source.availability == "available"
+            and observed_hash == source.content_hash
+            and observed_size == source.size_bytes
+        )
+        return VerificationResult(
+            source_id=source.source_id,
+            verified=verified,
+            expected_content_hash=source.content_hash,
+            observed_content_hash=observed_hash,
+            expected_size_bytes=source.size_bytes,
+            observed_size_bytes=observed_size,
+            checked_at="2026-08-10T00:00:00Z",
+            reason=None if verified else "managed bytes do not match the immutable Manifest",
+        )
+
+    @contextmanager
+    def materialize(self, source_id: str):
+        self.get(source_id)
+        try:
+            yield self.audio
+        finally:
+            self.closed = True
+
+
+def process_audio(
+    audio: Path,
+    output: Path,
+    transcription_provider: object,
+    speaker_provider: object,
+    analysis_provider: object,
+    *,
+    processed_at: datetime | None = None,
+) -> Path:
+    """Legacy-shaped test helper; production has no external-path entrypoint."""
+
+    access = TestManagedSourceAccess(audio)
+    return process_managed_audio(
+        SOURCE_ID,
+        access,
+        output,
+        transcription_provider,  # type: ignore[arg-type]
+        speaker_provider,  # type: ignore[arg-type]
+        analysis_provider,  # type: ignore[arg-type]
+        processed_at=processed_at,
+    )
+
+
 def run_pipeline(audio: Path, output: Path) -> Path:
     return process_audio(
         audio,
@@ -212,7 +305,11 @@ class PipelineTest(unittest.TestCase):
 
             manifest = json.loads((package / "manifest.json").read_text())
             self.assertEqual(manifest["artifacts"], list(ARTIFACTS))
-            self.assertEqual(manifest["schema_version"], "1.1")
+            self.assertEqual(manifest["schema_version"], "1.2")
+            self.assertEqual(manifest["source"]["id"], SOURCE_ID)
+            self.assertEqual(manifest["source"]["filename_hint"], "讨论.wav")
+            self.assertNotIn("path", manifest["source"])
+            self.assertNotIn(str(audio), json.dumps(manifest, ensure_ascii=False))
             self.assertEqual(
                 manifest["downstream"],
                 {
@@ -410,20 +507,16 @@ class PipelineTest(unittest.TestCase):
             write_silent_wav(audio)
 
             package = run_pipeline(audio, root / "out")
-            manifest = json.loads((package / "manifest.json").read_text())
             summary = (package / "meeting_summary.md").read_text()
 
             self.assertIn("Time: 待人工确认", summary)
-            self.assertNotIn(
-                f"Time: {manifest['source']['modified_at']}",
-                summary,
-            )
+            self.assertNotIn("Last modified", (package / "transcript.md").read_text())
 
     def test_rejects_unsupported_input(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             audio = Path(temp) / "discussion.mp4"
             audio.write_bytes(b"not used")
-            with self.assertRaisesRegex(ProcessingError, "unsupported audio format"):
+            with self.assertRaisesRegex(ProcessingError, "unsupported Managed Source audio"):
                 run_pipeline(audio, Path(temp) / "out")
 
     def test_refuses_to_overwrite_existing_package(self) -> None:
@@ -474,6 +567,115 @@ class PipelineTest(unittest.TestCase):
                     StubAnalysisProvider(),
                 )
             self.assertFalse(output.exists())
+
+    def test_transcription_failure_and_source_change_during_processing_do_not_publish(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            for label, transcriber, analysis in (
+                (
+                    "transcription-failure",
+                    FailingTranscriptionProvider(),
+                    StubAnalysisProvider(),
+                ),
+                (
+                    "source-changed",
+                    StubTranscriptionProvider(),
+                    MutatingAnalysisProvider(root / "source-changed.wav"),
+                ),
+            ):
+                with self.subTest(label=label):
+                    audio = root / f"{label}.wav"
+                    write_silent_wav(audio)
+                    access = TestManagedSourceAccess(audio)
+                    if label == "source-changed":
+                        analysis = MutatingAnalysisProvider(audio)
+                    with self.assertRaises(ProcessingError):
+                        process_managed_audio(
+                            SOURCE_ID,
+                            access,
+                            root / label,
+                            transcriber,
+                            StubSpeakerProvider(),
+                            analysis,
+                        )
+                    self.assertFalse((root / label).exists())
+
+    def test_managed_source_access_is_closed_and_never_leaks_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            audio = root / "synthetic.wav"
+            write_silent_wav(audio)
+            access = TestManagedSourceAccess(audio)
+
+            package = process_managed_audio(
+                SOURCE_ID,
+                access,
+                root / "out",
+                StubTranscriptionProvider(),
+                StubSpeakerProvider(),
+                StubAnalysisProvider(),
+                processed_at=FIXED_TIME,
+            )
+
+            self.assertTrue(access.closed)
+            rendered = "\n".join(
+                path.read_text(encoding="utf-8")
+                for path in package.iterdir()
+                if path.suffix in {".md", ".json", ".jsonl"}
+            )
+            self.assertNotIn(str(audio), rendered)
+            self.assertNotIn("ingested_from", rendered)
+
+    def test_unknown_unavailable_or_changed_managed_source_never_publishes(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            audio = root / "synthetic.wav"
+            write_silent_wav(audio)
+
+            for label, prepare in (
+                ("unknown", lambda access: "src_" + "b" * 32),
+                (
+                    "unavailable",
+                    lambda access: object.__setattr__(
+                        access.source, "availability", "unavailable"
+                    ),
+                ),
+                ("changed", lambda access: audio.write_bytes(b"changed")),
+            ):
+                with self.subTest(label=label):
+                    access = TestManagedSourceAccess(audio)
+                    requested = SOURCE_ID
+                    result = prepare(access)
+                    if isinstance(result, str):
+                        requested = result
+                    with self.assertRaises(ProcessingError):
+                        process_managed_audio(
+                            requested,
+                            access,
+                            root / label,
+                            StubTranscriptionProvider(),
+                            StubSpeakerProvider(),
+                            StubAnalysisProvider(),
+                        )
+                    self.assertFalse((root / label).exists())
+
+    def test_all_supported_audio_suffixes_are_accepted(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            for suffix in (".wav", ".mp3", ".m4a"):
+                with self.subTest(suffix=suffix):
+                    audio = root / f"synthetic{suffix}"
+                    write_silent_wav(audio)
+                    package = run_pipeline(audio, root / suffix[1:])
+                    self.assertEqual(package.name, SOURCE_ID)
+
+    def test_pipeline_depends_on_source_access_not_local_storage_or_tos(self) -> None:
+        import archeos.pipeline as pipeline
+
+        source = inspect.getsource(pipeline)
+        self.assertIn("ManagedSourceAccess", source)
+        self.assertNotIn("LocalManagedSourceRepository", source)
+        self.assertNotIn("tos", source.lower())
 
 
 if __name__ == "__main__":

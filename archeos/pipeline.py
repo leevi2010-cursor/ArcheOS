@@ -3,7 +3,6 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-import re
 import shutil
 import subprocess
 import tempfile
@@ -12,6 +11,7 @@ from pathlib import Path
 
 from . import __version__
 from .analysis import AnalysisProvider, AnalysisResult
+from .source import ManagedSource, ManagedSourceAccess
 from .speakers import SpeakerProvider
 from .transcription import Transcript, TranscriptionProvider, TranscriptSegment
 
@@ -63,11 +63,6 @@ def _validate_audio(path: Path) -> None:
     if result.returncode:
         detail = result.stderr.strip() or "no decodable audio stream"
         raise ProcessingError(f"invalid audio input: {detail}")
-
-
-def _source_id(path: Path, digest: str) -> str:
-    stem = re.sub(r"[^A-Za-z0-9_-]+", "-", path.stem).strip("-").lower()
-    return f"{stem or 'audio'}-{digest[:12]}"
 
 
 def _timestamp(seconds: float | None) -> str | None:
@@ -151,10 +146,10 @@ def _transcript_markdown(source: dict[str, object], transcript: Transcript) -> s
         "## Source Metadata",
         "",
         f"- Source ID: `{source['id']}`",
-        f"- File: `{source['path']}`",
-        f"- SHA-256: `{source['sha256']}`",
+        f"- Filename hint: `{source['filename_hint']}`",
+        f"- SHA-256: `{source['content_hash']}`",
         f"- Size: {source['size_bytes']} bytes",
-        f"- Last modified: {source['modified_at']}",
+        f"- Media type: `{source['media_type']}`",
         f"- Processed at: {source['processed_at']}",
         f"- Transcription engine: `{transcript.engine}`",
         f"- Model: `{transcript.model or 'not reported'}`",
@@ -284,8 +279,40 @@ def _residue_markdown(
     return "\n".join(lines).rstrip() + "\n"
 
 
-def process_audio(
-    audio: Path,
+def _source_snapshot(audio: Path) -> tuple[int, str]:
+    if not audio.is_file():
+        raise ProcessingError("materialized audio is missing or not a regular file")
+    return audio.stat().st_size, f"sha256:{_sha256(audio)}"
+
+
+def _validate_managed_source(source: ManagedSource) -> None:
+    if source.availability != "available":
+        raise ProcessingError("Managed Source is unavailable")
+    if (
+        len(source.content_hash) != len("sha256:") + 64
+        or not source.content_hash.startswith("sha256:")
+        or any(character not in "0123456789abcdef" for character in source.content_hash[7:])
+        or source.size_bytes < 0
+    ):
+        raise ProcessingError("Managed Source Manifest has invalid byte metadata")
+    filename_hint = Path(source.filename_hint)
+    if (
+        filename_hint.is_absolute()
+        or filename_hint.name != source.filename_hint
+        or "\\" in source.filename_hint
+    ):
+        raise ProcessingError("Managed Source filename hint must not contain a path")
+    suffix = filename_hint.suffix.lower()
+    if suffix not in SUPPORTED_AUDIO or not source.media_type.startswith("audio/"):
+        supported = ", ".join(sorted(SUPPORTED_AUDIO))
+        raise ProcessingError(
+            f"unsupported Managed Source audio; expected audio media type and one of: {supported}"
+        )
+
+
+def process_managed_audio(
+    source_id: str,
+    source_access: ManagedSourceAccess,
     output_root: Path,
     transcription_provider: TranscriptionProvider,
     speaker_provider: SpeakerProvider,
@@ -293,46 +320,49 @@ def process_audio(
     *,
     processed_at: datetime | None = None,
 ) -> Path:
-    audio = audio.expanduser().resolve()
     output_root = output_root.expanduser().resolve()
-    if not audio.is_file():
-        raise ProcessingError(f"audio file not found: {audio}")
-    if audio.suffix.lower() not in SUPPORTED_AUDIO:
-        supported = ", ".join(sorted(SUPPORTED_AUDIO))
-        raise ProcessingError(f"unsupported audio format; expected one of: {supported}")
-    _validate_audio(audio)
-
-    before = (audio.stat().st_size, audio.stat().st_mtime_ns, _sha256(audio))
-    digest = before[2]
-    source_id = _source_id(audio, digest)
-    package = output_root / source_id
-    if package.exists():
-        raise ProcessingError(f"processing package already exists: {package}")
-
     try:
-        transcript = transcription_provider.transcribe(audio)
-        transcript = speaker_provider.attribute(audio, transcript)
-        if not transcript.segments:
-            raise ValueError("transcription did not contain any segments")
-        analysis = analysis_provider.analyze(transcript)
-        digestion_coverage = _digestion_coverage(transcript, analysis)
+        source = source_access.get(source_id)
+        if source.source_id != source_id:
+            raise ValueError("Managed Source access returned a different source_id")
+        _validate_managed_source(source)
+        before_verification = source_access.verify(source_id)
+        if not before_verification.verified:
+            raise ValueError("Managed Source failed verification")
+        package = output_root / source.source_id
+        if package.exists():
+            raise ValueError(f"processing package already exists: {package}")
+        with source_access.materialize(source.source_id) as audio:
+            before = _source_snapshot(audio)
+            if before != (source.size_bytes, source.content_hash):
+                raise ValueError("materialized bytes do not match the Managed Source")
+            _validate_audio(audio)
+            transcript = transcription_provider.transcribe(audio)
+            transcript = speaker_provider.attribute(audio, transcript)
+            if not transcript.segments:
+                raise ValueError("transcription did not contain any segments")
+            analysis = analysis_provider.analyze(transcript)
+            digestion_coverage = _digestion_coverage(transcript, analysis)
+            after = _source_snapshot(audio)
+            if after != before:
+                raise ValueError("materialized audio changed during processing")
+        after_verification = source_access.verify(source.source_id)
+        if not after_verification.verified:
+            raise ValueError("Managed Source changed during processing")
     except (OSError, RuntimeError, ValueError, json.JSONDecodeError) as exc:
         raise ProcessingError(str(exc)) from exc
 
     processing_time = processed_at or datetime.now(timezone.utc)
     source = {
-        "id": source_id,
-        "path": str(audio),
-        "sha256": digest,
-        "size_bytes": before[0],
-        "modified_at": datetime.fromtimestamp(
-            audio.stat().st_mtime, tz=timezone.utc
-        ).isoformat(),
+        "id": source.source_id,
+        "content_hash": source.content_hash,
+        "size_bytes": source.size_bytes,
+        "media_type": source.media_type,
+        "filename_hint": source.filename_hint,
         "processed_at": processing_time.astimezone(timezone.utc).isoformat(),
-        "media_type": audio.suffix.lower().lstrip("."),
     }
     manifest = {
-        "schema_version": "1.1",
+        "schema_version": "1.2",
         "pipeline_version": __version__,
         "source": source,
         "transcription": {
@@ -395,8 +425,5 @@ def process_audio(
         (staging / "residue.md").write_text(
             _residue_markdown(source_id, transcript, analysis), encoding="utf-8"
         )
-        after = (audio.stat().st_size, audio.stat().st_mtime_ns, _sha256(audio))
-        if after != before:
-            raise ProcessingError("source audio changed during processing")
         os.rename(staging, package)
     return package

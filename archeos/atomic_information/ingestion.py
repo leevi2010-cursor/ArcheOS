@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from pathlib import Path
 
 from ..analysis import SEMANTIC_TYPES
@@ -34,12 +35,26 @@ def _manifest(package: Path) -> tuple[str, str]:
     if not isinstance(manifest, dict):
         raise TypeError("processing manifest must be an object")
     schema_version = manifest.get("schema_version")
-    if schema_version not in {"1.0", "1.1"}:
+    if schema_version not in {"1.0", "1.1", "1.2"}:
         raise ValueError("unsupported processing schema version")
     source = manifest.get("source")
     if not isinstance(source, dict):
         raise TypeError("processing manifest source must be an object")
-    return schema_version, _non_empty(source.get("id"), "manifest.source.id")
+    source_id = _non_empty(source.get("id"), "manifest.source.id")
+    if schema_version == "1.2":
+        content_hash = _non_empty(
+            source.get("content_hash"), "manifest.source.content_hash"
+        )
+        if not re.fullmatch(r"sha256:[0-9a-f]{64}", content_hash):
+            raise ValueError("manifest.source.content_hash must be a full sha256 hash")
+        size_bytes = source.get("size_bytes")
+        if isinstance(size_bytes, bool) or not isinstance(size_bytes, int) or size_bytes < 0:
+            raise ValueError("manifest.source.size_bytes must be a non-negative integer")
+        _non_empty(source.get("media_type"), "manifest.source.media_type")
+        _non_empty(source.get("filename_hint"), "manifest.source.filename_hint")
+        if "path" in source or "ingested_from" in source:
+            raise ValueError("Managed Source processing metadata must not contain paths")
+    return schema_version, source_id
 
 
 def _strings(value: object, field: str) -> tuple[str, ...]:
