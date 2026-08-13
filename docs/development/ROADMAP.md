@@ -217,17 +217,33 @@ Issue #21 只固化 Managed Source 的权威边界，不实现 runtime。后续�
 
 把音频 Processing 从 legacy 外部 path/hash provenance 切换到已验证的 Managed Source；不改变既有 Source、Evidence 和 Atomic Information 的语义边界。
 
-#### M2-C2 — 多格式 Normalized Representation（占位）
+#### #28 — M2-C2a 开源调查、复用治理与多格式基准
 
-在 Managed Source runtime 稳定后，扩展 PDF、图片、PPT、视频等格式的派生表示。具体 Issue 等前置能力完成后再设计。
+在正式多格式 Adapter 前完成官方开源能力调查、许可证与隐私边界评估，以及受控本地基准。它可以与 #23、#24 并行，但不实现 runtime。
 
-#### M2-C3 — Information Consolidation（占位）
+#### #29 — M2-C2b Normalized Representation 公共契约
 
-在多格式表示可靠后，研究跨表示、跨 Source 的信息整理边界。具体 Issue 等前置能力完成后再设计。
+在 #28 的调查结论基础上固定多格式派生表示的最小公共 contract，不实现具体格式 Adapter。
 
-#### M2-C4 — Object Emergence（占位）
+#### #30 — M2-C2c 首批多格式 Adapter（内部并行）
 
-在 Information Consolidation 有足够证据后，研究从 Information 到长期 Object 的受治理形成边界。具体 Issue 等前置能力完成后再设计。
+在 #29 后按已批准 contract 实现首批格式 Adapter；内部可以按格式并行，但不得形成平行 Representation 语义。
+
+#### #31 — M2-C2d Representation → Atomic Information
+
+在首批 Representation 稳定后，把可追溯的派生表示接入 Atomic Information 入口，保留 Source 与 locator 证据链。
+
+#### #32 — M2-C3a Information Consolidation 真实实验（内部并行）
+
+以真实、受控样本验证跨表示与跨 Source 的整理边界，不直接扩大为正式 runtime。
+
+#### #33 — M2-C3b Information Consolidation 运行时
+
+在 #32 的实验结论通过后，实现受治理的信息整理运行时。
+
+#### #34 — M2-C4 Object Emergence
+
+在 Information Consolidation 有充分证据后，研究从 Information 到长期 Object 的受治理形成边界。
 
 #### 并行任务：#23 Handoff Marker
 
@@ -340,20 +356,28 @@ Domain Agent：
  ↓
 #24 M2-C1d 音频 Processing 切换到 Managed Source
  ↓
-M2-C2 多格式 Normalized Representation
+#28 M2-C2a 开源调查 / 复用治理 / 多格式基准（可与 #24、#23 并行）
  ↓
-M2-C3 Information Consolidation
+#29 M2-C2b Normalized Representation 公共契约
  ↓
-M2-C4 Object Emergence
+#30 M2-C2c 首批多格式 Adapter（内部并行）
+ ↓
+#31 M2-C2d Representation → Atomic Information
+ ↓
+#32 M2-C3a Information Consolidation 真实实验（内部并行）
+ ↓
+#33 M2-C3b Information Consolidation 运行时
+ ↓
+#34 M2-C4 Object Emergence
  ↓
 #17 M2-D Migration Readiness / Clean-cut Plan
  ↓
-M3 Sales Agent
+#35 M3-A Sales Agent
  ↓
 单向 Imports / Cutover（按 Readiness 结果拆分）
 ```
 
-Issue #23 Handoff Marker 在 #22 后可并行，不阻塞 #24 主数据链。旧数据压力测试与迁移准备不得先于上述 #22、#24 和 M2-C2～C4 主线阶段；此前 #17 保持阻塞。
+Issue #23 Handoff Marker 在 #22 后可并行，不阻塞上述主线。旧数据压力测试与迁移准备不得先于 #22、#24、#28、#29、#30、#31、#32、#33 和 #34；此前 #17 保持阻塞。
 
 Human View 可在核心链路稳定后并行进入，但不作为上述主线的前置依赖。
 

@@ -1,0 +1,89 @@
+{
+  "experiment": "document-capabilities",
+  "version": "0.1.0",
+  "issue": 28,
+  "scope": "research-benchmark-governance",
+  "platform": {
+    "operating_system": "macOS",
+    "architecture": "Apple Silicon"
+  },
+  "sample_aggregate": {
+    "markdown": {
+      "status": "not_available",
+      "count": 0
+    },
+    "text_pdf": {
+      "status": "actually_run",
+      "count": 2
+    },
+    "scan_or_mixed_pdf": {
+      "status": "not_available",
+      "count": 0
+    },
+    "xlsx": {
+      "status": "actually_run",
+      "count": 2
+    },
+    "pptx": {
+      "status": "actually_run",
+      "count": 1
+    },
+    "images": {
+      "status": "actually_run",
+      "count": 3,
+      "media_type": "image/jpeg"
+    },
+    "ocr": {
+      "status": "blocked_by_network_or_model_gate"
+    }
+  },
+  "candidate_version_snapshot": {
+    "observed_at": "2026-08-13",
+    "complete_record": "CANDIDATES.md#版本审计快照",
+    "latest_observed_versions": {
+      "markdown_it_py": "4.2.0",
+      "markitdown": "0.1.7",
+      "apache_tika": "3.3.2",
+      "docling": "2.119.0",
+      "pdfplumber": "0.11.10",
+      "pymupdf": "1.28.2",
+      "mineru": "mineru-3.4.4-released",
+      "tesseract": "5.5.3",
+      "paddleocr": "3.7.0",
+      "unstructured": "0.25.2",
+      "openpyxl": "3.1.5",
+      "apache_poi": "5.5.1",
+      "libreoffice": "26.2.5",
+      "python_pptx": "1.0.2",
+      "libmagic_file": "not pinned (system CLI)",
+      "exiv2": "0.28.8",
+      "imagemagick": "7.1.2-29",
+      "llama_cpp": "b10405",
+      "ollama": "0.32.9"
+    },
+    "selected_or_benchmark_versions": "Actually run: pdfplumber 0.11.10, openpyxl 3.1.5, python-pptx 1.0.2, plus system file and sips for image structure checks. All other candidates remain not_run or blocked_by_network_or_model_gate; see CANDIDATES.md for per-candidate reasons."
+  },
+  "actually_run": {
+    "tools": {
+      "pdfplumber": "0.11.10",
+      "openpyxl": "3.1.5",
+      "python_pptx": "1.0.2",
+      "file": "system-provided, not pinned",
+      "sips": "system-provided, not pinned"
+    },
+    "network_model_tools_run_on_real_samples": false
+  },
+  "validation": [
+    "python3 -m json.tool docs/experiments/document-capabilities/v0.1.0/manifest.json",
+    "python3 -m py_compile docs/experiments/document-capabilities/v0.1.0/structural_benchmark.py",
+    "python3 -m unittest discover -s tests -v",
+    "python3 -m compileall -q archeos tests",
+    "uvx ruff@0.12.8 check .",
+    "git diff --check"
+  ],
+  "privacy": {
+    "real_sources_committed": false,
+    "real_paths_or_names_committed": false,
+    "network_model_tools_run_on_real_samples": false
+  }
+}
