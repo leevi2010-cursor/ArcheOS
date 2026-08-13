@@ -283,6 +283,82 @@ class CliTest(unittest.TestCase):
             self.assertIn("error:", output.getvalue())
             self.assertFalse(database.exists())
 
+    def test_source_cli_admit_show_verify_restore(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            external = root / "synthetic.txt"
+            external.write_bytes(b"synthetic source")
+            managed_root = root / "managed"
+            source_id = "src_" + "a" * 32
+
+            output = StringIO()
+            with redirect_stdout(output):
+                result = main(
+                    [
+                        "source",
+                        "admit",
+                        str(external),
+                        "--source-id",
+                        source_id,
+                        "--managed-root",
+                        str(managed_root),
+                    ]
+                )
+            admitted = json.loads(output.getvalue())
+            self.assertEqual(result, 0)
+            self.assertEqual(admitted["source"]["source_id"], source_id)
+
+            output = StringIO()
+            with redirect_stdout(output):
+                self.assertEqual(
+                    main(
+                        [
+                            "source",
+                            "show",
+                            source_id,
+                            "--managed-root",
+                            str(managed_root),
+                        ]
+                    ),
+                    0,
+                )
+            self.assertEqual(json.loads(output.getvalue())["source_id"], source_id)
+
+            output = StringIO()
+            with redirect_stdout(output):
+                self.assertEqual(
+                    main(
+                        [
+                            "source",
+                            "verify",
+                            source_id,
+                            "--managed-root",
+                            str(managed_root),
+                        ]
+                    ),
+                    0,
+                )
+            self.assertTrue(json.loads(output.getvalue())["verified"])
+
+            target = root / "restored.txt"
+            output = StringIO()
+            with redirect_stdout(output):
+                self.assertEqual(
+                    main(
+                        [
+                            "source",
+                            "restore",
+                            source_id,
+                            str(target),
+                            "--managed-root",
+                            str(managed_root),
+                        ]
+                    ),
+                    0,
+                )
+            self.assertTrue(json.loads(output.getvalue())["verified"])
+            self.assertEqual(target.read_bytes(), external.read_bytes())
+
 
 if __name__ == "__main__":
     unittest.main()
