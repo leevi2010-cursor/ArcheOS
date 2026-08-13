@@ -7,6 +7,7 @@ from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
 
+from archeos.filesystem import publish_file_no_replace
 from archeos.source import (
     HandoffMarkerConflictError,
     HandoffMarkerError,
@@ -22,7 +23,7 @@ TIMESTAMP = "2026-08-13T00:00:00.000Z"
 
 class HandoffMarkerTest(unittest.TestCase):
     def setUp(self) -> None:
-        self.temp = tempfile.TemporaryDirectory()
+        self.temp = tempfile.TemporaryDirectory(dir=Path.cwd())
         self.root = Path(self.temp.name)
         self.managed_root = self.root / "managed"
 
@@ -208,13 +209,22 @@ class HandoffMarkerTest(unittest.TestCase):
             service.write(source.source_id)
         self.assertEqual(marker.read_text(encoding="utf-8"), "user-authored")
 
-    # 20. failed publication cleans the staged sidecar.
-    def test_19_publish_failure_leaves_no_partial_marker_or_staging(self) -> None:
+    # 20. a competing marker that appears after staging cannot be replaced.
+    def test_19_publish_race_preserves_existing_marker_and_cleans_staging(self) -> None:
         _, external, source, service = self.admitted_service()
-        with patch("archeos.source.handoff.publish_file_no_replace", side_effect=OSError):
+        marker = self.marker_for(external)
+
+        def publish_after_competing_write(staging_path: Path, marker_path: Path) -> None:
+            marker_path.write_text("user-authored", encoding="utf-8")
+            publish_file_no_replace(staging_path, marker_path)
+
+        with patch(
+            "archeos.source.handoff.publish_file_no_replace",
+            side_effect=publish_after_competing_write,
+        ):
             with self.assertRaises(HandoffMarkerError):
                 service.write(source.source_id)
-        self.assertFalse(self.marker_for(external).exists())
+        self.assertEqual(marker.read_text(encoding="utf-8"), "user-authored")
         self.assertEqual(list(external.parent.glob("*.staging")), [])
 
     # 21. a valid marker is readable and confirms the Source.
@@ -271,3 +281,41 @@ class HandoffMarkerTest(unittest.TestCase):
         with self.assertRaises(HandoffMarkerError):
             service.write(source.source_id, target_file=link)
         self.assertFalse(self.marker_for(link).exists())
+
+    # Review: a symlink parent must not redirect a marker write outside its path.
+    def test_26_symlink_parent_fails_without_writing_external_sidecar(self) -> None:
+        _, _, source, service = self.admitted_service()
+        actual_directory = self.root / "actual-directory"
+        actual_directory.mkdir()
+        actual_target = actual_directory / "synthetic.txt"
+        actual_target.write_bytes(b"synthetic")
+        linked_directory = self.root / "linked-directory"
+        linked_directory.symlink_to(actual_directory, target_is_directory=True)
+        linked_target = linked_directory / actual_target.name
+
+        with self.assertRaises(HandoffMarkerError):
+            service.write(source.source_id, target_file=linked_target)
+
+        self.assertFalse(self.marker_for(actual_target).exists())
+
+    # Review: show must not follow a marker symlink or treat a directory as a marker.
+    def test_27_show_rejects_symlink_and_non_regular_marker(self) -> None:
+        _, external, source, service = self.admitted_service()
+        marker = self.marker_for(external)
+        service.write(source.source_id)
+        linked_marker = external.parent / "linked-marker.archeos.md"
+        linked_marker.symlink_to(marker)
+        linked_directory = external.parent / "linked-marker-directory"
+        linked_directory.symlink_to(external.parent, target_is_directory=True)
+        directory_marker = external.parent / "directory-marker.archeos.md"
+        directory_marker.mkdir()
+
+        with self.assertRaises(HandoffMarkerError):
+            service.show(linked_marker)
+        with self.assertRaises(HandoffMarkerError):
+            service.show(linked_directory / marker.name)
+        with self.assertRaises(HandoffMarkerError):
+            service.show(directory_marker)
+
+        self.assertTrue(marker.is_file())
+        self.assertTrue(service.repository.verify(source.source_id).verified)

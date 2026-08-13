@@ -100,6 +100,7 @@ def _render_marker(source_id: str, written_at: str) -> str:
 
 
 def _parse_marker(marker_path: Path) -> HandoffMarker:
+    _validate_marker_for_read(marker_path)
     try:
         content = marker_path.read_text(encoding="utf-8")
     except OSError as exc:
@@ -147,6 +148,30 @@ def _is_under(path: Path, root: Path) -> bool:
     except (OSError, RuntimeError, ValueError):
         return False
     return True
+
+
+def _validate_no_symlink_parents(path: Path) -> None:
+    """Reject a supplied path whose parent chain would redirect marker I/O."""
+
+    absolute_path = path.absolute()
+    parent = absolute_path.parent
+    while parent != Path(parent.anchor):
+        try:
+            if parent.is_symlink():
+                raise HandoffMarkerError("marker path must not contain symlink parent directories")
+        except OSError as exc:
+            raise HandoffMarkerError("marker path parent could not be safely inspected") from exc
+        parent = parent.parent
+
+
+def _validate_marker_for_read(marker_path: Path) -> None:
+    _validate_no_symlink_parents(marker_path)
+    try:
+        marker_path.lstat()
+    except OSError as exc:
+        raise HandoffMarkerError("Handoff Marker could not be read") from exc
+    if marker_path.is_symlink() or not marker_path.is_file():
+        raise HandoffMarkerError("Handoff Marker must be a regular file, not a symlink")
 
 
 class HandoffMarkerService:
@@ -227,6 +252,8 @@ class HandoffMarkerService:
 
     @staticmethod
     def _validate_target(target: Path, marker_path: Path) -> None:
+        _validate_no_symlink_parents(target)
+        _validate_no_symlink_parents(marker_path)
         try:
             target.lstat()
         except OSError as exc:

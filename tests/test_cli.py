@@ -363,7 +363,7 @@ class CliTest(unittest.TestCase):
             self.assertEqual(target.read_bytes(), external.read_bytes())
 
     def test_source_handoff_cli_write_and_show(self) -> None:
-        with tempfile.TemporaryDirectory() as temp:
+        with tempfile.TemporaryDirectory(dir=Path.cwd()) as temp:
             root = Path(temp)
             external = root / "synthetic.txt"
             external.write_bytes(b"synthetic handoff")
