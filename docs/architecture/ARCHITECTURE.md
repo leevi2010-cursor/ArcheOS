@@ -12,7 +12,7 @@
 - 版本说明：`docs/architecture/diagrams/v0.2.0/README.md`
 - 版本索引：`docs/architecture/diagrams/README.md`
 
-本文件与 `CONCEPTS.md` 已在该图形快照之后加入 Claim 与首批 Relationship vocabulary。概念与产品规则分别以 `CONCEPTS.md` 和 `INFORMATION_GOVERNANCE.md` 为权威；图形快照将在 B2 实现经过真实验证后升级下一版本，避免仅因概念小幅调整频繁重画。
+`v0.2.0` 图形快照早于 Claim、首批 Relationship vocabulary、Context Builder 实现以及 ADR-004 Managed Source 决策。当前文字权威以 `CONCEPTS.md`、本文件、`INFORMATION_GOVERNANCE.md` 和 ADR-004 为准。SVG 不在本 PR 重画；下一版图形快照将在本地 Managed Source runtime（Issue #22）和音频 Processing 切换（Issue #24）完成真实 / 合成验收后统一升级。
 
 ---
 
