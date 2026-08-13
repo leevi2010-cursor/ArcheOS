@@ -225,7 +225,7 @@ class RepresentationInformationTest(unittest.TestCase):
             service.extract(representation.representation_id, MutatingProvider(managed_bytes))
         self.assertFalse((self.output_root / representation.representation_id).exists())
 
-    def test_anonymized_real_markdown_representation_smoke(self) -> None:
+    def test_synthetic_markdown_representation_smoke(self) -> None:
         external = self.root / "smoke.md"
         external.write_text("# Synthetic\n\nSynthetic business content.\n", encoding="utf-8")
         source_id = "src_" + "a" * 32
