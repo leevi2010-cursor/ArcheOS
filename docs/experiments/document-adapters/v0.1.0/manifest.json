@@ -1,0 +1,19 @@
+{
+  "schema_version": "1.0",
+  "issue": 30,
+  "observed_at": "2026-08-13",
+  "scope": "local-lightweight-document-adapters",
+  "network_policy": "blocked_by_smoke_test",
+  "adapters": [
+    {"name": "markdown", "version": "4.2.0", "state": "not_available"},
+    {"name": "pdf-text", "version": "0.11.10", "state": "actually_run", "status": "partial"},
+    {"name": "xlsx", "version": "3.1.5", "state": "actually_run", "status": "partial"},
+    {"name": "pptx", "version": "1.0.2", "state": "actually_run", "status": "complete"},
+    {"name": "image-preflight", "version": "1.0", "state": "actually_run", "status": "partial"}
+  ],
+  "privacy": {
+    "real_source_content_committed": false,
+    "real_source_paths_committed": false,
+    "temporary_processing_cleaned": true
+  }
+}
