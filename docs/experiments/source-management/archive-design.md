@@ -2,143 +2,151 @@
 
 ## 技术摘要
 
-建议采用 **register first, copy on explicit admission** 的 Source Archive 方案：扫描只建立本地 Manifest 草稿和风险提示，不自动复制 6.89 GiB 数据，也不自动复制 Tolaria vault。只有用户明确选择 Archive、原位置不具备长期保留能力，或后续处理需要稳定原始字节时，系统才复制并验证。
+建议采用 **register candidate first, create Managed Source on explicit admission** 的方案。扫描只产生临时 intake candidate、结构观察和风险提示，不建立长期 Source 权威，也不自动复制数据。用户明确归档后，系统复制完整原始字节，校验 `size` 与 `content_hash`，再创建稳定的 `source_id` 并持久化 Managed Source Manifest。
 
-Archive 的职责是保存不可变的 Source 字节，不是整理目录、迁移系统、生成业务信息或替代原始文件。Normalized Representation 必须存放在独立派生区域，并通过 `source_id` 和源 hash 回到 Archive Source。
+归档完成后，ArcheOS 后续 Processing、Evidence 和 Normalized Representation 只引用 Managed Source。外部原文件变成旧入口或接入线索；它可以失效、移动或被用户删除，系统不再自动跟踪其变化。
 
 ## 核心关系
 
 ```text
-User Original File
-  │ read-only observation
+外部零散文件
+  = intake candidate / historical hint
+  │ 用户明确归档
   ▼
-Source Manifest (registered)
-  │ explicit archive admission
+复制完整原始字节 + size/content_hash 校验
   ▼
-ArcheOS Source Archive (byte-identical copy)
-  │ verified source_id + source hash
-  ▼
-Normalized Representation (derived, replaceable)
+Managed Source
+  = 稳定 source_id + managed_location + content_hash
+  │
+  ├── Evidence / Processing 的唯一权威输入
+  └── Normalized Representation（可替换派生物）
 ```
 
-Manifest 在复制之前就需要存在，用于记录扫描和用户选择；Archive 成功后更新位置和状态。上图表达依赖关系，不表示扫描时自动复制。
+Manifest 可以在扫描阶段以临时 candidate 形式存在，但正式 `source_id` 的创建点必须在 Managed Source 已成功写入并验证之后。这里的先后关系不是一条总生命周期；注册/可用性、存储副本、表示状态和交接说明分别记录。
 
-## 原始文件是否保留
+## 身份边界
 
-原始文件默认保留，并保持在用户原来的目录、名称和权限范围中。ArcheOS 不修改内容、mtime、文件名、目录结构或 Git 状态。
+| 名称 | 本实验定义 | 不是 |
+|---|---|---|
+| `source_id` | 已完成用户准入、复制和校验的 Managed Source 稳定内部身份 | 外部路径、文件名或 hash 的别名 |
+| `content_hash` | 某个受管字节快照的内容身份，用于完整性校验、存储去重和历史复现 | 业务真实性或语义等价证明 |
+| `managed_location` | 系统内部权威存储位置；未来可由 local 或 TOS adapter 承载 | 用户原目录路径 |
+| `ingested_from` | 可选的最初接入来源提示；可以失效、移动或被删除 | 后续 Evidence 定位 |
+| handoff marker | 外部目录中的可选交接说明 | Source、Evidence 或同步机制 |
 
-Archive 成功不等于允许删除原始文件。用户删除原文件必须是独立、显式的动作，并至少满足：
+外部文件和 Managed Source 在物理上可以同时存在，但角色不同：外部文件是用户侧旧副本/接入入口，Managed Source 是系统权威。它们不能被计算为两份独立 Evidence。
 
-- Archive 已完成且 hash 验证一致；
-- Archive 可以读取或恢复；
-- Manifest 已持久保存；
-- 相关 Normalized Representation 能回到 archived Source；
-- 用户确认删除的是 original occurrence，而不是唯一未归档 Source；
-- 删除动作可恢复，首选系统废纸篓而不是永久删除。
+## 原文件与 Managed Source
 
-M2-C1 只设计该 gate，本实验没有执行删除。
+归档前，外部文件是待接入材料。归档时必须复制完整原始字节，不做转码、压缩、OCR 或内容修改；复制完成后比较大小和 `content_hash`。只有验证通过，Managed Source 才可用，`source_id` 才可持久化。
 
-## Archive 是否需要复制
+归档后：
+
+- 系统不再自动监控外部文件；
+- 外部文件发生修改不会改变 Managed Source；
+- 不会因为外部文件变化自动重新处理或覆盖 Evidence；
+- 用户需要回到向阳经营系统中更新；
+- 外部文件若要再次进入系统，必须执行显式重新导入；
+- 已被 Evidence 引用的 Managed Source 字节不得原地覆盖。
+
+后续更新应生成新的受管字节快照并保留旧快照及其 Evidence。本实验不决定新快照是否沿用原 `source_id`，版本身份策略留给后续正式 ADR。
+
+## 什么时候复制
 
 ### 不立即复制
 
 - 用户只执行目录扫描；
-- Source 已处于用户认可的长期、版本化、可恢复存储中；
-- 文件体积很大，用户尚未选择保留范围；
-- 隐私或权限尚未确认；
-- 文件是完全重复内容，且已有可验证 archived blob；
-- adapter 暂不支持，但 Source 原位置仍稳定可读。
+- 用户尚未选择要纳入系统的范围；
+- 权限、隐私或存储策略尚未确认；
+- 文件位于已有可恢复、受治理的外部版本系统，但用户尚未要求独立 Managed Source；
+- 当前只需要 intake 分析，不需要建立系统权威。
 
 ### 应复制
 
-- 用户明确执行“加入 Archive”；
-- 原文件位于临时目录、移动设备、下载缓存或易失位置；
-- 后续 Normalization 需要一个稳定、不可变的源字节基准；
-- 原始目录可能改名、移动或由其他应用修改；
-- 需要跨设备恢复或使用 TOS 作为长期 Source 存储；
-- 合规或经营要求需要独立保留原始 Evidence。
+- 用户明确执行“加入向阳经营系统”；
+- 外部位置易失、可移动或可能被其他应用修改；
+- 后续 Processing 需要稳定、不可变的字节基准；
+- 需要跨设备恢复或由 TOS 承载受管存储；
+- 保留政策要求系统持有完整原始快照。
 
-### 已有受治理存储
+Tolaria Markdown 已处于 Git/version 语境。M2-C1 不应默认复制当前扫描到的 2,168 个 Markdown 文件；可以先作为 intake candidate 或历史来源提示，是否创建 Managed Source 必须由用户明确选择。
 
-Tolaria Markdown 已处于 Git/version 语境。M2-C1 不应默认再复制当前扫描到的 2,168 个 Markdown 文件。可先注册 repository、commit 和 relative path，Archive 状态保持 `registered_external`；只有保留政策明确要求独立副本时再归档。
+## 建议的归档协议
 
-## 建议的 Archive 操作协议
+1. **Observe**：只读获取 media type、size、`observed_at` 和临时 intake 位置。
+2. **Hash**：流式计算候选字节的 SHA-256，不创建临时明文副本。
+3. **Admit**：用户明确选择把该候选纳入系统。
+4. **Write Managed Source**：复制完整字节到受控 managed location。
+5. **Verify**：比较候选与受管字节的 size 和 `content_hash`。
+6. **Create identity**：验证成功后创建稳定 `source_id`，持久化 Managed Source Manifest。
+7. **Record replica status**：分别记录 local/TOS storage replica 的验证状态，不把它们当作新的 Source。
+8. **Normalize separately**：派生表示引用 `source_id`、生成时的 `content_hash`、adapter/version 和自身状态。
+9. **Write handoff marker**：仅在用户另行授权且前述 Manifest 已持久化后，才向外部目录写交接说明。
 
-1. **Observe**：只读获取 media type、size、mtime 和 original location。
-2. **Hash**：流式计算 SHA-256，不创建临时明文副本。
-3. **Register**：创建或复用 `source_id`，状态为 `registered`。
-4. **Deduplicate**：检查是否已有相同 hash 的已验证 archived bytes。
-5. **Admit**：用户明确选择 local archive 或 TOS archive。
-6. **Copy/Upload**：复制原始字节，不做转码、重压缩、OCR 或内容修改。
-7. **Verify**：比较源与 Archive 的 size 和 SHA-256；远端至少验证上传结果，并在可行时读取复核。
-8. **Commit Manifest**：只有验证通过后，设置 `archive_status=archived`。
-9. **Normalize separately**：派生表示写入独立位置，引用 `source_id` 和源 hash。
-
-任何一步失败都不能把状态伪装成 `archived`。失败记录应保留可操作原因，但不得包含凭证或真实内容。
+任何复制或校验失败都不能创建可用的 Managed Source，也不能把外部文件宣传为系统权威。失败原因应可操作且不包含凭证或真实内容。
 
 ## 如何避免重复
 
-Archive 去重以内容 hash 为准，不以文件名为准：
+`content_hash` 只表达字节一致：
 
-- 相同 SHA-256 的 Source occurrence 复用同一份 archived bytes；
-- 每个 original location 仍保留自己的 Manifest occurrence 和扫描时间；
-- Archive copy 本身不创建新的业务 Source；
-- 不同 hash 即使文件名相同，也不能自动合并；
-- 相同模板、相同日期或同目录只产生 lineage hint，不作为去重证据；
-- 不自动删除用户目录中的重复文件。
+- 受控存储可以按 `content_hash` 复用一份字节对象；
+- 两个无法证明同一来源语境的外部接入候选，不因 hash 相同而自动合并为同一 `source_id`；
+- 同一次接入中的外部旧文件和 Managed Source 不计为两份独立 Evidence；
+- 文件名、路径、日期、模板相似度不能替代 hash 校验或来源判断；
+- 不自动删除外部目录中的文件。
 
-为避免把路径隐私泄露到公共报告，真实 `original_location` 和 `archive_location` 只应存在于本地 Manifest；导出报告必须脱敏。
+本实验不建立长期 `observed_locations[]` 历史模型。`ingested_from` 只保留最初接入来源的可选、可失效提示；后续 Evidence 定位使用 Managed Source。
 
-## Archive 布局建议
+## Managed Source 存储布局候选
 
-以下只是存储布局候选，不是数据库 schema：
+以下是存储布局候选，不是数据库 schema：
 
 ```text
-archive-root/
+managed-root/
 ├── sources/
-│   └── sha256/<prefix>/<full-hash>/original-bytes
+│   └── <source-id>/original-bytes
 ├── manifests/
 │   └── <source-id>.json
 └── normalized/
     └── <source-id>/<representation-id>/...
 ```
 
-Source bytes、Manifest 和 Normalized Representation 分区存放，防止派生物覆盖原始 Source。文件扩展名可以作为可读元数据保留，但不参与内容 identity。
+`managed-root/sources/<source-id>/original-bytes` 是系统权威位置；Normalized Representation 独立存放，不能覆盖 Managed Source。内部布局可以由 storage adapter 实现，不能改变 Source 身份语义。
 
 ## 如何支持 TOS
 
-TOS 应作为 Archive storage adapter，而不是新的 Source 模型：
+TOS 应作为 Managed Source 的 storage adapter：
 
-- `archive_location` 使用不含凭证的 `tos://bucket/key` 形式；
-- object key 建议基于内容 hash，避免文件名泄露和重复上传；
-- 上传前本地计算 SHA-256；上传后验证对象大小和可用校验信息；
-- 只有验证成功才更新 `archive_status`；
-- TOS credential、access token、secret、签名 URL 不写入 Manifest；
-- bucket policy、加密、region、retention 和访问日志由部署配置管理，不写入业务 Source；
-- 同一内容对象已存在时，验证后复用，不覆盖；
-- Manifest 保存必要的 object/version locator，但公共导出必须脱敏。
+- TOS replica 是 Managed Source 的受管存储副本，不是新的 Source；
+- object key 可以基于 `source_id` 与 `content_hash`，但不得泄露不必要的文件名；
+- 上传前计算 `content_hash`，上传后验证对象大小和可用校验信息；
+- 只有验证成功才把该 replica 标为 `verified`；
+- credential、access token、secret、签名 URL 不写入 Manifest；
+- bucket、region、retention、加密和访问日志属于部署配置；
+- 同一 Managed Source 的 TOS replica 不提高 Evidence 来源数量，也不替代 local authority 的语义定义。
 
-本轮没有执行 TOS API、上传或恢复测试，因此不能声称 TOS 路径已经通过验收。
+本轮没有执行 TOS API、上传或恢复测试，不能声称 TOS adapter 已通过验收。
 
-## Archive 状态建议
+## 正交状态建议
 
-| 状态 | 含义 |
-|---|---|
-| `registered` | 已观察并记录，未复制 |
-| `registered_external` | 原文件处于用户认可的外部受治理存储，暂不复制 |
-| `archive_pending` | 用户已选择 Archive，尚未完成 |
-| `archived` | Archive bytes 已复制并验证 |
-| `archive_failed` | 复制或验证失败，原文件仍是唯一有效来源 |
-| `source_missing` | 原位置不可访问，不能据此假定 Archive 完整 |
+不要使用一条 `discovered → registered → archived → normalized` 总生命周期。至少分开记录：
 
-状态数量保持最小。更复杂生命周期必须由后续 Architecture Review 决定。
+| 维度 | 示例 | 说明 |
+|---|---|---|
+| Managed Source availability | `available` / `unavailable` | 系统权威字节当前是否可读；不由外部路径决定 |
+| Storage replica status | `pending` / `verified` / `failed` | local 或 TOS 各自记录，不互相覆盖 |
+| Normalized Representation status | `complete` / `failed` / `stale` | 每个表示独立记录，可同时存在多个结果 |
+| Handoff marker status | `not_requested` / `written` / `not_written` | 外部交接说明的独立状态 |
+
+外部旧文件丢失不等于 Managed Source 丢失；某个 OCR 失败不等于 Managed Source 归档失败；TOS replica 尚未创建不等于 local Managed Source 不可用。
 
 ## 安全边界
 
-- 扫描不等于 Archive；
-- Archive 不等于迁移；
-- Archive 不改变用户原目录的权威；
-- Normalization 不替代 Archive；
-- TOS 不接管 ArcheOS domain semantics；
-- hash 一致只证明字节重复，不证明业务等价；
-- Source Archive 不创建 Object、Atomic Information 或 World Model。
+- 扫描只产生临时 intake candidate，不建立长期 Source 权威；
+- Managed Source 只有在复制与 size/content_hash 校验后才成立；
+- 后续 Processing 与 Evidence 只引用 Managed Source；
+- 外部原文件可以保留、失效或被用户删除，不自动回写系统；
+- handoff marker 不是 Source，也不是同步机制；
+- Normalized Representation 不替代 Managed Source；
+- TOS 不创建新的 Source 模型；
+- 本实验不创建 Object、Atomic Information、World Model、数据库 schema 或 runtime。
