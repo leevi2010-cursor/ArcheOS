@@ -10,12 +10,12 @@
 
 | 类别 | 计划 | 本轮状态 |
 | --- | --- | --- |
-| Markdown | 2 个 | not available in sample |
-| 文本型 PDF | 2 个 | 已做只读结构基准 |
-| 扫描或混合 PDF | 1 个 | not available in sample |
-| XLSX | 2 个 | 已做只读结构基准 |
-| PPTX | 1 个 | 已做只读结构基准 |
-| 图片 | 场景与文档或 restricted 样本 | 已做 3 个图片结构元数据检查；未 OCR |
+| Markdown | 2 个 | not run；本轮未固定可复现样本集 |
+| 文本型 PDF | 2 个 | not run；本轮未固定可复现样本集 |
+| 扫描或混合 PDF | 1 个 | not run；本轮未固定可复现样本集 |
+| XLSX | 2 个 | not run；本轮未固定可复现样本集 |
+| PPTX | 1 个 | not run；本轮未固定可复现样本集 |
+| 图片 | 场景与文档或 restricted 样本 | not run；本轮未固定可复现样本集 |
 
 不得记录真实路径、名称、正文、图片、EXIF 值、hash 或业务实体。
 
@@ -24,20 +24,20 @@
 命令仅用于受控临时目录；执行前必须确认工具不会联网，或在禁网环境中运行。
 
 ```bash
-# 结构初筛；不读取业务正文
+# planned：本地工具读取文件字节以做结构初筛；不会输出业务正文。
 file --brief <managed-local-file>
 sips -g format -g pixelWidth -g pixelHeight <managed-local-image>
 
-# 文本 PDF 的 page / word / bbox 聚合（Adapter 原型的临时实验）
-python -m pdfplumber <managed-local-pdf>
-
-# XLSX / PPTX 的只读结构盘点；不得 load-save
-python -m openpyxl <managed-local-xlsx>
-python -m pptx <managed-local-pptx>
-
-# 仅在本地语言包与模型已锁定、禁网已验证时：
-tesseract <managed-local-image> stdout tsv
+# planned，未在本轮真实样本运行：仅输出匿名聚合，不输出输入路径或内容。
+python3 docs/experiments/document-capabilities/v0.1.0/structural_benchmark.py \
+  --format pdf <managed-local-pdf>
+python3 docs/experiments/document-capabilities/v0.1.0/structural_benchmark.py \
+  --format xlsx <managed-local-xlsx>
+python3 docs/experiments/document-capabilities/v0.1.0/structural_benchmark.py \
+  --format pptx <managed-local-pptx>
 ```
+
+`structural_benchmark.py` 是本次保存的最小、只读 benchmark script；它延迟导入候选库、只向 stdout 输出聚合计数与耗时、不写入输入目录。上述命令均为 planned，因当前样本与临时依赖不可用而未运行，不能当作本轮实测结果。Tesseract、PaddleOCR、Docling、MinerU、Unstructured、Tika、POI、LibreOffice 与 MarkItDown 的真实样本命令同样为 planned，必须先完成各自的离线、模型和许可证门禁。
 
 ## 指标
 
