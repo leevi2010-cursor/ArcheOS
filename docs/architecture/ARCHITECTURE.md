@@ -12,7 +12,7 @@
 - 版本说明：`docs/architecture/diagrams/v0.2.0/README.md`
 - 版本索引：`docs/architecture/diagrams/README.md`
 
-本文件与 `CONCEPTS.md` 已在该图形快照之后加入 Claim 与首批 Relationship vocabulary。概念与产品规则分别以 `CONCEPTS.md` 和 `INFORMATION_GOVERNANCE.md` 为权威；图形快照将在 B2 实现经过真实验证后升级下一版本，避免仅因概念小幅调整频繁重画。
+`v0.2.0` 图形快照早于 Claim、首批 Relationship vocabulary、Context Builder 实现以及 ADR-004 Managed Source 决策。当前文字权威以 `CONCEPTS.md`、本文件、`INFORMATION_GOVERNANCE.md` 和 ADR-004 为准。SVG 不在本 PR 重画；下一版图形快照将在本地 Managed Source runtime（Issue #22）和音频 Processing 切换（Issue #24）完成真实 / 合成验收后统一升级。
 
 ---
 
@@ -32,7 +32,29 @@ Claim 不建立第二条生命周期。它是 Atomic Information 中用于表达
 
 ## 2. Input 与 Processing
 
-Input 接收音频、PDF、图片、PPT、视频等原始信息。原始输入保持不可修改并可追溯。
+Input 接收音频、PDF、图片、PPT、视频等原始信息。正式 `Source` 必须经过用户明确准入、完整字节复制以及 `size` / `content_hash` 校验后才成立。
+
+Source 的权威边界是：
+
+```text
+外部文件
+  = 临时 intake candidate / 可失效接入线索
+  ↓ 用户明确准入 + 完整字节校验
+Managed Source
+  = 稳定 source_id + managed_location + 不可变字节快照
+  ↓
+Normalized Representation
+  ↓
+Evidence
+  ↓
+Atomic Information
+```
+
+Managed Source 是后续 Processing、Evidence 和 Normalized Representation 的唯一权威输入。外部文件归档完成后不再被系统自动跟踪、同步或重新处理；用户修改旧文件必须显式重新接入，形成新的 Source。已被 Evidence 引用的 Source 字节不得由同一 `source_id` 原地覆盖。
+
+`content_hash` 只表示某个受管字节快照的内容身份，可用于完整性校验和存储去重；它不单独定义 `source_id`，也不自动合并不同接入语境。Archive replica、TOS replica 和 Handoff Marker 都不是新的 Source。
+
+第一版本地 Managed Source 根目录为 `01_inbox/` 的受控 Source 区；实际字节和 Manifest 保持本地、Git-ignored。外部扫描 candidate 不复制到正式 Source 区，也不创建稳定 `source_id`。
 
 Processing 把输入转化为可理解、可追溯的中间产物。音频 M1 已支持：
 
@@ -46,6 +68,8 @@ Processing 把输入转化为可理解、可追溯的中间产物。音频 M1 �
 Claimant 尚未解析成 Object 时，可以继续使用 Source / speaker 归因，不强制创建 Person Object。
 
 会议纪要和 Residue 是 Processing 辅助产物，不建立平行生命周期。
+
+当前 M1 实现中的 `process_audio()` 仍直接接收外部本地音频路径，使用文件名 stem 与 SHA-256 前缀派生 Source ID，并在 processing manifest 中保存外部绝对路径。这些行为属于早期 legacy provenance，后续 Source runtime 迁移时必须替换；本 Issue 只固化架构权威，不修改代码或旧 Processing package 的读取兼容性。
 
 ---
 

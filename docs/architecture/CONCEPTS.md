@@ -44,7 +44,34 @@ Information Layer **允许彼此矛盾的 Atomic Information / Claim 并存**。
 
 ---
 
-## 3. Object
+## 3. Source
+
+`Source` 是经过用户明确准入、由系统保存为不可变字节快照，并具有稳定 `source_id` 的正式信息输入。
+
+Source 位于 Input / Information provenance 边界：
+
+- Source 是后续 Processing、Evidence 和 Normalized Representation 的权威输入；
+- Source 不是 World Model `Object`，不具有 Object 的业务身份、Role 或 Relationship；
+- Source 不因名称、外部路径、当前格式支持或所在目录而获得身份；
+- 一个 `source_id` 对应一份不可变 Managed Source 字节快照；
+- Source 字节一旦进入 Evidence 链，不得被同一 `source_id` 原地覆盖；
+- 新字节内容必须显式重新接入，并创建新的 `source_id`；
+- 相同 `content_hash` 可以支持存储去重，但不能自动复用 `source_id` 或合并来源语境。
+
+扫描到的外部文件在用户准入和复制校验完成前只是临时 intake candidate，不是正式 Source。归档完成后，外部文件可以作为可失效的 `ingested_from` 历史线索，但不参与后续 Evidence 定位，也不成为系统长期读取权威。
+
+Source 与以下架构术语的边界如下：
+
+- Managed Source 是 Source 已完成准入、复制和校验后的系统受管形态；
+- Archive / storage replica 是 Managed Source 的受管字节位置，不是新的 Source；
+- Handoff Marker 是外部目录中的交接说明，不是 Source、Evidence 或同步机制；
+- Normalized Representation 是从 Source + `content_hash` 生成的可替换派生表示，不是 Source。
+
+Source 与 Evidence 的关系是“Evidence 回到 Source”，不是 Source 本身等于 Evidence。Source 与 Atomic Information 的关系是“Atomic Information 可以引用 Source 作为依据”，不是 Source 等于信息内容。
+
+---
+
+## 4. Object
 
 `Object` 是现实世界或经营世界中一个**需要长期保持稳定身份的可引用对象**。
 
@@ -69,7 +96,7 @@ Object 可以：
 
 ---
 
-## 4. Role
+## 5. Role
 
 `Role` 表示一个 Object **当前或在某段时间内以什么业务身份被理解和使用**。
 
@@ -101,7 +128,7 @@ Role 可以随时间变化。Role 改变不意味着 Object 身份改变。
 
 ---
 
-## 5. Name
+## 6. Name
 
 `Name` 是 Object 面向人的可读名称。
 
@@ -117,7 +144,7 @@ Name 不是 Object 的身份键。
 
 ---
 
-## 6. Lifecycle
+## 7. Lifecycle
 
 `Lifecycle` 描述 Object 在时间上的存在、推进和结束特征。
 
@@ -150,7 +177,7 @@ lifecycle = bounded
 
 ---
 
-## 7. Relationship
+## 8. Relationship
 
 `Relationship` 表示两个 Object 之间可长期保存、可追溯的有类型关系。
 
@@ -196,7 +223,7 @@ Relationship 的方向属于其语义。例如：
 
 ---
 
-## 8. Atomic Information
+## 9. Atomic Information
 
 `Atomic Information` 是一个**可独立理解、可独立追溯的长期原子信息单元**。
 
@@ -263,7 +290,7 @@ A 与 B 可以同时长期保存，即使彼此冲突。冲突如何影响 World
 
 ---
 
-## 9. Atomic Information Candidate
+## 10. Atomic Information Candidate
 
 `Atomic Information Candidate` 是 Processing 阶段产生的、尚未进入长期 Atomic Information 层的原子信息候选。
 
@@ -279,7 +306,7 @@ Processing
 
 ---
 
-## 10. Evidence
+## 11. Evidence
 
 `Evidence` 是 Information 或 World Model 认知回到原始来源的可追溯依据。
 
@@ -301,7 +328,7 @@ Evidence 与 Atomic Information 不同：
 
 ---
 
-## 11. Residue
+## 12. Residue
 
 `Residue` 是 Processing 阶段当前无法安全转化为结构化信息的内容。
 
@@ -317,7 +344,7 @@ Residue 不是运行错误，也不是垃圾。
 
 ---
 
-## 12. Structured World Model
+## 13. Structured World Model
 
 `Structured World Model` 是对以下长期结构化内容的统称：
 
@@ -337,7 +364,7 @@ Information Layer 可以保留相互矛盾的 Claim；World Model 不需要把�
 
 ---
 
-## 13. Projection
+## 14. Projection
 
 `Projection` 表示为了某种理解目的，从同一份 World Model 中选择、组织和计算出一个观察结果的过程。
 
@@ -345,7 +372,7 @@ Projection 不改变 Core Data 本身。
 
 ---
 
-## 14. View
+## 15. View
 
 `View` 是对同一份 Core World Model 的一种**人类理解视角**。
 
@@ -375,7 +402,7 @@ View 不是新的 Core Object。
 
 ---
 
-## 15. View Model
+## 16. View Model
 
 `View Model` 是根据某个 View / Projection 从 Core Data 得到的、适合展示层读取的数据结构。
 
@@ -383,7 +410,7 @@ View 不是新的 Core Object。
 
 ---
 
-## 16. Presentation
+## 17. Presentation
 
 `Presentation` 表示最终面向人的呈现方式。
 
@@ -399,7 +426,7 @@ Presentation 不是 Core Data，也不承担长期 Object / Relationship 的权�
 
 ---
 
-## 17. Object Resolver
+## 18. Object Resolver
 
 `Object Resolver` 是读取时根据稳定 `object_id` 获取当前人类可读 Object 信息的机制。
 
@@ -415,7 +442,7 @@ Object Resolver 是读取机制，不是新的 Domain Object。
 
 ---
 
-## 18. 当前示例
+## 19. 当前示例
 
 ### 私享国际家具
 
@@ -449,7 +476,7 @@ A、B、C 之间的业务联系通过 Relationship 表达。
 
 ---
 
-## 19. 概念别名与收敛规则
+## 20. 概念别名与收敛规则
 
 ArcheOS 使用一个 canonical 概念体系。别名只帮助识别旧资料和不同系统的说法，不拥有独立定义，也不得在新代码中形成兼容类或平行存储模型。
 
@@ -477,7 +504,7 @@ ArcheOS 使用一个 canonical 概念体系。别名只帮助识别旧资料和�
 
 ---
 
-## 20. 信息生命周期补充概念
+## 21. 信息生命周期补充概念
 
 ArcheOS 的 canonical 生命周期仍是：
 
@@ -525,7 +552,7 @@ Evidence Fragment 负责回答“依据在原文哪里”；Atomic Information C
 
 ---
 
-## 21. 经营与项目治理概念
+## 22. 经营与项目治理概念
 
 这些概念用于组织经营推进。它们可以通过 Object、Role、Lifecycle、Relationship 和 View 实现，但业务含义保持一致。
 
@@ -574,7 +601,7 @@ Evidence Fragment 负责回答“依据在原文哪里”；Atomic Information C
 
 ---
 
-## 22. 系统设计概念
+## 23. 系统设计概念
 
 ### System、Subsystem、Module、Component
 
@@ -607,7 +634,7 @@ Module 可以由确定性代码、Agent 或二者组合实现；是否调用模�
 
 ---
 
-## 23. 运行、治理与反馈概念
+## 24. 运行、治理与反馈概念
 
 | 概念 | 定义 |
 | --- | --- |
@@ -636,7 +663,7 @@ State、Status、Lifecycle、Health、Freshness 不得互相替代。Signal、Fe
 
 ---
 
-## 24. Asset、Artifact、Product 与 System
+## 25. Asset、Artifact、Product 与 System
 
 - `Asset` 是某个 Goal 语境下，可被复用并产生收益或降低风险的 View / 角色，不是互斥的根 Object 类型。
 - `Artifact` 是被创建或维护、具有稳定身份的产物 Object。
@@ -649,7 +676,7 @@ State、Status、Lifecycle、Health、Freshness 不得互相替代。Signal、Fe
 
 ---
 
-## 25. 领域概念扩展
+## 26. 领域概念扩展
 
 当本文件不能表达某个项目的真实业务含义时，允许新增领域概念，但必须先保留在项目范围内。
 

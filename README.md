@@ -157,7 +157,9 @@ speaker map 使用转写片段编号，只接受中性标签，不执行 Person 
 
 自动 diarization 只在某个 speaker 对 transcript segment 具有明确、占多数的正时间重叠时赋值。相同 overlap、无明显主导或无有效 overlap 时保留未知 speaker；缺少可用时间戳且没有 speaker map 时会给出可操作错误。M1 不执行声纹、voice embedding、Person 匹配或真实身份推断。
 
-每个来源会生成确定性的 `source_id`，输出位于 `02_processing/<source_id>/`：
+当前 M1 实现仍会根据输入文件名 stem 与 SHA-256 前缀派生 `source_id`，并将外部路径写入 processing manifest。这是待迁移的 legacy provenance，不是未来 Managed Source 的身份规则；后续 Source runtime 必须在用户明确准入、完整字节复制和 size/content_hash 校验后创建 opaque `source_id`。本 Issue 不改动该旧实现。
+
+当前处理输出仍位于 `02_processing/<source_id>/`：
 
 ```text
 manifest.json
