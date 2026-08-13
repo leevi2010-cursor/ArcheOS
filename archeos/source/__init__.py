@@ -1,6 +1,14 @@
 """Local Managed Source admission, verification, and restore."""
 
 from .contracts import ManagedSourceAccess, ManagedSourceRepository
+from .handoff import (
+    HandoffMarker,
+    HandoffMarkerConflictError,
+    HandoffMarkerError,
+    HandoffMarkerService,
+    HandoffShowResult,
+    HandoffWriteResult,
+)
 from .local_repository import (
     AdmissionError,
     LocalManagedSourceRepository,
@@ -25,6 +33,12 @@ from .service import ManagedSourceService
 __all__ = [
     "AdmissionError",
     "AdmissionResult",
+    "HandoffMarker",
+    "HandoffMarkerConflictError",
+    "HandoffMarkerError",
+    "HandoffMarkerService",
+    "HandoffShowResult",
+    "HandoffWriteResult",
     "IngestedFrom",
     "LocalManagedSourceRepository",
     "ManagedSource",

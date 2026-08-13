@@ -189,9 +189,13 @@ python3 -m archeos source show <source_id>
 python3 -m archeos source list
 python3 -m archeos source verify <source_id>
 python3 -m archeos source restore <source_id> <target-file>
+python3 -m archeos source handoff write <source_id>
+python3 -m archeos source handoff show <external-file>.archeos.md
 ```
 
 可通过 `--managed-root <path>` 指定本地受控根目录，默认是 `01_inbox/`。准入协议会在 `.staging/` 中流式复制，重新检查外部文件，独立校验受管副本，写入严格 Manifest 后再以 atomic rename 发布；任一步骤失败都会清理 staging，不会覆盖已有 Source，也不会修改外部文件。`source_id` 是 opaque 的 `src_<uuid4 hex>`，相同内容只产生 content-equivalent 提示，不合并 Source identity。`verify` 为只读校验；`restore` 先验证 Source、默认拒绝覆盖已有目标，并在目标同目录中流式复制后原子发布。
+
+`source handoff write` 是准入后的独立显式动作：仅在 Source 已验证、外部旧文件仍存在且目标目录可写时，才在旧文件旁以 atomic no-replace 方式写入 `<外部文件名>.archeos.md`。它只提示用户使用 `source_id` 回到系统，不会修改外部原文件、Manifest 或受管字节，也不会同步、删除或恢复外部文件。相同 `source_id` 的合法 marker 重试会返回 `existing`；任何用户文件、损坏 marker 或不同 Source 均会拒绝覆盖。原文件已移动或删除时，可用 `--target-file <仍存在的旧入口>` 明确指定文件。
 
 ## M2-B1 Durable Atomic Information
 

@@ -44,3 +44,10 @@ def publish_directory_no_replace(staging_path: Path, final_path: Path) -> None:
     if error_number in {EEXIST, ENOTEMPTY}:
         raise FileExistsError(error_number, "target entry already exists", final_path)
     raise OSError(error_number, "atomic no-replace directory publication failed", final_path)
+
+
+def publish_file_no_replace(staging_path: Path, final_path: Path) -> None:
+    """Atomically publish a regular file without ever replacing ``final_path``."""
+
+    os.link(staging_path, final_path, follow_symlinks=False)
+    staging_path.unlink()

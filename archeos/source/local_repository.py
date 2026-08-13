@@ -20,7 +20,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Iterator, Mapping
 
-from ..filesystem import publish_directory_no_replace as _publish_directory_no_replace
+from ..filesystem import (
+    publish_directory_no_replace as _publish_directory_no_replace,
+    publish_file_no_replace as _publish_file_no_replace,
+)
 from .identity import require_managed_source_id
 from .models import (
     MANIFEST_SCHEMA_VERSION,
@@ -174,18 +177,6 @@ def _is_lexically_safe_locator(locator: object, source_id: str) -> bool:
     ):
         return False
     return path.name.startswith("original")
-
-
-def _publish_file_no_replace(staging_path: Path, target_path: Path) -> None:
-    """Atomically publish a regular file without ever replacing target_path."""
-
-    try:
-        os.link(staging_path, target_path, follow_symlinks=False)
-    except FileExistsError:
-        raise
-    except OSError:
-        raise
-    staging_path.unlink()
 
 
 class LocalManagedSourceRepository:

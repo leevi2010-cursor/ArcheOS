@@ -21,7 +21,12 @@ from .digestion import (
 from .pipeline import ProcessingError, process_managed_audio
 from .pyannote_speakers import PyannoteSpeakerProvider
 from .speakers import FileSpeakerProvider
-from .source import LocalManagedSourceRepository, ManagedSourceService, SourceError
+from .source import (
+    HandoffMarkerService,
+    LocalManagedSourceRepository,
+    ManagedSourceService,
+    SourceError,
+)
 from .transcription import FileTranscriptionProvider, MlxWhisperTranscriptionProvider
 from .world_model import ObjectResolver, SQLiteWorldModelRepository
 
@@ -247,6 +252,29 @@ def build_parser() -> argparse.ArgumentParser:
         "--managed-root", type=Path, default=argparse.SUPPRESS,
         help="Managed Source root (default: 01_inbox).",
     )
+    source_handoff = source_commands.add_parser(
+        "handoff", help="Write or inspect an explicit external Handoff Marker."
+    )
+    source_handoff_commands = source_handoff.add_subparsers(
+        dest="handoff_command", required=True
+    )
+    handoff_write = source_handoff_commands.add_parser(
+        "write", help="Write a file-level Handoff Marker next to an external old file."
+    )
+    handoff_write.add_argument("source_id")
+    handoff_write.add_argument("--target-file", type=Path)
+    handoff_write.add_argument(
+        "--managed-root", type=Path, default=argparse.SUPPRESS,
+        help="Managed Source root (default: 01_inbox).",
+    )
+    handoff_show = source_handoff_commands.add_parser(
+        "show", help="Read a strict ArcheOS Handoff Marker."
+    )
+    handoff_show.add_argument("marker_path", type=Path)
+    handoff_show.add_argument(
+        "--managed-root", type=Path, default=argparse.SUPPRESS,
+        help="Managed Source root (default: 01_inbox).",
+    )
     return parser
 
 
@@ -414,7 +442,8 @@ def _context_command(args: argparse.Namespace) -> int:
 
 
 def _source_command(args: argparse.Namespace) -> int:
-    service = ManagedSourceService(LocalManagedSourceRepository(args.managed_root))
+    repository = LocalManagedSourceRepository(args.managed_root)
+    service = ManagedSourceService(repository)
     try:
         if args.source_command == "admit":
             metadata: dict[str, object] = {}
@@ -446,6 +475,16 @@ def _source_command(args: argparse.Namespace) -> int:
             return 0 if result.verified else 1
         if args.source_command == "restore":
             result = service.restore(args.source_id, args.target_file)
+            print(json.dumps(result.to_dict(), ensure_ascii=False, indent=2))
+            return 0
+        if args.source_command == "handoff":
+            handoff = HandoffMarkerService(repository, args.managed_root)
+            if args.handoff_command == "write":
+                result = handoff.write(args.source_id, target_file=args.target_file)
+            elif args.handoff_command == "show":
+                result = handoff.show(args.marker_path)
+            else:  # pragma: no cover - argparse enforces this
+                return 2
             print(json.dumps(result.to_dict(), ensure_ascii=False, indent=2))
             return 0
         return 2  # pragma: no cover - argparse enforces this
