@@ -191,6 +191,33 @@ P0 信息丢失、P1 世界模型/治理错误阻止进入下一阶段。
 
 B4 不允许为了“让测试通过”而顺手新增 ontology、Web、Domain Agent 或大型基础设施。
 
+### M2-C1 — Managed Source Authority & Runtime
+
+架构 authority：Issue #21 / ADR-004。
+
+Issue #21 先固化 Managed Source 的权威边界；后续必须由独立 implementation Issue 实现 Source runtime。Source runtime 的顺序先于多格式 Normalization 和旧数据压力测试 / Migration Readiness：
+
+```text
+外部文件
+  → 只读 intake candidate
+  → 用户明确准入
+  → 完整字节复制 + size/content_hash 校验
+  → Managed Source（稳定 source_id、不可变快照）
+  → Normalized Representation
+  → Evidence / Atomic Information
+```
+
+runtime 目标：
+
+- `01_inbox/` 作为第一版本地 Managed Source 根目录；
+- 外部路径只保留为可失效 `ingested_from`，不再作为后续 Processing / Evidence 权威；
+- 一个 `source_id` 对应一份不可变字节快照，新字节显式重新接入并创建新的 `source_id`；
+- `content_hash` 支持完整性和存储去重，但不合并 Source provenance；
+- TOS 只作为 storage adapter / replica；
+- 不引入 Source version graph、`supersedes` 或 `version_of`。
+
+本阶段不在 Issue #21 实现 runtime、复制、恢复、删除、TOS 或多格式 adapter。
+
 ### M2-C — Human View（后置）
 
 Object Profile、向阳生长树、Relationship Graph、Timeline 等人类展示能力继续后置，不阻塞 B1～B4、Migration Readiness 或首个 Domain Agent。
@@ -274,6 +301,8 @@ Domain Agent：
 
 目标：把已经验证的 Processing 能力扩展到 PDF、图片、PPT、视频等输入格式，不复制新的对象体系或生命周期。
 
+M5 的多格式 Normalization 必须建立在 M2-C1 Managed Source runtime 之上，不直接把外部路径当作长期 Source。
+
 ---
 
 ## 当前推荐顺序
@@ -287,12 +316,16 @@ Domain Agent：
  ↓
 #16 M2-B4 Real End-to-End Validation
  ↓
+#21 M2-C1 Managed Source authority（后续独立 runtime Issue）
+ ↓
 #17 M2-D Migration Readiness / Clean-cut Plan
  ↓
 M3 Sales Agent
  ↓
 单向 Imports / Cutover（按 Readiness 结果拆分）
 ```
+
+旧数据压力测试与迁移准备不得先于 Managed Source runtime；真实数据只能在 Managed Source 权威链路稳定后进入下一阶段。
 
 Human View 可在核心链路稳定后并行进入，但不作为上述主线的前置依赖。
 

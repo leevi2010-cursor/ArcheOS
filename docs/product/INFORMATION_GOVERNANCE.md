@@ -16,7 +16,39 @@
 
 ---
 
-## 2. Atomic Information Candidate → Atomic Information
+## 2. Source 接入与 Managed Source 权威
+
+Source 的接入分为临时发现和正式准入两个阶段：
+
+```text
+外部文件
+  → 只读 intake candidate
+  → 用户明确准入
+  → 完整字节复制
+  → size / content_hash 校验
+  → Managed Source + 稳定 source_id
+```
+
+运行规则：
+
+- 扫描目录默认只读，不把扫描记录升级为正式 Source；
+- 只有复制到系统受控位置并通过字节校验后，才创建 Managed Source 和 `source_id`；
+- 第一版本地 Managed Source 根目录是 `01_inbox/` 的受控 Source 区，实际字节和 Manifest 保持本地、Git-ignored；
+- `source_id` 是一份不可变受管字节快照的稳定身份，不由外部路径、文件名或 `content_hash` 单独定义；
+- `content_hash` 用于完整性校验和存储去重，不自动合并不同接入语境；
+- 后续 Processing、Evidence 和 Normalized Representation 只引用 Managed Source，不依赖外部绝对路径；
+- 外部原文件和 Managed Source 可以物理共存，但不计算为两份独立 Evidence；
+- 归档完成后系统不自动跟踪、同步或重新处理外部文件变化；
+- 用户需要更新时必须回到系统显式重新接入，创建新的 Source；
+- 已被 Evidence 引用的 Source 字节不可由同一 `source_id` 原地覆盖；
+- `ingested_from` 只保留可失效的历史接入提示，不参与 Evidence 定位；
+- Handoff Marker 只能在 Managed Source 已复制、校验且 Manifest 持久化后，经用户另行授权写入；它不是 Source、Evidence 或同步机制。
+
+当前 `process_audio()` 的外部 path、文件名 stem 与 SHA-256 前缀派生 ID、以及 processing manifest 中的绝对路径，属于 M1 legacy provenance。它们保留为后续 Source 身份迁移对象，本规则不授权当前 Issue 修改代码。
+
+---
+
+## 3. Atomic Information Candidate → Atomic Information
 
 符合信息契约的 Atomic Information Candidate 可以自动进入长期 Atomic Information，不要求逐条人工审核。
 
@@ -32,7 +64,7 @@
 
 ---
 
-## 3. Claim 治理
+## 4. Claim 治理
 
 Claim 表示“谁以什么立场表达了什么”，**不是系统已经确认的事实**。
 
@@ -50,7 +82,7 @@ Claim 可以成为 World Model 变化的依据之一，但是否写入 World Mod
 
 ---
 
-## 4. Atomic Information 与已有 Object 的消化
+## 5. Atomic Information 与已有 Object 的消化
 
 新的 Atomic Information 涉及已有 Object 时，系统先判断业务影响：
 
@@ -74,7 +106,7 @@ Claim 可以成为 World Model 变化的依据之一，但是否写入 World Mod
 
 ---
 
-## 5. 安全自动更新
+## 6. 安全自动更新
 
 已有 Object 的更新在同时满足以下条件时可以自动执行：
 
@@ -95,7 +127,7 @@ Claim 可以成为 World Model 变化的依据之一，但是否写入 World Mod
 
 ---
 
-## 6. 必须交给人类判断的情况
+## 7. 必须交给人类判断的情况
 
 以下情况停止自动修改，并请求人类判断：
 
@@ -113,7 +145,7 @@ Claim 可以成为 World Model 变化的依据之一，但是否写入 World Mod
 
 ---
 
-## 7. Relationship 治理
+## 8. Relationship 治理
 
 当前允许写入 World Model 的通用 Relationship 语义以 `CONCEPTS.md` 为唯一词汇权威。
 
@@ -140,7 +172,7 @@ related_to
 
 ---
 
-## 8. 新建 Object 与孤立对象
+## 9. 新建 Object 与孤立对象
 
 ArcheOS 应尽量避免创建没有业务联系的孤立 Object。
 
@@ -154,7 +186,7 @@ ArcheOS 应尽量避免创建没有业务联系的孤立 Object。
 
 ---
 
-## 9. 删除 Object 与关系安全
+## 10. 删除 Object 与关系安全
 
 删除 Object 必须由人类确认。
 
@@ -170,7 +202,7 @@ ArcheOS 应尽量避免创建没有业务联系的孤立 Object。
 
 ---
 
-## 10. 面向人类的表达规则
+## 11. 面向人类的表达规则
 
 所有面向人类的内容必须使用**通俗业务语言**，而不是内部技术语言。
 
@@ -210,7 +242,7 @@ add_role(business_line)
 
 ---
 
-## 11. 存储无关性
+## 12. 存储无关性
 
 上述业务规则不得写死在某一种数据库 Adapter 中。
 
