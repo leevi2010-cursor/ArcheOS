@@ -20,4 +20,4 @@
 
 ## 范围边界
 
-本实验未实现 `Normalized Representation` runtime、任何生产 Adapter、OCR pipeline、Atomic Information、Object、TOS 或 UI。若未来运行真实样本，只允许在本机由受控工具只读处理；除确认结构结果所必需的最小人工检查外，不进行业务内容分析。本目录不记录或提交真实路径、文件名、正文、图片、hash、人员、公司、项目或凭证。
+本实验未实现 `Normalized Representation` runtime、任何生产 Adapter、OCR pipeline、Atomic Information、Object、TOS 或 UI。本轮真实样本仅在本机由受控工具只读处理；除确认结构结果所必需的最小人工检查外，未进行业务内容分析。本目录不记录或提交真实路径、文件名、正文、图片、hash、人员、公司、项目或凭证。

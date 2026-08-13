@@ -8,7 +8,34 @@
     "architecture": "Apple Silicon"
   },
   "sample_aggregate": {
-    "status": "not_run_no_fixed_reproducible_sample_set"
+    "markdown": {
+      "status": "not_available",
+      "count": 0
+    },
+    "text_pdf": {
+      "status": "actually_run",
+      "count": 2
+    },
+    "scan_or_mixed_pdf": {
+      "status": "not_available",
+      "count": 0
+    },
+    "xlsx": {
+      "status": "actually_run",
+      "count": 2
+    },
+    "pptx": {
+      "status": "actually_run",
+      "count": 1
+    },
+    "images": {
+      "status": "actually_run",
+      "count": 3,
+      "media_type": "image/jpeg"
+    },
+    "ocr": {
+      "status": "blocked_by_network_or_model_gate"
+    }
   },
   "candidate_version_snapshot": {
     "observed_at": "2026-08-13",
@@ -34,7 +61,17 @@
       "llama_cpp": "b10405",
       "ollama": "0.32.9"
     },
-    "selected_or_benchmark_versions": "No candidate library or system tool was run on a reproducible real sample in this experiment. See CANDIDATES.md for per-candidate reasons."
+    "selected_or_benchmark_versions": "Actually run: pdfplumber 0.11.10, openpyxl 3.1.5, python-pptx 1.0.2, plus system file and sips for image structure checks. All other candidates remain not_run or blocked_by_network_or_model_gate; see CANDIDATES.md for per-candidate reasons."
+  },
+  "actually_run": {
+    "tools": {
+      "pdfplumber": "0.11.10",
+      "openpyxl": "3.1.5",
+      "python_pptx": "1.0.2",
+      "file": "system-provided, not pinned",
+      "sips": "system-provided, not pinned"
+    },
+    "network_model_tools_run_on_real_samples": false
   },
   "validation": [
     "python3 -m json.tool docs/experiments/document-capabilities/v0.1.0/manifest.json",

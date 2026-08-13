@@ -1,4 +1,4 @@
-"""Planned read-only aggregate benchmark for future local document samples.
+"""Read-only structural benchmark for local document samples.
 
 The script intentionally writes no files and never prints input paths or content.
 It is documentation experiment tooling, not an ArcheOS Adapter or runtime.
@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
+import subprocess
 from time import perf_counter
 from zipfile import ZipFile
 
@@ -64,12 +65,37 @@ def _pptx(path: Path) -> dict[str, int]:
     }
 
 
+def _image(path: Path) -> dict[str, str]:
+    """Return only non-content structure fields from local system tools."""
+    mime_type = subprocess.run(
+        ["file", "--brief", "--mime-type", str(path)],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    sips = subprocess.run(
+        ["sips", "-g", "format", "-g", "pixelWidth", "-g", "pixelHeight", "-g", "alphaInfo", str(path)],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.splitlines()
+    fields: dict[str, str] = {"mime_type": mime_type}
+    for line in sips:
+        for name in ("format", "pixelWidth", "pixelHeight", "alphaInfo"):
+            marker = f"{name}: "
+            if line.strip().startswith(marker):
+                fields[name] = line.strip().split(marker, 1)[1]
+    return fields
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--format", choices=("pdf", "xlsx", "pptx"), required=True)
+    parser.add_argument(
+        "--format", choices=("pdf", "xlsx", "pptx", "image"), required=True
+    )
     parser.add_argument("input", type=Path)
     args = parser.parse_args()
-    handlers = {"pdf": _pdf, "xlsx": _xlsx, "pptx": _pptx}
+    handlers = {"pdf": _pdf, "xlsx": _xlsx, "pptx": _pptx, "image": _image}
     started = perf_counter()
     result = handlers[args.format](args.input)
     result["elapsed_milliseconds"] = round((perf_counter() - started) * 1000)

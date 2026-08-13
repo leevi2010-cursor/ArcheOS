@@ -10,17 +10,17 @@
 | MarkItDown | 0.1.7 | not run | Agent preview 候选；样本不可用 | 2026-08-13 |
 | Apache Tika | 3.3.2 | not run | 通用 detection / fallback 候选；JVM 未验证 | 2026-08-13 |
 | Docling | 2.119.0 | not run | 复杂结构候选；模型下载与离线未验证 | 2026-08-13 |
-| `pdfplumber` | 0.11.10 | not run | 文本型 PDF primary 候选；样本不可用 | 2026-08-13 |
+| `pdfplumber` | 0.11.10 | 0.11.10, actually_run | 文本型 PDF 的只读聚合基准 | 2026-08-13 |
 | PyMuPDF | 1.28.2 | not run | 有许可门禁，不作为默认依赖 | 2026-08-13 |
 | MinerU | mineru-3.4.4-released | not run | 附加许可与模型门禁，保持实验候选 | 2026-08-13 |
 | Tesseract | 5.5.3 | not run | 本地 OCR fallback 候选；语言包与断网未验证 | 2026-08-13 |
 | PaddleOCR | 3.7.0 | not run | 中文 OCR 候选；模型和网络门禁未验证 | 2026-08-13 |
 | Unstructured | 0.25.2 | not run | 本轮移除旧 0.24.1 调查标签；待以最新版本另行验证 | 2026-08-13 |
-| `openpyxl` | 3.1.5 | not run | XLSX structured primary 候选；样本不可用 | 2026-08-13 |
+| `openpyxl` | 3.1.5 | 3.1.5, actually_run | XLSX 的只读结构聚合基准 | 2026-08-13 |
 | Apache POI | 5.5.1 | not run | Office fallback 候选；JVM 未验证 | 2026-08-13 |
 | LibreOffice | 26.2.5 | not run | headless preview / conversion 候选；转换未验证 | 2026-08-13 |
-| `python-pptx` | 1.0.2 | not run | PPTX structured primary 候选；样本不可用 | 2026-08-13 |
-| libmagic / `file` | not pinned (system CLI) | system-provided, not pinned | 仅作为本机 intake precheck 候选；上游 tag 未作为依赖选择 | 2026-08-13 |
+| `python-pptx` | 1.0.2 | 1.0.2, actually_run | PPTX 的只读结构聚合基准 | 2026-08-13 |
+| libmagic / `file` | not pinned (system CLI) | system-provided, actually_run | 图片本机 intake precheck；上游 tag 未作为依赖选择 | 2026-08-13 |
 | Exiv2 | 0.28.8 | not run | GPL-2.0-or-later 门禁；仅研究隔离 CLI 可行性 | 2026-08-13 |
 | ImageMagick | 7.1.2-29 | not run | 默认安全 policy 不满足要求 | 2026-08-13 |
 | `llama.cpp` | b10405 | not run | rolling release；多模态与模型下载后置验证 | 2026-08-13 |
