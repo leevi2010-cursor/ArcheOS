@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import sqlite3
+import sys
 from dataclasses import asdict
 from pathlib import Path
 
@@ -31,6 +32,14 @@ from .source import (
 )
 from .transcription import FileTranscriptionProvider, MlxWhisperTranscriptionProvider
 from .world_model import ObjectResolver, SQLiteWorldModelRepository
+from .workspace import (
+    codex_integration_status,
+    doctor,
+    initialize_workspace,
+    install_codex_integration,
+    load_workspace_config,
+    remove_codex_integration,
+)
 
 DEFAULT_WORLD_MODEL_DATABASE = Path("04_core/archeos.sqlite3")
 DEFAULT_ATOMIC_INFORMATION_STORE = Path("03_information/atomic_information.jsonl")
@@ -42,7 +51,41 @@ DEFAULT_REPRESENTATION_ROOT = Path("02_processing/representations")
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="archeos")
+    from . import __version__
+
+    parser.add_argument("--version", action="version", version=__version__)
     subparsers = parser.add_subparsers(dest="command", required=True)
+
+    init = subparsers.add_parser("init", help="Initialize a private local ArcheOS Workspace.")
+    init.add_argument("workspace_path", type=Path, nargs="?", default=Path.cwd())
+    init.add_argument("--config", type=Path, help="ArcheOS local configuration path.")
+
+    doctor_command = subparsers.add_parser("doctor", help="Check the local core installation and Workspace.")
+    doctor_command.add_argument("--config", type=Path, help="ArcheOS local configuration path.")
+
+    config = subparsers.add_parser("config", help="Inspect local ArcheOS configuration.")
+    config.add_argument("--config", type=Path, help="ArcheOS local configuration path.")
+    config_commands = config.add_subparsers(dest="config_command", required=True)
+    config_commands.add_parser("show", help="Show non-secret local configuration.")
+
+    mcp = subparsers.add_parser("mcp", help="Run the local read-only ArcheOS MCP server.")
+    mcp_commands = mcp.add_subparsers(dest="mcp_command", required=True)
+    mcp_serve = mcp_commands.add_parser("serve", help="Serve canonical read tools over stdio.")
+    mcp_serve.add_argument("--workspace", type=Path, help="Initialized ArcheOS Workspace.")
+    mcp_serve.add_argument("--config", type=Path, help="ArcheOS local configuration path.")
+
+    integration = subparsers.add_parser("integration", help="Manage supported local Agent integrations.")
+    integration_commands = integration.add_subparsers(dest="integration_target", required=True)
+    codex = integration_commands.add_parser("codex", help="Manage the local Codex MCP registration.")
+    codex_commands = codex.add_subparsers(dest="integration_command", required=True)
+    for command_name, help_text in (
+        ("install", "Install the ArcheOS-managed local Codex MCP entry."),
+        ("status", "Show whether Codex can discover the managed MCP entry."),
+        ("remove", "Remove only the ArcheOS-managed local Codex MCP entry."),
+    ):
+        command = codex_commands.add_parser(command_name, help=help_text)
+        command.add_argument("--config", type=Path, help="ArcheOS local configuration path.")
+        command.add_argument("--codex-config", type=Path, help="Codex config.toml path (for explicit local scope).")
 
     process = subparsers.add_parser(
         "process", help="Process one verified Managed Source audio input."
@@ -392,6 +435,54 @@ def _process_command(args: argparse.Namespace) -> int:
     return 0
 
 
+def _workspace_command(args: argparse.Namespace) -> int:
+    try:
+        if args.command == "init":
+            config, changed = initialize_workspace(args.workspace_path, config_path=args.config)
+            print(json.dumps({**config.to_dict(), "created_or_updated": changed}, ensure_ascii=False, indent=2))
+            return 0
+        if args.command == "doctor":
+            report = doctor(args.config)
+            print(json.dumps(report, ensure_ascii=False, indent=2))
+            return 0 if report.get("healthy") else 1
+        if args.command == "config":
+            if args.config_command != "show":  # pragma: no cover - argparse enforces this
+                return 2
+            print(json.dumps(load_workspace_config(args.config).to_dict(), ensure_ascii=False, indent=2))
+            return 0
+        if args.command == "integration":
+            if args.integration_target != "codex":  # pragma: no cover - argparse enforces this
+                return 2
+            if args.integration_command == "remove":
+                print(json.dumps({"result": remove_codex_integration(args.codex_config)}, ensure_ascii=False, indent=2))
+                return 0
+            config = load_workspace_config(args.config)
+            if args.integration_command == "install":
+                print(json.dumps({"result": "installed", "config_path": install_codex_integration(config, args.codex_config)}, ensure_ascii=False, indent=2))
+                return 0
+            if args.integration_command == "status":
+                print(json.dumps(codex_integration_status(config, args.codex_config), ensure_ascii=False, indent=2))
+                return 0
+        return 2
+    except (OSError, ValueError) as exc:
+        print(f"error: {exc}")
+        return 1
+
+
+def _mcp_command(args: argparse.Namespace) -> int:
+    if args.mcp_command != "serve":  # pragma: no cover - argparse enforces this
+        return 2
+    try:
+        workspace = args.workspace or load_workspace_config(args.config).workspace
+        from .mcp_server import serve
+
+        serve(workspace)
+    except (OSError, RuntimeError, ValueError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    return 0
+
+
 def _information_command(args: argparse.Namespace) -> int:
     if (
         args.information_command != "ingest"
@@ -601,6 +692,10 @@ def _representation_command(args: argparse.Namespace) -> int:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    if args.command in {"init", "doctor", "config", "integration"}:
+        return _workspace_command(args)
+    if args.command == "mcp":
+        return _mcp_command(args)
     if args.command == "process":
         return _process_command(args)
     if args.command == "object":

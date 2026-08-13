@@ -51,14 +51,22 @@ def _validate_confidence(confidence: float | None) -> float | None:
 
 
 class SQLiteWorldModelRepository:
-    def __init__(self, database: Path) -> None:
+    def __init__(self, database: Path, *, read_only: bool = False) -> None:
         self.database = Path(database)
-        self.database.parent.mkdir(parents=True, exist_ok=True)
-        self._connection = sqlite3.connect(self.database)
+        self.read_only = read_only
+        if read_only:
+            if not self.database.is_file():
+                raise ValueError(f"World Model database does not exist: {self.database}")
+            database_uri = self.database.resolve().as_uri() + "?mode=ro&immutable=1"
+            self._connection = sqlite3.connect(database_uri, uri=True)
+        else:
+            self.database.parent.mkdir(parents=True, exist_ok=True)
+            self._connection = sqlite3.connect(self.database)
         self._connection.row_factory = sqlite3.Row
         self._connection.execute("PRAGMA foreign_keys = ON")
         self._transaction_depth = 0
-        self.initialize()
+        if not read_only:
+            self.initialize()
 
     def __enter__(self) -> Self:
         return self
