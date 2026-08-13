@@ -1,0 +1,71 @@
+{
+  "schema_version": "experimental-0.2",
+  "example_data": true,
+  "source_id": "src_example_01",
+  "managed_source": {
+    "managed_location": "managed-source://sources/src_example_01/original-bytes",
+    "content_hash": "sha256:EXAMPLE_NOT_A_REAL_HASH",
+    "size_bytes": 123456,
+    "archived_at": "2026-08-12T00:00:00Z",
+    "availability": "available"
+  },
+  "ingested_from": {
+    "location": "file:///example/intake/sample-document.pdf",
+    "observed_at": "2026-08-12T00:00:00Z",
+    "record_status": "historical_hint",
+    "may_be_missing": true
+  },
+  "verification_records": [
+    {
+      "verified_at": "2026-08-12T00:01:00Z",
+      "observed_content_hash": "sha256:EXAMPLE_NOT_A_REAL_HASH",
+      "managed_content_hash": "sha256:EXAMPLE_NOT_A_REAL_HASH",
+      "observed_size_bytes": 123456,
+      "managed_size_bytes": 123456,
+      "hash_matches": true,
+      "size_matches": true
+    }
+  ],
+  "storage_replicas": [
+    {
+      "kind": "local",
+      "location": "managed-source://sources/src_example_01/original-bytes",
+      "status": "verified"
+    }
+  ],
+  "handoff_marker": {
+    "requested": true,
+    "written": true,
+    "kind": "sidecar",
+    "written_at": "2026-08-12T00:02:00Z"
+  },
+  "normalized_representations": [
+    {
+      "representation_id": "repr_example_01",
+      "kind": "pdf_text_blocks",
+      "location": "managed-derived://normalized/src_example_01/text-blocks.json",
+      "derived_from_source_id": "src_example_01",
+      "source_content_hash": "sha256:EXAMPLE_NOT_A_REAL_HASH",
+      "adapter_version": "example-adapter-1",
+      "generated_at": "2026-08-12T00:03:00Z",
+      "status": "complete",
+      "warnings": []
+    },
+    {
+      "representation_id": "repr_example_02",
+      "kind": "pdf_ocr",
+      "location": "managed-derived://normalized/src_example_01/ocr.json",
+      "derived_from_source_id": "src_example_01",
+      "source_content_hash": "sha256:EXAMPLE_NOT_A_REAL_HASH",
+      "adapter_version": "example-ocr-1",
+      "generated_at": "2026-08-12T00:04:00Z",
+      "status": "failed",
+      "warnings": ["Synthetic failure status; no real processing was run."]
+    }
+  ],
+  "warnings": [
+    "Synthetic example only; contains no real path, hash, document, or user data.",
+    "ingested_from is a historical hint and is not an Evidence locator.",
+    "This example is not a database schema or a formal Source contract."
+  ]
+}
