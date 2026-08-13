@@ -13,16 +13,15 @@ import mimetypes
 import os
 import re
 import shutil
-import sys
 import tempfile
 import uuid
 from contextlib import contextmanager
-from errno import EEXIST, ENOTEMPTY
-from ctypes import CDLL, c_char_p, c_int, get_errno
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Iterator, Mapping
 
+from ..filesystem import publish_directory_no_replace as _publish_directory_no_replace
+from .identity import require_managed_source_id
 from .models import (
     MANIFEST_SCHEMA_VERSION,
     AdmissionResult,
@@ -36,14 +35,9 @@ from .models import (
 
 
 CHUNK_SIZE = 1024 * 1024
-SOURCE_ID_PATTERN = re.compile(r"^src_[0-9a-f]{32}$")
 HASH_PATTERN = re.compile(r"^sha256:[0-9a-f]{64}$")
 SOURCE_DIR_NAME = "sources"
 STAGING_DIR_NAME = ".staging"
-AT_FDCWD_DARWIN = -2
-AT_FDCWD_LINUX = -100
-RENAME_EXCL_DARWIN = 0x00000004
-RENAME_NOREPLACE_LINUX = 1
 
 
 class SourceError(RuntimeError):
@@ -85,11 +79,10 @@ def _default_id_factory() -> str:
 
 
 def _validate_source_id(source_id: object) -> str:
-    if not isinstance(source_id, str) or not SOURCE_ID_PATTERN.fullmatch(source_id):
-        raise SourceValidationError(
-            "source_id must be src_ followed by 32 lowercase hex characters"
-        )
-    return source_id
+    try:
+        return require_managed_source_id(source_id)
+    except ValueError as exc:
+        raise SourceValidationError(str(exc)) from exc
 
 
 def _validate_hash(value: object, field: str = "content_hash") -> str:
@@ -181,37 +174,6 @@ def _is_lexically_safe_locator(locator: object, source_id: str) -> bool:
     ):
         return False
     return path.name.startswith("original")
-
-
-def _publish_directory_no_replace(staging_path: Path, final_path: Path) -> None:
-    """Publish a fully written Source directory without replacing a rival path."""
-
-    libc = CDLL(None, use_errno=True)
-    if sys.platform == "darwin":
-        rename_no_replace = libc.renameatx_np
-        directory_fd = AT_FDCWD_DARWIN
-        flag = RENAME_EXCL_DARWIN
-    elif sys.platform == "linux" and hasattr(libc, "renameat2"):
-        rename_no_replace = libc.renameat2
-        directory_fd = AT_FDCWD_LINUX
-        flag = RENAME_NOREPLACE_LINUX
-    else:
-        raise OSError("atomic no-replace directory publication is unavailable")
-    rename_no_replace.argtypes = (c_int, c_char_p, c_int, c_char_p, c_int)
-    rename_no_replace.restype = c_int
-    result = rename_no_replace(
-        directory_fd,
-        os.fsencode(staging_path),
-        directory_fd,
-        os.fsencode(final_path),
-        flag,
-    )
-    if result == 0:
-        return
-    error_number = get_errno()
-    if error_number in {EEXIST, ENOTEMPTY}:
-        raise FileExistsError(error_number, "Managed Source ID already exists", final_path)
-    raise OSError(error_number, "atomic Managed Source publication failed", final_path)
 
 
 def _publish_file_no_replace(staging_path: Path, target_path: Path) -> None:
@@ -434,13 +396,26 @@ class LocalManagedSourceRepository:
 
     @contextmanager
     def materialize(self, source_id: str) -> Iterator[Path]:
-        """Expose verified local bytes for one bounded Processing operation."""
+        """Copy verified Source bytes into an isolated bounded runtime path."""
 
         source = self.get(source_id)
+        verification = self.verify(source.source_id)
+        if not verification.verified:
+            raise SourceIntegrityError("Managed Source failed verification")
         managed_path = self._managed_path(source)
-        if not managed_path.is_file() or managed_path.is_symlink():
-            raise SourceIntegrityError("managed bytes are missing or not a regular file")
-        yield managed_path
+        with tempfile.TemporaryDirectory(prefix="archeos-materialized-") as temp:
+            runtime_path = Path(temp) / f"audio{_safe_suffix(source.filename_hint)}"
+            copied_hash, copied_size = _copy_stream(
+                managed_path,
+                runtime_path,
+                chunk_size=self.chunk_size,
+            )
+            if copied_hash != source.content_hash or copied_size != source.size_bytes:
+                raise SourceIntegrityError(
+                    "materialized bytes failed hash or size verification"
+                )
+            os.chmod(runtime_path, 0o400)
+            yield runtime_path
 
     def restore(self, source_id: str, target_path: Path | str) -> RestoreResult:
         source = self.get(source_id)

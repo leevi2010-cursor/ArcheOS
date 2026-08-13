@@ -3,13 +3,16 @@ from __future__ import annotations
 import hashlib
 import inspect
 import json
+import os
 import tempfile
 import unittest
 import wave
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
+from unittest.mock import patch
 
+import archeos.pipeline as pipeline_module
 from archeos.analysis import (
     AnalysisResult,
     AtomicInformationCandidate,
@@ -21,7 +24,11 @@ from archeos.atomic_information import (
     ingest_processing_package,
 )
 from archeos.pipeline import ARTIFACTS, ProcessingError, process_managed_audio
-from archeos.source import ManagedSource, VerificationResult
+from archeos.source import (
+    LocalManagedSourceRepository,
+    ManagedSource,
+    VerificationResult,
+)
 from archeos.transcription import Transcript, TranscriptSegment
 
 FIXED_TIME = datetime(2026, 8, 10, 12, 0, tzinfo=timezone.utc)
@@ -154,6 +161,14 @@ class MutatingAnalysisProvider:
         return StubAnalysisProvider().analyze(transcript)
 
 
+class MutatingTranscriptionProvider:
+    def transcribe(self, audio: Path) -> Transcript:
+        self.audio = audio
+        os.chmod(audio, 0o600)
+        audio.write_bytes(b"tampered runtime bytes")
+        return StubTranscriptionProvider().transcribe(audio)
+
+
 class IncompleteAnalysisProvider:
     name = "incomplete-analysis"
 
@@ -247,6 +262,34 @@ class TestManagedSourceAccess:
             yield self.audio
         finally:
             self.closed = True
+
+
+class FinalVerificationFailureAccess(TestManagedSourceAccess):
+    def __init__(self, audio: Path) -> None:
+        super().__init__(audio)
+        self.verify_calls = 0
+
+    def verify(self, source_id: str) -> VerificationResult:
+        self.verify_calls += 1
+        result = super().verify(source_id)
+        if self.verify_calls == 3:
+            return VerificationResult(
+                source_id=result.source_id,
+                verified=False,
+                expected_content_hash=result.expected_content_hash,
+                observed_content_hash=result.observed_content_hash,
+                expected_size_bytes=result.expected_size_bytes,
+                observed_size_bytes=result.observed_size_bytes,
+                checked_at=result.checked_at,
+                reason="synthetic final verification failure",
+            )
+        return result
+
+
+class InvalidReturnedSourceAccess(TestManagedSourceAccess):
+    def get(self, source_id: str) -> ManagedSource:
+        del source_id
+        return self.source
 
 
 def process_audio(
@@ -599,6 +642,182 @@ class PipelineTest(unittest.TestCase):
                             analysis,
                         )
                     self.assertFalse((root / label).exists())
+
+    def test_real_local_materialization_is_isolated_and_cleanup_preserves_source(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            external = root / "synthetic.wav"
+            write_silent_wav(external)
+            repository = LocalManagedSourceRepository(
+                root / "managed", id_factory=lambda: SOURCE_ID
+            )
+            source = repository.admit(external).source
+            canonical = root / "managed" / source.managed_locator
+            before = (canonical.read_bytes(), canonical.stat().st_size)
+            transcriber = StubTranscriptionProvider()
+
+            package = process_managed_audio(
+                source.source_id,
+                repository,
+                root / "out",
+                transcriber,
+                StubSpeakerProvider(),
+                StubAnalysisProvider(),
+                processed_at=FIXED_TIME,
+            )
+
+            self.assertNotEqual(transcriber.audio, canonical)
+            self.assertFalse(transcriber.audio.exists())
+            self.assertTrue(package.is_dir())
+            self.assertTrue(repository.verify(source.source_id).verified)
+            self.assertEqual(before, (canonical.read_bytes(), canonical.stat().st_size))
+
+    def test_real_local_provider_mutation_fails_and_preserves_canonical_source(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            external = root / "synthetic.wav"
+            write_silent_wav(external)
+            repository = LocalManagedSourceRepository(
+                root / "managed", id_factory=lambda: SOURCE_ID
+            )
+            source = repository.admit(external).source
+            canonical = root / "managed" / source.managed_locator
+            before = (canonical.read_bytes(), canonical.stat().st_size)
+            transcriber = MutatingTranscriptionProvider()
+
+            with self.assertRaisesRegex(ProcessingError, "materialized audio changed"):
+                process_managed_audio(
+                    source.source_id,
+                    repository,
+                    root / "out",
+                    transcriber,
+                    StubSpeakerProvider(),
+                    StubAnalysisProvider(),
+                )
+
+            self.assertFalse((root / "out" / source.source_id).exists())
+            self.assertFalse(transcriber.audio.exists())
+            self.assertTrue(repository.verify(source.source_id).verified)
+            self.assertEqual(before, (canonical.read_bytes(), canonical.stat().st_size))
+
+    def test_final_verification_failure_before_publish_cleans_staging(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            audio = root / "synthetic.wav"
+            write_silent_wav(audio)
+            access = FinalVerificationFailureAccess(audio)
+            output = root / "out"
+
+            with self.assertRaisesRegex(ProcessingError, "final verification"):
+                process_managed_audio(
+                    SOURCE_ID,
+                    access,
+                    output,
+                    StubTranscriptionProvider(),
+                    StubSpeakerProvider(),
+                    StubAnalysisProvider(),
+                )
+
+            self.assertFalse((output / SOURCE_ID).exists())
+            self.assertEqual(list(output.glob(f".{SOURCE_ID}-*")), [])
+
+    def test_atomic_publish_race_never_replaces_any_existing_target(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            for target_kind in ("directory", "file", "broken-symlink"):
+                with self.subTest(target_kind=target_kind):
+                    audio = root / f"{target_kind}.wav"
+                    write_silent_wav(audio)
+                    access = TestManagedSourceAccess(audio)
+                    output = root / target_kind
+                    target = output / SOURCE_ID
+                    real_publish = pipeline_module.publish_directory_no_replace
+
+                    def race_publish(staging: Path, final: Path) -> None:
+                        final.parent.mkdir(parents=True, exist_ok=True)
+                        if target_kind == "directory":
+                            final.mkdir()
+                            (final / "marker").write_text("keep", encoding="utf-8")
+                        elif target_kind == "file":
+                            final.write_text("keep", encoding="utf-8")
+                        else:
+                            final.symlink_to("missing-target")
+                        real_publish(staging, final)
+
+                    with patch.object(
+                        pipeline_module,
+                        "publish_directory_no_replace",
+                        side_effect=race_publish,
+                    ), self.assertRaises(ProcessingError):
+                        process_managed_audio(
+                            SOURCE_ID,
+                            access,
+                            output,
+                            StubTranscriptionProvider(),
+                            StubSpeakerProvider(),
+                            StubAnalysisProvider(),
+                        )
+
+                    self.assertEqual(list(output.glob(f".{SOURCE_ID}-*")), [])
+                    if target_kind == "directory":
+                        self.assertEqual((target / "marker").read_text(), "keep")
+                    elif target_kind == "file":
+                        self.assertEqual(target.read_text(), "keep")
+                    else:
+                        self.assertTrue(target.is_symlink())
+                        self.assertFalse(target.exists())
+
+    def test_invalid_managed_source_ids_fail_before_access_or_output_creation(self) -> None:
+        invalid_ids = (
+            "",
+            "..",
+            "../escape",
+            "/absolute/path",
+            "src_x/child",
+            "src_" + "a" * 31 + "\\",
+            "src_" + "A" * 32,
+            "src_" + "a" * 31,
+            "src_" + "a" * 33,
+            "src_" + "g" * 32,
+            "a" * 32,
+        )
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            audio = root / "synthetic.wav"
+            write_silent_wav(audio)
+            for invalid_id in invalid_ids:
+                with self.subTest(source_id=invalid_id):
+                    access = TestManagedSourceAccess(audio)
+                    output = root / hashlib.sha256(invalid_id.encode()).hexdigest()
+                    with self.assertRaises(ProcessingError):
+                        process_managed_audio(
+                            invalid_id,
+                            access,
+                            output,
+                            StubTranscriptionProvider(),
+                            StubSpeakerProvider(),
+                            StubAnalysisProvider(),
+                        )
+                    self.assertFalse(output.exists())
+
+    def test_invalid_source_id_returned_by_access_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            audio = root / "synthetic.wav"
+            write_silent_wav(audio)
+            access = InvalidReturnedSourceAccess(audio)
+            object.__setattr__(access.source, "source_id", "../escape")
+
+            with self.assertRaises(ProcessingError):
+                process_managed_audio(
+                    SOURCE_ID,
+                    access,
+                    root / "out",
+                    StubTranscriptionProvider(),
+                    StubSpeakerProvider(),
+                    StubAnalysisProvider(),
+                )
+            self.assertFalse((root / "out").exists())
 
     def test_managed_source_access_is_closed_and_never_leaks_paths(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

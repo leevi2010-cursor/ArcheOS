@@ -6,6 +6,7 @@ import re
 from pathlib import Path
 
 from ..analysis import SEMANTIC_TYPES
+from ..source.identity import require_managed_source_id
 from .models import (
     EvidenceRecord,
     IngestionResult,
@@ -42,6 +43,9 @@ def _manifest(package: Path) -> tuple[str, str]:
         raise TypeError("processing manifest source must be an object")
     source_id = _non_empty(source.get("id"), "manifest.source.id")
     if schema_version == "1.2":
+        source_id = require_managed_source_id(
+            source_id, field="manifest.source.id"
+        )
         content_hash = _non_empty(
             source.get("content_hash"), "manifest.source.content_hash"
         )

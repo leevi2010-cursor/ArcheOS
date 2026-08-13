@@ -18,6 +18,7 @@ from archeos.atomic_information import (
 )
 from archeos.cli import main
 from archeos.codex_app_server import CodexAnalysisProvider
+from archeos.pipeline import ProcessingError
 from archeos.pyannote_speakers import PyannoteSpeakerProvider
 from archeos.world_model import SQLiteWorldModelRepository
 
@@ -490,7 +491,21 @@ class CliTest(unittest.TestCase):
                     ]
                 )
             self.assertEqual(result, 1)
-            self.assertIn("Managed Source", output.getvalue())
+            self.assertIn("source_id", output.getvalue())
+
+    @patch("archeos.cli.ingest_processing_package")
+    @patch("archeos.cli.process_managed_audio")
+    def test_processing_publish_failure_never_triggers_ingestion(
+        self,
+        process_managed_audio: Mock,
+        ingest_processing_package: Mock,
+    ) -> None:
+        process_managed_audio.side_effect = ProcessingError("cannot publish safely")
+        with redirect_stdout(StringIO()):
+            result = main(["process", "src_" + "a" * 32])
+
+        self.assertEqual(result, 1)
+        ingest_processing_package.assert_not_called()
 
 
 if __name__ == "__main__":

@@ -102,7 +102,9 @@ class SourceTest(unittest.TestCase):
 
         with repository.materialize(source.source_id) as materialized:
             self.assertEqual(materialized.read_bytes(), b"managed bytes")
-            self.assertEqual(materialized, self.managed_root / source.managed_locator)
+            self.assertNotEqual(materialized, self.managed_root / source.managed_locator)
+            self.assertFalse(materialized.is_relative_to(self.managed_root))
+        self.assertFalse(materialized.exists())
 
     # 6. Manifest fields are correct
     def test_06_manifest_contains_verified_size_hash_and_locator(self) -> None:

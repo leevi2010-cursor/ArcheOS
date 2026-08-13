@@ -11,7 +11,9 @@ from pathlib import Path
 
 from . import __version__
 from .analysis import AnalysisProvider, AnalysisResult
+from .filesystem import publish_directory_no_replace
 from .source import ManagedSource, ManagedSourceAccess
+from .source.identity import require_managed_source_id
 from .speakers import SpeakerProvider
 from .transcription import Transcript, TranscriptionProvider, TranscriptSegment
 
@@ -322,7 +324,11 @@ def process_managed_audio(
 ) -> Path:
     output_root = output_root.expanduser().resolve()
     try:
+        source_id = require_managed_source_id(source_id)
         source = source_access.get(source_id)
+        require_managed_source_id(
+            source.source_id, field="Managed Source access result source_id"
+        )
         if source.source_id != source_id:
             raise ValueError("Managed Source access returned a different source_id")
         _validate_managed_source(source)
@@ -330,7 +336,7 @@ def process_managed_audio(
         if not before_verification.verified:
             raise ValueError("Managed Source failed verification")
         package = output_root / source.source_id
-        if package.exists():
+        if os.path.lexists(package):
             raise ValueError(f"processing package already exists: {package}")
         with source_access.materialize(source.source_id) as audio:
             before = _source_snapshot(audio)
@@ -425,5 +431,11 @@ def process_managed_audio(
         (staging / "residue.md").write_text(
             _residue_markdown(source_id, transcript, analysis), encoding="utf-8"
         )
-        os.rename(staging, package)
+        final_verification = source_access.verify(source_id)
+        if not final_verification.verified:
+            raise ProcessingError("Managed Source failed final verification")
+        try:
+            publish_directory_no_replace(staging, package)
+        except (FileExistsError, OSError) as exc:
+            raise ProcessingError("processing package already exists or could not publish safely") from exc
     return package
