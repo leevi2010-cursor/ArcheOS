@@ -9,12 +9,14 @@ import unittest
 from contextlib import redirect_stdout
 from io import StringIO
 from pathlib import Path
+from unittest import mock
 
 from archeos.cli import main
 from archeos.atomic_information import AtomicInformationRevision, EvidenceRecord, JsonlAtomicInformationStore
 from archeos.digestion import JsonlChangeProposalStore
 from archeos.digestion.models import ChangeProposal, HumanReviewContent, WorldModelOperation
 from archeos.mcp_server import CanonicalReadService, create_server
+import archeos.workspace as workspace_module
 from archeos.workspace import (
     MANAGED_CONFIG_COMMENT,
     MANAGED_TABLE,
@@ -47,6 +49,16 @@ class WorkspaceAndMcpTest(unittest.TestCase):
             self.assertEqual(json.loads(output.getvalue())["workspace"], str(workspace.resolve()))
             with redirect_stdout(StringIO()):
                 self.assertEqual(main(["doctor", "--config", str(config)]), 0)
+
+    def test_doctor_reports_audio_and_document_optional_runtime_statuses(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            _, _ = initialize_workspace(root, config_path=root / "archeos.toml")
+            with mock.patch.object(workspace_module, "_optional_audio_status", return_value="unavailable"):
+                with mock.patch.object(workspace_module.importlib.util, "find_spec", return_value=None):
+                    report = workspace_module.doctor(root / "archeos.toml")
+            self.assertEqual(report["optional_audio_runtime"], "unavailable")
+            self.assertEqual(report["optional_document_runtime"], "unavailable")
 
     def test_init_refuses_to_retarget_existing_config(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -85,6 +97,31 @@ class WorkspaceAndMcpTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "unmanaged"):
                 install_codex_integration(config, codex_config)
             self.assertEqual(codex_config.read_text(encoding="utf-8"), original)
+
+    def test_codex_integration_fails_closed_when_config_changes_before_atomic_replace(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            config, _ = initialize_workspace(root / "workspace", config_path=root / "archeos.toml")
+            codex_config = root / "codex.toml"
+            original = "[mcp_servers.existing]\ncommand = \"existing-server\"\n"
+            changed = original + "[profiles.default]\nmodel = \"user-change\"\n"
+            codex_config.write_text(original, encoding="utf-8")
+            original_write = workspace_module._write_private_config
+
+            def write_after_user_change(
+                path: Path,
+                content: str,
+                *,
+                expected_snapshot: object,
+            ) -> None:
+                codex_config.write_text(changed, encoding="utf-8")
+                original_write(path, content, expected_snapshot=expected_snapshot)  # type: ignore[arg-type]
+
+            with mock.patch.object(workspace_module, "_write_private_config", side_effect=write_after_user_change):
+                with self.assertRaisesRegex(ValueError, "changed during integration"):
+                    install_codex_integration(config, codex_config)
+            self.assertEqual(codex_config.read_text(encoding="utf-8"), changed)
+            self.assertFalse((root / ".codex.toml.archeos.lock").exists())
 
     def test_read_only_server_exposes_only_canonical_read_tools_and_context(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

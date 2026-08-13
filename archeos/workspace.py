@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import json
+import hashlib
+import importlib.util
 import os
 import shutil
 import subprocess
 import tempfile
 import tomllib
 from dataclasses import dataclass
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -29,6 +32,16 @@ class WorkspaceConfig:
 
     def to_dict(self) -> dict[str, str]:
         return {"workspace": str(self.workspace), "config_path": str(self.config_path)}
+
+
+@dataclass(frozen=True)
+class _FileSnapshot:
+    exists: bool
+    device: int | None = None
+    inode: int | None = None
+    size: int | None = None
+    modified_ns: int | None = None
+    content_hash: str | None = None
 
 
 def _toml_string(value: str) -> str:
@@ -125,6 +138,7 @@ def doctor(config_path: Path | None = None) -> dict[str, object]:
     integration = codex_integration_status(config, None)
     result["codex_mcp"] = integration["state"]
     result["optional_audio_runtime"] = _optional_audio_status()
+    result["optional_document_runtime"] = _optional_document_status()
     result["healthy"] = bool(result["workspace_structure"] and result["workspace_read_write"])
     return result
 
@@ -141,6 +155,11 @@ def _optional_audio_status() -> str:
     except ImportError:
         return "unavailable"
     return "available"
+
+
+def _optional_document_status() -> str:
+    modules = ("markdown_it", "pdfplumber", "openpyxl", "pptx")
+    return "available" if all(importlib.util.find_spec(name) is not None for name in modules) else "unavailable"
 
 
 def default_codex_config_path() -> Path:
@@ -169,53 +188,133 @@ def _managed_bounds(text: str) -> tuple[int, int] | None:
     return start, end
 
 
-def _read_codex_config(path: Path) -> str:
+def _snapshot(path: Path) -> _FileSnapshot:
     if not path.exists():
-        return ""
-    text = path.read_text(encoding="utf-8")
+        return _FileSnapshot(False)
     try:
-        tomllib.loads(text)
-    except tomllib.TOMLDecodeError as exc:
-        raise ValueError(f"Codex config is invalid; refusing to modify it: {path}") from exc
-    return text
+        details = path.stat()
+        content = path.read_bytes()
+    except OSError as exc:
+        raise ValueError(f"unable to read Codex config: {path}") from exc
+    return _FileSnapshot(
+        True,
+        details.st_dev,
+        details.st_ino,
+        details.st_size,
+        details.st_mtime_ns,
+        hashlib.sha256(content).hexdigest(),
+    )
 
 
-def _write_private_config(path: Path, content: str) -> None:
+@contextmanager
+def _codex_config_lock(path: Path):
+    lock_path = path.with_name(f".{path.name}.archeos.lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor: int | None = None
+    try:
+        descriptor = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    except FileExistsError as exc:
+        raise ValueError(
+            f"Codex config is being changed by another ArcheOS operation: {path}"
+        ) from exc
+    try:
+        yield
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+        try:
+            lock_path.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def _read_codex_config(path: Path) -> tuple[str, _FileSnapshot]:
+    for _ in range(2):
+        before = _snapshot(path)
+        if not before.exists:
+            return "", before
+        try:
+            content = path.read_bytes()
+        except OSError as exc:
+            raise ValueError(f"unable to read Codex config: {path}") from exc
+        after = _snapshot(path)
+        if before != after or hashlib.sha256(content).hexdigest() != before.content_hash:
+            continue
+        try:
+            text = content.decode("utf-8")
+            tomllib.loads(text)
+        except (UnicodeDecodeError, tomllib.TOMLDecodeError) as exc:
+            raise ValueError(f"Codex config is invalid; refusing to modify it: {path}") from exc
+        return text, before
+    raise ValueError(f"Codex config changed while reading; refusing to modify it: {path}")
+
+
+def _write_private_config(
+    path: Path,
+    content: str,
+    *,
+    expected_snapshot: _FileSnapshot,
+) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_suffix(path.suffix + ".archeos.tmp")
-    temporary.write_text(content, encoding="utf-8")
-    os.chmod(temporary, 0o600)
-    os.replace(temporary, path)
+    temporary_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=path.parent,
+            prefix=f".{path.name}.archeos-",
+            suffix=".tmp",
+            delete=False,
+        ) as temporary:
+            temporary_path = Path(temporary.name)
+            temporary.write(content)
+            temporary.flush()
+            os.fsync(temporary.fileno())
+        os.chmod(temporary_path, 0o600)
+        if _snapshot(path) != expected_snapshot:
+            raise ValueError(
+                f"Codex config changed during integration; refusing to overwrite it: {path}"
+            )
+        os.replace(temporary_path, path)
+    finally:
+        if temporary_path is not None and temporary_path.exists():
+            temporary_path.unlink()
 
 
 def install_codex_integration(config: WorkspaceConfig, codex_config: Path | None = None) -> str:
     path = (codex_config or default_codex_config_path()).expanduser()
-    text = _read_codex_config(path)
-    bounds = _managed_bounds(text)
-    if bounds is None and MANAGED_TABLE in text:
-        raise ValueError("Codex already has an unmanaged 'archeos' MCP server; refusing to replace it")
-    if bounds is not None:
-        text = text[: bounds[0]] + text[bounds[1] :]
-    if text and not text.endswith("\n\n"):
-        text += "\n"
-    _write_private_config(path, text + _managed_block(config))
+    with _codex_config_lock(path):
+        text, snapshot = _read_codex_config(path)
+        bounds = _managed_bounds(text)
+        if bounds is None and MANAGED_TABLE in text:
+            raise ValueError("Codex already has an unmanaged 'archeos' MCP server; refusing to replace it")
+        if bounds is not None:
+            text = text[: bounds[0]] + text[bounds[1] :]
+        if text and not text.endswith("\n\n"):
+            text += "\n"
+        _write_private_config(path, text + _managed_block(config), expected_snapshot=snapshot)
     return str(path)
 
 
 def remove_codex_integration(codex_config: Path | None = None) -> str:
     path = (codex_config or default_codex_config_path()).expanduser()
-    text = _read_codex_config(path)
-    bounds = _managed_bounds(text)
-    if bounds is None:
-        return "not_installed"
-    _write_private_config(path, (text[: bounds[0]] + text[bounds[1] :]).strip() + "\n")
+    with _codex_config_lock(path):
+        text, snapshot = _read_codex_config(path)
+        bounds = _managed_bounds(text)
+        if bounds is None:
+            return "not_installed"
+        _write_private_config(
+            path,
+            (text[: bounds[0]] + text[bounds[1] :]).strip() + "\n",
+            expected_snapshot=snapshot,
+        )
     return "removed"
 
 
 def codex_integration_status(config: WorkspaceConfig, codex_config: Path | None) -> dict[str, object]:
     path = (codex_config or default_codex_config_path()).expanduser()
     try:
-        text = _read_codex_config(path)
+        text, _ = _read_codex_config(path)
         bounds = _managed_bounds(text)
     except ValueError as exc:
         return {"state": "invalid_config", "config_path": str(path), "error": str(exc)}

@@ -1,8 +1,8 @@
 # ArcheOS（元枢）
 
-> **当前结论：** ArcheOS 将被重新定位为 Leo 的统一信息治理与 Agent 记忆底座。未来，电脑中几乎所有具有长期价值的信息，都应按统一治理规范沉淀到本目录或由本目录登记其权威来源，供人、Codex、其他 Agent 和自动化系统持续使用。
+> **当前能力：** ArcheOS 是本地可安装的信息治理与 Agent 记忆底座，提供 Workspace、Managed Source、Atomic Information、受治理 World Model 与只读 Context 能力，供人、Codex、其他 Agent 和自动化系统按权限使用。
 >
-> 当前阶段只确认定位与边界，尚未确定最终目录结构、对象模型和写入协议。旧 ArcheOS 产品代码与配套工件从当前版本清除，但仍可通过 Git 历史恢复。
+> ArcheOS 不开发自己的 Agent，也不自动把 Agent 推断写入长期认知；长期变更必须遵守既有 Evidence、Proposal 与人类判断边界。安装程序只提供代码和本地运行时，不同步用户资料。
 
 ## 本地安装与 Codex 接入
 
