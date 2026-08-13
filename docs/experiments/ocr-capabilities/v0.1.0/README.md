@@ -4,7 +4,7 @@
 
 ## 结论级别
 
-当前结论为 **blocked，不建议创建 production OCR Adapter Issue**。Tesseract 已完成 arm64 安装、合成 PNG 试跑与 TSV bbox/confidence 字段验证，但尚无强制断网审计、artifact lock、资源与 PDF rasterization 门禁；PaddleOCR 虽解析到固定包版本，但未能完成可复现的离线 runtime 安装、模型预取或断网运行。两者均未达到最低门禁，仍按本 Issue 限制不扩展候选。
+当前结论为 **blocked，不建议创建 production OCR Adapter Issue**。Tesseract 已完成 arm64 安装、合成 PNG 试跑与显式 TSV bbox/confidence 文件验证；若进程 exit=0 但 TSV 缺失或无效，脚本会 fail closed。它仍缺少强制断网审计、artifact lock、资源与 PDF rasterization 门禁；PaddleOCR 虽解析到固定包版本，但未能完成可复现的离线 runtime 安装、模型预取或断网运行。两者均未达到最低门禁，仍按本 Issue 限制不扩展候选。
 
 - [候选与许可](CANDIDATES.md)
 - [离线与 restricted 路线](OFFLINE_SECURITY.md)
