@@ -1,0 +1,21 @@
+{
+  "experiment_version": "0.1.0",
+  "issue": 39,
+  "classification": "synthetic_local_gate",
+  "candidates": [
+    {"name": "Tesseract", "runtime_version": "5.5.3", "status": "partial_pass_requires_artifact_and_network_gates"},
+    {"name": "PaddleOCR", "runtime_version": "3.7.0", "status": "blocked_by_incomplete_prefetch"}
+  ],
+  "platform": {"os": "macOS 27.0", "architecture": "arm64", "cpu": "Apple M5"},
+  "fixtures": {"classification": "synthetic_non_sensitive", "case_count": 5},
+  "network_evidence": "blocked: no independently auditable forced-network-isolation result",
+  "verification_commands": [
+    "TESSDATA_DIR=<pre-audited-local-dir> sh docs/experiments/ocr-capabilities/v0.1.0/run_synthetic_ocr_gate.sh",
+    "PYTHONPATH=. python3 -m pytest tests/test_ocr_experiment_gate.py",
+    "python3 -m json.tool docs/experiments/ocr-capabilities/v0.1.0/manifest.json",
+    "python3 -m compileall archeos tests",
+    "python3 -m pytest",
+    "python3 -m ruff check archeos tests"
+  ],
+  "recommendation": "do_not_create_production_ocr_adapter_issue"
+}
