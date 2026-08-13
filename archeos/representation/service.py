@@ -72,6 +72,7 @@ class RepresentationService:
                     built = adapter.build(source, Path(materialized_path), staging_dir, configuration)
                 except Exception as exc:
                     raise RepresentationError("Representation Adapter failed") from exc
+                self._verify_materialized(Path(materialized_path), source)
                 representation = self._representation_from_build(
                     representation_id_value,
                     source,
@@ -81,6 +82,7 @@ class RepresentationService:
                     built,
                 )
                 self.repository.write_manifest(staging_dir, representation)
+                self.repository.validate_staged(staging_dir, representation)
                 self._verify_source(requested_source_id, source)
                 try:
                     published = self.repository.publish(staging_dir, representation)

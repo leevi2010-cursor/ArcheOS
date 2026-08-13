@@ -3,6 +3,7 @@ from __future__ import annotations
 import ast
 import io
 import json
+import shutil
 import tempfile
 import unittest
 from contextlib import contextmanager
@@ -43,9 +44,16 @@ class FakeAdapter:
     kind = "synthetic"
     supported_media_types = ("application/x-synthetic",)
 
-    def __init__(self, *, version: str = "1.0", mutate: Path | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        version: str = "1.0",
+        mutate: Path | None = None,
+        mutate_materialized: bool = False,
+    ) -> None:
         self.version = version
         self.mutate = mutate
+        self.mutate_materialized = mutate_materialized
         self.calls = 0
 
     def build(self, source, materialized_path, staging_dir, configuration):
@@ -54,9 +62,10 @@ class FakeAdapter:
             raise RuntimeError("synthetic adapter failure")
         if self.mutate is not None:
             self.mutate.write_bytes(b"changed managed bytes")
+        if self.mutate_materialized:
+            materialized_path.write_bytes(b"changed materialized bytes")
         artifacts = staging_dir / "artifacts"
         (artifacts / "document.json").write_text('{"synthetic":true}\n', encoding="utf-8")
-        (artifacts / "preview.txt").write_text("synthetic preview\n", encoding="utf-8")
         if configuration.get("escape"):
             return AdapterBuildResult(
                 kind=self.kind,
@@ -70,6 +79,7 @@ class FakeAdapter:
                 completeness=0.5,
                 warnings=(RepresentationWarning("synthetic_partial", "synthetic partial", "warning"),),
             )
+        (artifacts / "preview.txt").write_text("synthetic preview\n", encoding="utf-8")
         return AdapterBuildResult(
             kind=self.kind,
             artifacts=(
@@ -198,6 +208,17 @@ class RepresentationTest(unittest.TestCase):
         self.assertIsNotNone(self.access.materialized)
         self.assertFalse(self.access.materialized.exists())  # type: ignore[union-attr]
 
+    def test_07b_adapter_materialization_mutation_fails_without_changing_source(self) -> None:
+        with self.assertRaises(RepresentationError):
+            self.service.build(
+                self.source.source_id, FakeAdapter(mutate_materialized=True), {}
+            )
+        self.assertTrue(self.source_repository.verify(self.source.source_id).verified)
+        self.assertEqual(self.repository.list_for_source(self.source.source_id), ())
+        self.assert_staging_clean()
+        self.assertIsNotNone(self.access.materialized)
+        self.assertFalse(self.access.materialized.exists())  # type: ignore[union-attr]
+
     def test_08_complete_and_partial_invariants(self) -> None:
         complete = self.build().representation
         partial = self.build(partial=True).representation
@@ -299,6 +320,29 @@ class RepresentationTest(unittest.TestCase):
         self.assertEqual((finals[0] / "sentinel").read_text(encoding="utf-8"), "existing")
         self.assert_staging_clean()
 
+    def test_16b_final_source_verify_runs_after_staged_validation(self) -> None:
+        class BoundaryAccess(TrackingAccess):
+            fail_final_verify = False
+
+            def verify(inner, source_id):
+                result = super(BoundaryAccess, inner).verify(source_id)
+                return replace(result, verified=False) if inner.fail_final_verify else result
+
+        access = BoundaryAccess(self.source_repository)
+        service = RepresentationService(access, self.repository, clock=lambda: TIMESTAMP)
+        real_validate = self.repository.validate_staged
+
+        def validate_then_fail(staging_dir, representation):
+            real_validate(staging_dir, representation)
+            access.fail_final_verify = True
+
+        with patch.object(self.repository, "validate_staged", side_effect=validate_then_fail):
+            with self.assertRaises(RepresentationError):
+                service.build(self.source.source_id, FakeAdapter(), {})
+        self.assertTrue(self.source_repository.verify(self.source.source_id).verified)
+        self.assertEqual(self.repository.list_for_source(self.source.source_id), ())
+        self.assert_staging_clean()
+
     def test_17_list_is_stable_and_scoped_to_source(self) -> None:
         first = self.build(mode="a").representation
         second = self.build(mode="b").representation
@@ -362,6 +406,58 @@ class RepresentationTest(unittest.TestCase):
         payload["representation_id"] = "repr_" + "f" * 64
         with self.assertRaises(RepresentationManifestError):
             self.repository._parse_manifest(payload)
+
+    def test_23_source_parent_symlink_never_reads_outside_representation_root(self) -> None:
+        built = self.build().representation
+        source_dir = self.representation_root / self.source.source_id
+        outside = self.root / "outside"
+        shutil.copytree(source_dir, outside)
+        shutil.rmtree(source_dir)
+        source_dir.symlink_to(outside, target_is_directory=True)
+
+        with self.assertRaises(RepresentationValidationError):
+            self.repository.get(built.representation_id)
+        with self.assertRaises(RepresentationValidationError):
+            self.service.show(built.representation_id)
+        self.assertFalse(self.repository.verify(built.representation_id).verified)
+
+    def test_24_staged_inventory_rejects_undeclared_root_artifact_symlink_and_directory(self) -> None:
+        class InventoryAdapter(FakeAdapter):
+            def __init__(self, extra_kind: str) -> None:
+                super().__init__()
+                self.extra_kind = extra_kind
+
+            def build(self, source, materialized_path, staging_dir, configuration):
+                result = super().build(source, materialized_path, staging_dir, configuration)
+                artifacts = staging_dir / "artifacts"
+                if self.extra_kind == "root":
+                    (staging_dir / "secret.tmp").write_text("extra", encoding="utf-8")
+                elif self.extra_kind == "artifact":
+                    (artifacts / "unlisted.log").write_text("extra", encoding="utf-8")
+                elif self.extra_kind == "symlink":
+                    (artifacts / "unlisted-link").symlink_to(artifacts / "preview.txt")
+                else:
+                    (artifacts / "cache").mkdir()
+                return result
+
+        for extra_kind in ("root", "artifact", "symlink", "directory"):
+            with self.subTest(extra_kind=extra_kind):
+                with self.assertRaises(RepresentationManifestError):
+                    self.service.build(
+                        self.source.source_id,
+                        InventoryAdapter(extra_kind),
+                        {"extra_kind": extra_kind},
+                    )
+                self.assertEqual(self.repository.list_for_source(self.source.source_id), ())
+                self.assert_staging_clean()
+
+    def test_25_persisted_extra_file_fails_verify(self) -> None:
+        built = self.build().representation
+        directory = self.representation_dir(built.representation_id)
+        (directory / "artifacts" / "unlisted.log").write_text("extra", encoding="utf-8")
+        self.assertFalse(self.repository.verify(built.representation_id).verified)
+        (directory / "unexpected").mkdir()
+        self.assertFalse(self.repository.verify(built.representation_id).verified)
 
 
 if __name__ == "__main__":

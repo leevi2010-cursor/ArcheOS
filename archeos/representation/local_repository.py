@@ -155,36 +155,72 @@ class LocalRepresentationRepository:
     def publish(
         self, staging_dir: Path, representation: NormalizedRepresentation
     ) -> NormalizedRepresentation:
-        self._validate_staging_dir(staging_dir)
-        manifest_path = staging_dir / "manifest.json"
-        if manifest_path.is_symlink() or not manifest_path.is_file():
-            raise RepresentationManifestError("staged Representation must contain a regular manifest")
-        if self._read_manifest(manifest_path) != representation:
-            raise RepresentationManifestError("staged manifest did not match the Representation")
-        self._verify_artifacts_in(staging_dir, representation)
-        source_root = self.representation_root / representation.source_id
-        source_root.mkdir(parents=True, exist_ok=True)
-        self._ensure_layout()
-        if source_root.is_symlink() or not source_root.is_dir():
-            raise RepresentationValidationError("Representation Source directory was unsafe")
-        final_dir = source_root / representation.representation_id
+        """Atomically publish a staging directory already validated by the service."""
+        final_dir = self._final_directory(representation)
         try:
             publish_directory_no_replace(staging_dir, final_dir)
         except FileExistsError as exc:
             raise RepresentationConflictError("Representation ID already exists") from exc
         return self.get(representation.representation_id)
 
+    def validate_staged(
+        self, staging_dir: Path, representation: NormalizedRepresentation
+    ) -> None:
+        """Complete all strict staged checks before the final Source verification."""
+        self._validate_staging_dir(staging_dir)
+        manifest_path = staging_dir / "manifest.json"
+        if manifest_path.is_symlink() or not manifest_path.is_file():
+            raise RepresentationManifestError("staged Representation must contain a regular manifest")
+        if self._read_manifest(manifest_path) != representation:
+            raise RepresentationManifestError("staged manifest did not match the Representation")
+        self._verify_representation_tree(staging_dir, representation)
+        self._final_directory(representation, create_parent=True)
+
+    def _final_directory(
+        self, representation: NormalizedRepresentation, *, create_parent: bool = False
+    ) -> Path:
+        source_root = self.representation_root / representation.source_id
+        if create_parent:
+            self.representation_root.mkdir(parents=True, exist_ok=True)
+            self.staging_root.mkdir(exist_ok=True)
+            source_root.mkdir(exist_ok=True)
+        self._ensure_layout()
+        if source_root.is_symlink() or not source_root.is_dir():
+            raise RepresentationValidationError("Representation Source directory was unsafe")
+        try:
+            root_real = self.representation_root.resolve(strict=True)
+            source_real = source_root.resolve(strict=True)
+        except (OSError, RuntimeError) as exc:
+            raise RepresentationValidationError("Representation Source directory could not be resolved") from exc
+        if source_real.parent != root_real:
+            raise RepresentationValidationError("Representation Source directory escaped its root")
+        return source_root / representation.representation_id
+
     def get(self, representation_id: str) -> NormalizedRepresentation:
         representation_id = self._representation_id(representation_id)
         if not self.representation_root.exists():
             raise RepresentationNotFoundError("Representation was not found")
         self._ensure_layout()
-        matches = list(self.representation_root.glob(f"src_*/{representation_id}"))
+        matches: list[Path] = []
+        for source_dir in self.representation_root.iterdir():
+            try:
+                source_id = self._source_id(source_dir.name)
+            except RepresentationValidationError:
+                continue
+            if source_dir.is_symlink():
+                raise RepresentationValidationError(
+                    "Representation Source directory must not be a symlink"
+                )
+            if not source_dir.is_dir():
+                raise RepresentationValidationError("Representation Source directory was unsafe")
+            candidate = source_dir / representation_id
+            if not candidate.exists() and not candidate.is_symlink():
+                continue
+            self._validate_persisted_directory(candidate, source_dir, source_id)
+            matches.append(candidate)
         if len(matches) != 1:
             raise RepresentationNotFoundError("Representation was not found")
         directory = matches[0]
-        if directory.is_symlink() or not directory.is_dir():
-            raise RepresentationNotFoundError("Representation was not found")
         manifest_path = directory / "manifest.json"
         if manifest_path.is_symlink() or not manifest_path.is_file():
             raise RepresentationNotFoundError("Representation was not found")
@@ -209,7 +245,7 @@ class LocalRepresentationRepository:
         try:
             representation = self.get(representation_id)
             directory = self._directory(representation)
-            self._verify_artifacts_in(directory, representation)
+            self._verify_representation_tree(directory, representation)
         except RepresentationError as exc:
             return RepresentationVerificationResult(
                 representation_id=str(representation_id), verified=False, reason=str(exc)
@@ -220,19 +256,83 @@ class LocalRepresentationRepository:
 
     def _directory(self, representation: NormalizedRepresentation) -> Path:
         directory = self.representation_root / representation.source_id / representation.representation_id
-        try:
-            root_real = self.representation_root.resolve(strict=True)
-            directory_real = directory.resolve(strict=True)
-            directory_real.relative_to(root_real)
-        except (OSError, RuntimeError, ValueError) as exc:
-            raise RepresentationValidationError("Representation directory escaped its root") from exc
-        if directory.is_symlink():
-            raise RepresentationValidationError("Representation directory must not be a symlink")
+        self._validate_persisted_directory(
+            directory, directory.parent, representation.source_id
+        )
         return directory
 
-    def _verify_artifacts_in(
+    def _validate_persisted_directory(
+        self, directory: Path, source_root: Path, source_id: str
+    ) -> None:
+        if source_root.is_symlink() or directory.is_symlink():
+            raise RepresentationValidationError(
+                "Representation Source and Representation directories must not be symlinks"
+            )
+        if not source_root.is_dir() or not directory.is_dir():
+            raise RepresentationNotFoundError("Representation was not found")
+        try:
+            root_real = self.representation_root.resolve(strict=True)
+            source_real = source_root.resolve(strict=True)
+            directory_real = directory.resolve(strict=True)
+            source_real.relative_to(root_real)
+            directory_real.relative_to(source_real)
+        except (OSError, RuntimeError, ValueError) as exc:
+            raise RepresentationValidationError("Representation directory escaped its root") from exc
+        if source_real.parent != root_real or source_root.name != source_id:
+            raise RepresentationValidationError("Representation Source directory escaped its root")
+        if directory_real.parent != source_real:
+            raise RepresentationValidationError("Representation directory escaped its Source directory")
+
+    def _verify_representation_tree(
         self, directory: Path, representation: NormalizedRepresentation
     ) -> None:
+        allowed_root = {"manifest.json", "artifacts"}
+        try:
+            root_entries = {entry.name for entry in directory.iterdir()}
+        except OSError as exc:
+            raise RepresentationManifestError("Representation directory could not be read") from exc
+        if root_entries != allowed_root:
+            raise RepresentationManifestError(
+                "Representation root must contain only manifest.json and artifacts"
+            )
+        manifest_path = directory / "manifest.json"
+        artifacts_root = directory / "artifacts"
+        if manifest_path.is_symlink() or not manifest_path.is_file():
+            raise RepresentationManifestError("Representation manifest must be a regular file")
+        if artifacts_root.is_symlink() or not artifacts_root.is_dir():
+            raise RepresentationManifestError("Representation artifacts must be a regular directory")
+
+        declared_files = {artifact.locator for artifact in representation.artifacts}
+        declared_directories = {"artifacts"}
+        for locator in declared_files:
+            path = Path(locator)
+            declared_directories.update(
+                Path("artifacts", *path.parts[1:index]).as_posix()
+                for index in range(2, len(path.parts))
+            )
+        actual_files: set[str] = set()
+        actual_directories: set[str] = {"artifacts"}
+        pending = [artifacts_root]
+        while pending:
+            current = pending.pop()
+            for entry in current.iterdir():
+                relative = entry.relative_to(directory).as_posix()
+                if entry.is_symlink():
+                    raise RepresentationManifestError("Representation tree must not contain symlinks")
+                if entry.is_dir():
+                    actual_directories.add(relative)
+                    pending.append(entry)
+                elif entry.is_file():
+                    actual_files.add(relative)
+                else:
+                    raise RepresentationManifestError(
+                        "Representation tree must contain only regular files and directories"
+                    )
+        if actual_files != declared_files or actual_directories != declared_directories:
+            raise RepresentationManifestError(
+                "Representation files did not exactly match the manifest artifact inventory"
+            )
+
         seen: set[str] = set()
         for artifact in representation.artifacts:
             if artifact.locator in seen:

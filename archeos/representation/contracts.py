@@ -35,6 +35,10 @@ class RepresentationRepository(Protocol):
         self, staging_dir: Path, representation: NormalizedRepresentation
     ) -> None: ...
 
+    def validate_staged(
+        self, staging_dir: Path, representation: NormalizedRepresentation
+    ) -> None: ...
+
     def publish(
         self, staging_dir: Path, representation: NormalizedRepresentation
     ) -> NormalizedRepresentation: ...
