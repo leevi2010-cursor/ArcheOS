@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "archeos"
+version = "0.1.0"
+description = "Local, governed information context runtime for Codex and other agents."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+dependencies = [
+  "mcp>=1.27,<2",
+]
+
+[project.optional-dependencies]
+audio = [
+  "openai-codex==0.144.4",
+  "pyannote.audio==4.0.7",
+]
+document = [
+  "markdown-it-py==4.2.0",
+  "pdfplumber==0.11.10",
+  "openpyxl==3.1.5",
+  "python-pptx==1.0.2",
+]
+
+[project.scripts]
+archeos = "archeos.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["archeos*"]

@@ -4,6 +4,38 @@
 >
 > 当前阶段只确认定位与边界，尚未确定最终目录结构、对象模型和写入协议。旧 ArcheOS 产品代码与配套工件从当前版本清除，但仍可通过 Git 历史恢复。
 
+## 本地安装与 Codex 接入
+
+ArcheOS 是本地运行的受治理信息上下文层，不是 Agent。本仓库的 Git clone 或安装程序**只获取代码，绝不会同步任何用户的本地 ArcheOS 数据**；`01_inbox/`、`02_processing/`、`03_information/` 和 `04_core/` 中的真实资料保持在本机，并默认由 Git 忽略。
+
+核心 CLI 不安装音频、文档、OCR 模型或 JVM 运行时。可使用标准 Python 安装方式，例如：
+
+```bash
+uv tool install git+https://github.com/leevi2010-cursor/ArcheOS.git
+# 或在源码目录中：python3 -m pip install .
+archeos --version
+```
+
+音频处理与文档 Adapter 都是可选本地运行时，按需安装：`python3 -m pip install '.[audio]'` 或 `python3 -m pip install '.[document]'`。音频仍可能需要额外的本地模型与 `ffmpeg`，不会在核心安装时下载。
+
+初始化一份本地 Workspace 后，CLI 会将其位置写入不含凭证的本机配置；重复初始化不会覆盖已有资料：
+
+```bash
+archeos init /path/to/archeos-workspace
+archeos doctor
+archeos config show
+```
+
+要让本机 Codex 使用只读 Context / Evidence MCP，可显式安装受 ArcheOS 标记管理的配置。它保留其他 Codex 设置、不读取或写入 token，也不会覆盖项目的 `AGENTS.md`：
+
+```bash
+archeos integration codex install
+archeos integration codex status
+archeos integration codex remove
+```
+
+安装使用 Codex 已公开的本地 `config.toml` STDIO MCP 机制。重启或新开本地 Codex 会话后，可调用 `archeos_object_resolve`、`archeos_context_build`、`archeos_source_show` 与 `archeos_source_verify`。这些工具只复用 ArcheOS 的 canonical read services；不会写入 Object、Relationship、Decision、Source 或其他 Core 数据。
+
 ## 定位
 
 ArcheOS 不是一款单一业务应用，而是一套以目录为载体、以治理规范为核心的长期信息基础设施。

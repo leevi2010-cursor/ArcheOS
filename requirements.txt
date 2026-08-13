@@ -1,3 +1,4 @@
+# Optional local processing runtimes. The installable CLI core is defined in pyproject.toml.
 openai-codex==0.144.4
 pyannote.audio==4.0.7
 markdown-it-py==4.2.0
