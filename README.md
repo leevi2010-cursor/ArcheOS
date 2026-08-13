@@ -197,6 +197,19 @@ python3 -m archeos source handoff show <external-file>.archeos.md
 
 `source handoff write` 是准入后的独立显式动作：仅在 Source 已验证、外部旧文件仍存在且目标目录可写时，才在旧文件旁以 atomic no-replace 方式写入 `<外部文件名>.archeos.md`。它只提示用户使用 `source_id` 回到系统，不会修改外部原文件、Manifest 或受管字节，也不会同步、删除或恢复外部文件。相同 `source_id` 的合法 marker 重试会返回 `existing`；任何用户文件、损坏 marker 或不同 Source 均会拒绝覆盖。原文件已移动或删除时，可用 `--target-file <仍存在的旧入口>` 明确指定文件。
 
+## M2-C2b Normalized Representation
+
+Normalized Representation 是从已验证 Managed Source 生成的可重算 Processing 派生物，不是 Source、Evidence authority、Atomic Information 或 Object。它以 Source 的不可变 `content_hash`、Adapter 名称/版本、kind 和 canonical configuration fingerprint 生成确定性 `representation_id`，并将严格 Manifest 与 artifact 放在 Git 忽略的 `02_processing/representations/`。
+
+```bash
+python3 -m archeos representation build <source_id> --adapter <adapter-name>
+python3 -m archeos representation show <representation_id>
+python3 -m archeos representation list --source <source_id>
+python3 -m archeos representation verify <representation_id>
+```
+
+四个命令均支持 `--managed-root` 与 `--representation-root`。本版本没有注册生产格式 Adapter；`build` 只保留受控入口，任何 Markdown、PDF、XLSX、PPTX、图片或 OCR Adapter 都必须由后续独立 Issue 实现并经过架构审核。`show`、`list`、`verify` 可读取和校验已存在的受控 Representation。
+
 ## M2-B1 Durable Atomic Information
 
 正常 `process` 命令会在五个 Processing artifacts 成功落盘后，把 contract-valid candidates 作为 revision 1 自动写入本地 `03_information/atomic_information.jsonl`。`atomic_information_id` 由来源和 candidate ID 确定性生成；精确重试不会产生重复记录，来源内容发生变化时会 fail closed。原始 `concerns` 作为文本保留，M2-B1 不将其解释为 Object ID，也不执行任何 World Model 写入。

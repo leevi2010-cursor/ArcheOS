@@ -105,6 +105,23 @@ class InboxPrivacyTest(unittest.TestCase):
         )
         self.assertEqual(obsolete.returncode, 1)
 
+    def test_normalized_representations_are_ignored(self) -> None:
+        repository = Path(__file__).resolve().parents[1]
+        representation = subprocess.run(
+            [
+                "git",
+                "check-ignore",
+                "--quiet",
+                "--no-index",
+                "02_processing/representations/src_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/"
+                "repr_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/"
+                "artifacts/private.json",
+            ],
+            cwd=repository,
+            check=False,
+        )
+        self.assertEqual(representation.returncode, 0)
+
 
 if __name__ == "__main__":
     unittest.main()

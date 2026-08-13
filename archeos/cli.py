@@ -20,6 +20,7 @@ from .digestion import (
 )
 from .pipeline import ProcessingError, process_managed_audio
 from .pyannote_speakers import PyannoteSpeakerProvider
+from .representation import LocalRepresentationRepository, RepresentationError, RepresentationService
 from .speakers import FileSpeakerProvider
 from .source import (
     HandoffMarkerService,
@@ -35,6 +36,7 @@ DEFAULT_ATOMIC_INFORMATION_STORE = Path("03_information/atomic_information.jsonl
 DEFAULT_CHANGE_PROPOSAL_STORE = Path("03_information/change_proposals.jsonl")
 DEFAULT_CHANGE_JOURNAL = Path("03_information/change_journal.jsonl")
 DEFAULT_MANAGED_SOURCE_ROOT = Path("01_inbox")
+DEFAULT_REPRESENTATION_ROOT = Path("02_processing/representations")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -275,6 +277,60 @@ def build_parser() -> argparse.ArgumentParser:
         "--managed-root", type=Path, default=argparse.SUPPRESS,
         help="Managed Source root (default: 01_inbox).",
     )
+
+    representation = subparsers.add_parser(
+        "representation", help="Inspect or build a Normalized Representation."
+    )
+    representation.add_argument(
+        "--managed-root",
+        type=Path,
+        default=DEFAULT_MANAGED_SOURCE_ROOT,
+        help="Managed Source root (default: 01_inbox).",
+    )
+    representation.add_argument(
+        "--representation-root",
+        type=Path,
+        default=DEFAULT_REPRESENTATION_ROOT,
+        help="Representation root (default: 02_processing/representations).",
+    )
+    representation_commands = representation.add_subparsers(
+        dest="representation_command", required=True
+    )
+    representation_build = representation_commands.add_parser(
+        "build", help="Build with a registered production Representation Adapter."
+    )
+    representation_build.add_argument("source_id")
+    representation_build.add_argument("--adapter", required=True)
+    representation_show = representation_commands.add_parser(
+        "show", help="Show one persisted Normalized Representation."
+    )
+    representation_show.add_argument("representation_id")
+    representation_list = representation_commands.add_parser(
+        "list", help="List persisted Representations for one Managed Source."
+    )
+    representation_list.add_argument("--source", required=True)
+    representation_verify = representation_commands.add_parser(
+        "verify", help="Verify a persisted Normalized Representation."
+    )
+    representation_verify.add_argument("representation_id")
+    for command in (
+        representation_build,
+        representation_show,
+        representation_list,
+        representation_verify,
+    ):
+        command.add_argument(
+            "--managed-root",
+            type=Path,
+            default=argparse.SUPPRESS,
+            help="Managed Source root (default: 01_inbox).",
+        )
+        command.add_argument(
+            "--representation-root",
+            type=Path,
+            default=argparse.SUPPRESS,
+            help="Representation root (default: 02_processing/representations).",
+        )
     return parser
 
 
@@ -493,6 +549,45 @@ def _source_command(args: argparse.Namespace) -> int:
         return 1
 
 
+def _representation_command(args: argparse.Namespace) -> int:
+    repository = LocalRepresentationRepository(args.representation_root)
+    service = RepresentationService(
+        LocalManagedSourceRepository(args.managed_root), repository
+    )
+    try:
+        if args.representation_command == "build":
+            # Issue #29 intentionally registers no production parser/adapter.
+            raise RepresentationError(
+                f"no production Representation Adapter is registered for {args.adapter}"
+            )
+        if args.representation_command == "show":
+            print(
+                json.dumps(
+                    service.show(args.representation_id).to_dict(),
+                    ensure_ascii=False,
+                    indent=2,
+                )
+            )
+            return 0
+        if args.representation_command == "list":
+            print(
+                json.dumps(
+                    [item.to_dict() for item in service.list(args.source)],
+                    ensure_ascii=False,
+                    indent=2,
+                )
+            )
+            return 0
+        if args.representation_command == "verify":
+            result = service.verify(args.representation_id)
+            print(json.dumps(result.to_dict(), ensure_ascii=False, indent=2))
+            return 0 if result.verified else 1
+        return 2  # pragma: no cover - argparse enforces this
+    except (OSError, RepresentationError, SourceError, TypeError, ValueError) as exc:
+        print(f"error: {exc}")
+        return 1
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     if args.command == "process":
@@ -507,4 +602,6 @@ def main(argv: list[str] | None = None) -> int:
         return _context_command(args)
     if args.command == "source":
         return _source_command(args)
+    if args.command == "representation":
+        return _representation_command(args)
     return 2  # pragma: no cover - argparse enforces this
