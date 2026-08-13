@@ -21,6 +21,7 @@ from .digestion import (
 from .pipeline import ProcessingError, process_managed_audio
 from .pyannote_speakers import PyannoteSpeakerProvider
 from .representation import LocalRepresentationRepository, RepresentationError, RepresentationService
+from .representation.registry import production_adapter
 from .speakers import FileSpeakerProvider
 from .source import (
     HandoffMarkerService,
@@ -556,10 +557,9 @@ def _representation_command(args: argparse.Namespace) -> int:
     )
     try:
         if args.representation_command == "build":
-            # Issue #29 intentionally registers no production parser/adapter.
-            raise RepresentationError(
-                f"no production Representation Adapter is registered for {args.adapter}"
-            )
+            result = service.build(args.source_id, production_adapter(args.adapter), {})
+            print(json.dumps(result.to_dict(), ensure_ascii=False, indent=2))
+            return 0
         if args.representation_command == "show":
             print(
                 json.dumps(
