@@ -176,6 +176,20 @@ residue.md
 
 同一来源已有处理包时，CLI 会停止而不是覆盖。分析可以从一个转写片段提取多条 Atomic Information Candidate，也可以用多个片段共同支持一条 Candidate；歧义、冲突、上下文不足或证据不足的信息进入 residue。新 Processing 包使用 schema `1.1` 和 `candidate` 状态，明确区分自动 Atomic Information ingestion 与受治理的 World Model write。
 
+## M2-C1b 本地 Managed Source
+
+Managed Source 是经过用户明确准入、完整复制并通过 size / `content_hash` 校验后的不可变字节快照。外部文件在准入前只是候选输入；准入后，系统只从 `01_inbox/` 下受控的 Managed Source 读取，不自动跟踪或覆盖外部文件。Source、Manifest 和临时 staging 数据均保持本地并由 Git 忽略。
+
+```bash
+python3 -m archeos source admit <external-file>
+python3 -m archeos source show <source_id>
+python3 -m archeos source list
+python3 -m archeos source verify <source_id>
+python3 -m archeos source restore <source_id> <target-file>
+```
+
+可通过 `--managed-root <path>` 指定本地受控根目录，默认是 `01_inbox/`。准入协议会在 `.staging/` 中流式复制，重新检查外部文件，独立校验受管副本，写入严格 Manifest 后再以 atomic rename 发布；任一步骤失败都会清理 staging，不会覆盖已有 Source，也不会修改外部文件。`source_id` 是 opaque 的 `src_<uuid4 hex>`，相同内容只产生 content-equivalent 提示，不合并 Source identity。`verify` 为只读校验；`restore` 先验证 Source、默认拒绝覆盖已有目标，并在目标同目录中流式复制后原子发布。
+
 ## M2-B1 Durable Atomic Information
 
 正常 `process` 命令会在五个 Processing artifacts 成功落盘后，把 contract-valid candidates 作为 revision 1 自动写入本地 `03_information/atomic_information.jsonl`。`atomic_information_id` 由来源和 candidate ID 确定性生成；精确重试不会产生重复记录，来源内容发生变化时会 fail closed。原始 `concerns` 作为文本保留，M2-B1 不将其解释为 Object ID，也不执行任何 World Model 写入。

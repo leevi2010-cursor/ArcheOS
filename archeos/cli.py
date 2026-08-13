@@ -21,6 +21,7 @@ from .digestion import (
 from .pipeline import ProcessingError, process_audio
 from .pyannote_speakers import PyannoteSpeakerProvider
 from .speakers import FileSpeakerProvider
+from .source import LocalManagedSourceRepository, ManagedSourceService, SourceError
 from .transcription import FileTranscriptionProvider, MlxWhisperTranscriptionProvider
 from .world_model import ObjectResolver, SQLiteWorldModelRepository
 
@@ -28,6 +29,7 @@ DEFAULT_WORLD_MODEL_DATABASE = Path("04_core/archeos.sqlite3")
 DEFAULT_ATOMIC_INFORMATION_STORE = Path("03_information/atomic_information.jsonl")
 DEFAULT_CHANGE_PROPOSAL_STORE = Path("03_information/change_proposals.jsonl")
 DEFAULT_CHANGE_JOURNAL = Path("03_information/change_journal.jsonl")
+DEFAULT_MANAGED_SOURCE_ROOT = Path("01_inbox")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -194,6 +196,51 @@ def build_parser() -> argparse.ArgumentParser:
     context_build.add_argument("--max-changes", type=int, default=50)
     context_build.add_argument("--max-pending", type=int, default=20)
     context_build.add_argument("--max-evidence", type=int, default=5)
+
+    source = subparsers.add_parser(
+        "source", help="Admit, inspect, verify, and restore local Managed Sources."
+    )
+    source.add_argument(
+        "--managed-root",
+        type=Path,
+        default=DEFAULT_MANAGED_SOURCE_ROOT,
+        help="Managed Source root (default: 01_inbox).",
+    )
+    source_commands = source.add_subparsers(dest="source_command", required=True)
+    source_admit = source_commands.add_parser(
+        "admit", help="Explicitly admit one external file as a Managed Source."
+    )
+    source_admit.add_argument("external_file", type=Path)
+    source_admit.add_argument("--source-id", help="Inject a deterministic Source ID for tests.")
+    source_admit.add_argument("--media-type")
+    source_admit.add_argument(
+        "--managed-root", type=Path, default=argparse.SUPPRESS,
+        help="Managed Source root (default: 01_inbox).",
+    )
+    for command_name, help_text in (
+        ("show", "Show one immutable Managed Source Manifest."),
+        ("verify", "Verify Managed Source bytes against its Manifest."),
+    ):
+        command = source_commands.add_parser(command_name, help=help_text)
+        command.add_argument("source_id")
+        command.add_argument(
+            "--managed-root", type=Path, default=argparse.SUPPRESS,
+            help="Managed Source root (default: 01_inbox).",
+        )
+    source_list = source_commands.add_parser("list", help="List local Managed Sources.")
+    source_list.add_argument(
+        "--managed-root", type=Path, default=argparse.SUPPRESS,
+        help="Managed Source root (default: 01_inbox).",
+    )
+    source_restore = source_commands.add_parser(
+        "restore", help="Restore a verified Managed Source without overwriting."
+    )
+    source_restore.add_argument("source_id")
+    source_restore.add_argument("target_file", type=Path)
+    source_restore.add_argument(
+        "--managed-root", type=Path, default=argparse.SUPPRESS,
+        help="Managed Source root (default: 01_inbox).",
+    )
     return parser
 
 
@@ -359,6 +406,47 @@ def _context_command(args: argparse.Namespace) -> int:
     return 0
 
 
+def _source_command(args: argparse.Namespace) -> int:
+    service = ManagedSourceService(LocalManagedSourceRepository(args.managed_root))
+    try:
+        if args.source_command == "admit":
+            metadata: dict[str, object] = {}
+            if args.media_type:
+                metadata["media_type"] = args.media_type
+            result = service.admit(
+                args.external_file,
+                source_id=args.source_id,
+                metadata=metadata,
+            )
+            print(json.dumps(result.to_dict(), ensure_ascii=False, indent=2))
+            return 0
+        if args.source_command == "show":
+            result = service.show(args.source_id)
+            print(json.dumps(result.to_dict(), ensure_ascii=False, indent=2))
+            return 0
+        if args.source_command == "list":
+            print(
+                json.dumps(
+                    [source.to_dict() for source in service.list()],
+                    ensure_ascii=False,
+                    indent=2,
+                )
+            )
+            return 0
+        if args.source_command == "verify":
+            result = service.verify(args.source_id)
+            print(json.dumps(result.to_dict(), ensure_ascii=False, indent=2))
+            return 0 if result.verified else 1
+        if args.source_command == "restore":
+            result = service.restore(args.source_id, args.target_file)
+            print(json.dumps(result.to_dict(), ensure_ascii=False, indent=2))
+            return 0
+        return 2  # pragma: no cover - argparse enforces this
+    except (OSError, SourceError, TypeError, ValueError) as exc:
+        print(f"error: {exc}")
+        return 1
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     if args.command == "process":
@@ -371,4 +459,6 @@ def main(argv: list[str] | None = None) -> int:
         return _digest_command(args)
     if args.command == "context":
         return _context_command(args)
+    if args.command == "source":
+        return _source_command(args)
     return 2  # pragma: no cover - argparse enforces this
