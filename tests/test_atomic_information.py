@@ -21,6 +21,7 @@ from archeos.atomic_information import (
 )
 
 SOURCE_ID = "synthetic-source-123456789abc"
+MANAGED_SOURCE_ID = "src_" + "a" * 32
 PROCESSING_TIME = "2026-08-11T00:00:00+00:00"
 
 
@@ -31,6 +32,7 @@ def candidate(
     semantic_type: str = "requirement",
     status: str = "candidate",
     segment: int = 1,
+    evidence_source_id: str = SOURCE_ID,
 ) -> dict[str, object]:
     return {
         "id": candidate_id,
@@ -39,7 +41,7 @@ def candidate(
         "concerns": ["Synthetic Operations"],
         "source_evidence": [
             {
-                "source_id": SOURCE_ID,
+                "source_id": evidence_source_id,
                 "artifact": "transcript.md",
                 "segment": segment,
                 "speaker": "Speaker_1",
@@ -68,6 +70,14 @@ def write_package(
         "schema_version": schema_version,
         "source": {"id": SOURCE_ID},
     }
+    if schema_version == "1.2":
+        manifest["source"] = {
+            "id": MANAGED_SOURCE_ID,
+            "content_hash": "sha256:" + "a" * 64,
+            "size_bytes": 3200,
+            "media_type": "audio/wav",
+            "filename_hint": "synthetic.wav",
+        }
     if legacy_review:
         manifest["review"] = {
             "status": "awaiting_human_review",
@@ -93,6 +103,10 @@ def write_package(
     for artifact in ("transcript.md", "meeting_summary.md", "residue.md"):
         (package / artifact).write_text("synthetic\n", encoding="utf-8")
     return package
+
+
+def managed_candidate() -> dict[str, object]:
+    return candidate(evidence_source_id=MANAGED_SOURCE_ID)
 
 
 class RecordingAtomicInformationStore:
@@ -308,6 +322,86 @@ class AtomicInformationIngestionTest(unittest.TestCase):
 
             self.assertEqual(result.created, 1)
 
+    def test_managed_source_v1_2_package_is_ingestible_and_idempotent(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            package = write_package(root, [managed_candidate()], schema_version="1.2")
+            store = JsonlAtomicInformationStore(root / "atomic_information.jsonl")
+
+            first = ingest_processing_package(package, store)
+            second = ingest_processing_package(package, store)
+
+            self.assertEqual(first.created, 1)
+            self.assertEqual(second.existing, 1)
+            self.assertEqual(
+                store.list_atomic_information()[0].origin_source_id, MANAGED_SOURCE_ID
+            )
+
+    def test_managed_source_v1_2_rejects_path_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            package = write_package(root, [managed_candidate()], schema_version="1.2")
+            manifest_path = package / "manifest.json"
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            manifest["source"]["path"] = "/private/synthetic.wav"
+            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+            with self.assertRaisesRegex(ValueError, "must not contain paths"):
+                ingest_processing_package(
+                    package,
+                    JsonlAtomicInformationStore(root / "atomic_information.jsonl"),
+                )
+
+    def test_managed_source_v1_2_rejects_invalid_content_hash(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            package = write_package(root, [managed_candidate()], schema_version="1.2")
+            manifest_path = package / "manifest.json"
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            manifest["source"]["content_hash"] = "not-a-hash"
+            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+            with self.assertRaisesRegex(ValueError, "full sha256 hash"):
+                ingest_processing_package(
+                    package,
+                    JsonlAtomicInformationStore(root / "atomic_information.jsonl"),
+                )
+
+    def test_managed_source_v1_2_rejects_invalid_source_ids_without_writing(self) -> None:
+        invalid_ids = (
+            "",
+            "..",
+            "../escape",
+            "/absolute/path",
+            "src_x/child",
+            "src_" + "a" * 31 + "\\",
+            "src_" + "A" * 32,
+            "src_" + "a" * 31,
+            "src_" + "a" * 33,
+            "src_" + "g" * 32,
+            "a" * 32,
+        )
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            for index, invalid_id in enumerate(invalid_ids):
+                with self.subTest(source_id=invalid_id):
+                    package_root = root / str(index)
+                    package_root.mkdir()
+                    package = write_package(
+                        package_root, [managed_candidate()], schema_version="1.2"
+                    )
+                    manifest_path = package / "manifest.json"
+                    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+                    manifest["source"]["id"] = invalid_id
+                    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+                    store_path = package_root / "atomic_information.jsonl"
+
+                    with self.assertRaises(ValueError):
+                        ingest_processing_package(
+                            package, JsonlAtomicInformationStore(store_path)
+                        )
+                    self.assertFalse(store_path.exists())
+
     def test_corrupted_existing_store_fails_instead_of_skipping_history(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
@@ -347,13 +441,13 @@ class AtomicInformationIngestionTest(unittest.TestCase):
             store_path = root / "atomic_information.jsonl"
 
             with (
-                patch("archeos.cli.process_audio", return_value=package),
+                patch("archeos.cli.process_managed_audio", return_value=package),
                 redirect_stdout(StringIO()),
             ):
                 process_result = main(
                     [
                         "process",
-                        "synthetic.wav",
+                        SOURCE_ID,
                         "--information-store",
                         str(store_path),
                     ]
@@ -393,13 +487,13 @@ class AtomicInformationIngestionTest(unittest.TestCase):
             store_path = root / "atomic_information.jsonl"
 
             with (
-                patch("archeos.cli.process_audio", return_value=package),
+                patch("archeos.cli.process_managed_audio", return_value=package),
                 redirect_stdout(StringIO()),
             ):
                 result = main(
                     [
                         "process",
-                        "synthetic.wav",
+                        SOURCE_ID,
                         "--information-store",
                         str(store_path),
                     ]

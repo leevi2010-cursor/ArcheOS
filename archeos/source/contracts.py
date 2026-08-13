@@ -3,9 +3,19 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Mapping, Protocol
+from typing import ContextManager, Mapping, Protocol
 
 from .models import AdmissionResult, ManagedSource, RestoreResult, VerificationResult
+
+
+class ManagedSourceAccess(Protocol):
+    """Read-only Source access used by Processing without storage details."""
+
+    def get(self, source_id: str) -> ManagedSource: ...
+
+    def verify(self, source_id: str) -> VerificationResult: ...
+
+    def materialize(self, source_id: str) -> ContextManager[Path]: ...
 
 
 class ManagedSourceRepository(Protocol):

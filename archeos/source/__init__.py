@@ -1,6 +1,6 @@
 """Local Managed Source admission, verification, and restore."""
 
-from .contracts import ManagedSourceRepository
+from .contracts import ManagedSourceAccess, ManagedSourceRepository
 from .local_repository import (
     AdmissionError,
     LocalManagedSourceRepository,
@@ -28,6 +28,7 @@ __all__ = [
     "IngestedFrom",
     "LocalManagedSourceRepository",
     "ManagedSource",
+    "ManagedSourceAccess",
     "ManagedSourceRepository",
     "ManagedSourceService",
     "ManifestError",

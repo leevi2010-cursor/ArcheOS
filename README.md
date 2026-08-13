@@ -131,14 +131,17 @@ python3 -m pip install mlx-whisper
 
 模型下载后的推理在本机执行。ArcheOS 不保存、打印或提交 Hugging Face access token，并在未显式设置时默认使用 `PYANNOTE_METRICS_ENABLED=0`。
 
+先将外部音频显式准入为 Managed Source，再按返回的 `source_id` 处理：
+
 ```bash
-python3 -m archeos process 01_inbox/discussion.m4a --language zh
+python3 -m archeos source admit /path/to/discussion.m4a
+python3 -m archeos process <source_id> --language zh
 ```
 
 首次运行可能需要由 `mlx_whisper` 和 pyannote 下载模型。也可以使用已有 Whisper JSON、speaker map 或 schema-compliant analysis JSON 进行可重复处理和诊断；提供 `--speaker-map` 时不会运行自动 diarization：
 
 ```bash
-python3 -m archeos process 01_inbox/discussion.m4a \
+python3 -m archeos process <source_id> \
   --transcript /path/to/discussion.transcript.json \
   --speaker-map /path/to/discussion.speakers.json \
   --analysis-file /path/to/discussion.analysis.json
@@ -157,7 +160,7 @@ speaker map 使用转写片段编号，只接受中性标签，不执行 Person 
 
 自动 diarization 只在某个 speaker 对 transcript segment 具有明确、占多数的正时间重叠时赋值。相同 overlap、无明显主导或无有效 overlap 时保留未知 speaker；缺少可用时间戳且没有 speaker map 时会给出可操作错误。M1 不执行声纹、voice embedding、Person 匹配或真实身份推断。
 
-当前 M1 实现仍会根据输入文件名 stem 与 SHA-256 前缀派生 `source_id`，并将外部路径写入 processing manifest。这是待迁移的 legacy provenance，不是未来 Managed Source 的身份规则；后续 Source runtime 必须在用户明确准入、完整字节复制和 size/content_hash 校验后创建 opaque `source_id`。本 Issue 不改动该旧实现。
+`process` 只接受已经通过校验的 Managed Source ID；不会接收外部路径或自动准入。Processing 通过存储无关的只读 Source access contract 获取受控字节，且不会读取 `ingested_from`。新 package 固定使用 Managed Source 的 opaque `source_id`，不会把外部路径、受控绝对路径或临时 materialization 写入 artifact。`--transcript`、`--speaker-map` 与 `--analysis-file` 仅用于确定性的开发和测试 fixture，不改变 Source identity 或 Source Lineage。
 
 当前处理输出仍位于 `02_processing/<source_id>/`：
 
@@ -174,7 +177,7 @@ residue.md
 若同一片段同时支持 Atomic Information Candidate 和 Residue，`digestion_coverage.overlap_segments`
 会记录该重叠，因此始终可以按“Atomic Information Candidate 片段数 + Residue 片段数 - 重叠片段数”核对已覆盖片段总数。
 
-同一来源已有处理包时，CLI 会停止而不是覆盖。分析可以从一个转写片段提取多条 Atomic Information Candidate，也可以用多个片段共同支持一条 Candidate；歧义、冲突、上下文不足或证据不足的信息进入 residue。新 Processing 包使用 schema `1.1` 和 `candidate` 状态，明确区分自动 Atomic Information ingestion 与受治理的 World Model write。
+同一来源已有处理包时，CLI 会停止而不是覆盖。分析可以从一个转写片段提取多条 Atomic Information Candidate，也可以用多个片段共同支持一条 Candidate；歧义、冲突、上下文不足或证据不足的信息进入 residue。新 Processing 包使用 schema `1.2` 和 `candidate` 状态，明确区分自动 Atomic Information ingestion 与受治理的 World Model write。旧 schema `1.0` / `1.1` 包仍可读取，但不会再生成。
 
 ## M2-C1b 本地 Managed Source
 

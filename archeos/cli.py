@@ -18,7 +18,7 @@ from .digestion import (
     JsonlChangeJournal,
     JsonlChangeProposalStore,
 )
-from .pipeline import ProcessingError, process_audio
+from .pipeline import ProcessingError, process_managed_audio
 from .pyannote_speakers import PyannoteSpeakerProvider
 from .speakers import FileSpeakerProvider
 from .source import LocalManagedSourceRepository, ManagedSourceService, SourceError
@@ -37,9 +37,15 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     process = subparsers.add_parser(
-        "process", help="Create a reviewable processing package from an audio file."
+        "process", help="Process one verified Managed Source audio input."
     )
-    process.add_argument("audio", type=Path)
+    process.add_argument("source_id", help="Verified Managed Source ID to process.")
+    process.add_argument(
+        "--managed-root",
+        type=Path,
+        default=DEFAULT_MANAGED_SOURCE_ROOT,
+        help="Managed Source root (default: 01_inbox).",
+    )
     process.add_argument(
         "--output-root",
         type=Path,
@@ -49,7 +55,7 @@ def build_parser() -> argparse.ArgumentParser:
     process.add_argument(
         "--transcript",
         type=Path,
-        help="Use an existing .json or text transcript instead of running mlx_whisper.",
+        help="Development/testing only: use an existing transcript fixture.",
     )
     process.add_argument(
         "--model",
@@ -60,12 +66,12 @@ def build_parser() -> argparse.ArgumentParser:
     process.add_argument(
         "--speaker-map",
         type=Path,
-        help="Optional JSON diarization map using neutral Speaker_N labels.",
+        help="Development/testing only: JSON diarization map using neutral Speaker_N labels.",
     )
     process.add_argument(
         "--analysis-file",
         type=Path,
-        help="Use an existing schema-compliant analysis JSON instead of Codex.",
+        help="Development/testing only: schema-compliant analysis fixture instead of Codex.",
     )
     process.add_argument(
         "--information-store",
@@ -264,8 +270,9 @@ def _process_command(args: argparse.Namespace) -> int:
         else CodexAnalysisProvider()
     )
     try:
-        package = process_audio(
-            args.audio,
+        package = process_managed_audio(
+            args.source_id,
+            LocalManagedSourceRepository(args.managed_root),
             args.output_root,
             transcriber,
             speaker_provider,

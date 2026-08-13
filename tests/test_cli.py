@@ -4,6 +4,7 @@ import hashlib
 import json
 import tempfile
 import unittest
+import wave
 from contextlib import redirect_stdout
 from io import StringIO
 from pathlib import Path
@@ -17,19 +18,20 @@ from archeos.atomic_information import (
 )
 from archeos.cli import main
 from archeos.codex_app_server import CodexAnalysisProvider
+from archeos.pipeline import ProcessingError
 from archeos.pyannote_speakers import PyannoteSpeakerProvider
 from archeos.world_model import SQLiteWorldModelRepository
 
 
 class CliTest(unittest.TestCase):
     @patch("archeos.cli.ingest_processing_package")
-    @patch("archeos.cli.process_audio")
+    @patch("archeos.cli.process_managed_audio")
     def test_constructs_file_backed_providers(
         self,
-        process_audio: Mock,
+        process_managed_audio: Mock,
         ingest_processing_package: Mock,
     ) -> None:
-        process_audio.return_value = Path("/tmp/package")
+        process_managed_audio.return_value = Path("/tmp/package")
         ingest_processing_package.return_value = IngestionResult(0, 0, 0, ())
         with redirect_stdout(StringIO()):
             result = main(
@@ -45,9 +47,10 @@ class CliTest(unittest.TestCase):
                 ]
             )
         self.assertEqual(result, 0)
-        self.assertEqual(process_audio.call_count, 1)
-        transcriber, speaker_provider, analysis_provider = process_audio.call_args.args[
-            2:
+        self.assertEqual(process_managed_audio.call_count, 1)
+        self.assertEqual(process_managed_audio.call_args.args[0], "sample.wav")
+        transcriber, speaker_provider, analysis_provider = process_managed_audio.call_args.args[
+            3:
         ]
         self.assertEqual(transcriber.transcript_file, Path("transcript.json"))
         self.assertEqual(speaker_provider.speaker_map, Path("speakers.json"))
@@ -60,19 +63,19 @@ class CliTest(unittest.TestCase):
         )
 
     @patch("archeos.cli.ingest_processing_package")
-    @patch("archeos.cli.process_audio")
+    @patch("archeos.cli.process_managed_audio")
     def test_uses_automatic_diarization_and_codex_sdk_by_default(
         self,
-        process_audio: Mock,
+        process_managed_audio: Mock,
         ingest_processing_package: Mock,
     ) -> None:
-        process_audio.return_value = Path("/tmp/package")
+        process_managed_audio.return_value = Path("/tmp/package")
         ingest_processing_package.return_value = IngestionResult(0, 0, 0, ())
         with redirect_stdout(StringIO()):
             result = main(["process", "sample.wav", "--transcript", "transcript.json"])
         self.assertEqual(result, 0)
-        speaker_provider = process_audio.call_args.args[3]
-        analysis_provider = process_audio.call_args.args[4]
+        speaker_provider = process_managed_audio.call_args.args[4]
+        analysis_provider = process_managed_audio.call_args.args[5]
         self.assertIsInstance(speaker_provider, PyannoteSpeakerProvider)
         self.assertIsInstance(analysis_provider, CodexAnalysisProvider)
 
@@ -358,6 +361,151 @@ class CliTest(unittest.TestCase):
                 )
             self.assertTrue(json.loads(output.getvalue())["verified"])
             self.assertEqual(target.read_bytes(), external.read_bytes())
+
+    def test_process_managed_source_synthetic_end_to_end_smoke(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            original = root / "synthetic.wav"
+            with wave.open(str(original), "wb") as audio:
+                audio.setnchannels(1)
+                audio.setsampwidth(2)
+                audio.setframerate(16_000)
+                audio.writeframes(b"\x00\x00" * 1_600)
+            source_id = "src_" + "b" * 32
+            managed_root = root / "managed"
+            output_root = root / "processing"
+            information_store = root / "information.jsonl"
+            transcript = root / "transcript.json"
+            transcript.write_text(
+                json.dumps(
+                    {
+                        "text": "Synthetic decision. Synthetic ambiguity.",
+                        "segments": [
+                            {"text": "Synthetic decision.", "start": 0, "end": 1},
+                            {"text": "Synthetic ambiguity.", "start": 1, "end": 2},
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            speakers = root / "speakers.json"
+            speakers.write_text(
+                json.dumps({"segments": [{"segment": 1, "speaker": "Speaker_1"}]}),
+                encoding="utf-8",
+            )
+            analysis = root / "analysis.json"
+            analysis.write_text(
+                json.dumps(
+                    {
+                        "meeting_summary": {
+                            "topic": "Synthetic smoke",
+                            "participants": ["Speaker_1"],
+                            "discussion_goal": "Validate Managed Source provenance.",
+                            "main_discussion": ["Synthetic processing."],
+                            "key_viewpoints": ["Managed Source is authoritative."],
+                            "agreements": ["Use source_id."],
+                            "disagreements": [],
+                            "unresolved_questions": ["Synthetic ambiguity."],
+                            "next_actions": ["Review the output."],
+                        },
+                        "atomic_information_candidates": [
+                            {
+                                "statement": "Synthetic decision.",
+                                "semantic_type": "decision",
+                                "concerns": ["Synthetic smoke"],
+                                "evidence_segments": [1],
+                                "context": "Synthetic test only.",
+                                "confidence": 0.9,
+                            }
+                        ],
+                        "residue": [
+                            {
+                                "evidence_segments": [2],
+                                "reason_not_absorbed": "Synthetic ambiguity.",
+                                "future_value_or_uncertainty": "Needs synthetic review.",
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            with redirect_stdout(StringIO()):
+                self.assertEqual(
+                    main(
+                        [
+                            "source", "admit", str(original), "--source-id", source_id,
+                            "--managed-root", str(managed_root),
+                        ]
+                    ),
+                    0,
+                )
+            output = StringIO()
+            with redirect_stdout(output):
+                self.assertEqual(
+                    main(
+                        [
+                            "process", source_id,
+                            "--managed-root", str(managed_root),
+                            "--output-root", str(output_root),
+                            "--information-store", str(information_store),
+                            "--transcript", str(transcript),
+                            "--speaker-map", str(speakers),
+                            "--analysis-file", str(analysis),
+                        ]
+                    ),
+                    0,
+                )
+            package = output_root / source_id
+            manifest = json.loads((package / "manifest.json").read_text(encoding="utf-8"))
+            self.assertEqual(manifest["schema_version"], "1.2")
+            self.assertEqual(manifest["source"]["id"], source_id)
+            self.assertNotIn("path", manifest["source"])
+            self.assertNotIn(str(original), (package / "transcript.md").read_text())
+            candidate = json.loads(
+                (package / "atomic_information_candidates.jsonl").read_text().splitlines()[0]
+            )
+            self.assertEqual(candidate["source_evidence"][0]["source_id"], source_id)
+            self.assertEqual(
+                JsonlAtomicInformationStore(information_store)
+                .list_atomic_information()[0]
+                .source_evidence[0]
+                .source_id,
+                source_id,
+            )
+            original.unlink()
+            with redirect_stdout(StringIO()):
+                self.assertEqual(
+                    main(["source", "verify", source_id, "--managed-root", str(managed_root)]),
+                    0,
+                )
+
+    def test_process_rejects_external_path_as_unknown_source(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            output = StringIO()
+            with redirect_stdout(output):
+                result = main(
+                    [
+                        "process", str(Path(temp) / "external.wav"),
+                        "--managed-root", str(Path(temp) / "managed"),
+                    ]
+                )
+            self.assertEqual(result, 1)
+            self.assertIn("source_id", output.getvalue())
+
+    @patch("archeos.cli.ingest_processing_package")
+    @patch("archeos.cli.process_managed_audio")
+    def test_processing_publish_failure_never_triggers_ingestion(
+        self,
+        process_managed_audio: Mock,
+        ingest_processing_package: Mock,
+    ) -> None:
+        process_managed_audio.side_effect = ProcessingError("cannot publish safely")
+        with redirect_stdout(StringIO()):
+            result = main(["process", "src_" + "a" * 32])
+
+        self.assertEqual(result, 1)
+        ingest_processing_package.assert_not_called()
 
 
 if __name__ == "__main__":
