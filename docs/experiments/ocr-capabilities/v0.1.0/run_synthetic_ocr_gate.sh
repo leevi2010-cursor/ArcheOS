@@ -70,7 +70,14 @@ set +e
 TASK_MISSING_MODEL_EXIT=$?
 set -e
 
-printf '%s\n' "engine=tesseract" "missing_model_exit=$TASK_MISSING_MODEL_EXIT" "temporary_directory_cleanup=scheduled"
+if [ "$TASK_MISSING_MODEL_EXIT" -eq 0 ]; then
+  TASK_MISSING_MODEL_STATUS=unexpected_success
+  TASK_REQUIRED_FAILURE=1
+else
+  TASK_MISSING_MODEL_STATUS=failed_closed
+fi
+
+printf '%s\n' "engine=tesseract" "missing_model_exit=$TASK_MISSING_MODEL_EXIT" "missing_model_status=$TASK_MISSING_MODEL_STATUS" "temporary_directory_cleanup=scheduled"
 if [ "$TASK_REQUIRED_FAILURE" -ne 0 ]; then
   exit 1
 fi
