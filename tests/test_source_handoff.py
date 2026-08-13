@@ -13,12 +13,34 @@ from archeos.source import (
     HandoffMarkerError,
     HandoffMarkerService,
     LocalManagedSourceRepository,
+    ManagedSource,
+    VerificationResult,
 )
 
 
 ID_1 = "src_" + "1" * 32
 ID_2 = "src_" + "2" * 32
 TIMESTAMP = "2026-08-13T00:00:00.000Z"
+
+
+class StubRepository:
+    """Storage-independent repository double for Handoff identity boundaries."""
+
+    def __init__(
+        self, source: ManagedSource, verification: VerificationResult
+    ) -> None:
+        self.source = source
+        self.verification = verification
+        self.get_calls: list[str] = []
+        self.verify_calls: list[str] = []
+
+    def get(self, source_id: str) -> ManagedSource:
+        self.get_calls.append(source_id)
+        return self.source
+
+    def verify(self, source_id: str) -> VerificationResult:
+        self.verify_calls.append(source_id)
+        return self.verification
 
 
 class HandoffMarkerTest(unittest.TestCase):
@@ -319,3 +341,90 @@ class HandoffMarkerTest(unittest.TestCase):
 
         self.assertTrue(marker.is_file())
         self.assertTrue(service.repository.verify(source.source_id).verified)
+
+    # Review: the request ID remains authoritative across storage-independent calls.
+    def test_28_invalid_requested_id_fails_before_repository_io(self) -> None:
+        repository, external, source, _ = self.admitted_service()
+        stub = StubRepository(source, repository.verify(source.source_id))
+        service = HandoffMarkerService(stub, self.managed_root)
+
+        with self.assertRaises(HandoffMarkerError):
+            service.write("not-a-managed-source-id", target_file=external)
+
+        self.assertEqual(stub.get_calls, [])
+        self.assertEqual(stub.verify_calls, [])
+        self.assertFalse(self.marker_for(external).exists())
+
+    # Review: adapters cannot redirect a requested Source to another valid identity.
+    def test_29_write_rejects_redirected_or_invalid_get_identity(self) -> None:
+        repository, external, source, _ = self.admitted_service()
+        verification = repository.verify(source.source_id)
+        for returned_source_id in (ID_2, "invalid"):
+            with self.subTest(returned_source_id=returned_source_id):
+                stub = StubRepository(
+                    replace(source, source_id=returned_source_id), verification
+                )
+                service = HandoffMarkerService(stub, self.managed_root)
+
+                with self.assertRaises(HandoffMarkerError):
+                    service.write(source.source_id, target_file=external)
+
+                self.assertEqual(stub.get_calls, [source.source_id])
+                self.assertEqual(stub.verify_calls, [])
+                self.assertFalse(self.marker_for(external).exists())
+
+    # Review: a successful verification is insufficient when it names another Source.
+    def test_30_write_rejects_mismatched_or_invalid_verification_identity(self) -> None:
+        repository, external, source, _ = self.admitted_service()
+        verification = repository.verify(source.source_id)
+        for returned_source_id in (ID_2, "invalid"):
+            with self.subTest(returned_source_id=returned_source_id):
+                stub = StubRepository(
+                    source, replace(verification, source_id=returned_source_id, verified=True)
+                )
+                service = HandoffMarkerService(stub, self.managed_root)
+
+                with self.assertRaises(HandoffMarkerError):
+                    service.write(source.source_id, target_file=external)
+
+                self.assertEqual(stub.get_calls, [source.source_id])
+                self.assertEqual(stub.verify_calls, [source.source_id])
+                self.assertFalse(self.marker_for(external).exists())
+
+    # Review: matching request/get/verify identities retain the existing write contract.
+    def test_31_write_accepts_matching_storage_independent_identities(self) -> None:
+        repository, external, source, _ = self.admitted_service()
+        stub = StubRepository(source, repository.verify(source.source_id))
+        service = HandoffMarkerService(stub, self.managed_root, clock=lambda: TIMESTAMP)
+
+        result = service.write(source.source_id, target_file=external)
+
+        self.assertEqual(result.status, "written")
+        self.assertEqual(result.marker.source_id, source.source_id)
+        self.assertEqual(stub.get_calls, [source.source_id])
+        self.assertEqual(stub.verify_calls, [source.source_id])
+        self.assertEqual(self._marker_source_id(self.marker_for(external)), source.source_id)
+
+    # Review: show must not report a different repository identity as the marker Source.
+    def test_32_show_rejects_get_or_verify_identity_mismatch(self) -> None:
+        repository, external, source, service = self.admitted_service()
+        marker_path = service.write(source.source_id).marker.marker_path
+        verification = repository.verify(source.source_id)
+        cases = (
+            (replace(source, source_id=ID_2), verification, []),
+            (source, replace(verification, source_id=ID_2, verified=True), [source.source_id]),
+        )
+        for returned_source, returned_verification, expected_verify_calls in cases:
+            with self.subTest(returned_source_id=returned_source.source_id):
+                stub = StubRepository(returned_source, returned_verification)
+                with self.assertRaises(HandoffMarkerError):
+                    HandoffMarkerService(stub, self.managed_root).show(marker_path)
+                self.assertEqual(stub.get_calls, [source.source_id])
+                self.assertEqual(stub.verify_calls, expected_verify_calls)
+
+    @staticmethod
+    def _marker_source_id(marker_path: Path) -> str:
+        for line in marker_path.read_text(encoding="utf-8").splitlines():
+            if line.startswith("source_id: "):
+                return line.removeprefix("source_id: ")
+        raise AssertionError("marker did not contain source_id")

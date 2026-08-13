@@ -191,13 +191,21 @@ class HandoffMarkerService:
     def write(
         self, source_id: str, *, target_file: Path | str | None = None
     ) -> HandoffWriteResult:
+        requested_source_id = self._require_source_id(source_id)
         try:
-            source = self.repository.get(source_id)
-            verification = self.repository.verify(source.source_id)
+            source = self.repository.get(requested_source_id)
         except SourceError as exc:
             raise HandoffMarkerError(
                 "Managed Source was not found or could not be verified"
             ) from exc
+        self._require_matching_source_id(source.source_id, requested_source_id)
+        try:
+            verification = self.repository.verify(requested_source_id)
+        except SourceError as exc:
+            raise HandoffMarkerError(
+                "Managed Source was not found or could not be verified"
+            ) from exc
+        self._require_matching_source_id(verification.source_id, requested_source_id)
         if not verification.verified:
             raise HandoffMarkerError("Managed Source verification failed; marker was not written")
         target = self._target_file(source.ingested_from.location if source.ingested_from else None, target_file)
@@ -206,18 +214,20 @@ class HandoffMarkerService:
             raise HandoffMarkerError("marker target must be outside the Managed Source root")
         self._validate_target(target, marker_path)
         if os.path.lexists(marker_path):
-            return self._existing(marker_path, source.source_id)
+            return self._existing(marker_path, requested_source_id)
 
         written_at = self.clock()
         _validate_timestamp(written_at)
-        staging_path = self._stage(marker_path, _render_marker(source.source_id, written_at))
+        staging_path = self._stage(
+            marker_path, _render_marker(requested_source_id, written_at)
+        )
         try:
             try:
                 publish_file_no_replace(staging_path, marker_path)
             except FileExistsError:
-                return self._existing(marker_path, source.source_id)
+                return self._existing(marker_path, requested_source_id)
             return HandoffWriteResult(
-                marker=HandoffMarker(source.source_id, marker_path, written_at),
+                marker=HandoffMarker(requested_source_id, marker_path, written_at),
                 status="written",
             )
         except HandoffMarkerError:
@@ -233,15 +243,33 @@ class HandoffMarkerService:
     def show(self, marker_path: Path | str) -> HandoffShowResult:
         marker = _parse_marker(Path(marker_path))
         try:
-            self.repository.get(marker.source_id)
+            source = self.repository.get(marker.source_id)
         except SourceError:
             return HandoffShowResult(marker, source_exists=False, source_verified=None)
-        verification = self.repository.verify(marker.source_id)
+        self._require_matching_source_id(source.source_id, marker.source_id)
+        try:
+            verification = self.repository.verify(marker.source_id)
+        except SourceError as exc:
+            raise HandoffMarkerError("Managed Source could not be verified") from exc
+        self._require_matching_source_id(verification.source_id, marker.source_id)
         return HandoffShowResult(
             marker,
             source_exists=True,
             source_verified=verification.verified,
         )
+
+    @staticmethod
+    def _require_source_id(value: object) -> str:
+        try:
+            return require_managed_source_id(value)
+        except ValueError as exc:
+            raise HandoffMarkerError("Managed Source ID is invalid") from exc
+
+    @classmethod
+    def _require_matching_source_id(cls, value: object, requested_source_id: str) -> None:
+        returned_source_id = cls._require_source_id(value)
+        if returned_source_id != requested_source_id:
+            raise HandoffMarkerError("Managed Source identity did not match the request")
 
     def _target_file(self, historical_location: str | None, target_file: Path | str | None) -> Path:
         if target_file is not None:
