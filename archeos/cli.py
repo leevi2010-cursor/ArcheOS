@@ -302,6 +302,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     representation_build.add_argument("source_id")
     representation_build.add_argument("--adapter", required=True)
+    representation_build.add_argument(
+        "--privacy-route",
+        choices=("unknown", "restricted", "standard"),
+        help="Image only: unknown, restricted, or standard (default: unknown).",
+    )
     representation_show = representation_commands.add_parser(
         "show", help="Show one persisted Normalized Representation."
     )
@@ -557,7 +562,13 @@ def _representation_command(args: argparse.Namespace) -> int:
     )
     try:
         if args.representation_command == "build":
-            result = service.build(args.source_id, production_adapter(args.adapter), {})
+            adapter = production_adapter(args.adapter)
+            configuration: dict[str, object] = {}
+            if adapter.name == "image-preflight":
+                configuration["privacy_route"] = args.privacy_route or "unknown"
+            elif args.privacy_route is not None:
+                raise RepresentationError("--privacy-route is only supported by image-preflight")
+            result = service.build(args.source_id, adapter, configuration)
             print(json.dumps(result.to_dict(), ensure_ascii=False, indent=2))
             return 0
         if args.representation_command == "show":

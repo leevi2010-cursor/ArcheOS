@@ -4,7 +4,7 @@ import io
 import json
 import tempfile
 import unittest
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 
 from archeos.cli import main
@@ -126,6 +126,7 @@ class DocumentAdapterTest(unittest.TestCase):
         from PIL import Image
         from openpyxl import Workbook
         from openpyxl.drawing.image import Image as XlsxImage
+        from openpyxl.styles import Alignment, Font, PatternFill
         from openpyxl.worksheet.table import Table, TableStyleInfo
 
         external = self.root / "fixture.xlsx"
@@ -141,6 +142,11 @@ class DocumentAdapterTest(unittest.TestCase):
         table = Table(displayName="SyntheticTable", ref="A1:B2")
         table.tableStyleInfo = TableStyleInfo(name="TableStyleMedium2", showRowStripes=True)
         worksheet.add_table(table)
+        formatted_blank = worksheet["G4"]
+        formatted_blank.number_format = "0.00%"
+        formatted_blank.font = Font(name="Synthetic Font", bold=True)
+        formatted_blank.fill = PatternFill("solid", fgColor="FF00FF00")
+        formatted_blank.alignment = Alignment(horizontal="center", wrap_text=True)
         image_path = self.root / "xlsx-image.png"
         Image.new("RGBA", (1, 1), (0, 0, 0, 0)).save(image_path)
         worksheet.add_image(XlsxImage(str(image_path)), "F3")
@@ -164,6 +170,12 @@ class DocumentAdapterTest(unittest.TestCase):
         self.assertIn("E", sheet["hidden_columns"])
         self.assertEqual(sheet["tables"], [{"name": "SyntheticTable", "ref": "A1:B2"}])
         self.assertEqual(sheet["embedded_media"][0]["anchor"]["from"], {"row": 3, "column": 6})
+        blank = next(cell for cell in sheet["cells"] if cell["source_locator"]["cell"] == "G4")
+        self.assertIsNone(blank["value"])
+        self.assertEqual(blank["blank_structure"]["number_format"], "0.00%")
+        self.assertTrue(blank["blank_structure"]["font"]["bold"])
+        self.assertEqual(blank["blank_structure"]["fill"]["foreground"], "FF00FF00")
+        self.assertTrue(blank["blank_structure"]["alignment"]["wrap_text"])
         self.assertTrue(payload["sheets"][1]["hidden"])
 
     def test_pptx_preserves_slide_shape_text_and_table_locators(self) -> None:
@@ -178,6 +190,9 @@ class DocumentAdapterTest(unittest.TestCase):
         text_box.text = "Synthetic slide"
         table = slide.shapes.add_table(1, 1, Inches(1), Inches(2), Inches(2), Inches(1)).table
         table.cell(0, 0).text = "table value"
+        group = slide.shapes.add_group_shape()
+        grouped_text = group.shapes.add_textbox(Inches(1), Inches(3), Inches(3), Inches(1))
+        grouped_text.text = "Grouped synthetic slide"
         image_path = self.root / "pptx-image.png"
         Image.new("RGB", (1, 1), (1, 2, 3)).save(image_path)
         slide.shapes.add_picture(str(image_path), Inches(4), Inches(1), Inches(1), Inches(1))
@@ -187,7 +202,7 @@ class DocumentAdapterTest(unittest.TestCase):
             "application/vnd.openxmlformats-officedocument.presentationml.presentation",
             PptxRepresentationAdapter(),
         )
-        self.assertEqual(result.representation.status, "complete")
+        self.assertEqual(result.representation.status, "partial")
         shapes = payload["slides"][0]["shapes"]
         self.assertTrue(any(item.get("text") == "Synthetic slide" for item in shapes))
         table_shape = next(item for item in shapes if "table" in item)
@@ -195,6 +210,16 @@ class DocumentAdapterTest(unittest.TestCase):
         self.assertIn("slide_id", table_shape["source_locator"])
         self.assertIn("shape_id", table_shape["source_locator"])
         self.assertTrue(any("media" in item for item in shapes))
+        group_shape = next(item for item in shapes if "children" in item)
+        child = group_shape["children"][0]
+        self.assertEqual(child["text"], "Grouped synthetic slide")
+        self.assertEqual(
+            child["source_locator"]["group_path"], [group_shape["source_locator"]["shape_id"]]
+        )
+        self.assertIn(
+            "GROUP_LAYOUT_COORDINATES_UNVERIFIED",
+            {item.code for item in result.representation.warnings},
+        )
 
     def test_image_preflight_is_local_and_privacy_route_is_explicit(self) -> None:
         external = self.root / "fixture.png"
@@ -268,3 +293,58 @@ class DocumentAdapterTest(unittest.TestCase):
                 0,
             )
         self.assertIn('"status": "built"', output.getvalue())
+
+    def test_cli_image_privacy_route_is_fingerprinted_and_fails_closed(self) -> None:
+        external = self.root / "cli-image.png"
+        external.write_bytes(
+            b"\x89PNG\r\n\x1a\n" + b"\x00\x00\x00\rIHDR" + (3).to_bytes(4, "big")
+            + (2).to_bytes(4, "big") + b"\x08\x06\x00\x00\x00"
+        )
+        managed_root = self.root / "cli-image-managed"
+        representation_root = self.root / "cli-image-representations"
+        source_id = "src_" + "b" * 32
+        with redirect_stdout(io.StringIO()):
+            self.assertEqual(
+                main([
+                    "source", "admit", str(external), "--managed-root", str(managed_root),
+                    "--media-type", "image/png", "--source-id", source_id,
+                ]),
+                0,
+            )
+
+        def build(*arguments: str) -> tuple[int, dict[str, object]]:
+            output = io.StringIO()
+            with redirect_stdout(output):
+                code = main([
+                    "representation", "build", source_id, "--adapter", "image-preflight",
+                    "--managed-root", str(managed_root), "--representation-root", str(representation_root),
+                    *arguments,
+                ])
+            return code, json.loads(output.getvalue()) if code == 0 else {"error": output.getvalue()}
+
+        default_code, default = build()
+        unknown_code, unknown = build("--privacy-route", "unknown")
+        restricted_code, restricted = build("--privacy-route", "restricted")
+        self.assertEqual((default_code, unknown_code, restricted_code), (0, 0, 0))
+        default_representation = default["representation"]["representation"]
+        unknown_representation = unknown["representation"]["representation"]
+        restricted_representation = restricted["representation"]["representation"]
+        self.assertEqual(default_representation["status"], "partial")
+        self.assertEqual(unknown["status"], "existing")
+        self.assertEqual(
+            default_representation["configuration_fingerprint"],
+            unknown_representation["configuration_fingerprint"],
+        )
+        self.assertNotEqual(
+            default_representation["configuration_fingerprint"],
+            restricted_representation["configuration_fingerprint"],
+        )
+        self.assertEqual(restricted_representation["status"], "complete")
+        with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            main([
+                "representation", "build", source_id, "--adapter", "image-preflight",
+                "--managed-root", str(managed_root), "--representation-root", str(representation_root),
+                "--privacy-route", "cloud",
+            ])
+        manifests = list((representation_root / source_id).glob("*/manifest.json"))
+        self.assertEqual(len(manifests), 2)

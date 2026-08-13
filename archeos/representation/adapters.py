@@ -221,7 +221,7 @@ class XlsxRepresentationAdapter:
                 cells: list[dict[str, object]] = []
                 for row in worksheet.iter_rows():
                     for cell in row:
-                        if cell.value is None:
+                        if cell.value is None and not cell.has_style:
                             continue
                         if remaining == 0:
                             warnings.append(
@@ -241,18 +241,19 @@ class XlsxRepresentationAdapter:
                                     f"{worksheet.title}!{cell.coordinate} has no cached value",
                                 )
                             )
-                        cells.append(
-                            {
-                                "source_locator": {
-                                    "sheet": worksheet.title,
-                                    "sheet_index": index,
-                                    "cell": cell.coordinate,
-                                },
-                                "value": _json_value(cell.value),
-                                "formula": formula,
-                                "cached_value": cached_value,
-                            }
-                        )
+                        cell_data: dict[str, object] = {
+                            "source_locator": {
+                                "sheet": worksheet.title,
+                                "sheet_index": index,
+                                "cell": cell.coordinate,
+                            },
+                            "value": _json_value(cell.value),
+                            "formula": formula,
+                            "cached_value": cached_value,
+                        }
+                        if cell.value is None:
+                            cell_data["blank_structure"] = self._blank_structure(cell)
+                        cells.append(cell_data)
                         remaining -= 1
                     if remaining == 0:
                         break
@@ -312,6 +313,23 @@ class XlsxRepresentationAdapter:
             payload["to"] = {"row": end.row + 1, "column": end.col + 1}
         return payload
 
+    @staticmethod
+    def _blank_structure(cell: object) -> dict[str, object]:
+        font = cell.font
+        fill = cell.fill
+        alignment = cell.alignment
+        return {
+            "style_id": cell.style_id,
+            "number_format": cell.number_format,
+            "font": {"name": font.name, "bold": font.bold, "italic": font.italic},
+            "fill": {"type": fill.fill_type, "foreground": fill.fgColor.value},
+            "alignment": {
+                "horizontal": alignment.horizontal,
+                "vertical": alignment.vertical,
+                "wrap_text": alignment.wrap_text,
+            },
+        }
+
 
 class PptxRepresentationAdapter:
     name = "pptx"
@@ -334,31 +352,17 @@ class PptxRepresentationAdapter:
         warnings: list[RepresentationWarning] = []
         slides: list[dict[str, object]] = []
         for slide_index, slide in enumerate(presentation.slides, start=1):
-            shapes: list[dict[str, object]] = []
-            for shape_order, shape in enumerate(slide.shapes, start=1):
-                locator = {
-                    "slide_index": slide_index,
-                    "slide_id": slide.slide_id,
-                    "shape_id": shape.shape_id,
-                    "shape_order": shape_order,
-                    "shape_type": str(shape.shape_type),
-                    "bbox": [shape.left, shape.top, shape.width, shape.height],
-                }
-                shape_data: dict[str, object] = {"source_locator": locator}
-                if getattr(shape, "has_text_frame", False):
-                    shape_data["text"] = shape.text
-                if getattr(shape, "has_table", False):
-                    shape_data["table"] = [
-                        [cell.text for cell in row.cells] for row in shape.table.rows
-                    ]
-                if hasattr(shape, "image"):
-                    image = shape.image
-                    shape_data["media"] = {
-                        "format": str(image.ext),
-                        "content_type": image.content_type,
-                        "size_bytes": len(image.blob),
-                    }
-                shapes.append(shape_data)
+            shapes = [
+                self._shape_data(
+                    shape,
+                    slide_index,
+                    slide.slide_id,
+                    shape_order,
+                    (),
+                    warnings,
+                )
+                for shape_order, shape in enumerate(slide.shapes, start=1)
+            ]
             notes = None
             if slide.has_notes_slide:
                 notes = slide.notes_slide.notes_text_frame.text
@@ -379,6 +383,58 @@ class PptxRepresentationAdapter:
         completeness = 1.0 if not warnings else 0.8
         artifact = _write_artifact(staging_dir, "slides.json", {"slides": slides})
         return AdapterBuildResult(self.kind, (artifact,), completeness, tuple(warnings))
+
+    def _shape_data(
+        self,
+        shape: object,
+        slide_index: int,
+        slide_id: int,
+        shape_order: int,
+        group_path: tuple[int, ...],
+        warnings: list[RepresentationWarning],
+    ) -> dict[str, object]:
+        locator: dict[str, object] = {
+            "slide_index": slide_index,
+            "slide_id": slide_id,
+            "shape_id": shape.shape_id,
+            "shape_order": shape_order,
+            "shape_type": str(shape.shape_type),
+            "bbox": [shape.left, shape.top, shape.width, shape.height],
+        }
+        if group_path:
+            locator["group_path"] = list(group_path)
+        shape_data: dict[str, object] = {"source_locator": locator}
+        if getattr(shape, "has_text_frame", False):
+            shape_data["text"] = shape.text
+        if getattr(shape, "has_table", False):
+            shape_data["table"] = [[cell.text for cell in row.cells] for row in shape.table.rows]
+        if hasattr(shape, "image"):
+            image = shape.image
+            shape_data["media"] = {
+                "format": str(image.ext),
+                "content_type": image.content_type,
+                "size_bytes": len(image.blob),
+            }
+        children = getattr(shape, "shapes", None)
+        if children is not None:
+            warnings.append(
+                _warning(
+                    "GROUP_LAYOUT_COORDINATES_UNVERIFIED",
+                    f"slide {slide_index} group transform is retained but not flattened",
+                )
+            )
+            shape_data["children"] = [
+                self._shape_data(
+                    child,
+                    slide_index,
+                    slide_id,
+                    child_order,
+                    (*group_path, shape.shape_id),
+                    warnings,
+                )
+                for child_order, child in enumerate(children, start=1)
+            ]
+        return shape_data
 
 
 class ImagePreflightRepresentationAdapter:

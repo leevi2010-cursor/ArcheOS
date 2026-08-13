@@ -14,7 +14,7 @@ OCR、复杂 PDF、视觉语义、云服务和模型下载均未实现，也未�
 
 ## 合成验证
 
-`tests/test_document_adapters.py` 覆盖 8 个场景：五个 Adapter 的结构、locator、warning、registry/CLI，以及 PDF runtime error 的无发布/清理行为。
+`tests/test_document_adapters.py` 覆盖 9 个场景：五个 Adapter 的结构、locator、warning、registry/CLI、受控图片 privacy route、格式化空白 XLSX 单元格、PPTX GroupShape 递归保留，以及 PDF runtime error 的无发布/清理行为。
 
 ## 匿名本地 smoke
 
@@ -22,10 +22,10 @@ OCR、复杂 PDF、视觉语义、云服务和模型下载均未实现，也未�
 
 | 格式 | 样本数 | 状态 | verify | warning | artifact | 耗时（毫秒） |
 | --- | ---: | --- | --- | --- | ---: | ---: |
-| 文本型 PDF | 1 | partial | true | `READING_ORDER_NOT_VERIFIED` | 1 | 143 |
-| XLSX | 1 | partial | true | `EMBEDDED_MEDIA_UNSUPPORTED` | 1 | 1137 |
-| PPTX | 1 | complete | true | 无 | 1 | 214 |
-| 图片 | 1 | partial | true | `PRIVACY_ROUTE_UNKNOWN` | 1 | 3 |
+| 文本型 PDF | 1 | partial | true | `READING_ORDER_NOT_VERIFIED` | 1 | 160 |
+| XLSX | 1 | partial | true | `EMBEDDED_MEDIA_UNSUPPORTED` | 1 | 1236 |
+| PPTX | 1 | complete | true | 无 | 1 | 207 |
+| 图片 | 1 | partial | true | `PRIVACY_ROUTE_UNKNOWN` | 1 | 4 |
 | Markdown | 0 | not_available | 不适用 | 不适用 | 0 | 不适用 |
 
 其中 XLSX warning 表示 Reader 报告存在不支持的嵌入媒体；Adapter 未保留该内容且没有把该运行时提示吞掉。图片样本在没有显式隐私路由时保持 `unknown`，不进行 OCR、视觉理解或路由降级。
