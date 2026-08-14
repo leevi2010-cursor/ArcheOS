@@ -2,14 +2,48 @@
 
 ## 文档职责
 
-本文件只定义 ArcheOS 的阶段演化顺序，不承担单个开发任务的实现规格。
+本文件定义 ArcheOS **为了通过当前 Product Stage，需要按什么顺序建立能力、完成实验与取得真实验证证据**。它不承担单个开发任务的实现规格，也不独立决定长期产品方向。
 
-- `AGENTS.md`：定义 Agent 的工作规则与权威关系。
-- `docs/architecture/CONCEPTS.md`：定义 Core 概念。
-- `docs/product/INFORMATION_GOVERNANCE.md`：定义信息吸收、自动更新与人工判断的产品规则。
-- 本 `ROADMAP.md`：定义长期阶段顺序。
-- GitHub Issue：定义当前一次开发必须交付什么；复杂 Issue 可以内嵌 Architect 批准的 Implementation Plan 与 Test Cases。
+权威关系：
+
+- `AGENTS.md`：定义 Agent 的工作规则、Roadmap Alignment 与权威关系；
+- `docs/product/PRODUCT_SPEC.md`：定义 ArcheOS 长期是什么、为谁创造什么价值、产品边界是什么；
+- `docs/product/PRODUCT_ROADMAP.md`：定义 Product Stage、Stage Gate，以及为了成为目标产品依次必须证明什么；
+- `docs/architecture/CONCEPTS.md`：定义 Core 概念；
+- `docs/product/INFORMATION_GOVERNANCE.md`：定义信息吸收、自动更新与人工判断的产品规则；
+- 本 `ROADMAP.md`：在已批准 Product Stage 内，定义为了关闭 Evidence Gap 所需的技术演化与验证顺序；
+- GitHub Issue：定义当前一次开发必须交付什么；复杂 Issue 可以内嵌 Architect 批准的 Implementation Plan 与 Test Cases；
 - Durable Spec / ADR：仅在稳定契约或架构决策需要跨多个 Issue 复用时建立。
+
+因此，本文件回答的是“为了证明当前产品阶段成立，系统接下来缺什么能力”，而不是“一个完整软件理论上还应该有哪些功能”。技术完整度不能反过来成为产品路线权威。
+
+如果 Experiment、Issue、PR 或真实使用产生了与 Product Roadmap 假设冲突的新 Evidence，应通过 `AGENTS.md` 定义的 Roadmap Feedback 机制向上反馈；必要时先修正 Product Roadmap，再重排本文件，而不是让实现静默漂移。
+
+## 当前 Product Stage 对齐
+
+当前上游 Product Stage 以 `docs/product/PRODUCT_ROADMAP.md` 为准，目前是：
+
+> **Stage 1 — 证明“长期认知”真实成立。**
+
+当前 Stage Gate 的核心不是完成某一组功能，而是证明真实、异构、持续变化的信息长期进入系统后，ArcheOS 仍能保持信息守恒、provenance、冲突 / 时间变化 / 不确定性、Object identity 与 Context 质量，并且不会随着数据增长越来越混乱。
+
+因此，当前 Development Roadmap 的主要技术工作之所以有优先级，是因为它们分别关闭以下 Evidence Gap：
+
+```text
+Source / provenance 是否稳定
+        ↓
+多格式与 Conversation 是否进入同一 Information lifecycle
+        ↓
+重复 / 派生 / 补充 / 时间变化 / 冲突是否能受治理地整理
+        ↓
+长期 Object 是否能从真实 Information 中安全形成与演化
+        ↓
+Context 是否随着真实数据增长变得更有用而不是更嘈杂
+        ↓
+真实旧数据与长期使用压力下，整条认知链是否仍然成立
+```
+
+任何新的大型能力、UI、平台基础设施或集成在进入当前主线前，都必须说明它关闭哪一个当前 Stage Gate 的 Evidence Gap；否则默认后置。维护、安全、隐私、完整性和回归修复按 `AGENTS.md` 的 Maintenance / Integrity 例外处理。
 
 产品名称长期使用 **向阳经营系统（Sunward Operating System）**；`ArcheOS` 仅作为当前重构迁移阶段的工程 / 仓库代号。待新系统完成真实数据验证、旧 `sunward-operating-system` 完成 clean-cut 退役且命名切换不会造成双重权威时，再将 ArcheOS 正式恢复为“向阳经营系统”产品名称；在此之前不为了改名打断当前主线。
 
@@ -506,6 +540,8 @@ Goal
 
 ## 当前推荐顺序
 
+以下顺序是**当前 Product Stage 下关闭 Evidence Gap 的最佳已知技术顺序**，不是不可修改的长期产品承诺。若真实实验产生 Roadmap Feedback，应先判断影响范围，再按权威链修正 Product / Development Roadmap。
+
 已完成阶段不再重复执行；当前主线从 #31 继续：
 
 ```text
@@ -545,24 +581,27 @@ ArcheOS / 新向阳经营系统始终沿一条主线演化：
 
 并遵守：
 
-1. Core 概念以 `CONCEPTS.md` 为准；
-2. 产品行为规则以 `INFORMATION_GOVERNANCE.md` 为准；
-3. 优先复用已有概念，不建立平行模型；
-4. Object ID 稳定，Name / Role / View 可以演化；
-5. Atomic Information 与 World Model 分层，历史与 Evidence 不丢失；
-6. 存储 adapter 可替换，不让业务规则依赖 SQLite / JSONL；
-7. Change Proposal 只服务需要人类判断的变更，不成为所有写入的强制中间层；
-8. Change Journal 保留自动和人工变更的审计链，但不成为第二份事实源；
-9. Context Builder 是统一上下文组装能力，默认 bounded / provenance-aware / truncation-aware；
-10. 真实数据验收是阶段门槛，不以 synthetic tests 代替真实语义验证；
-11. 迁移采用 clean-cut / 单向导入，除非出现真实不可丢数据或外部消费者才重新讨论 compatibility；
-12. Human View 只消费 canonical read contracts，不建立第二份 truth；
-13. ArcheOS 不开发自己的 Agent，而是增强外部 Agent / Human 的认知与决策能力；
-14. 长期产品名回归“向阳经营系统”，但工程改名不得早于真实使用稳定和旧系统 clean-cut；
-15. M4 设计必须先执行 Concept Convergence Check；流程阶段名、UI 名称、Prompt 字段和运行记录不得自动升级为 Core concept；
-16. 使用 canonical `Protocol` 控制流程 / 门禁，`Policy` 控制可调参数，`Pattern` 承载可复用解决结构，Prompt 只作为实现 artifact，不把经营判断硬编码进 runtime；
-17. 历史 Decision 必须固定引用当时使用的 Protocol / Policy / Pattern 版本或 snapshot，不允许后来修改规则而改写历史；
-18. 决策可观测性通过 `Derived Artifact / Audit Event / Projection / View / Evidence` 实现，不新建 ThinkingRun / DecisionTrace truth，也不存储模型私有 chain-of-thought；
-19. 前端“模型库”第一版映射到 canonical Pattern Library；只有真实实验证明 Pattern 无法表达时，才考虑新增 Model concept；
-20. 用户未来可以观察、比较、调整 Protocol / Pattern，但编辑与激活必须分离，变更先验证再生效，并保留回滚能力；
-21. 不因为未来可能需要某个能力，就提前建设完整框架。
+1. `PRODUCT_SPEC.md` 定义长期产品方向与边界；`PRODUCT_ROADMAP.md` 定义 Product Stage 与 Stage Gate；本文件只能在该上游方向内安排技术演化；
+2. 新的重大能力、集成、UI 或平台基础设施进入 Ready 前必须通过 `AGENTS.md` 的 Roadmap Alignment Check，说明它关闭哪个当前 Evidence Gap；
+3. Experiment / Issue / PR / Real-world Validation 可以产生 Roadmap Feedback；失败实验只要获得了预期 Evidence，也可以是有效产品进展；
+4. Core 概念以 `CONCEPTS.md` 为准；
+5. 产品行为规则以 `INFORMATION_GOVERNANCE.md` 为准；
+6. 优先复用已有概念，不建立平行模型；
+7. Object ID 稳定，Name / Role / View 可以演化；
+8. Atomic Information 与 World Model 分层，历史与 Evidence 不丢失；
+9. 存储 adapter 可替换，不让业务规则依赖 SQLite / JSONL；
+10. Change Proposal 只服务需要人类判断的变更，不成为所有写入的强制中间层；
+11. Change Journal 保留自动和人工变更的审计链，但不成为第二份事实源；
+12. Context Builder 是统一上下文组装能力，默认 bounded / provenance-aware / truncation-aware；
+13. 真实数据验收是阶段门槛，不以 synthetic tests 代替真实语义验证；
+14. 迁移采用 clean-cut / 单向导入，除非出现真实不可丢数据或外部消费者才重新讨论 compatibility；
+15. Human View 只消费 canonical read contracts，不建立第二份 truth；
+16. ArcheOS 不开发自己的 Agent，而是增强外部 Agent / Human 的认知与决策能力；
+17. 长期产品名回归“向阳经营系统”，但工程改名不得早于真实使用稳定和旧系统 clean-cut；
+18. M4 设计必须先执行 Concept Convergence Check；流程阶段名、UI 名称、Prompt 字段和运行记录不得自动升级为 Core concept；
+19. 使用 canonical `Protocol` 控制流程 / 门禁，`Policy` 控制可调参数，`Pattern` 承载可复用解决结构，Prompt 只作为实现 artifact，不把经营判断硬编码进 runtime；
+20. 历史 Decision 必须固定引用当时使用的 Protocol / Policy / Pattern 版本或 snapshot，不允许后来修改规则而改写历史；
+21. 决策可观测性通过 `Derived Artifact / Audit Event / Projection / View / Evidence` 实现，不新建 ThinkingRun / DecisionTrace truth，也不存储模型私有 chain-of-thought；
+22. 前端“模型库”第一版映射到 canonical Pattern Library；只有真实实验证明 Pattern 无法表达时，才考虑新增 Model concept；
+23. 用户未来可以观察、比较、调整 Protocol / Pattern，但编辑与激活必须分离，变更先验证再生效，并保留回滚能力；
+24. 不因为未来可能需要某个能力，就提前建设完整框架。
