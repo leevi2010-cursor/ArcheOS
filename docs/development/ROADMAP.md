@@ -279,7 +279,12 @@ Human View 是人类理解和治理 ArcheOS 的 Presentation 层，不是新的�
 - **Pending / Conflict / Unresolved**：明确展示待判断、冲突、不确定和 Context truncation，不把候选伪装成事实；
 - **Human Judgment**：在真实使用证明 CLI / Agent prompt 审核效率不足时，为已有 Governance 提供轻量人类操作界面；不得另建第二套 Proposal / Review truth；
 - **Context Preview**：让用户看到 Agent 实际会读取到的 bounded Context，帮助发现缺失、噪声和错误结构化；
-- **Source / Intake Status**：查看 Source、Representation、processing/completeness/warnings，但不把前端变成通用文件管理器。
+- **Source / Intake Status**：查看 Source、Representation、processing/completeness/warnings，但不把前端变成通用文件管理器；
+- **Thinking Run / Decision Trace**：让用户按阶段查看一次系统性思考使用了哪些输入、产生了哪些结构化中间结果、哪些 Evidence / Unknown / Assumption 支撑最终 Decision Proposal；不得展示或长期保存模型私有 chain-of-thought；
+- **Thinking Protocol Library**：查看当前有哪些 Thinking Protocol、各自解决什么类型的问题、当前 active version、历史版本、状态与变更记录；用户应能看到 Protocol 的阶段、Prompt/Policy 绑定和版本差异；
+- **Reasoning / Decision Model Library**：查看系统目前有哪些“解决问题的方法模型”，它们适用于什么问题、需要什么输入、输出什么、有哪些假设/限制、当前版本与状态，以及哪些 Thinking Protocol / stage 正在使用它们；这里的“模型”指方法模型 / 决策模型，不等于 GPT 等基础大模型；
+- **Decision → Protocol / Model Drill-down**：每个 Decision Proposal / Decision 页面显示本次使用的 `protocol_version` 与 Reasoning / Decision Model version，并提供链接跳转到对应 Protocol / Model detail；同时保留实际执行所用外部基础模型、Prompt version、Policy snapshot 作为运行 provenance；
+- **Protocol / Model Governance**：未来允许用户至少观察、比较和追溯协议与方法模型；当开放调整能力时，采用 draft → validate/compare → activate → deprecate/rollback 的治理路径，不允许直接覆盖已经参与历史 Decision 的版本。
 
 旧 `sunward-operating-system` 前端可以作为设计素材，优先复用：
 
@@ -386,20 +391,144 @@ Provider 不建立自己的 Atomic Information 生命周期。
 
 ## M4 — 主动认知与决策增强（后置探索）
 
-ArcheOS 的职责是增强外部 Agent / Human 的长期认知和决策依据，不实现自有 Decision Agent。
+ArcheOS 的职责是增强外部 Agent / Human 的长期认知和决策依据，不实现自有 Decision Agent。真正的推理交给外部 Agent；ArcheOS 负责让这段推理过程**系统化、可控、可观察、可版本治理、可追溯**。
 
-目标方向：
+### M4-A — Thinking Protocol 契约实验（#42，当前 blocked）
+
+#42 启动时优先验证 **Thinking Protocol**，而不是直接建设 `DecisionEngine`。
+
+第一版建议把系统性思考拆成受控阶段：
 
 ```text
-Context / Evidence / Preference / Constraint / Goal
-→ 外部 Agent 主动发现问题、探索、学习和提出 Decision Proposal
-→ Human Judgment / governed Decision
+Thinking Trigger
+→ Problem Framing
+→ Context Assembly
+→ Option Generation
+→ Option Evaluation
+→ Challenge / Critique
+→ Decision Proposal
+→ Human Decision
 → Action / Commitment
-→ Feedback 重新进入 Information lifecycle
-→ 更新后的 Context
+→ Feedback
 ```
 
-#42 负责未来真实业务决策契约实验，当前保持 blocked。正式 Goal、consequential Decision 仍保持 human-in-the-loop；不提前建设 MotivationEngine、ValueSystem、CausalGraph 或 autonomous Agent runtime。
+职责边界：
+
+```text
+Code / Runtime
+  = 控制阶段顺序、权限、输入输出 contract、预算、失败重试与 human gate
+
+Prompt
+  = 定义某一步如何思考、如何提出方案、如何评价与挑战
+
+Policy
+  = 定义可调整参数，例如最少方案数、风险偏好、时间范围、是否要求独立 Critic
+
+Context
+  = ArcheOS 提供的 Goal / World Model / Information / Evidence / Preference / Constraint / previous Decision / Feedback
+
+External Agent
+  = 执行推理
+```
+
+例如“先提出 3 个可行方案”不应写死为业务代码；更适合作为可版本化 Policy + Prompt 约束。代码只验证结果是否满足当前 contract。
+
+每个 stage 都应有明确的 structured input / output，优先保存可审计的 reasoning artifacts，例如：
+
+- problem framing；
+- known facts / unknowns；
+- assumptions；
+- alternatives；
+- evaluation criteria / tradeoffs；
+- risks；
+- challenge / counter-evidence；
+- rejected alternatives；
+- recommendation rationale；
+- `what_would_change_my_mind`；
+- Evidence refs。
+
+不要求、不展示、不长期保存外部模型的私有 chain-of-thought；系统治理的是**可检查的论证结果与依据**。
+
+### M4-B — Thinking Protocol Governance（规划，未启动）
+
+Thinking Protocol 不应成为黑盒 Prompt。长期至少需要：
+
+- `protocol_id + version`；
+- version 一旦参与正式 Thinking Run / Decision，不原地覆盖；
+- `draft / active / deprecated` 等治理状态；
+- 用户可观察当前 active version、历史版本、阶段定义、Prompt / Policy / Model 绑定；
+- 版本 diff、change rationale、created/approved provenance；
+- 支持基于真实 Decision Case 做新旧版本对照；
+- 新版本先 draft / validate，再 activate；
+- 必要时可以 rollback 到历史 active version；
+- 每次 Thinking Run 固定记录实际使用的 Protocol / Prompt / Policy snapshot，保证后来能够重放“当时为什么这样思考”。
+
+用户未来可以调整 Protocol，但“可编辑”与“立即生效”必须分离，避免一次修改悄悄改变所有后续决策逻辑。
+
+### M4-C — Reasoning / Decision Model Library（规划，未启动）
+
+建立一个可治理的**问题解决方法模型库**。这里的 Model 不是 GPT / Claude / Codex 等基础大模型，而是用于解决某类问题的稳定方法模型，例如未来可能出现的投资评价模型、招聘判断模型、客户机会评价模型、假设检验模型等；是否真的建立这些具体模型必须由真实业务反复使用证明，不提前造 ontology。
+
+Model Library 至少需要回答：
+
+1. 当前库里有哪些 Model；
+2. 每个 Model 解决哪类问题 / 不解决什么；
+3. 当前哪个 Protocol / stage 使用哪个 Model；
+4. Model 需要哪些输入、产生哪些结构化输出；
+5. Model 的 assumptions / constraints / applicability；
+6. 当前版本、状态、owner、来源与变更历史；
+7. 有哪些真实 Decision / Feedback 支持或挑战该 Model；
+8. 某次 Decision 实际使用的是哪个 Model version。
+
+Model 同样采用 append-only version governance：已经参与历史 Decision 的版本不可被原地篡改；修订产生新版本，并允许 compare / deprecate / rollback。
+
+外部基础大模型的运行选择属于 execution provenance，应另外记录 provider/model/version（若可得）、Prompt version、tool/runtime 信息，但不与 Reasoning / Decision Model Library 混为一个概念。
+
+### M4-D — Decision Traceability + Human Oversight（规划，前端后置）
+
+未来 Decision / Thinking Run 必须能够从最终结果逐层回看：
+
+```text
+Decision / Decision Proposal
+  → Thinking Run
+  → Thinking Protocol version
+  → stage outputs
+  → Reasoning / Decision Model version(s)
+  → Prompt version / Policy snapshot
+  → Context / Evidence / Assumption / Unknown
+  → external model execution provenance
+```
+
+前端重点不是展示“AI 的脑内思维”，而是让用户清楚看到：
+
+- 为什么启动这次思考；
+- 使用了哪个 Protocol / 哪个版本；
+- 各阶段输入与结构化输出是什么；
+- 生成了哪些候选方案；
+- 使用什么方法模型比较；
+- 哪些证据支持 / 反对；
+- 哪些假设仍未验证；
+- 最终推荐与 Human Decision 有何差异；
+- 后续 Feedback 是否支持原 Decision；
+- 从 Decision 页面一键跳转到 Protocol detail 与 Model detail。
+
+这一能力与 Human View / Frontend 同步规划，但**当前不启动前端开发**。
+
+### M4-E — 主动触发机制（更后置探索）
+
+当被动 Decision Protocol 被真实业务验证以后，再研究系统何时应该主动思考。优先从现有概念组合探索：
+
+```text
+Goal
++ Health / State
++ Constraint / Red Line
++ Signal / anomaly / opportunity
++ Policy
+→ Thinking Trigger
+→ Explore / Decision Protocol
+```
+
+暂不建设 `MotivationEngine`、`ValueSystem`、`CausalGraph` 或 autonomous Agent runtime。生存、增长、Vision、Red Line 等动力机制必须先通过真实业务实验验证，再决定是否需要新的 canonical concept。
 
 ---
 
@@ -428,7 +557,8 @@ Context / Evidence / Preference / Constraint / Goal
 #43 Codex Conversation production       等 #47 收敛
 #44 Workspace portability               后置
 Human View / Frontend                    已写入 Roadmap，不启动
-#42 主动认知 / 决策增强实验              blocked
+#42 Thinking Protocol / 决策增强实验      blocked；真实认知链稳定后再启动
+Protocol / Model Governance              M4 后置规划，不启动
 ```
 
 旧 `sunward-operating-system` 从现在起不再承担产品主线；新输入、新认知、新 Agent Context 与新功能均进入 ArcheOS。#17 只负责完成最后的旧数据 / UI 资产盘点和仓库正式 Archive 条件确认，而不是维持旧系统继续运行。
@@ -457,4 +587,9 @@ ArcheOS / 新向阳经营系统始终沿一条主线演化：
 12. Human View 只消费 canonical read contracts，不建立第二份 truth；
 13. ArcheOS 不开发自己的 Agent，而是增强外部 Agent / Human 的认知与决策能力；
 14. 长期产品名回归“向阳经营系统”，但工程改名不得早于真实使用稳定和旧系统 clean-cut；
-15. 不因为未来可能需要某个能力，就提前建设完整框架。
+15. Thinking Protocol 用代码控制流程 / 权限 / contract，用 Prompt 与 Policy 控制可演化的思考方法，不把经营判断硬编码进 runtime；
+16. Thinking Protocol、Prompt、Policy 与 Reasoning / Decision Model 都必须版本化；历史 Decision 必须固定引用当时使用的版本，不允许原地改写历史；
+17. 决策可观测性以 structured reasoning artifacts、Evidence、Assumption、Unknown、Alternatives、Tradeoffs 和 Feedback 为核心，不存储或暴露模型私有 chain-of-thought；
+18. Reasoning / Decision Model Library 与外部基础大模型 registry/provenance 分离：前者治理“用什么方法解决问题”，后者记录“由什么模型执行”；
+19. 用户未来可以观察、比较、调整 Thinking Protocol / Model，但编辑与激活必须分离，变更先验证再生效，并保留回滚能力；
+20. 不因为未来可能需要某个能力，就提前建设完整框架。
