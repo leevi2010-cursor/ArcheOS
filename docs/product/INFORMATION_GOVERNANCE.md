@@ -14,6 +14,8 @@
 - `AGENTS.md`：约束 Architect / Executor 如何遵守上述权威文档；
 - GitHub Issue：定义一次具体开发要实现哪些规则。
 
+本文件不维护当前 Issue 顺序或 runtime 实现状态；这些分别以 `docs/development/ROADMAP.md`、GitHub Issue 和代码为准。
+
 ---
 
 ## 2. Source 接入与 Managed Source 权威
@@ -44,7 +46,7 @@ Source 的接入分为临时发现和正式准入两个阶段：
 - `ingested_from` 只保留可失效的历史接入提示，不参与 Evidence 定位；
 - Handoff Marker 只能在 Managed Source 已复制、校验且 Manifest 持久化后，经用户另行授权写入；它不是 Source、Evidence 或同步机制。
 
-当前 `process_audio()` 的外部 path、文件名 stem 与 SHA-256 前缀派生 ID、以及 processing manifest 中的绝对路径，属于 M1 legacy provenance。它们保留为后续 Source 身份迁移对象，本规则不授权当前 Issue 修改代码。
+历史 package / schema 若仍保留早期 path/hash provenance，只作为已实现 legacy compatibility 读取，不改变上述当前 Source 权威，也不得成为新设计继续使用旧身份语义的理由。
 
 ---
 
@@ -57,6 +59,7 @@ Source 的接入分为临时发现和正式准入两个阶段：
 - 保留来源和 Evidence；
 - 保留 context 与 confidence / uncertainty；
 - 能够明确识别声明主体 / 立场时，保留 Claim；
+- 能够明确识别为可检验、尚未成为稳定知识的命题时，可以按 canonical Hypothesis 语义保存；
 - 重复处理同一信息时应避免无意义重复；
 - Atomic Information 后续修订不得静默覆盖历史，应保留版本或等价的可追溯历史。
 
@@ -82,31 +85,51 @@ Claim 可以成为 World Model 变化的依据之一，但是否写入 World Mod
 
 ---
 
-## 5. Atomic Information 与已有 Object 的消化
+## 5. Hypothesis 治理
+
+Hypothesis 是 Atomic Information 的 canonical 语义形态，用于保存**尚未成为稳定知识、但可以被后续 Evidence / Feedback 支持、反对、修订或淘汰的可检验命题**。
+
+运行时遵循：
+
+- 影响 Judgment / Decision 的关键 Hypothesis 必须显式保存，不能只藏在 Prompt、自由文本或模型私有 chain-of-thought 中；
+- Hypothesis 应尽可能记录 supporting Evidence、challenging / counter Evidence、适用 scope、预期可观察结果和后续 Feedback；
+- 新 Evidence / Feedback 对 Hypothesis 的结果可以是 `supports / challenges / inconclusive` 或等价语义，不能强迫每次反馈都给出二元真/假；
+- Hypothesis 被现实支持到什么程度**不得复用 `Atomic Information.confidence`**；后者仍只表示抽取 / 语义理解置信度；
+- 不能因为模型认为 Hypothesis 很可能正确，就自动把它升级成 World Model fact、Policy、Pattern、Protocol 或 Principle；
+- Hypothesis 被反对、修订或淘汰时仍保留历史与 Evidence，不删除旧版本来制造“从未判断错过”的假象；
+- 当某个 Hypothesis 经过多个独立场景反复支持，需要沉淀为 Pattern / Protocol / Policy / Principle 时，必须通过相应治理创建或修订目标结构的新版本，并保留 Hypothesis / Evidence / Feedback provenance；不得原地改类型。
+
+一次 Decision 成功不自动证明它依赖的所有 Hypothesis；一次 Decision 失败也不自动否定所有 Hypothesis。复盘必须按可观察结果与 Evidence 分别判断。
+
+---
+
+## 6. Atomic Information 与已有 Object 的消化
 
 新的 Atomic Information 涉及已有 Object 时，系统先判断业务影响：
 
-### 4.1 补充
+### 6.1 补充
 
-新信息与当前认知相容，只是增加更多事实、背景、Claim 或细节。
+新信息与当前认知相容，只是增加更多事实、背景、Claim、Hypothesis 或细节。
 
 处理：**自动吸收 Information；不需要为了“保存信息”强行修改 World Model。**
 
-### 4.2 更新
+### 6.2 更新
 
 新信息说明已有长期认知需要调整，例如名称、Role、Relationship 或 Lifecycle 的某项信息需要变化。
 
 处理：满足“安全自动更新”条件时可以自动执行；否则交给人类判断。
 
-### 4.3 冲突
+### 6.3 冲突
 
 新信息、Claim 或 Evidence 与已有可信认知无法安全同时成立。
 
 处理：**不得静默覆盖，保留所有来源并交给人类判断。**
 
+Hypothesis 与当前 World Model 不一致时，首先把它当作待验证命题，不把“提出不同解释”本身当成需要立即重写 World Model 的冲突。
+
 ---
 
-## 6. 安全自动更新
+## 7. 安全自动更新
 
 已有 Object 的更新在同时满足以下条件时可以自动执行：
 
@@ -119,15 +142,16 @@ Claim 可以成为 World Model 变化的依据之一，但是否写入 World Mod
 - 不涉及删除 Object；
 - 不会使仍需保留的 Object 变成孤立对象；
 - 不需要模型猜测一条不确定的 Relationship；
-- 如果信息带有 Claim，其结构变化不依赖尚未解决的“该相信谁”判断。
+- 如果信息带有 Claim，其结构变化不依赖尚未解决的“该相信谁”判断；
+- 如果结构变化依赖某个尚未验证的 Hypothesis，则不能仅凭该 Hypothesis 自动执行。
 
 例如：系统已经明确知道“展厅经营”是哪一个长期对象，新的可靠信息说明“9 月 1 日正式启动”，且与已有信息不冲突，可以直接补充其开始时间，不要求人类再次确认。
 
-自动更新仍必须保存来源、Evidence、Atomic Information / Claim 和历史。
+自动更新仍必须保存来源、Evidence、Atomic Information / Claim / Hypothesis 和历史。
 
 ---
 
-## 7. 必须交给人类判断的情况
+## 8. 必须交给人类判断的情况
 
 以下情况停止自动修改，并请求人类判断：
 
@@ -139,13 +163,14 @@ Claim 可以成为 World Model 变化的依据之一，但是否写入 World Mod
 - 新增或调整 Role 时，无法清楚说明它与对象当前业务上下文、现有关系的联系；
 - 变更可能使仍需保留的 Object 变成孤立对象；
 - 涉及真正的业务取舍，而不是证据明确的信息更新；
-- 需要比较不同 claimant / source 的可信度才能得出结论。
+- 需要比较不同 claimant / source 的可信度才能得出结论；
+- 需要把尚未验证的 Hypothesis 当作既定事实才能完成 consequential change。
 
 人类判断可以直接通过 AI 对话或 prompt 完成，不要求专门审核前端。
 
 ---
 
-## 8. Relationship 治理
+## 9. Relationship 治理
 
 当前允许写入 World Model 的通用 Relationship 语义以 `CONCEPTS.md` 为唯一词汇权威。
 
@@ -166,13 +191,13 @@ related_to
 - 关系方向必须明确；
 - 不同时持久化一条关系及其纯查询意义上的反向副本；
 - 能用更具体已批准关系表达时，不应为了省事全部写成 `related_to`；
-- 现有词汇不足时保留 Atomic Information / Claim，并交由 Architect 判断是否需要扩展，不允许 Agent 临时发明新的 relation 值。
+- 现有词汇不足时保留 Atomic Information / Claim / Hypothesis，并交由 Architect 判断是否需要扩展；在 `CONCEPTS.md` 修改通过前，不允许 Agent 临时发明新的 relation 值。
 
-后续是否增加 `supports`、`participates_in`、`serves` 等关系，以真实 B2 / B4 数据反复出现的需求为依据，不提前扩展。
+是否增加新的通用 Relationship，只以真实数据反复证明的缺口为依据，不提前扩展。
 
 ---
 
-## 9. 新建 Object 与孤立对象
+## 10. 新建 Object 与孤立对象
 
 ArcheOS 应尽量避免创建没有业务联系的孤立 Object。
 
@@ -182,17 +207,17 @@ ArcheOS 应尽量避免创建没有业务联系的孤立 Object。
 - 如果暂时无法建立关系，应向人类说明为什么这个对象仍值得单独长期保留；
 - 人类确认后才进入长期 World Model。
 
-系统不能因为录音或文档里出现了一个名词，就自动把它升级成 Object。
+系统不能因为录音、文档、Conversation 或 Hypothesis 里出现了一个名词，就自动把它升级成 Object。
 
 ---
 
-## 10. 删除 Object 与关系安全
+## 11. 删除 Object 与关系安全
 
 删除 Object 必须由人类确认。
 
 删除前检查：
 
-- 是否仍有重要 Atomic Information / Claim / Evidence / 历史依赖这个 Object；
+- 是否仍有重要 Atomic Information / Claim / Hypothesis / Evidence / 历史依赖这个 Object；
 - 删除后是否会让其他仍需保留的 Object 因失去唯一有效联系而变成孤立对象；
 - 是否需要先建立新的业务关系，或一起处理相关 Object。
 
@@ -202,7 +227,7 @@ ArcheOS 应尽量避免创建没有业务联系的孤立 Object。
 
 ---
 
-## 11. 面向人类的表达规则
+## 12. 面向人类的表达规则
 
 所有面向人类的内容必须使用**通俗业务语言**，而不是内部技术语言。
 
@@ -227,6 +252,13 @@ ArcheOS 应尽量避免创建没有业务联系的孤立 Object。
 
 当冲突来自不同 Claim 时，面向人类应说明“谁表达了什么、依据来自哪里、为什么目前不能安全合并”，而不是只显示内部冲突代码。
 
+当建议依赖关键 Hypothesis 时，应明确告诉用户：
+
+- 当前假设是什么；
+- 哪些 Evidence 支持 / 反对；
+- 哪个结果尚未验证；
+- 什么新 Evidence 可能改变当前判断。
+
 例如内部动作可能是：
 
 ```text
@@ -242,7 +274,7 @@ add_role(business_line)
 
 ---
 
-## 12. 存储无关性
+## 13. 存储无关性
 
 上述业务规则不得写死在某一种数据库 Adapter 中。
 
@@ -250,7 +282,7 @@ add_role(business_line)
 
 - 自动更新边界一致；
 - 人工判断边界一致；
-- Claim / Evidence 与历史要求一致；
+- Claim / Hypothesis / Evidence 与历史要求一致；
 - 孤立对象保护规则一致；
 - 人类表达规则一致。
 
