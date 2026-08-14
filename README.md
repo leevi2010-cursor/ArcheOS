@@ -1,24 +1,64 @@
-# ArcheOS（元枢）
+# ArcheOS — 向阳经营系统重构工程
 
-> **当前能力：** ArcheOS 是本地可安装的信息治理与 Agent 记忆底座，提供 Workspace、Managed Source、Atomic Information、受治理 World Model 与只读 Context 能力，供人、Codex、其他 Agent 和自动化系统按权限使用。
->
-> ArcheOS 不开发自己的 Agent，也不自动把 Agent 推断写入长期认知；长期变更必须遵守既有 Evidence、Proposal 与人类判断边界。安装程序只提供代码和本地运行时，不同步用户资料。
+> **产品名称：向阳经营系统（Sunward Operating System）**  
+> `ArcheOS` 是当前重构 / 迁移阶段的工程与仓库代号。
 
-## 本地安装与 Codex 接入
+ArcheOS 是一个本地优先、用户拥有、模型无关、可追溯、受治理的长期认知底座。它把持续进入的文件、录音、对话和业务资料转化为可长期维护的 Information / World Model / Context，供 Human、Codex 和其他 External Agent 使用。
 
-ArcheOS 是本地运行的受治理信息上下文层，不是 Agent。本仓库的 Git clone 或安装程序**只获取代码，绝不会同步任何用户的本地 ArcheOS 数据**；`01_inbox/`、`02_processing/`、`03_information/` 和 `04_core/` 中的真实资料保持在本机，并默认由 Git 忽略。
+ArcheOS **不是 Agent**，也不会把 Agent 推断自动写成长期事实或正式 Decision。推理可以交给外部 Agent；ArcheOS 负责长期认知、Evidence、Context、治理和受控写回边界。
 
-核心 CLI 不安装音频、文档、OCR 模型或 JVM 运行时。可使用标准 Python 安装方式，例如：
+## 当前 Product Stage
+
+当前处于：
+
+> **Stage 1 — 证明“长期认知”真实成立。**
+
+当前重点不是补齐常见软件功能，而是用真实、异构、持续变化的数据证明：信息不丢、来源可追溯、重复/派生/时间变化/冲突不会被错误处理、Object identity 能稳定演化、Context 不会随着数据增长越来越混乱。
+
+产品阶段、Stage Gate 与长期商业化路线以 `docs/product/PRODUCT_ROADMAP.md` 为唯一产品路线权威；当前技术顺序以 `docs/development/ROADMAP.md` 为准。
+
+## 当前已具备的主要能力
+
+当前 main 已形成以下基础边界：
+
+- **Workspace**：本地初始化、doctor 与本机配置；
+- **Managed Source**：显式准入、不可变 Source identity、verify / restore、可选 Handoff Marker；
+- **Audio Processing**：只从已验证 Managed Source 读取，不再把外部绝对路径作为新 package 的 Source / Evidence 权威；
+- **Normalized Representation**：格式无关 contract、strict manifest、stable locator、completeness / warning、verify / no-replace publish；
+- **首批多格式 Adapter**：Markdown、text PDF、XLSX、PPTX、image structural preflight；
+- **Atomic Information / Claim / Evidence / Residue**：长期 Information foundation 与可追溯历史；
+- **Structured World Model**：稳定 Object identity、Name / Role / Lifecycle、Relationship；
+- **Information Governance**：安全自动更新、人类判断、冲突与孤立 Object 保护；
+- **Context Builder**：Object-scoped、bounded、provenance-aware、truncation-aware Context；
+- **Codex 只读接入**：通过本地 MCP 读取 canonical Context / Evidence，不绕过 Governance 写 Core。
+
+`Hypothesis` 已作为 canonical Information 语义写入概念与 ADR，但其决策增强 runtime 属于后续 Product Stage 2，不代表当前已经实现 Hypothesis engine。
+
+当前 Stage 1 尚未完成的关键能力与验证包括 Representation → Atomic Information contract 收口、正式 Semantic Analysis Provider、Conversation Ingestion、Information Consolidation、Object Emergence 与大规模真实数据压力测试；具体顺序不要从 README 推断，请读取 Development Roadmap。
+
+## 本地安装
+
+Git clone 或安装程序**只获取软件，不同步用户本地 ArcheOS 数据**。Workspace 中的真实 Source、Processing、Information 和 World Model 默认保留在本机并由 Git 忽略。
+
+核心 CLI：
 
 ```bash
 uv tool install git+https://github.com/leevi2010-cursor/ArcheOS.git
 # 或在源码目录中：python3 -m pip install .
+
 archeos --version
 ```
 
-音频处理与文档 Adapter 都是可选本地运行时，按需安装：`python3 -m pip install '.[audio]'` 或 `python3 -m pip install '.[document]'`。音频仍可能需要额外的本地模型与 `ffmpeg`，不会在核心安装时下载。
+音频和文档运行时按需安装：
 
-初始化一份本地 Workspace 后，CLI 会将其位置写入不含凭证的本机配置；重复初始化不会覆盖已有资料：
+```bash
+python3 -m pip install '.[audio]'
+python3 -m pip install '.[document]'
+```
+
+音频运行仍可能需要本地 `ffmpeg`、转写模型和 speaker diarization 模型；核心安装不会为了“可能以后用到”而自动下载大型模型。
+
+## 初始化 Workspace
 
 ```bash
 archeos init /path/to/archeos-workspace
@@ -26,7 +66,52 @@ archeos doctor
 archeos config show
 ```
 
-要让本机 Codex 使用只读 Context / Evidence MCP，可显式安装受 ArcheOS 标记管理的配置。它保留其他 Codex 设置、不读取或写入 token，也不会覆盖项目的 `AGENTS.md`：
+重复初始化不得覆盖已有 Workspace 数据。
+
+## Managed Source
+
+外部文件必须先显式准入，随后使用 stable `source_id`：
+
+```bash
+archeos source admit /path/to/file
+archeos source show <source_id>
+archeos source verify <source_id>
+archeos source list
+```
+
+恢复已验证 Source 时使用：
+
+```bash
+archeos source restore <source_id> /path/to/target
+```
+
+Handoff Marker 是可选外部交接说明，不是 Source、Evidence 或同步机制；仅在用户显式授权时使用相应 CLI。
+
+## 音频处理
+
+音频 Processing 只接受已准入、校验通过的 `source_id`：
+
+```bash
+archeos process <source_id> --language zh
+```
+
+开发 / 测试可以显式提供 transcript、speaker map 或 analysis fixture，但这些 fixture path 不改变 Source identity，也不得进入长期 provenance。
+
+## Normalized Representation
+
+首批文档 Adapter 已通过统一 Representation boundary 工作。具体可用 Adapter 名称和 CLI 参数以 `archeos representation --help` 与当前代码为准。
+
+重要边界：
+
+- Adapter 只产生可替换的派生表示；
+- Representation 不是新的 Source；
+- locator 必须回到 immutable Managed Source；
+- partial / unsupported content 必须显式 warning，不能静默丢失；
+- image structural preflight 不等于 OCR 或视觉语义理解。
+
+## Codex 只读接入
+
+初始化 Workspace 后，可显式安装 ArcheOS 管理的本地 MCP 配置：
 
 ```bash
 archeos integration codex install
@@ -34,273 +119,58 @@ archeos integration codex status
 archeos integration codex remove
 ```
 
-安装使用 Codex 已公开的本地 `config.toml` STDIO MCP 机制。重启或新开本地 Codex 会话后，可调用 `archeos_object_resolve`、`archeos_context_build`、`archeos_source_show` 与 `archeos_source_verify`。这些工具只复用 ArcheOS 的 canonical read services；不会写入 Object、Relationship、Decision、Source 或其他 Core 数据。
+它保留其他 Codex 设置，不读取或复制 token，也不会覆盖项目 `AGENTS.md`。重启 / 新开 Codex 会话后，可以通过 ArcheOS 的 read tools 获取 Object、Context 与 Source verify 信息；当前 MCP 不提供绕过 Governance 的 Core 写入口。
 
-## 定位
+## 产品与架构边界
 
-ArcheOS 不是一款单一业务应用，而是一套以目录为载体、以治理规范为核心的长期信息基础设施。
-
-它负责把分散在电脑文件、沟通记录、业务系统和 Agent 工作过程中的信息，转化为可追溯、可理解、可复用、可授权和可演化的信息资产。不同工具可以读取或使用这些资产，但不各自维护一套彼此冲突的长期记忆。
-
-这个目录未来可以同时承载：
-
-- Codex 与其他 Agent 的长期记忆和上下文入口；
-- 各领域的概念、方法、经验和研究知识；
-- 项目、客户、产品、运营等业务数据与业务记录；
-- 决策、规则、权限、状态、证据和变更历史；
-- 面向不同人或 Agent 生成的索引、摘要和工作视图。
-
-## 核心目标
-
-1. **统一沉淀**：让长期有价值的信息进入同一个可治理的信息空间，而不是散落在聊天、下载目录和各类工具中。
-2. **保留事实来源**：任何重要结论都能追溯到原始来源、责任人、时间和证据。
-3. **形成共享记忆**：Codex 和其他 Agent 从同一套受控资产构建上下文，减少重复解释与记忆漂移。
-4. **沉淀领域资产**：把一次性信息逐步转化为可复用的领域知识、业务对象和方法。
-5. **支持持续演化**：信息可以被修订、合并、归档和派生，同时保留版本与审计线索。
-6. **保持可迁移**：优先采用开放、可读的格式，避免系统能力被某个 Agent、模型或软件锁定。
-
-## 信息如何进入系统
+长期结构保持：
 
 ```text
-电脑文件 / 沟通记录 / 业务系统 / Agent 产出
-                    ↓
-             收集与来源登记
-                    ↓
-       分类、去重、校验、授权与版本治理
-                    ↓
-   原始记录 / 事实 / 知识 / 业务对象 / 决策与规则
-                    ↓
-       索引、上下文包、Agent 记忆与业务视图
-                    ↓
-          人、Codex、其他 Agent 与自动化
+ArcheOS Core
+长期 Information / Evidence / World Model / Context / Governance
+        ↓
+External Agent
+理解 / 推理 / Judgment / 建议 / 获授权执行
+        ↓
+Domain Product
+围绕明确 Job-to-be-Done 提供用户体验
 ```
 
-Agent 记忆是治理后信息的一种使用方式，而不是独立的事实源。摘要、索引和上下文包可以重新生成；原始来源、确认过的事实和正式决策必须保留清晰的权威归属。
+未来可能形成 Founder、Sales、Project、Research、Operations 等 Domain Product，但哪个最先产品化由真实使用和市场 Evidence 决定，不在 Core 中预建领域 Agent 类型。
 
-## 治理原则
+## 隐私与数据所有权
 
-- **来源可追溯**：重要信息必须记录来源；推断、候选信息与已确认事实不得混写。
-- **权威唯一且有边界**：每类事实都要说明由哪个文件、对象或外部系统负责，目录不无条件复制外部系统的权威。
-- **状态明确**：草稿、待确认、有效、失效、已归档等状态必须可区分，Agent 产出不得自动视为事实或决策。
-- **变更可审计**：重要写入应保留作者、时间、原因、版本和必要的读回验证。
-- **最小必要权限**：读取、写入、分发和删除遵循明确授权，敏感信息按范围隔离。
-- **原始与派生分离**：原始材料、治理后的对象以及面向使用场景生成的视图分别管理。
-- **生命周期受控**：信息应有更新、合并、失效、归档和恢复规则，避免无限堆积。
-- **人拥有最终裁决权**：Agent 可以整理、建议和执行获授权的操作，但不能替代 Leo 对权限、事实、决策和删除的最终确认。
+- 密码、token、私钥和其他凭证不得进入仓库；
+- 真实客户录音、聊天正文、Object 数据和 Evidence 默认本地、Git-ignored；
+- 任何可能上传真实内容、调用远程模型或首次下载模型的路径必须遵守显式授权与当前 Issue 的 privacy boundary；
+- Source / Evidence / World Model 之间保持清晰权威边界；
+- 删除、对外同步、权限改变和 consequential Decision 保留明确的人类治理边界。
 
-## 安全边界
+## 权威文档导航
 
-“几乎所有信息”不等于把所有内容以明文提交到 Git。
-
-- 密码、访问令牌、私钥和其他凭证不得写入仓库；这里只保存安全引用或使用说明。
-- 受隐私、合同或法规约束的信息，应按权限分区，必要时仅登记元数据和受控存储位置。
-- 大型文件、频繁变化的数据或必须由业务系统维护的记录，可以保留在合适的外部存储中，并由本目录登记来源、标识、治理状态和访问方式。
-- 删除、对外同步和权限变更属于高风险动作，必须经过明确授权并保留验证证据。
-
-## 本系统不是什么
-
-- 不是一个随意堆放文件的总目录；
-- 不是某个模型私有、不可迁移的黑盒记忆；
-- 不是所有外部业务系统的机械镜像；
-- 不是未经确认就把 Agent 推断升级为事实的自动知识库；
-- 不是以收集数量为目标、缺少清理和失效机制的永久档案箱。
-
-## 当前阶段
-
-目前处于**定位确认阶段**：
-
-- 已明确统一信息治理、共享 Agent 记忆、领域知识和业务数据的总体方向；
-- 已清理旧 ArcheOS 产品路线的现行代码与配套工件；
-- 与现有 Tolaria／开放信息系统（OIOS）的关系仍待确认；本 README 不自动迁移、合并或取代其现行权威；
-- 尚未批准新的信息架构、目录规范、对象模型、权限模型或自动采集方案；
-- 在治理规范确定前，不进行大规模信息迁移。
-
-旧版本仍保留在 Git 历史中：
-
-- `c9aa46e`：退役前完整工件快照；
-- `31af498`：旧 ArcheOS 的归档状态。
-
-## 定位确认后的下一步
-
-1. 定义信息分层、核心对象及各自的权威边界；
-2. 设计目录结构、命名、元数据、状态和版本规范；
-3. 定义收集、校验、写入、读回、修订、归档与删除协议；
-4. 定义 Codex 与其他 Agent 的读取、记忆生成和受控回写方式；
-5. 选择一个真实领域做小规模迁移试点，再决定是否扩大到电脑中的其他信息。
-
-## M1 通用音频处理
-
-仓库提供一个最小 Python CLI，将 `.m4a`、`.mp3` 或 `.wav` 音频转换为 Processing 包，并把符合契约的 Atomic Information Candidate 自动吸收为本地 durable Atomic Information。运行环境需要 `ffmpeg`、`mlx_whisper`、官方 Codex Python SDK 和本地 pyannote 模型；不会修改原始音频，也不会自动修改 `04_core/` World Model 或决策层。
-
-处理链分为三个可替换边界：
+不要从 README 推断完整产品或架构规则。当前权威关系是：
 
 ```text
-audio → TranscriptionProvider → SpeakerProvider → AnalysisProvider → review package
+docs/product/PRODUCT_SPEC.md
+  产品长期是什么
+        ↓
+docs/product/PRODUCT_ROADMAP.md
+  依次必须证明什么
+        ↓
+docs/development/ROADMAP.md
+  当前 Stage 为了取得 Evidence 还缺什么
+        ↓
+GitHub Issue
+  一次具体交付
 ```
 
-- `TranscriptionProvider` 默认使用本机 `mlx_whisper`；
-- `SpeakerProvider` 默认使用本地 `pyannote/speaker-diarization-community-1` 自动生成中性 `Speaker_N` 标签，也可读取已有 diarization map；
-- `AnalysisProvider` 的首个实现通过官方 `openai-codex==0.144.4` Python SDK 使用 Codex app-server runtime，不读取或复制登录令牌。
+横向约束：
 
-Codex SDK/runtime 负责登录状态、app-server 生命周期、模型执行、运行时管理和 structured output；ArcheOS 只提交 AnalysisProvider 输入输出契约并消费已完成结果。ArcheOS 不管理 token、不选择模型、不实现重试，也不修补非法模型输出。
+- `AGENTS.md`：Architect / Executor 工作规则、Roadmap Alignment、开发前 Concept Convergence；
+- `docs/architecture/CONCEPTS.md`：canonical concepts 的唯一权威；
+- `docs/product/INFORMATION_GOVERNANCE.md`：信息吸收、自动更新与人类判断规则；
+- `docs/architecture/ARCHITECTURE.md`：系统边界与连接方式；
+- `docs/decisions/ADR-*.md`：关键架构决策与原因；
+- `docs/experiments/`：实验与验证证据。
 
-建议使用 Python 3.13 的独立虚拟环境安装固定的 M1 runtime 依赖，并单独安装转写工具：
-
-```bash
-python3.13 -m venv .venv
-source .venv/bin/activate
-python3 -m pip install -r requirements.txt
-python3 -m pip install mlx-whisper
-```
-
-`openai-codex` 会安装匹配的 Codex runtime，并复用本机现有 Codex 登录状态。ArcheOS 不发起登录，也不接触 OAuth/token 文件。
-
-自动 speaker diarization 首次使用前，需要：
-
-1. 在 Hugging Face 接受 [`pyannote/speaker-diarization-community-1`](https://huggingface.co/pyannote/speaker-diarization-community-1) 的访问条件；
-2. 通过本机 Hugging Face CLI 执行 `hf auth login` 配置访问权限；
-3. 首次运行时下载模型到标准 Hugging Face 本地缓存。
-
-模型下载后的推理在本机执行。ArcheOS 不保存、打印或提交 Hugging Face access token，并在未显式设置时默认使用 `PYANNOTE_METRICS_ENABLED=0`。
-
-先将外部音频显式准入为 Managed Source，再按返回的 `source_id` 处理：
-
-```bash
-python3 -m archeos source admit /path/to/discussion.m4a
-python3 -m archeos process <source_id> --language zh
-```
-
-首次运行可能需要由 `mlx_whisper` 和 pyannote 下载模型。也可以使用已有 Whisper JSON、speaker map 或 schema-compliant analysis JSON 进行可重复处理和诊断；提供 `--speaker-map` 时不会运行自动 diarization：
-
-```bash
-python3 -m archeos process <source_id> \
-  --transcript /path/to/discussion.transcript.json \
-  --speaker-map /path/to/discussion.speakers.json \
-  --analysis-file /path/to/discussion.analysis.json
-```
-
-speaker map 使用转写片段编号，只接受中性标签，不执行 Person 身份匹配：
-
-```json
-{
-  "segments": [
-    {"segment": 1, "speaker": "Speaker_1"},
-    {"segment": 2, "speaker": "Speaker_2"}
-  ]
-}
-```
-
-自动 diarization 只在某个 speaker 对 transcript segment 具有明确、占多数的正时间重叠时赋值。相同 overlap、无明显主导或无有效 overlap 时保留未知 speaker；缺少可用时间戳且没有 speaker map 时会给出可操作错误。M1 不执行声纹、voice embedding、Person 匹配或真实身份推断。
-
-`process` 只接受已经通过校验的 Managed Source ID；不会接收外部路径或自动准入。Processing 通过存储无关的只读 Source access contract 获取受控字节，且不会读取 `ingested_from`。新 package 固定使用 Managed Source 的 opaque `source_id`，不会把外部路径、受控绝对路径或临时 materialization 写入 artifact。`--transcript`、`--speaker-map` 与 `--analysis-file` 仅用于确定性的开发和测试 fixture，不改变 Source identity 或 Source Lineage。
-
-当前处理输出仍位于 `02_processing/<source_id>/`：
-
-```text
-manifest.json
-transcript.md
-meeting_summary.md
-atomic_information_candidates.jsonl
-residue.md
-```
-
-`manifest.json` 同时报告语义条目数和去重后的证据片段数：
-`atomic_information_candidates` / `atomic_information_candidate_segments`、`residue_items` / `residue_segments`。
-若同一片段同时支持 Atomic Information Candidate 和 Residue，`digestion_coverage.overlap_segments`
-会记录该重叠，因此始终可以按“Atomic Information Candidate 片段数 + Residue 片段数 - 重叠片段数”核对已覆盖片段总数。
-
-同一来源已有处理包时，CLI 会停止而不是覆盖。分析可以从一个转写片段提取多条 Atomic Information Candidate，也可以用多个片段共同支持一条 Candidate；歧义、冲突、上下文不足或证据不足的信息进入 residue。新 Processing 包使用 schema `1.2` 和 `candidate` 状态，明确区分自动 Atomic Information ingestion 与受治理的 World Model write。旧 schema `1.0` / `1.1` 包仍可读取，但不会再生成。
-
-## M2-C1b 本地 Managed Source
-
-Managed Source 是经过用户明确准入、完整复制并通过 size / `content_hash` 校验后的不可变字节快照。外部文件在准入前只是候选输入；准入后，系统只从 `01_inbox/` 下受控的 Managed Source 读取，不自动跟踪或覆盖外部文件。Source、Manifest 和临时 staging 数据均保持本地并由 Git 忽略。
-
-```bash
-python3 -m archeos source admit <external-file>
-python3 -m archeos source show <source_id>
-python3 -m archeos source list
-python3 -m archeos source verify <source_id>
-python3 -m archeos source restore <source_id> <target-file>
-python3 -m archeos source handoff write <source_id>
-python3 -m archeos source handoff show <external-file>.archeos.md
-```
-
-可通过 `--managed-root <path>` 指定本地受控根目录，默认是 `01_inbox/`。准入协议会在 `.staging/` 中流式复制，重新检查外部文件，独立校验受管副本，写入严格 Manifest 后再以 atomic rename 发布；任一步骤失败都会清理 staging，不会覆盖已有 Source，也不会修改外部文件。`source_id` 是 opaque 的 `src_<uuid4 hex>`，相同内容只产生 content-equivalent 提示，不合并 Source identity。`verify` 为只读校验；`restore` 先验证 Source、默认拒绝覆盖已有目标，并在目标同目录中流式复制后原子发布。
-
-`source handoff write` 是准入后的独立显式动作：仅在 Source 已验证、外部旧文件仍存在且目标目录可写时，才在旧文件旁以 atomic no-replace 方式写入 `<外部文件名>.archeos.md`。它只提示用户使用 `source_id` 回到系统，不会修改外部原文件、Manifest 或受管字节，也不会同步、删除或恢复外部文件。相同 `source_id` 的合法 marker 重试会返回 `existing`；任何用户文件、损坏 marker 或不同 Source 均会拒绝覆盖。原文件已移动或删除时，可用 `--target-file <仍存在的旧入口>` 明确指定文件。
-
-## M2-C2b Normalized Representation
-
-Normalized Representation 是从已验证 Managed Source 生成的可重算 Processing 派生物，不是 Source、Evidence authority、Atomic Information 或 Object。它以 Source 的不可变 `content_hash`、Adapter 名称/版本、kind 和 canonical configuration fingerprint 生成确定性 `representation_id`，并将严格 Manifest 与 artifact 放在 Git 忽略的 `02_processing/representations/`。
-
-```bash
-python3 -m archeos representation build <source_id> --adapter <adapter-name>
-python3 -m archeos representation show <representation_id>
-python3 -m archeos representation list --source <source_id>
-python3 -m archeos representation verify <representation_id>
-```
-
-四个命令均支持 `--managed-root` 与 `--representation-root`。本版本没有注册生产格式 Adapter；`build` 只保留受控入口，任何 Markdown、PDF、XLSX、PPTX、图片或 OCR Adapter 都必须由后续独立 Issue 实现并经过架构审核。`show`、`list`、`verify` 可读取和校验已存在的受控 Representation。
-
-## M2-B1 Durable Atomic Information
-
-正常 `process` 命令会在五个 Processing artifacts 成功落盘后，把 contract-valid candidates 作为 revision 1 自动写入本地 `03_information/atomic_information.jsonl`。`atomic_information_id` 由来源和 candidate ID 确定性生成；精确重试不会产生重复记录，来源内容发生变化时会 fail closed。原始 `concerns` 作为文本保留，M2-B1 不将其解释为 Object ID，也不执行任何 World Model 写入。
-
-可以使用手动命令安全重试或导入已有 M1 schema `1.0` 包：
-
-```bash
-python3 -m archeos information ingest 02_processing/<source_id>
-```
-
-开发和测试可以通过 `process --information-store <path>` 或 `information --store <path> ingest ...` 覆盖默认 Atomic Information store。实际 Atomic Information 数据位于 Git 忽略的 `03_information/**`；测试只使用合成数据和临时目录。读取旧 M1 schema `1.0` 包时仅兼容其历史 artifact 文件名；不会保留任何旧领域类型、ID、CLI 或存储路径别名。
-
-## M2-A 本地 World Model
-
-M2-A 使用标准库 SQLite 保存稳定 `Object` identity，并把 Name、Role、Lifecycle
-与 Relationship 分开建模。默认数据库是本地且被 Git 忽略的
-`04_core/archeos.sqlite3`；内部关系始终引用 opaque `object_id`，人工读取则通过
-resolver 同时看到当前名称和 active Roles。
-
-```bash
-python3 -m archeos object create --name "Synthetic Operations" \
-  --role business_line
-python3 -m archeos object show <object_id>
-python3 -m archeos object rename <object_id> --name "Renamed Operations"
-python3 -m archeos object add-role <object_id> brand
-```
-
-这些命令只提供本地开发和人工验证边界，不会从 Atomic Information Candidate
-自动创建或修改 Object。Role 仅接受 `CONCEPTS.md` 已批准的 vocabulary；
-relationship 与 lifecycle 的基础操作由 repository contract 提供，并通过临时数据库测试。
-
-## M2-B2 受治理消化
-
-M2-B2 以显式命令把 durable Atomic Information / optional Claim 解释为对现有 World Model 的受治理变更。Claim enrichment 作为同一 `atomic_information_id` 的新 revision 保存，可保留已解析或尚未解析的 claimant、`assert / deny / uncertain` stance 与归因置信度；旧 B1 记录缺少 Claim 时继续读取为 `claim=None`。确定性名称匹配只使用当前或历史 Name，并只做空格和大小写归一化；唯一精确匹配可以绑定稳定 Object ID，歧义不会猜测，无匹配不会自动新建 Object。
-
-安全、明确且证据充分的既有 Object 更新可以自动执行。Relationship 只接受 `part_of / member_of / responsible_for / depends_on / related_to`，并保留方向。新建、删除、Claim 冲突、歧义、关系不确定及 Role/Relationship 重解释会生成轻量 Change Proposal，等待人类批准、拒绝或稍后决定；`deferred` 仍属于未决状态，之后可以批准或拒绝。provider 上下文保持最多 20 条，但 Claim 冲突的自动执行安全门会扫描全部相关 current Atomic Information。已有 Claim 的人工修订以同一 Atomic Information 的新 revision 保存，不会出现只改 Proposal 状态的无效果批准。所有实际变更进入 append-only Change Journal；Atomic Information、Claim、Evidence 与 World Model 历史均保留。Atomic Information extraction confidence 和 Claim attribution confidence 不会被复制为 World Model truth confidence。
-
-批准前会同时检查 World Model before-state 与 Atomic Information revision。SQLite transaction 内的 apply receipt 会记录已经真正提交的结构变更；自动重试会在再次调用 interpretation provider 前扫描并补齐旧 receipt，人工批准一旦已有 receipt 就不能再改成拒绝或稍后决定。若后续 Atomic Information binding、Change Journal 或 Proposal JSONL 写入失败，重试只补齐缺失记录，不会重复创建、删除或结束结构。B2 不会自动跟在 B1 ingestion 后运行。
-
-```bash
-python3 -m archeos digest information <atomic_information_id>
-python3 -m archeos digest pending
-python3 -m archeos digest decide <proposal_id> approve
-```
-
-默认解释器通过官方 Codex SDK 使用 read-only、deny-all、ephemeral structured-output runtime。开发、测试和可重复诊断可用 `digest information ... --interpretation-file <path>` 提供结构化解释；该路径不需要网络。默认本地记录位于 Git 忽略的 `03_information/change_proposals.jsonl` 与 `03_information/change_journal.jsonl`，World Model 仍使用 `04_core/archeos.sqlite3`。
-
-## M2-B3 统一 Context Builder
-
-Context Builder 只读地组合一个 Object 的当前 World Model、直接 Relationship、已绑定的当前 Atomic Information、已应用变更和未决（`pending` / `deferred`）Proposal；不会调用模型、访问网络、写入任何 store，也不会递归展开 Relationship。默认边界由 `ContextRequest` 校验，超出边界时在 metadata 中报告覆盖范围和原因。
-
-```bash
-python3 -m archeos context build --scope object <object_id>
-```
-
-可用 `--max-relationships`、`--max-information`、`--max-changes`、`--max-pending` 和 `--max-evidence` 调整正整数上限。输出为 JSON Context Bundle；未知 Object、存储损坏或不满足 resolver 不变量时命令以非零状态失败，不输出部分上下文。
-
-运行自动化测试：
-
-```bash
-python3 -m unittest discover -s tests -v
-```
+如果文档发生冲突，不要选择“看起来更新”的一份继续实现；按照 `AGENTS.md` 的权威与冲突处理规则停止相关范围并提交 Architect 决策。
