@@ -79,6 +79,41 @@ Agents must:
 
 `Note` is not a canonical Core concept. Do not create a parallel Note model alongside Atomic Information.
 
+### Issue Concept Convergence Check
+
+Architect 与 Executor 都必须受“概念收敛”约束。任何涉及产品语义、长期状态、数据 contract、治理或新领域名词的 Issue，在进入 Ready 或开始实现前，必须先完成一次 **Concept Convergence Check**。
+
+Architect 在创建或实质修改 Issue 前必须：
+
+1. 先阅读当前 `docs/architecture/CONCEPTS.md`，不能凭会话记忆或旧系统命名直接设计；
+2. 列出 Issue 中会影响数据模型、生命周期、长期状态、API contract 或用户理解的主要名词；
+3. 对每个名词优先寻找已有 canonical concept，或使用已有概念组合表达；
+4. 明确区分 **Core concept** 与流程阶段名、UI 名称、Prompt 字段、临时变量、实现记录、View / Projection / Presentation label；后者不得因为出现在设计文档中就自动获得独立 ID、Store、生命周期或 API；
+5. `Candidate` 只表示某个已有概念的候选状态，必须说明候选的是什么；不得创建泛化 Candidate 实体；
+6. 对“模型 / 方法 / 流程 / 规则”类名词，先检查能否收敛到已有 `Pattern / Protocol / Policy / Principle`；
+7. 对建议、推断、候选目标、候选决策等内容，先检查能否用 `Atomic Information Candidate / Atomic Information / Claim / Goal / Decision / Action` 等已有语义表达，而不是新建平行 Proposal truth；
+8. 对一次运行或可观测记录，先检查能否用已有 `Processing Run / Audit Event / Derived Artifact / View / Projection` 表达，而不是把运行记录升级为业务 Core；
+9. 如果只是为了让代码更好写而需要一个新名词，默认不批准新增概念；
+10. 如果现有概念确实无法表达，先说明缺口、为什么已有概念组合仍不足、真实业务例子、与相邻概念的边界和旧称映射，再由 Architect 决定是否修改 `CONCEPTS.md`；在 concept change 合并前，相关 Issue 不得进入 Ready。
+
+涉及上述语义的 Issue 必须包含一个简短的：
+
+```markdown
+## Concept Convergence Check
+
+| Issue 术语 | Canonical 映射 | 是否新增概念 | 说明 |
+| --- | --- | --- | --- |
+| ... | ... | 否 | ... |
+
+New canonical concepts: none
+```
+
+理想结果是 `New canonical concepts: none`。如果不是 `none`，必须引用已经完成或明确前置的 `CONCEPTS.md` / domain concept change。
+
+Executor 开始实现时必须重新核对该表。如果实现过程中发现必须新增未获批准的类型、Role、Relationship、状态机、长期记录、Store 或 API noun，必须停止相关实现并报告 `ARCHITECT_DECISION_REQUIRED`，不得自行把实现便利升级成产品概念。
+
+PR Architecture Review 同样检查 **concept diff**：不仅看代码是否工作，也检查 PR 是否偷偷引入了 Issue 未声明的新概念或平行模型。
+
 ## Product-rule governance
 
 Business behavior is not defined in `CONCEPTS.md`.
