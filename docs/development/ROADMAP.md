@@ -11,7 +11,9 @@
 - GitHub Issue：定义当前一次开发必须交付什么；复杂 Issue 可以内嵌 Architect 批准的 Implementation Plan 与 Test Cases。
 - Durable Spec / ADR：仅在稳定契约或架构决策需要跨多个 Issue 复用时建立。
 
-产品名称长期使用 **向阳经营系统（Sunward Operating System）**；`ArcheOS` 仅作为当前重构迁移阶段的工程 / 仓库代号。
+产品名称长期使用 **向阳经营系统（Sunward Operating System）**；`ArcheOS` 仅作为当前重构迁移阶段的工程 / 仓库代号。待新系统完成真实数据验证、旧 `sunward-operating-system` 完成 clean-cut 退役且命名切换不会造成双重权威时，再将 ArcheOS 正式恢复为“向阳经营系统”产品名称；在此之前不为了改名打断当前主线。
+
+旧 `sunward-operating-system` 从当前阶段起视为 **legacy / migration source / UI design reference**：不再新增产品能力、不再写入新的 canonical 经营数据、不再作为 Agent 长期上下文权威。仓库是否正式 Archive 留到 #17 完成最终 KEEP / IMPORT / REBUILD / RETIRE 盘点后执行。
 
 ---
 
@@ -162,7 +164,7 @@ Object
 
 实现 authority：Issue #16。
 
-这是进入迁移和 Domain Agent 前的**阶段门槛**，不是新功能建设阶段。
+这是进入后续真实资料扩展和迁移验证前的阶段门槛，不是新功能建设阶段。
 
 使用至少一段真实家具经营录音验证：
 
@@ -189,7 +191,7 @@ Recording
 
 P0 信息丢失、P1 世界模型/治理错误阻止进入下一阶段。
 
-B4 不允许为了“让测试通过”而顺手新增 ontology、Web、Domain Agent 或大型基础设施。
+B4 不允许为了“让测试通过”而顺手新增 ontology、Web、自有 Agent 或大型基础设施。
 
 ### M2-C1a — Managed Source 架构权威
 
@@ -233,9 +235,13 @@ Issue #21 只固化 Managed Source 的权威边界，不实现 runtime。后续�
 
 在首批 Representation 稳定后，把可追溯的派生表示接入 Atomic Information 入口，保留 Source 与 locator 证据链。
 
+#### #48 — M3-B1a 微信 Conversation Representation 与统一信息消化接入
+
+在 #31 稳定后，以现有真实微信 Source 验证 Conversation Representation、message-level Evidence、bounded context 与统一信息消化。微信只做 provider-specific mapping，不建立微信专用长期信息模型。
+
 #### #32 — M2-C3a Information Consolidation 真实实验（内部并行）
 
-以真实、受控样本验证跨表示与跨 Source 的整理边界，不直接扩大为正式 runtime。
+以真实、受控样本验证跨表示与跨 Source 的整理边界，不直接扩大为正式 runtime。微信 Conversation 在可用后应成为真实实验的重要输入之一。
 
 #### #33 — M2-C3b Information Consolidation 运行时
 
@@ -260,9 +266,30 @@ Issue #23 可以在 #22 完成后并行处理用户交接说明。它不阻塞 #
 
 上述 runtime 和后续阶段不属于 Issue #21 的实现范围；Issue #21 不实现复制、恢复、删除、TOS 或多格式 adapter。
 
-### 横向能力：Human View（后置）
+### 横向能力：Human View / Frontend（已规划，后置，不启动）
 
-Object Profile、向阳生长树、Relationship Graph、Timeline 等人类展示能力继续后置，不阻塞 B1～B4、Migration Readiness 或首个 Domain Agent。
+Human View 是人类理解和治理 ArcheOS 的 Presentation 层，不是新的业务 truth，也不是当前信息消化主线的前置条件。
+
+第一版需求方向记录为：
+
+- **Object Profile**：一个长期 Object 的名称、Role、Lifecycle、关键关系、当前认知与未决事项；
+- **Relationship Graph / 向阳生长图**：可视化 Object 之间的长期关系，支持聚焦相关节点，但不把展示树结构反写为新的 canonical hierarchy；
+- **Timeline**：展示与 Object 相关的重要 Atomic Information、Decision、Change Journal 与时间变化；
+- **Information / Evidence Drill-down**：从结论展开到 Claim、Evidence、Representation locator 和 Source；
+- **Pending / Conflict / Unresolved**：明确展示待判断、冲突、不确定和 Context truncation，不把候选伪装成事实；
+- **Human Judgment**：在真实使用证明 CLI / Agent prompt 审核效率不足时，为已有 Governance 提供轻量人类操作界面；不得另建第二套 Proposal / Review truth；
+- **Context Preview**：让用户看到 Agent 实际会读取到的 bounded Context，帮助发现缺失、噪声和错误结构化；
+- **Source / Intake Status**：查看 Source、Representation、processing/completeness/warnings，但不把前端变成通用文件管理器。
+
+旧 `sunward-operating-system` 前端可以作为设计素材，优先复用：
+
+- React / React Flow 图交互经验；
+- 经营树、关系聚焦、卡片与详情面板的视觉模式；
+- Evidence 来源跳转；
+- `confirmed / candidate / needs_review` 一类状态表达；
+- unresolved questions、Timeline、经营态势等 Human View 经验。
+
+不得直接继承旧前端的 canonical 数据模型和 API，包括 `roadmap / asset / branch` 物理实体语义、旧 `cognition_kind`、旧 cognitive relation vocabulary 或旧 Review Center 数据权威。
 
 长期读取边界保持：
 
@@ -273,13 +300,13 @@ Canonical State
   → Presentation
 ```
 
-未来 Human View 与 Domain Agent 应尽量消费同一 canonical state/read contracts，而不是建立第二份 read truth。
+**当前不创建 Frontend 实现 Issue，不启动开发。** 只有当真实使用反复证明“人类理解 / 审核成为主要瓶颈”后，再由 Architect 根据当时的 canonical read contracts 创建最小 Human View Issue。
 
 ### M2-D — Migration Readiness & Clean-cut Plan
 
 实现 authority：Issue #17。
 
-只在 B4 无 P0/P1 blocker 后开始。
+只在前置真实数据链路无 P0/P1 blocker 后开始。
 
 目标：盘点 Tolaria 与旧 `sunward-operating-system`，把旧资料/能力分成：
 
@@ -292,12 +319,14 @@ RETIRE
 
 核心迁移原则：
 
-- 旧系统只作为 migration source，不作为新架构权威；
+- 旧 `sunward-operating-system` 已停止作为产品主线和数据权威，仅作为 migration source / design reference；
 - 不长期 dual-read / dual-write；
 - 旧开发态 structured state 不因为存在就必须兼容；
 - Raw Source / Evidence / provenance 不可因 structured reset 被误删；
 - IMPORT/REBUILD 必须映射到现有 canonical concepts；
 - 缺失的真实业务语义交由 Architect 决策，不在 migration script 中偷偷造 schema；
+- 前端资产优先判断为 `REBUILD / reference`，只复用可证明有价值的交互，不继承旧数据模型；
+- #17 完成旧数据与前端资产盘点后，可正式 Archive 旧 `sunward-operating-system` 仓库；
 - 先形成版本化 inventory / mapping / cutover plan，再创建少量单向 Import Issues。
 
 旧系统真正值得借鉴的模式以“收敛后复用”为原则：
@@ -305,81 +334,104 @@ RETIRE
 - Context Builder bounded / provenance / truncation；
 - 真实数据作为阶段门槛；
 - clean-cut migration；
-- consequential change 的审计性。
+- consequential change 的审计性；
+- Human View 的图、卡片、Evidence drill-down 与经营态势表达。
 
-旧系统以下复杂度不自动继承：Proposal Queue、Web Review Center、Agent Contract、MCP/HTTP、D1 coexistence、长期 compatibility facade。
-
----
-
-## M3 — Domain Agent
-
-M2-D readiness 完成后开始。
-
-目标：在 Atomic Information、Structured World Model 与 Context Builder 之上增加领域解释能力，而不污染 Core。
-
-第一条优先：**Sales Agent**。
-
-后续候选：Brand Agent、Project Agent。
-
-Domain Agent：
-
-- 优先读取 canonical Context Builder；
-- 不重新扫描全部 raw sources 作为常规路径；
-- 不各自建立 Context Builder；
-- 可以产生报告、判断、建议和需要治理的变更请求；
-- 不因为领域术语新增平行 Core ontology。
-
-至少一个真实 Domain Agent 工作流通过后，才具备正式 cutover 旧向阳写入路径的关键条件之一。
+旧系统以下复杂度不自动继承：Proposal Queue、Web Review Center、Agent Contract、旧 MCP/HTTP contract、D1 coexistence、长期 compatibility facade。
 
 ---
 
-## M4 — 决策与反馈闭环
+## M3 — Agent Integration + Conversation Ingestion
 
-目标：让结构化信息参与 Goal → Decision → Action → Feedback，并保留依据与结果反馈。
+ArcheOS 不开发自己的 Agent。M3 的目标是让 Codex 与未来其他 Agent 能够读取同一份受治理 Context，并把有长期价值的对话重新进入同一 Information lifecycle。
+
+### M3-A — 可安装 CLI + Codex 只读接入（#35，已完成）
+
+提供标准 `archeos` CLI、Workspace init/doctor、本地只读 MCP 与 Codex 一键接入。Agent 读取 canonical Context / Evidence，不获得绕过 Governance 的直接写权限。
+
+### M3-B — Conversation Ingestion
+
+Conversation 是输入 / Representation 形态，不是新的业务 Core。
+
+当前顺序：
+
+```text
+#48 微信 Conversation production v1
+↓
+#47 继续完成 Codex / ChatGPT 跨 Provider 对照研究
+↓
+#43 Codex Conversation production（按 #47 结论收敛）
+↓
+ChatGPT Export Provider（未来独立 Issue，按 #47 结论决定）
+```
+
+统一目标：
+
+```text
+WeChat / Codex / ChatGPT / future provider
+→ provider-specific capture/import
+→ Conversation Representation
+→ Representation Analysis Units
+→ Atomic Information + Residue + Evidence
+→ Consolidation / World Model / Context
+```
+
+Provider 不建立自己的 Atomic Information 生命周期。
+
+### M3-C — Workspace Portability（#44，已规划，当前后置）
+
+跨机器 Workspace、snapshot、single-writer authority 和远端 replica 继续保留为规划项，但在单机真实数据消化与日常使用尚未稳定前不作为当前优先级。
+
+---
+
+## M4 — 主动认知与决策增强（后置探索）
+
+ArcheOS 的职责是增强外部 Agent / Human 的长期认知和决策依据，不实现自有 Decision Agent。
+
+目标方向：
+
+```text
+Context / Evidence / Preference / Constraint / Goal
+→ 外部 Agent 主动发现问题、探索、学习和提出 Decision Proposal
+→ Human Judgment / governed Decision
+→ Action / Commitment
+→ Feedback 重新进入 Information lifecycle
+→ 更新后的 Context
+```
+
+#42 负责未来真实业务决策契约实验，当前保持 blocked。正式 Goal、consequential Decision 仍保持 human-in-the-loop；不提前建设 MotivationEngine、ValueSystem、CausalGraph 或 autonomous Agent runtime。
 
 ---
 
 ## 当前推荐顺序
 
+已完成阶段不再重复执行；当前主线从 #31 继续：
+
 ```text
-#9  M2-B1 Durable Atomic Information
+#31 Representation → Atomic Information
  ↓
-#10 M2-B2 Digestion + Lightweight Governance
+#48 微信 Conversation → 统一信息消化
  ↓
-#11 M2-B3 Context Builder — Object scope v1
+#32 Information Consolidation 真实实验
  ↓
-#16 M2-B4 Real End-to-End Validation
+#33 Information Consolidation 运行时
  ↓
-#21 M2-C1a Managed Source 架构权威
+#34 Object Emergence
  ↓
-#22 M2-C1b 本地 Managed Source 准入 / 校验 / 恢复
- ↓
-#24 M2-C1d 音频 Processing 切换到 Managed Source
- ↓
-#28 M2-C2a 开源调查 / 复用治理 / 多格式基准（可与 #24、#23 并行）
- ↓
-#29 M2-C2b Normalized Representation 公共契约
- ↓
-#30 M2-C2c 首批多格式 Adapter（内部并行）
- ↓
-#31 M2-C2d Representation → Atomic Information
- ↓
-#32 M2-C3a Information Consolidation 真实实验（内部并行）
- ↓
-#33 M2-C3b Information Consolidation 运行时
- ↓
-#34 M2-C4 Object Emergence
- ↓
-#17 M2-D Migration Readiness / Clean-cut Plan
- ↓
-#35 M3-A Sales Agent
- ↓
-单向 Imports / Cutover（按 Readiness 结果拆分）
+#17 真实旧数据压力测试 / clean-cut readiness
 ```
 
-Issue #23 Handoff Marker 在 #22 后可并行，不阻塞上述主线。旧数据压力测试与迁移准备不得先于 #22、#24、#28、#29、#30、#31、#32、#33 和 #34；此前 #17 保持阻塞。
+并行 / 后置：
 
-Human View 可在核心链路稳定后并行进入，但不作为上述主线的前置依赖。
+```text
+#47 Conversation 跨 Provider 研究       后续继续，不阻塞 #48
+#43 Codex Conversation production       等 #47 收敛
+#44 Workspace portability               后置
+Human View / Frontend                    已写入 Roadmap，不启动
+#42 主动认知 / 决策增强实验              blocked
+```
+
+旧 `sunward-operating-system` 从现在起不再承担产品主线；新输入、新认知、新 Agent Context 与新功能均进入 ArcheOS。#17 只负责完成最后的旧数据 / UI 资产盘点和仓库正式 Archive 条件确认，而不是维持旧系统继续运行。
 
 ---
 
@@ -402,4 +454,7 @@ ArcheOS / 新向阳经营系统始终沿一条主线演化：
 9. Context Builder 是统一上下文组装能力，默认 bounded / provenance-aware / truncation-aware；
 10. 真实数据验收是阶段门槛，不以 synthetic tests 代替真实语义验证；
 11. 迁移采用 clean-cut / 单向导入，除非出现真实不可丢数据或外部消费者才重新讨论 compatibility；
-12. 不因为未来可能需要某个能力，就提前建设完整框架。
+12. Human View 只消费 canonical read contracts，不建立第二份 truth；
+13. ArcheOS 不开发自己的 Agent，而是增强外部 Agent / Human 的认知与决策能力；
+14. 长期产品名回归“向阳经营系统”，但工程改名不得早于真实使用稳定和旧系统 clean-cut；
+15. 不因为未来可能需要某个能力，就提前建设完整框架。
