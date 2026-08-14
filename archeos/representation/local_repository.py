@@ -254,6 +254,20 @@ class LocalRepresentationRepository:
             representation_id=representation.representation_id, verified=True
         )
 
+    def read_artifact(self, representation_id: str, artifact_id: str) -> bytes:
+        """Read one verified artifact through the repository boundary."""
+        representation = self.get(representation_id)
+        verification = self.verify(representation_id)
+        if not verification.verified:
+            raise RepresentationManifestError("Representation failed verification")
+        artifact = next(
+            (item for item in representation.artifacts if item.artifact_id == artifact_id),
+            None,
+        )
+        if artifact is None:
+            raise RepresentationNotFoundError("Representation artifact was not found")
+        return self._artifact_path(self._directory(representation), artifact.locator).read_bytes()
+
     def _directory(self, representation: NormalizedRepresentation) -> Path:
         directory = self.representation_root / representation.source_id / representation.representation_id
         self._validate_persisted_directory(

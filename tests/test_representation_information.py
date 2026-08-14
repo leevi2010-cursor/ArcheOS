@@ -1,0 +1,486 @@
+from __future__ import annotations
+
+import json
+import tempfile
+import threading
+import unittest
+from pathlib import Path
+from types import SimpleNamespace
+
+from archeos.atomic_information import JsonlAtomicInformationStore, ingest_processing_package
+from archeos.representation import (
+    AdapterArtifact,
+    AdapterBuildResult,
+    LocalRepresentationRepository,
+    RepresentationService,
+)
+from archeos.representation.adapters import MarkdownRepresentationAdapter
+from archeos.representation_information import (
+    CodexRepresentationAnalysisProvider,
+    RepresentationAnalysisResult,
+    RepresentationAnalysisUnit,
+    RepresentationCandidateDraft,
+    RepresentationInformationError,
+    RepresentationInformationService,
+    RepresentationResidueDraft,
+)
+from archeos.source import LocalManagedSourceRepository
+
+
+TIMESTAMP = "2026-08-13T00:00:00.000Z"
+
+
+class JsonAdapter:
+    name = "synthetic"
+    version = "1.0"
+    supported_media_types = ("application/synthetic",)
+
+    def __init__(self, kind: str, payload: object) -> None:
+        self.kind = kind
+        self.payload = payload
+
+    def build(self, source, materialized_path, staging_dir, configuration):
+        path = staging_dir / "artifacts" / "synthetic.json"
+        path.write_text(json.dumps(self.payload), encoding="utf-8")
+        return AdapterBuildResult(
+            self.kind,
+            (AdapterArtifact("structure", "artifacts/synthetic.json", "application/json"),),
+            1.0,
+        )
+
+
+class CoveringProvider:
+    name = "covering-fake"
+
+    def __init__(self) -> None:
+        self.batches: list[tuple[str, ...]] = []
+
+    def analyze(self, units):
+        self.batches.append(tuple(unit.unit_id for unit in units))
+        return RepresentationAnalysisResult(
+            candidates=tuple(
+                RepresentationCandidateDraft(
+                    statement=f"Synthetic {unit.kind} is retained.",
+                    semantic_type="observation",
+                    concerns=("Synthetic",),
+                    evidence_unit_ids=(unit.unit_id,),
+                    context=unit.context,
+                    confidence=1.0,
+                )
+                for unit in units
+            ),
+            residue=(),
+        )
+
+
+class InvalidReferenceProvider:
+    name = "invalid-reference"
+
+    def analyze(self, units):
+        return RepresentationAnalysisResult(
+            candidates=(),
+            residue=(
+                RepresentationResidueDraft(
+                    evidence_unit_ids=("unit_" + "0" * 64,),
+                    reason_not_absorbed="Synthetic invalid reference.",
+                    future_value_or_uncertainty="None.",
+                ),
+            ),
+        )
+
+
+class FailingProvider:
+    name = "failing"
+
+    def analyze(self, units):
+        raise RuntimeError("synthetic provider failure")
+
+
+class FailingSecondBatchProvider:
+    name = "failing-second-batch"
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def analyze(self, units):
+        self.calls += 1
+        if self.calls == 2:
+            raise RuntimeError("synthetic second batch failure")
+        return RepresentationAnalysisResult(
+            candidates=tuple(
+                RepresentationCandidateDraft(
+                    statement="Synthetic first batch statement.",
+                    semantic_type="observation",
+                    concerns=("Synthetic",),
+                    evidence_unit_ids=(unit.unit_id,),
+                    context=unit.context,
+                    confidence=1.0,
+                )
+                for unit in units
+            ),
+            residue=(),
+        )
+
+
+class FakeCodexTurn:
+    def __init__(
+        self,
+        response: str | None,
+        error: Exception | None = None,
+        *,
+        block: bool = False,
+    ) -> None:
+        self.response = response
+        self.error = error
+        self.block = block
+        self.interrupted = False
+        self._blocked = threading.Event()
+
+    def run(self) -> object:
+        if self.block:
+            self._blocked.wait()
+        if self.error:
+            raise self.error
+        return SimpleNamespace(final_response=self.response)
+
+    def interrupt(self) -> None:
+        self.interrupted = True
+
+
+class FakeCodexThread:
+    def __init__(self, response: str | None, error: Exception | None = None) -> None:
+        self.response = response
+        self.error = error
+        self.turn_kwargs: dict[str, object] | None = None
+        self.turn_handle: FakeCodexTurn | None = None
+
+    def turn(self, prompt: str, **kwargs: object) -> FakeCodexTurn:
+        self.turn_kwargs = {"prompt": prompt, **kwargs}
+        self.turn_handle = FakeCodexTurn(
+            self.response, self.error, block=getattr(self, "block", False)
+        )
+        return self.turn_handle
+
+
+class FakeCodex:
+    instance: "FakeCodex"
+    thread = FakeCodexThread(None)
+
+    def __init__(self) -> None:
+        self.thread_kwargs: dict[str, object] | None = None
+        self.closed = False
+        FakeCodex.instance = self
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args: object) -> None:
+        self.closed = True
+        return None
+
+    def thread_start(self, **kwargs: object) -> FakeCodexThread:
+        self.thread_kwargs = kwargs
+        return self.thread
+
+
+def codex_sdk_loader() -> tuple[type[object], object, object]:
+    return FakeCodex, "deny-all", "read-only"
+
+
+class MutatingProvider(CoveringProvider):
+    name = "mutating"
+
+    def __init__(self, managed_bytes: Path) -> None:
+        super().__init__()
+        self.managed_bytes = managed_bytes
+
+    def analyze(self, units):
+        self.managed_bytes.write_text("changed", encoding="utf-8")
+        return super().analyze(units)
+
+
+class RepresentationInformationTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp.name)
+        self.managed_root = self.root / "managed"
+        self.representation_root = self.root / "representations"
+        self.output_root = self.root / "information"
+        self.number = 0
+
+    def tearDown(self) -> None:
+        self.temp.cleanup()
+
+    def build(self, kind: str, payload: object):
+        self.number += 1
+        external = self.root / f"source-{self.number}.bin"
+        external.write_text("synthetic", encoding="utf-8")
+        source_id = f"src_{self.number:032x}"
+        sources = LocalManagedSourceRepository(
+            self.managed_root,
+            id_factory=lambda: source_id,
+            clock=lambda: TIMESTAMP,
+        )
+        source = sources.admit(
+            external, metadata={"media_type": "application/synthetic"}
+        ).source
+        representations = LocalRepresentationRepository(
+            self.representation_root, clock=lambda: TIMESTAMP
+        )
+        representation = RepresentationService(
+            sources, representations, clock=lambda: TIMESTAMP
+        ).build(source.source_id, JsonAdapter(kind, payload)).representation
+        return sources, representations, representation
+
+    def extract(self, kind: str, payload: object, provider, *, batch_size: int = 100):
+        sources, representations, representation = self.build(kind, payload)
+        service = RepresentationInformationService(
+            sources,
+            representations,
+            self.output_root,
+            batch_size=batch_size,
+            clock=lambda: TIMESTAMP,
+        )
+        package = service.extract(representation.representation_id, provider)
+        return representation, package
+
+    def test_format_mappings_have_replayable_units_and_image_is_excluded(self) -> None:
+        fixtures = (
+            ("markdown_blocks", {"blocks": [{"kind": "paragraph", "raw": "Synthetic markdown.", "source_locator": {"line_start": 1, "line_end": 1}}]}, 1),
+            ("pdf_text", {"pages": [{"source_locator": {"page": 1}, "text_blocks": [{"text": "Synthetic PDF.", "source_locator": {"page": 1, "ordinal": 1}}], "tables": []}]}, 1),
+            ("xlsx_structure", {"sheets": [{"cells": [{"value": "Synthetic XLSX.", "source_locator": {"sheet": "Sheet", "cell": "A1"}}], "embedded_media": []}]}, 1),
+            ("pptx_structure", {"slides": [{"source_locator": {"slide_index": 1}, "speaker_notes": None, "shapes": [{"source_locator": {"slide_index": 1, "shape_id": 1}, "text": "Synthetic PPTX."}]}]}, 1),
+            ("image_structural_preflight", {"format": "png", "pixel_width": 1, "pixel_height": 1}, 0),
+        )
+        for kind, payload, candidates in fixtures:
+            with self.subTest(kind=kind):
+                representation, package = self.extract(kind, payload, CoveringProvider())
+                manifest = json.loads((package / "manifest.json").read_text(encoding="utf-8"))
+                self.assertEqual(manifest["representation"]["representation_id"], representation.representation_id)
+                self.assertEqual(manifest["counts"]["atomic_information_candidates"], candidates)
+                self.assertEqual(manifest["counts"]["unaccounted_eligible_units"], 0)
+                self.assertTrue(all(item["unit_id"].startswith("unit_") for item in manifest["units"]))
+                if candidates:
+                    evidence = json.loads(
+                        (package / "atomic_information_candidates.jsonl")
+                        .read_text(encoding="utf-8")
+                        .splitlines()[0]
+                    )["source_evidence"][0]
+                    self.assertEqual(evidence["representation_kind"], kind)
+                    if kind == "pdf_text":
+                        self.assertEqual(manifest["units"][0]["kind"], "pdf_text_block")
+                        self.assertEqual(evidence["representation_kind"], "pdf_text")
+                if kind == "image_structural_preflight":
+                    self.assertEqual(manifest["counts"]["eligible_units"], 0)
+                    self.assertEqual(
+                        manifest["units"][0]["exclusion_reason"],
+                        "IMAGE_STRUCTURAL_PREFLIGHT_HAS_NO_BUSINESS_SEMANTICS",
+                    )
+
+    def test_batches_cover_every_eligible_unit_and_ingestion_is_idempotent(self) -> None:
+        payload = {"blocks": [{"kind": "paragraph", "raw": f"Synthetic {index}.", "source_locator": {"line_start": index, "line_end": index}} for index in range(1, 6)]}
+        provider = CoveringProvider()
+        _, package = self.extract("markdown_blocks", payload, provider, batch_size=2)
+        manifest = json.loads((package / "manifest.json").read_text(encoding="utf-8"))
+        self.assertEqual([len(batch) for batch in provider.batches], [2, 2, 1])
+        self.assertEqual([len(batch["unit_ids"]) for batch in manifest["batches"]], [2, 2, 1])
+        store = JsonlAtomicInformationStore(self.root / "atomic.jsonl")
+        first = ingest_processing_package(package, store)
+        second = ingest_processing_package(package, store)
+        self.assertEqual(first.created, 5)
+        self.assertEqual(second.existing, 5)
+        information = store.list_atomic_information()[0]
+        evidence = information.source_evidence[0]
+        self.assertIsNotNone(evidence.representation_id)
+        self.assertTrue(evidence.unit_id.startswith("unit_"))
+        self.assertEqual(evidence.excerpt, "Synthetic 1.")
+
+    def test_invalid_reference_and_runtime_failure_publish_nothing(self) -> None:
+        payload = {"blocks": [{"kind": "paragraph", "raw": "Synthetic.", "source_locator": {"line_start": 1, "line_end": 1}}]}
+        for provider in (InvalidReferenceProvider(), FailingProvider()):
+            with self.subTest(provider=provider.name):
+                sources, representations, representation = self.build("markdown_blocks", payload)
+                service = RepresentationInformationService(
+                    sources, representations, self.output_root, clock=lambda: TIMESTAMP
+                )
+                with self.assertRaises(RepresentationInformationError):
+                    service.extract(representation.representation_id, provider)
+                self.assertFalse((self.output_root / representation.representation_id).exists())
+
+    def test_second_batch_failure_does_not_publish(self) -> None:
+        payload = {
+            "blocks": [
+                {"kind": "paragraph", "raw": f"Synthetic {index}.", "source_locator": {"line_start": index, "line_end": index}}
+                for index in range(1, 4)
+            ]
+        }
+        sources, representations, representation = self.build("markdown_blocks", payload)
+        provider = FailingSecondBatchProvider()
+        service = RepresentationInformationService(
+            sources, representations, self.output_root, batch_size=1, clock=lambda: TIMESTAMP
+        )
+        with self.assertRaises(RepresentationInformationError):
+            service.extract(representation.representation_id, provider)
+        self.assertEqual(provider.calls, 2)
+        self.assertFalse((self.output_root / representation.representation_id).exists())
+
+    def test_strict_package_rejects_path_leak_before_store_write(self) -> None:
+        payload = {"blocks": [{"kind": "paragraph", "raw": "Synthetic.", "source_locator": {"line_start": 1, "line_end": 1}}]}
+        _, package = self.extract("markdown_blocks", payload, CoveringProvider())
+        manifest_path = package / "manifest.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest["source"]["path"] = "/private/synthetic"
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+        store_path = self.root / "untouched.jsonl"
+        with self.assertRaises(RepresentationInformationError):
+            ingest_processing_package(package, JsonlAtomicInformationStore(store_path))
+        self.assertFalse(store_path.exists())
+
+    def test_managed_source_change_during_analysis_does_not_publish(self) -> None:
+        payload = {"blocks": [{"kind": "paragraph", "raw": "Synthetic.", "source_locator": {"line_start": 1, "line_end": 1}}]}
+        sources, representations, representation = self.build("markdown_blocks", payload)
+        managed_bytes = self.managed_root / "sources" / representation.source_id / "original.bin"
+        service = RepresentationInformationService(
+            sources, representations, self.output_root, clock=lambda: TIMESTAMP
+        )
+        with self.assertRaises(RepresentationInformationError):
+            service.extract(representation.representation_id, MutatingProvider(managed_bytes))
+        self.assertFalse((self.output_root / representation.representation_id).exists())
+
+    def test_codex_provider_uses_official_sdk_with_read_only_boundaries(self) -> None:
+        unit = RepresentationAnalysisUnit(
+            unit_id="unit_" + "a" * 64,
+            representation_id="repr_" + "b" * 64,
+            source_id="src_" + "c" * 32,
+            source_content_hash="sha256:" + "d" * 64,
+            representation_kind="pdf_text",
+            kind="pdf_text_block",
+            content="Synthetic unit. " * 2000,
+            structured_value=None,
+            locator={"page": 1, "ordinal": 1},
+            context="PDF text block",
+            artifact_id="artifact_" + "e" * 64,
+            artifact_locator="artifacts/pages.json",
+            analysis_eligible=True,
+        )
+        FakeCodex.thread = FakeCodexThread(
+            json.dumps(
+                {
+                    "candidates": [
+                        {
+                            "statement": "Synthetic statement.",
+                            "semantic_type": "observation",
+                            "concerns": ["Synthetic"],
+                            "evidence_unit_ids": [unit.unit_id],
+                            "context": "Synthetic context.",
+                            "confidence": 0.9,
+                        }
+                    ],
+                    "residue": [],
+                }
+            )
+        )
+        result = CodexRepresentationAnalysisProvider(
+            sdk_loader=codex_sdk_loader
+        ).analyze((unit,))
+
+        self.assertEqual(result.candidates[0].evidence_unit_ids, (unit.unit_id,))
+        thread_kwargs = FakeCodex.instance.thread_kwargs
+        assert thread_kwargs is not None
+        self.assertEqual(thread_kwargs["approval_mode"], "deny-all")
+        self.assertEqual(thread_kwargs["sandbox"], "read-only")
+        self.assertTrue(thread_kwargs["ephemeral"])
+        self.assertIn("cwd", thread_kwargs)
+        self.assertIn("developer_instructions", thread_kwargs)
+        turn_kwargs = FakeCodex.thread.turn_kwargs
+        assert turn_kwargs is not None
+        self.assertEqual(turn_kwargs["sandbox"], "read-only")
+        self.assertIn("output_schema", turn_kwargs)
+        self.assertIn("Every eligible unit", turn_kwargs["prompt"])
+        self.assertNotIn(unit.source_id, turn_kwargs["prompt"])
+
+    def test_codex_provider_rejects_invalid_structured_output(self) -> None:
+        FakeCodex.thread = FakeCodexThread("not json")
+        with self.assertRaisesRegex(RuntimeError, "invalid structured Representation output"):
+            CodexRepresentationAnalysisProvider(sdk_loader=codex_sdk_loader).analyze(())
+
+    def test_codex_provider_rejects_missing_structured_output(self) -> None:
+        FakeCodex.thread = FakeCodexThread(None)
+        with self.assertRaisesRegex(RuntimeError, "completed without structured Representation output"):
+            CodexRepresentationAnalysisProvider(sdk_loader=codex_sdk_loader).analyze(())
+
+    def test_codex_provider_runtime_error_does_not_echo_unit_content(self) -> None:
+        unit = RepresentationAnalysisUnit(
+            unit_id="unit_" + "a" * 64,
+            representation_id="repr_" + "b" * 64,
+            source_id="src_" + "c" * 32,
+            source_content_hash="sha256:" + "d" * 64,
+            representation_kind="pdf_text",
+            kind="pdf_text_block",
+            content="Synthetic confidential unit content.",
+            structured_value=None,
+            locator={"page": 1, "ordinal": 1},
+            context="PDF text block",
+            artifact_id="artifact_" + "e" * 64,
+            artifact_locator="artifacts/pages.json",
+            analysis_eligible=True,
+        )
+        FakeCodex.thread = FakeCodexThread(None, RuntimeError(unit.content))
+        with self.assertRaisesRegex(RuntimeError, "analysis failed before a structured result") as error:
+            CodexRepresentationAnalysisProvider(sdk_loader=codex_sdk_loader).analyze((unit,))
+        self.assertNotIn(unit.content, str(error.exception))
+
+    def test_codex_provider_timeout_interrupts_and_closes_without_unit_content(self) -> None:
+        unit = RepresentationAnalysisUnit(
+            unit_id="unit_" + "a" * 64,
+            representation_id="repr_" + "b" * 64,
+            source_id="src_" + "c" * 32,
+            source_content_hash="sha256:" + "d" * 64,
+            representation_kind="pdf_text",
+            kind="pdf_text_block",
+            content="Synthetic confidential unit content.",
+            structured_value=None,
+            locator={"page": 1, "ordinal": 1},
+            context="PDF text block",
+            artifact_id="artifact_" + "e" * 64,
+            artifact_locator="artifacts/pages.json",
+            analysis_eligible=True,
+        )
+        FakeCodex.thread = FakeCodexThread(None)
+        FakeCodex.thread.block = True
+        with self.assertRaisesRegex(RuntimeError, "timed out before a structured result") as error:
+            CodexRepresentationAnalysisProvider(
+                sdk_loader=codex_sdk_loader, timeout_seconds=0.01
+            ).analyze((unit,))
+        assert FakeCodex.thread.turn_handle is not None
+        self.assertTrue(FakeCodex.thread.turn_handle.interrupted)
+        self.assertTrue(FakeCodex.instance.closed)
+        self.assertNotIn(unit.content, str(error.exception))
+
+    def test_synthetic_markdown_representation_smoke(self) -> None:
+        external = self.root / "smoke.md"
+        external.write_text("# Synthetic\n\nSynthetic business content.\n", encoding="utf-8")
+        source_id = "src_" + "a" * 32
+        sources = LocalManagedSourceRepository(
+            self.managed_root, id_factory=lambda: source_id, clock=lambda: TIMESTAMP
+        )
+        source = sources.admit(
+            external, metadata={"media_type": "text/markdown"}
+        ).source
+        representations = LocalRepresentationRepository(
+            self.representation_root, clock=lambda: TIMESTAMP
+        )
+        representation = RepresentationService(
+            sources, representations, clock=lambda: TIMESTAMP
+        ).build(source.source_id, MarkdownRepresentationAdapter()).representation
+        package = RepresentationInformationService(
+            sources, representations, self.output_root, clock=lambda: TIMESTAMP
+        ).extract(representation.representation_id, CoveringProvider())
+        result = ingest_processing_package(
+            package, JsonlAtomicInformationStore(self.root / "smoke-information.jsonl")
+        )
+        self.assertGreater(result.created, 0)
+
+
+if __name__ == "__main__":
+    unittest.main()
