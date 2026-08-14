@@ -467,7 +467,7 @@ Signal / Event / Human request
 → Protocol
 → Context Builder
 → 候选 Action + 预期结果 + Hypothesis
-→ Judgment：基于 Goal / Preference / Constraint / Policy / Evidence / Pattern
+→ Judgment：基于 Goal / Preference / Requirement / Policy / Evidence / Pattern
 → Challenge（Protocol 阶段标签）
 → Atomic Information Candidate（Agent recommendation / judgment）
 → Human Decision
@@ -482,7 +482,7 @@ Signal / Event / Human request
 - `Policy`：控制最少候选 Action 数、风险偏好、时间范围、是否强制 Challenge 等可调参数；
 - `Pattern`：承载反复问题对应的可复用解决结构；前端可以把 Pattern Library 显示为“模型库”；
 - `Hypothesis`：记录会影响 Judgment / Decision、并可被后续 Evidence / Feedback 支持或反对的可检验命题；
-- `Context Builder`：提供 Goal / World Model / Information / Evidence / Preference / Constraint / previous Decision / Feedback 等 bounded Context；不建立 Decision Context Builder；
+- `Context Builder`：提供 Goal / World Model / Information / Evidence / Preference / Requirement / previous Decision / Feedback 等 bounded Context；不建立 Decision Context Builder；
 - External Agent：执行真正推理；
 - `Derived Artifact`：保存 Protocol 阶段的结构化中间结果；
 - `Audit Event`：记录关键运行和版本 provenance；
@@ -558,7 +558,7 @@ Decision
 ```text
 Goal
 + Health / State
-+ Constraint / Red Line
++ Requirement / Red Line
 + Signal / Event / opportunity
 + Policy
 → 启动 Protocol
