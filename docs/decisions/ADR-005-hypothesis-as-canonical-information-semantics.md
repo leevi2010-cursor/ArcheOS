@@ -32,7 +32,7 @@ Hypothesis 属于 Information Layer。
 
 - `Observation / Evidence`：回答“观察到了什么 / 依据在哪里”；Hypothesis 回答“当前有哪些可被未来事实验证或反驳的解释、预测或条件性命题”。
 - `Claim`：回答“谁以什么立场说了什么”；Hypothesis 可以来源于某个 Claim，也可以由 Agent / Human 基于多个 Evidence 提出，但提出不意味着已经成立。
-- `Judgment`：是在当前 Goal / Evidence / Constraint 下作出的判断；Judgment 可以依赖 Hypothesis，但二者不等同。
+- `Judgment`：是在当前 Goal / Evidence / Requirement 下作出的判断；Judgment 可以依赖 Hypothesis，但二者不等同。
 - `Action`：回答“做什么”；Hypothesis 可以表达“为什么认为该 Action 会产生某个 Outcome”。
 - `Decision`：是 Human 受治理确认的取舍；Decision 可以基于多个 Hypothesis，但不会把这些 Hypothesis 自动变成事实。
 - `Pattern / Protocol / Policy / Principle`：是更稳定、可复用的方法或治理结构；被反复验证的 Hypothesis 可以为它们的创建或修订提供依据，但不会通过原地改类型的方式“变身”为这些概念。
@@ -81,7 +81,7 @@ ArcheOS 不新增泛化 `Knowledge` Core 作为第二套 truth。
 
 - 重复问题的可复用解决结构 → `Pattern`；
 - 跨任务可复用的交互 / 判断 / 门禁流程 → `Protocol`；
-- 明确范围内可执行参数与约束 → `Policy`；
+- 明确范围内可执行参数与要求 → `Policy`；
 - 稳定的取舍准则 → `Principle`；
 - 仅是稳定事实性认识 → 继续作为受治理的 `Atomic Information` / World Model 依据。
 
