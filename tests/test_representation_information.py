@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -95,17 +96,70 @@ class FailingProvider:
         raise RuntimeError("synthetic provider failure")
 
 
+class FailingSecondBatchProvider:
+    name = "failing-second-batch"
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def analyze(self, units):
+        self.calls += 1
+        if self.calls == 2:
+            raise RuntimeError("synthetic second batch failure")
+        return RepresentationAnalysisResult(
+            candidates=tuple(
+                RepresentationCandidateDraft(
+                    statement="Synthetic first batch statement.",
+                    semantic_type="observation",
+                    concerns=("Synthetic",),
+                    evidence_unit_ids=(unit.unit_id,),
+                    context=unit.context,
+                    confidence=1.0,
+                )
+                for unit in units
+            ),
+            residue=(),
+        )
+
+
+class FakeCodexTurn:
+    def __init__(
+        self,
+        response: str | None,
+        error: Exception | None = None,
+        *,
+        block: bool = False,
+    ) -> None:
+        self.response = response
+        self.error = error
+        self.block = block
+        self.interrupted = False
+        self._blocked = threading.Event()
+
+    def run(self) -> object:
+        if self.block:
+            self._blocked.wait()
+        if self.error:
+            raise self.error
+        return SimpleNamespace(final_response=self.response)
+
+    def interrupt(self) -> None:
+        self.interrupted = True
+
+
 class FakeCodexThread:
     def __init__(self, response: str | None, error: Exception | None = None) -> None:
         self.response = response
         self.error = error
-        self.run_kwargs: dict[str, object] | None = None
+        self.turn_kwargs: dict[str, object] | None = None
+        self.turn_handle: FakeCodexTurn | None = None
 
-    def run(self, prompt: str, **kwargs: object) -> object:
-        if self.error:
-            raise self.error
-        self.run_kwargs = {"prompt": prompt, **kwargs}
-        return SimpleNamespace(final_response=self.response)
+    def turn(self, prompt: str, **kwargs: object) -> FakeCodexTurn:
+        self.turn_kwargs = {"prompt": prompt, **kwargs}
+        self.turn_handle = FakeCodexTurn(
+            self.response, self.error, block=getattr(self, "block", False)
+        )
+        return self.turn_handle
 
 
 class FakeCodex:
@@ -114,12 +168,14 @@ class FakeCodex:
 
     def __init__(self) -> None:
         self.thread_kwargs: dict[str, object] | None = None
+        self.closed = False
         FakeCodex.instance = self
 
     def __enter__(self):
         return self
 
     def __exit__(self, *_args: object) -> None:
+        self.closed = True
         return None
 
     def thread_start(self, **kwargs: object) -> FakeCodexThread:
@@ -251,6 +307,23 @@ class RepresentationInformationTest(unittest.TestCase):
                     service.extract(representation.representation_id, provider)
                 self.assertFalse((self.output_root / representation.representation_id).exists())
 
+    def test_second_batch_failure_does_not_publish(self) -> None:
+        payload = {
+            "blocks": [
+                {"kind": "paragraph", "raw": f"Synthetic {index}.", "source_locator": {"line_start": index, "line_end": index}}
+                for index in range(1, 4)
+            ]
+        }
+        sources, representations, representation = self.build("markdown_blocks", payload)
+        provider = FailingSecondBatchProvider()
+        service = RepresentationInformationService(
+            sources, representations, self.output_root, batch_size=1, clock=lambda: TIMESTAMP
+        )
+        with self.assertRaises(RepresentationInformationError):
+            service.extract(representation.representation_id, provider)
+        self.assertEqual(provider.calls, 2)
+        self.assertFalse((self.output_root / representation.representation_id).exists())
+
     def test_strict_package_rejects_path_leak_before_store_write(self) -> None:
         payload = {"blocks": [{"kind": "paragraph", "raw": "Synthetic.", "source_locator": {"line_start": 1, "line_end": 1}}]}
         _, package = self.extract("markdown_blocks", payload, CoveringProvider())
@@ -282,7 +355,7 @@ class RepresentationInformationTest(unittest.TestCase):
             source_content_hash="sha256:" + "d" * 64,
             representation_kind="pdf_text",
             kind="pdf_text_block",
-            content="Synthetic unit.",
+            content="Synthetic unit. " * 2000,
             structured_value=None,
             locator={"page": 1, "ordinal": 1},
             context="PDF text block",
@@ -319,17 +392,70 @@ class RepresentationInformationTest(unittest.TestCase):
         self.assertTrue(thread_kwargs["ephemeral"])
         self.assertIn("cwd", thread_kwargs)
         self.assertIn("developer_instructions", thread_kwargs)
-        run_kwargs = FakeCodex.thread.run_kwargs
-        assert run_kwargs is not None
-        self.assertEqual(run_kwargs["sandbox"], "read-only")
-        self.assertIn("output_schema", run_kwargs)
-        self.assertIn("Every eligible unit", run_kwargs["prompt"])
-        self.assertNotIn(unit.source_id, run_kwargs["prompt"])
+        turn_kwargs = FakeCodex.thread.turn_kwargs
+        assert turn_kwargs is not None
+        self.assertEqual(turn_kwargs["sandbox"], "read-only")
+        self.assertIn("output_schema", turn_kwargs)
+        self.assertIn("Every eligible unit", turn_kwargs["prompt"])
+        self.assertNotIn(unit.source_id, turn_kwargs["prompt"])
 
     def test_codex_provider_rejects_invalid_structured_output(self) -> None:
         FakeCodex.thread = FakeCodexThread("not json")
         with self.assertRaisesRegex(RuntimeError, "invalid structured Representation output"):
             CodexRepresentationAnalysisProvider(sdk_loader=codex_sdk_loader).analyze(())
+
+    def test_codex_provider_rejects_missing_structured_output(self) -> None:
+        FakeCodex.thread = FakeCodexThread(None)
+        with self.assertRaisesRegex(RuntimeError, "completed without structured Representation output"):
+            CodexRepresentationAnalysisProvider(sdk_loader=codex_sdk_loader).analyze(())
+
+    def test_codex_provider_runtime_error_does_not_echo_unit_content(self) -> None:
+        unit = RepresentationAnalysisUnit(
+            unit_id="unit_" + "a" * 64,
+            representation_id="repr_" + "b" * 64,
+            source_id="src_" + "c" * 32,
+            source_content_hash="sha256:" + "d" * 64,
+            representation_kind="pdf_text",
+            kind="pdf_text_block",
+            content="Synthetic confidential unit content.",
+            structured_value=None,
+            locator={"page": 1, "ordinal": 1},
+            context="PDF text block",
+            artifact_id="artifact_" + "e" * 64,
+            artifact_locator="artifacts/pages.json",
+            analysis_eligible=True,
+        )
+        FakeCodex.thread = FakeCodexThread(None, RuntimeError(unit.content))
+        with self.assertRaisesRegex(RuntimeError, "analysis failed before a structured result") as error:
+            CodexRepresentationAnalysisProvider(sdk_loader=codex_sdk_loader).analyze((unit,))
+        self.assertNotIn(unit.content, str(error.exception))
+
+    def test_codex_provider_timeout_interrupts_and_closes_without_unit_content(self) -> None:
+        unit = RepresentationAnalysisUnit(
+            unit_id="unit_" + "a" * 64,
+            representation_id="repr_" + "b" * 64,
+            source_id="src_" + "c" * 32,
+            source_content_hash="sha256:" + "d" * 64,
+            representation_kind="pdf_text",
+            kind="pdf_text_block",
+            content="Synthetic confidential unit content.",
+            structured_value=None,
+            locator={"page": 1, "ordinal": 1},
+            context="PDF text block",
+            artifact_id="artifact_" + "e" * 64,
+            artifact_locator="artifacts/pages.json",
+            analysis_eligible=True,
+        )
+        FakeCodex.thread = FakeCodexThread(None)
+        FakeCodex.thread.block = True
+        with self.assertRaisesRegex(RuntimeError, "timed out before a structured result") as error:
+            CodexRepresentationAnalysisProvider(
+                sdk_loader=codex_sdk_loader, timeout_seconds=0.01
+            ).analyze((unit,))
+        assert FakeCodex.thread.turn_handle is not None
+        self.assertTrue(FakeCodex.thread.turn_handle.interrupted)
+        self.assertTrue(FakeCodex.instance.closed)
+        self.assertNotIn(unit.content, str(error.exception))
 
     def test_synthetic_markdown_representation_smoke(self) -> None:
         external = self.root / "smoke.md"

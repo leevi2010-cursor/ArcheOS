@@ -7,6 +7,7 @@ import json
 import os
 import tempfile
 import re
+import threading
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -24,6 +25,7 @@ from .source.identity import require_managed_source_id
 
 PACKAGE_SCHEMA_VERSION = "2.0"
 PACKAGE_KIND = "representation_information"
+DEFAULT_CODEX_ANALYSIS_TIMEOUT_SECONDS = 120.0
 
 
 class RepresentationInformationError(RuntimeError):
@@ -220,8 +222,20 @@ class CodexRepresentationAnalysisProvider:
 
     name = "codex-app-server"
 
-    def __init__(self, *, sdk_loader: SdkLoader = _load_sdk) -> None:
+    def __init__(
+        self,
+        *,
+        sdk_loader: SdkLoader = _load_sdk,
+        timeout_seconds: float = DEFAULT_CODEX_ANALYSIS_TIMEOUT_SECONDS,
+    ) -> None:
+        if (
+            isinstance(timeout_seconds, bool)
+            or not isinstance(timeout_seconds, (int, float))
+            or timeout_seconds <= 0
+        ):
+            raise ValueError("timeout_seconds must be a positive number")
         self.sdk_loader = sdk_loader
+        self.timeout_seconds = float(timeout_seconds)
 
     def analyze(
         self, units: Sequence[RepresentationAnalysisUnit]
@@ -240,15 +254,18 @@ class CodexRepresentationAnalysisProvider:
                         ephemeral=True,
                         sandbox=read_only,
                     )
-                    result = thread.run(
+                    turn = thread.turn(
                         _representation_analysis_prompt(units),
                         output_schema=representation_analysis_schema(),
                         sandbox=read_only,
                     )
+                    result = _run_codex_turn_with_deadline(turn, self.timeout_seconds)
             except Exception as exc:
-                detail = str(exc).strip() or exc.__class__.__name__
+                if isinstance(exc, CodexRepresentationAnalysisTimeout):
+                    raise
                 raise RuntimeError(
-                    f"Codex app-server Representation analysis failed: {detail}"
+                    "Codex app-server Representation analysis failed before a "
+                    "structured result; no processing package was published"
                 ) from exc
         final_response = getattr(result, "final_response", None)
         if not isinstance(final_response, str) or not final_response.strip():
@@ -273,6 +290,49 @@ class CodexRepresentationAnalysisProvider:
             raise RuntimeError(
                 "Codex app-server returned invalid structured Representation output"
             ) from exc
+
+
+class CodexRepresentationAnalysisTimeout(RuntimeError):
+    """The app-server did not complete before the provider's fixed deadline."""
+
+
+def _run_codex_turn_with_deadline(turn: object, timeout_seconds: float) -> object:
+    completed = threading.Event()
+    outcome: dict[str, object] = {}
+
+    def collect() -> None:
+        try:
+            outcome["result"] = getattr(turn, "run")()
+        except Exception as exc:  # pragma: no cover - tested through the provider
+            outcome["error"] = exc
+        finally:
+            completed.set()
+
+    worker = threading.Thread(target=collect, daemon=True)
+    worker.start()
+    if not completed.wait(timeout_seconds):
+        interrupter = threading.Thread(
+            target=_best_effort_turn_interrupt, args=(turn,), daemon=True
+        )
+        interrupter.start()
+        interrupter.join(timeout=0.1)
+        raise CodexRepresentationAnalysisTimeout(
+            "Codex app-server Representation analysis timed out before a structured "
+            "result; no processing package was published"
+        )
+    error = outcome.get("error")
+    if isinstance(error, Exception):
+        raise error
+    if "result" not in outcome:
+        raise RuntimeError("Codex app-server returned no turn result")
+    return outcome["result"]
+
+
+def _best_effort_turn_interrupt(turn: object) -> None:
+    try:
+        getattr(turn, "interrupt")()
+    except Exception:
+        pass
 
 
 def _items(value: object, field: str) -> list[object]:
