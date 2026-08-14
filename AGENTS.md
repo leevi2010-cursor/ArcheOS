@@ -192,20 +192,23 @@ Ordinary engineering choices inside approved scope do not need product-owner app
 
 ## Concept governance
 
-ArcheOS minimizes its conceptual vocabulary.
+ArcheOS minimizes its conceptual vocabulary. **Concept convergence must happen before implementation, not after implementation.**
 
 Agents must:
 
 1. Reuse concepts already defined in `docs/architecture/CONCEPTS.md` whenever possible.
 2. Avoid synonyms, parallel models, and business-specific Core concepts that duplicate an existing concept.
 3. Treat business terms as Name, Role, Relationship, Atomic Information, View, or presentation labels when sufficient.
-4. Never add a durable Object type, Role, Relationship semantic, Lifecycle concept, or Information concept merely because a feature needs a convenient noun.
-5. When another system or project uses a conflicting definition, use `CONCEPTS.md` for new ArcheOS design and record an explicit mapping; do not silently rename or migrate the old system.
-6. If existing concepts are genuinely insufficient and the meaning is domain-specific, create or update that project's `docs/domain/CONCEPTS.md` before implementation. Domain concepts remain local and must not redefine common concepts.
-7. A domain concept may enter the common vocabulary only through an architecture review that updates `CONCEPTS.md` and records an ADR / Decision.
-8. Preserve stable Object identity and history when names or interpretations change.
+4. Never add a durable Object type, Role, Relationship semantic, Lifecycle concept, Information concept, Store, state machine or API noun merely because a feature needs a convenient noun.
+5. For **unimplemented designs**, directly rewrite the design / Roadmap / Issue / Prompt contract to canonical terminology before the Issue enters Ready. Do not keep a non-canonical planned noun alive merely by adding a mapping table.
+6. A concept mapping / alias is reserved for **already implemented or externally exposed legacy** that must remain readable or migratable: production code, persisted data, public API / CLI, historical package/schema, or an external system being imported.
+7. UI labels may use business-friendly wording, but the Issue must explicitly state that the label maps to an existing canonical concept and does not create a second Core truth.
+8. When another system or already-developed project uses a conflicting definition, use `CONCEPTS.md` for new ArcheOS design and record an explicit migration mapping; do not silently rename or rewrite historical data.
+9. If existing concepts are genuinely insufficient and the meaning is domain-specific, create or update that project's `docs/domain/CONCEPTS.md` **before implementation**. Domain concepts remain local and must not redefine common concepts.
+10. A domain concept may enter the common vocabulary only through an architecture review that updates `CONCEPTS.md` and records an ADR / Decision **before any production implementation depends on it**.
+11. Preserve stable Object identity and history when names or interpretations change.
 
-`Note` is not a canonical Core concept. Do not create a parallel Note model alongside Atomic Information.
+`Note` is not a canonical Core concept. Existing historical `Note` / `Atomic Note` names may be mapped to Atomic Information for compatibility, but no new design may introduce a parallel Note model.
 
 ### Issue Concept Convergence Check
 
@@ -214,33 +217,43 @@ Architect 与 Executor 都必须受“概念收敛”约束。任何涉及产品
 Architect 在创建或实质修改 Issue 前必须：
 
 1. 先阅读当前 `docs/architecture/CONCEPTS.md`，不能凭会话记忆或旧系统命名直接设计；
-2. 列出 Issue 中会影响数据模型、生命周期、长期状态、API contract 或用户理解的主要名词；
+2. 列出会影响数据模型、生命周期、长期状态、API contract 或用户理解的主要名词；
 3. 对每个名词优先寻找已有 canonical concept，或使用已有概念组合表达；
 4. 明确区分 **Core concept** 与流程阶段名、UI 名称、Prompt 字段、临时变量、实现记录、View / Projection / Presentation label；后者不得因为出现在设计文档中就自动获得独立 ID、Store、生命周期或 API；
-5. `Candidate` 只表示某个已有概念的候选状态，必须说明候选的是什么；不得创建泛化 Candidate 实体；
-6. 对“模型 / 方法 / 流程 / 规则”类名词，先检查能否收敛到已有 `Pattern / Protocol / Policy / Principle`；
-7. 对建议、推断、候选目标、候选决策等内容，先检查能否用 `Atomic Information Candidate / Atomic Information / Claim / Goal / Decision / Action` 等已有语义表达，而不是新建平行 Proposal truth；
-8. 对一次运行或可观测记录，先检查能否用已有 `Processing Run / Audit Event / Derived Artifact / View / Projection` 表达，而不是把运行记录升级为业务 Core；
-9. 如果只是为了让代码更好写而需要一个新名词，默认不批准新增概念；
-10. 如果现有概念确实无法表达，先说明缺口、为什么已有概念组合仍不足、真实业务例子、与相邻概念的边界和旧称映射，再由 Architect 决定是否修改 `CONCEPTS.md`；在 concept change 合并前，相关 Issue 不得进入 Ready。
+5. 对**尚未开发**的词，如果已有 canonical 表达，应直接把 Issue 正文改成 canonical term，而不是保留“新词 → 旧词”的长期映射；
+6. `Candidate` 只表示某个已有概念的候选状态，必须说明候选的是什么；不得创建泛化 Candidate 实体；
+7. 对“模型 / 方法 / 流程 / 规则”类名词，先检查能否直接使用已有 `Pattern / Protocol / Policy / Principle`；
+8. 对建议、推断、候选目标、候选决策等内容，先检查能否直接使用 `Atomic Information Candidate / Atomic Information / Claim / Hypothesis / Goal / Judgment / Decision / Action` 等已有语义，而不是新建平行 Proposal truth；
+9. 对一次运行或可观测记录，先检查能否用已有 `Processing Run / Audit Event / Derived Artifact / View / Projection` 表达，而不是把运行记录升级为业务 Core；
+10. 如果只是为了让代码更好写而需要一个新名词，默认不批准新增概念；
+11. 如果现有概念确实无法表达，先说明缺口、为什么已有概念组合仍不足、真实业务例子、与相邻概念的边界，再先修改 `CONCEPTS.md` / domain concept authority；在 concept change 合并前，相关实现 Issue 不得进入 Ready。
 
-涉及上述语义的 Issue 必须包含一个简短的：
+新设计 Issue 的理想状态不是维护一张越来越大的 alias 表，而是正文已经使用 canonical terminology。只有存在**已实现 legacy compatibility / migration**，或需要说明某个纯 UI label 不属于 Core 时，才保留最小映射表，例如：
 
 ```markdown
 ## Concept Convergence Check
 
-| Issue 术语 | Canonical 映射 | 是否新增概念 | 说明 |
-| --- | --- | --- | --- |
-| ... | ... | 否 | ... |
+Canonical concepts used:
+- Protocol
+- Pattern
+- Hypothesis
+- Judgment
+- Decision
+
+Legacy / UI mappings (only if actually needed):
+| Existing legacy/UI term | Canonical mapping | Why mapping must remain |
+| --- | --- | --- |
+| Atomic Note (historical package) | Atomic Information | Existing read compatibility |
+| “模型库” (UI label) | Pattern Library | Human-facing label only |
 
 New canonical concepts: none
 ```
 
-理想结果是 `New canonical concepts: none`。如果不是 `none`，必须引用已经完成或明确前置的 `CONCEPTS.md` / domain concept change。
+如果确需新增 canonical concept，Issue 必须引用**已经合并**的 `CONCEPTS.md` / domain concept change 和 ADR / Decision；不能让“本 Issue 计划新增概念”与实现同时发生。
 
-Executor 开始实现时必须重新核对该表。如果实现过程中发现必须新增未获批准的类型、Role、Relationship、状态机、长期记录、Store 或 API noun，必须停止相关实现并报告 `ARCHITECT_DECISION_REQUIRED`，不得自行把实现便利升级成产品概念。
+Executor 开始实现时必须重新核对 Issue 正文已经使用 canonical terms。如果实现过程中发现必须新增未获批准的类型、Role、Relationship、状态机、长期记录、Store 或 API noun，必须停止相关实现并报告 `ARCHITECT_DECISION_REQUIRED`，不得自行把实现便利升级成产品概念。
 
-PR Architecture Review 同样检查 **concept diff**：不仅看代码是否工作，也检查 PR 是否偷偷引入了 Issue 未声明的新概念或平行模型。
+PR Architecture Review 同样检查 **concept diff**：不仅看代码是否工作，也检查 PR 是否偷偷引入了 Issue 未声明的新概念或让已收敛的旧词重新变成平行模型。对于尚未开发的新能力，发现本应在设计阶段收敛的概念漂移应直接退回 Issue/Concept 设计，不用兼容层补救。
 
 ## Product-rule governance
 
@@ -341,6 +354,7 @@ Agents must:
 6. Treat uncertainty explicitly rather than inventing identities, facts, relationships, or roadmap certainty.
 7. Start significant product / architecture planning from the current Product Stage's evidence gap, not from a feature wish list.
 8. Allow evidence to challenge the roadmap through the explicit Roadmap Feedback path rather than silently drifting implementation direction.
+9. Converge concepts in documents and Issues before implementation; do not use compatibility mappings to postpone design decisions.
 
 ## Naming
 

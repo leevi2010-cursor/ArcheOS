@@ -33,12 +33,13 @@ Information 层主要包含：
 - `Atomic Information Candidate`
 - `Atomic Information`
 - `Claim`
+- `Hypothesis`
 - `Evidence`
 - `Residue`
 
 Information 描述“我们获得了什么信息”，不等同于长期世界中的 Object，也不等同于系统已经确认的 World Model 状态。
 
-Information Layer **允许彼此矛盾的 Atomic Information / Claim 并存**。保存“某人说过什么”或“某个来源表达了什么”，不意味着 ArcheOS 已经把该内容接受为当前事实。
+Information Layer **允许彼此矛盾的 Atomic Information / Claim / Hypothesis 并存**。保存“某人说过什么”、系统当前提出什么可检验命题，或“某个来源表达了什么”，都不意味着 ArcheOS 已经把对应内容接受为当前事实。
 
 `Note` **不是 ArcheOS Core 的正式概念**。在旧系统、历史文件或人类界面中遇到 `Note` 时，可以把它识别为 `Atomic Information` 的旧称或展示名称，但不得因此建立独立的 Note 模型、Store、ID 或生命周期。
 
@@ -288,6 +289,45 @@ A 与 B 可以同时长期保存，即使彼此冲突。冲突如何影响 World
 
 当多个主体独立表达同一内容时，优先保留各自可追溯的 Atomic Information / Claim，而不是为了减少记录而抹平不同来源。
 
+### Hypothesis
+
+`Hypothesis` 表示：**一个尚未被 ArcheOS 当作稳定知识接受、但可以通过后续 Evidence / Feedback 被支持、反对、修订或淘汰的可检验命题。**
+
+Hypothesis 属于 Information Layer，并复用 Atomic Information 的长期身份、Revision、Evidence、context 与 provenance。第一版不建立独立 `HypothesisStore`、独立 Object、独立 ID 或第二套生命周期；实现上应把它作为 Atomic Information 的 canonical 语义形态，而不是平行信息模型。
+
+Hypothesis 可以由 Human 或 Agent 基于一个或多个 Evidence 提出。提出 Hypothesis 不意味着它已经成立，也不意味着其内容已经成为 World Model state。
+
+Hypothesis 与相邻概念的边界：
+
+- `Observation / Evidence` 回答“观察到了什么 / 依据在哪里”；Hypothesis 回答“当前有哪些可被未来事实验证或反驳的解释、预测或条件性命题”；
+- `Claim` 回答“谁以什么立场说了什么”；某个 Claim 可以提出 Hypothesis，但归因与命题是否被现实支持是两个维度；
+- `Judgment` 表示在当前 Goal / Evidence / Requirement 下作出的判断；Judgment 可以依赖多个 Hypothesis，但不等于这些 Hypothesis；
+- `Action` 回答“做什么”；Hypothesis 可以表达“为什么预期该 Action 会产生某种 Outcome”；
+- `Decision` 是 Human 受治理确认的取舍；Decision 可以依赖 Hypothesis，但不会把 Hypothesis 自动升级为事实；
+- `Pattern / Protocol / Policy / Principle` 是更稳定、可复用的方法或治理结构；被反复验证的 Hypothesis 可以为它们的新版本提供依据，但不能通过原地改类型的方式“变身”为这些概念。
+
+影响 Judgment / Decision 的关键 Hypothesis 应能够追溯到 supporting Evidence、challenging Evidence、预期可观察结果与后续 Feedback。Hypothesis 被现实支持到什么程度，**不得复用 `Atomic Information.confidence` 表示**；后者继续只表示信息提取 / 语义理解正确性的置信程度。第一版优先保留支持/反对 Evidence、验证结果、适用条件和 Revision，不提前制造“真实性概率”。
+
+### Atomic Information semantic types
+
+`semantic_type` 是 Atomic Information 的**语义标签**，不是一组拥有独立 Store、ID、生命周期或基类的平行 Core concepts。
+
+当前 production 已实现并验证的 vocabulary 为：
+
+- `observation`：来源明确表达或系统提取到的观察 / 状态描述；
+- `preference`：主体对选择、结果或方式的偏好；
+- `requirement`：必须满足、必须避免或构成边界条件的要求；业务界面可以自然表达为“要求 / 约束”，但 Core 不另建 `constraint` semantic type；
+- `judgment`：主体基于当前信息作出的判断、评估或推荐；
+- `decision`：已经作出的选择 / 决定的原子记录；需要长期身份、责任、状态和复盘时，可进一步由 Object + `decision` Role 表达正式 Decision；
+- `commitment`：主体已承诺承担或完成的事项；
+- `action`：已经发生、正在发生或明确提出的动作；
+- `question`：仍需回答或调查的问题；
+- `other`：重要但当前不适合更具体标签的信息。
+
+这些 label 的边界属于现有 production contract。以后若要合并、重命名或新增已持久化 semantic type，必须按**已开发兼容迁移**处理，不能只改文档导致历史 Atomic Information 失去可读性。
+
+`Hypothesis` 已是 canonical Information 语义，但当前 production `SEMANTIC_TYPES` 尚未实现对应 label。未来实现 Hypothesis 时，应扩展同一 Atomic Information semantic mechanism，并先定义兼容 / schema 变更；不得为 Hypothesis 建立第二个 Store 或生命周期。
+
 ---
 
 ## 10. Atomic Information Candidate
@@ -324,7 +364,8 @@ Evidence 与 Atomic Information 不同：
 
 - Atomic Information 表示“系统记录了什么信息”；
 - Claim 表示“谁以什么立场表达了这条信息”；
-- Evidence 表示“这条信息和归因依据什么来源”。
+- Hypothesis 表示“当前有哪些可检验但尚未成为稳定知识的命题”；
+- Evidence 表示“这条信息、归因或 Hypothesis 依据什么来源”。
 
 ---
 
@@ -358,9 +399,9 @@ Object
 
 它不是需要单独创建 ID 的 Object，而是一个架构层概念。
 
-Atomic Information / Claim / Evidence 描述和支撑 World Model；World Model 表达 ArcheOS 对长期经营世界的**当前受治理认知**。
+Atomic Information / Claim / Hypothesis / Evidence 描述和支撑 World Model；World Model 表达 ArcheOS 对长期经营世界的**当前受治理认知**。
 
-Information Layer 可以保留相互矛盾的 Claim；World Model 不需要把每个 Claim 都复制成结构化事实。
+Information Layer 可以保留相互矛盾的 Claim / Hypothesis；World Model 不需要把每个 Claim 或 Hypothesis 都复制成结构化事实。
 
 ---
 
@@ -478,7 +519,9 @@ A、B、C 之间的业务联系通过 Relationship 表达。
 
 ## 20. 概念别名与收敛规则
 
-ArcheOS 使用一个 canonical 概念体系。别名只帮助识别旧资料和不同系统的说法，不拥有独立定义，也不得在新代码中形成兼容类或平行存储模型。
+ArcheOS 使用一个 canonical 概念体系。别名只帮助识别**已经存在的历史资料、旧代码、旧 API / package 或不同系统的既有说法**，不拥有独立定义，也不得在新设计中作为未开发规划词继续存在。
+
+对尚未开发的设计：应直接使用 canonical concept；如果现有概念确实不足，应先完成 `CONCEPTS.md` 的 concept change，再进入实现。只有已经落地、需要兼容或迁移的旧名称才进入下面的映射。
 
 | Canonical 概念 | 可识别旧称 / 别名 | 收敛规则 |
 | --- | --- | --- |
@@ -518,23 +561,13 @@ Input → Processing → Atomic Information → Structured Object → Decision �
 
 `Inbox` 是尚未完成来源登记的临时输入区。内容可能重复、无效、缺少权限或无法处理，因此不是长期事实权威。
 
-### Source Object
-
-`Source Object` 是已经登记、可稳定引用的原始来源身份，例如一份文件、录音、邮件或外部系统记录。
-
-Source Object 属于 Information / Evidence 边界，不等于 World Model Object。它至少能够指向原始内容位置、内容摘要、来源、权限范围和接收记录。
-
-### Intake Receipt
-
-`Intake Receipt` 记录某个来源在何时、通过何种渠道被系统接收。相同内容从不同渠道重复到达时，可以共享 Source Object，同时保留多份 Intake Receipt。
-
 ### Derived Artifact
 
-`Derived Artifact` 是从 Source Object 经处理产生的转写、摘要、解析结果或其他中间产物。它不得覆盖原始来源，并应保留 Processing Run 与版本来路。
+`Derived Artifact` 是从 Source 经处理产生的转写、摘要、解析结果或其他中间产物。它不得覆盖原始 Source，并应保留 Processing Run 与版本来路。
 
 ### Evidence Fragment
 
-`Evidence Fragment` 是 Source Object 或 Derived Artifact 中可精确读回的位置，例如页码、时间段、表格行或文本片段。
+`Evidence Fragment` 是 Source 或 Derived Artifact 中可精确读回的位置，例如页码、时间段、表格行或文本片段。
 
 Evidence Fragment 负责回答“依据在原文哪里”；Atomic Information Candidate / Atomic Information 负责回答“这段依据表达了什么”。一个 Fragment 可以支持多条信息，一条信息也可以引用多个 Fragment。
 
@@ -548,7 +581,7 @@ Evidence Fragment 负责回答“依据在原文哪里”；Atomic Information C
 
 ### Feedback
 
-`Feedback` 是行动或写入后重新获得的现实状态和结果，用于修正下一轮 Atomic Information、判断、Decision 或行为。
+`Feedback` 是行动或写入后重新获得的现实状态和结果，用于修正下一轮 Atomic Information、Hypothesis、判断、Decision 或行为。
 
 ---
 
@@ -564,13 +597,15 @@ Evidence Fragment 负责回答“依据在原文哪里”；Atomic Information C
 
 `Goal` 是希望达到、并可用于判断行动方向的结果状态。
 
-- 一次性提到的目标可以先作为 Atomic Information 的 semantic type；
-- 需要长期责任、状态、关系和复盘时，建立 Object 并赋予 `goal` Role。
+- 一次性提到的目标性表达可以先作为普通 Atomic Information 保存，不要求为了“出现一个目标句子”立即新增 Goal Object；
+- 当该目标需要长期责任、状态、关系、完成条件和复盘时，建立 Object 并赋予 `goal` Role；
 - `Vision` 是更长期的 Goal 层级；`Objective` 作为 Goal 别名，不新增概念。
 
 ### Roadmap
 
-`Roadmap` 是 Workspace 基于 Goal、现实、资产、约束和 Decision 形成的长期路径 View。它不是 Project 内部必须存在的层级，也不作为独立 Core 身份重复保存底层对象。
+`Roadmap` 是 Workspace 基于 Goal、现实、资产、Requirement 和 Decision 形成的长期路径 View。它不是 Project 内部必须存在的层级，也不作为独立 Core 身份重复保存底层对象。
+
+这里的业务 `Roadmap` 是 World Model / View 语义；仓库中的 `PRODUCT_ROADMAP.md` / Development Roadmap 是开发治理文档，不因此创建运行时 Roadmap Object。
 
 ### Project
 
@@ -655,7 +690,7 @@ State、Status、Lifecycle、Health、Freshness 不得互相替代。Signal、Fe
 
 - `Constitution`：最高层、稳定、跨任务的治理基线。
 - `Principle`：用于判断取舍的稳定原则。
-- `Policy`：某一明确范围内版本化、可执行的业务参数和约束。
+- `Policy`：某一明确范围内版本化、可执行的业务参数和要求。
 - `Protocol`：跨任务可复用的交互、判断、门禁与流转规则。
 - `Pattern`：反复问题对应的可复用解决结构。
 

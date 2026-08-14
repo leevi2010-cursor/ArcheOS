@@ -34,6 +34,8 @@ Source / provenance 是否稳定
         ↓
 多格式与 Conversation 是否进入同一 Information lifecycle
         ↓
+语义执行是否稳定、可审计、隐私可控
+        ↓
 重复 / 派生 / 补充 / 时间变化 / 冲突是否能受治理地整理
         ↓
 长期 Object 是否能从真实 Information 中安全形成与演化
@@ -245,37 +247,60 @@ Issue #21 只固化 Managed Source 的权威边界，不实现 runtime。后续�
 
 后续主线阶段：
 
-#### #22 — M2-C1b 本地 Managed Source 准入、校验与恢复
+#### #22 — M2-C1b 本地 Managed Source 准入、校验与恢复（已完成）
 
-实现本地受控 Source 区、用户明确准入、完整字节复制、大小与 `content_hash` 校验、Manifest 持久化和恢复验证。它是后续 Processing 切换的前置条件。
+实现本地受控 Source 区、用户明确准入、完整字节复制、大小与 `content_hash` 校验、Manifest 持久化和恢复验证。
 
-#### #24 — M2-C1d 音频 Processing 切换到 Managed Source
+#### #24 — M2-C1d 音频 Processing 切换到 Managed Source（已完成）
 
-把音频 Processing 从 legacy 外部 path/hash provenance 切换到已验证的 Managed Source；不改变既有 Source、Evidence 和 Atomic Information 的语义边界。
+音频 Processing 已从 legacy 外部 path/hash provenance 切换到已验证的 Managed Source；新 Processing package 不再依赖外部绝对路径作为 Source / Evidence 权威。
 
-#### #28 — M2-C2a 开源调查、复用治理与多格式基准
+#### #28 — M2-C2a 开源调查、复用治理与多格式基准（已完成）
 
-在正式多格式 Adapter 前完成官方开源能力调查、许可证与隐私边界评估，以及受控本地基准。它可以与 #23、#24 并行，但不实现 runtime。
+完成官方开源能力调查、许可证与隐私边界评估，以及受控本地基准，为多格式 Adapter 提供复用证据。
 
-#### #29 — M2-C2b Normalized Representation 公共契约
+#### #29 — M2-C2b Normalized Representation 公共契约（已完成）
 
-在 #28 的调查结论基础上固定多格式派生表示的最小公共 contract，不实现具体格式 Adapter。
+固定格式无关的 Normalized Representation contract 与本地运行骨架。
 
-#### #30 — M2-C2c 首批多格式 Adapter（内部并行）
+#### #30 — M2-C2c 首批多格式 Adapter（已完成）
 
-在 #29 后按已批准 contract 实现首批格式 Adapter；内部可以按格式并行，但不得形成平行 Representation 语义。
+已按统一 contract 实现 Markdown、text PDF、XLSX、PPTX 与 image structural preflight；OCR / 复杂视觉语义继续后置。
 
-#### #31 — M2-C2d Representation → Atomic Information
+#### #31 — M2-C2d Representation → Atomic Information contract（当前）
 
-在首批 Representation 稳定后，把可追溯的派生表示接入 Atomic Information 入口，保留 Source 与 locator 证据链。
+把具有可分析业务内容的 Normalized Representation 接入唯一 Atomic Information 生命周期，建立 stable Analysis Units、Candidate / Residue coverage、Evidence、strict package 与 durable ingestion contract。
 
-#### #48 — M3-B1a 微信 Conversation Representation 与统一信息消化接入
+#31 **不再承担正式 semantic execution provider 的选择**；其 production semantic provider 已拆到 #50。#31 可以在不选择 live Provider 的前提下完成 contract / plumbing，并保持 fail-closed。
 
-在 #31 稳定后，以现有真实微信 Source 验证 Conversation Representation、message-level Evidence、bounded context 与统一信息消化。微信只做 provider-specific mapping，不建立微信专用长期信息模型。
+#### #50 — M2-C2e Semantic Analysis Provider 验证（当前，可与 #48 并行）
 
-#### #32 — M2-C3a Information Consolidation 真实实验（内部并行）
+独立验证正式 semantic execution path：比较 pinned/latest Codex、External Agent handoff 以及必要的其他成熟 Provider，回答哪条路线能够稳定、可审计、隐私可控地产生严格 structured result。
 
-以真实、受控样本验证跨表示与跨 Source 的整理边界，不直接扩大为正式 runtime。微信 Conversation 在可用后应成为真实实验的重要输入之一。
+#50 不修改 Atomic Information / World Model 语义；其结论是后续真实多格式和微信 semantic digestion 的执行门禁。
+
+#### #48 — M3-B1a 微信 Conversation Representation v1（#31 后，可与 #50 并行）
+
+以现有真实微信 Source 验证 Conversation Representation、stable message locator、message-level Evidence、bounded context-only units、metadata preservation、analysis eligibility 与 deterministic batching。
+
+#48 只把微信稳定地转换成可交给 #31 `RepresentationAnalysisProvider` contract 的 Analysis Units，**不负责选择 production semantic provider，也不在本 Issue 宣称真实微信已经完成长期 Atomic Information 消化**。
+
+#### 微信真实 Semantic Digestion（#48 + #50 后，后续最小 Issue）
+
+当 #48 的 Conversation Representation 通过 Architecture Review，且 #50 给出正式 provider route 后，再创建最小 Issue 完成：
+
+```text
+Conversation Analysis Units
+→ production semantic provider
+→ Atomic Information Candidate + Residue
+→ Durable Atomic Information
+```
+
+真实 50 条微信的语义质量、遗漏/错误信息、Evidence 与 unresolved referent 在此阶段验收，而不是提前塞回 #48。
+
+#### #32 — M2-C3a Information Consolidation 真实实验
+
+在统一 Atomic Information 能稳定承接真实多格式 / Conversation 数据后，以真实、受控样本验证跨 Source 的 equivalent、derived、complementary、temporal_update、conflict、uncertain 等整理边界，不直接扩大为正式 runtime。
 
 #### #33 — M2-C3b Information Consolidation 运行时
 
@@ -285,11 +310,11 @@ Issue #21 只固化 Managed Source 的权威边界，不实现 runtime。后续�
 
 在 Information Consolidation 有充分证据后，研究从 Information 到长期 Object 的受治理形成边界。
 
-#### 并行任务：#23 Handoff Marker
+#### 并行任务：#23 Handoff Marker（已完成，非主线 Gate）
 
-Issue #23 可以在 #22 完成后并行处理用户交接说明。它不阻塞 #24 的主数据链，也不改变 Managed Source、Evidence 或 Processing 的权威边界。
+Handoff Marker 只提供可选外部交接说明，不改变 Managed Source、Evidence 或 Processing 的权威边界。
 
-共同的 runtime 目标：
+共同的 runtime 原则：
 
 - `01_inbox/` 作为第一版本地 Managed Source 根目录；
 - 外部路径只保留为可失效 `ingested_from`，不再作为后续 Processing / Evidence 权威；
@@ -298,26 +323,24 @@ Issue #23 可以在 #22 完成后并行处理用户交接说明。它不阻塞 #
 - TOS 只作为 storage adapter / replica；
 - 不引入 Source version graph、`supersedes` 或 `version_of`。
 
-上述 runtime 和后续阶段不属于 Issue #21 的实现范围；Issue #21 不实现复制、恢复、删除、TOS 或多格式 adapter。
-
 ### 横向能力：Human View / Frontend（已规划，后置，不启动）
 
-Human View 是人类理解和治理 ArcheOS 的 Presentation 层，不是新的业务 truth，也不是当前信息消化主线的前置条件。
+Human View 是人类理解和治理 ArcheOS 的 Presentation 层，不是新的业务 truth，也不是当前 Stage 1 信息消化主线的前置条件。
 
 第一版需求方向记录为：
 
 - **Object Profile**：一个长期 Object 的名称、Role、Lifecycle、关键关系、当前认知与未决事项；
 - **Relationship Graph / 向阳生长图**：可视化 Object 之间的长期关系，支持聚焦相关节点，但不把展示树结构反写为新的 canonical hierarchy；
 - **Timeline**：展示与 Object 相关的重要 Atomic Information、Decision、Change Journal 与时间变化；
-- **Information / Evidence Drill-down**：从结论展开到 Claim、Evidence、Representation locator 和 Source；
+- **Information / Evidence Drill-down**：从结论展开到 Claim、Hypothesis、Evidence、Representation locator 和 Source；
 - **Pending / Conflict / Unresolved**：明确展示待判断、冲突、不确定和 Context truncation，不把候选伪装成事实；
 - **Human Judgment**：在真实使用证明 CLI / Agent prompt 审核效率不足时，为已有 Governance 提供轻量人类操作界面；不得另建第二套 Proposal / Review truth；
 - **Context Preview**：让用户看到 Agent 实际会读取到的 bounded Context，帮助发现缺失、噪声和错误结构化；
 - **Source / Intake Status**：查看 Source、Representation、processing/completeness/warnings，但不把前端变成通用文件管理器；
-- **Protocol 执行 / Decision 追溯 View**：按阶段查看一次 Protocol 执行使用了哪些 Context、产生了哪些 `Derived Artifact`、哪些 Evidence / unresolved / 工作假设支撑最终 Judgment；该页面是 `Projection / View`，不创建 `Thinking Run / Decision Trace` Core；
+- **Protocol 执行 / Decision 追溯 View**：按阶段查看一次 Protocol 执行使用了哪些 Context、产生了哪些 `Derived Artifact`、哪些 Evidence / unresolved / Hypothesis 支撑最终 Judgment；该页面是 `Projection / View`，不创建 `Thinking Run / Decision Trace` Core；
 - **Protocol Library**：查看当前有哪些 canonical `Protocol`、各自解决什么类型的问题、当前 active version、历史版本、状态与变更记录；
 - **Pattern Library（前端可显示“模型库”）**：查看系统目前有哪些 canonical `Pattern`、适用于什么问题、输入输出、适用条件、限制、版本与状态，以及哪些 Protocol 阶段使用它；前端“模型”只是业务展示名称，不创建第二套 Model truth；
-- **Decision → Protocol / Pattern Drill-down**：Decision 页面显示本次使用的 Protocol version、Pattern version、Policy snapshot、Evidence 与外部基础模型运行 provenance，并可跳转到对应详情；
+- **Decision → Protocol / Pattern Drill-down**：Decision 页面显示本次使用的 Protocol version、Pattern version、Policy snapshot、关键 Hypothesis、Evidence 与外部基础模型运行 provenance，并可跳转到对应详情；
 - **Protocol / Pattern Governance**：未来允许用户观察、比较和追溯版本；编辑与激活分离，采用 draft → validate/compare → active → deprecated/rollback，不原地覆盖历史 Decision 使用过的版本。
 
 旧 `sunward-operating-system` 前端可以作为设计素材，优先复用：
@@ -339,7 +362,7 @@ Canonical State
   → Presentation
 ```
 
-**当前不创建 Frontend 实现 Issue，不启动开发。** 只有当真实使用反复证明“人类理解 / 审核成为主要瓶颈”后，再由 Architect 根据当时的 canonical read contracts 创建最小 Human View Issue。
+**当前不创建 Frontend 实现 Issue，不启动开发。** 只有当真实使用反复证明“人类理解 / 审核成为主要瓶颈”，或 Product Roadmap 进入需要 Human View 的阶段后，再由 Architect 根据当时的 canonical read contracts 创建最小 Human View Issue。
 
 ### M2-D — Migration Readiness & Clean-cut Plan
 
@@ -363,6 +386,7 @@ RETIRE
 - 旧开发态 structured state 不因为存在就必须兼容；
 - Raw Source / Evidence / provenance 不可因 structured reset 被误删；
 - IMPORT/REBUILD 必须映射到现有 canonical concepts；
+- 迁移映射只用于**已经存在的旧代码、旧数据和旧语义**；不得用 mapping 为尚未开发的新设计保留平行概念；
 - 缺失的真实业务语义交由 Architect 决策，不在 migration script 中偷偷造 schema；
 - 前端资产优先判断为 `REBUILD / reference`，只复用可证明有价值的交互，不继承旧数据模型；
 - #17 完成旧数据与前端资产盘点后，可正式 Archive 旧 `sunward-operating-system` 仓库；
@@ -382,7 +406,7 @@ RETIRE
 
 ## M3 — Agent Integration + Conversation Ingestion
 
-ArcheOS 不开发自己的 Agent。M3 的目标是让 Codex 与未来其他 Agent 能够读取同一份受治理 Context，并把有长期价值的对话重新进入同一 Information lifecycle。
+ArcheOS 不开发自己的 Agent。M3 的目标是让 Codex 与未来其他 External Agent 能够读取同一份受治理 Context，并把有长期价值的对话重新进入同一 Information lifecycle。
 
 ### M3-A — 可安装 CLI + Codex 只读接入（#35，已完成）
 
@@ -395,7 +419,9 @@ Conversation 是输入 / Representation 形态，不是新的业务 Core。
 当前顺序：
 
 ```text
-#48 微信 Conversation production v1
+#48 微信 Conversation Representation v1
+↓
+#50 gate 后的微信真实 Semantic Digestion
 ↓
 #47 继续完成 Codex / ChatGPT 跨 Provider 对照研究
 ↓
@@ -411,7 +437,8 @@ WeChat / Codex / ChatGPT / future provider
 → provider-specific capture/import
 → Conversation Representation
 → Representation Analysis Units
-→ Atomic Information + Residue + Evidence
+→ production semantic provider
+→ Atomic Information + Hypothesis + Residue + Evidence
 → Consolidation / World Model / Context
 ```
 
@@ -423,11 +450,11 @@ Provider 不建立自己的 Atomic Information 生命周期。
 
 ---
 
-## M4 — 主动认知与决策增强（后置探索）
+## M4 — 主动认知与决策增强（Product Stage 2，后置探索）
 
-ArcheOS 的职责是增强外部 Agent / Human 的长期认知和决策依据，不实现自有 Decision Agent。真正的推理交给外部 Agent；ArcheOS 负责用已有 `Protocol / Policy / Pattern / Context / Judgment / Decision / Action / Feedback` 等 canonical concepts，让推理过程系统化、可控、可观察、可版本治理、可追溯。
+ArcheOS 的职责是增强 External Agent / Human 的长期认知和决策依据，不实现自有 Decision Agent。真正的推理交给 External Agent；ArcheOS 负责用已有 `Protocol / Policy / Pattern / Context / Hypothesis / Judgment / Decision / Action / Feedback` 等 canonical concepts，让推理过程系统化、可控、可观察、可版本治理、可追溯。
 
-任何 M4 Issue 在进入 Ready 前都必须执行 `AGENTS.md` 的 **Concept Convergence Check**；默认 `New canonical concepts: none`。
+M4 对应 Product Roadmap Stage 2 的主要技术探索。**Stage 1 未通过前不启动。**任何 M4 实现 Issue 在进入 Ready 前都必须重新读取当时的 `CONCEPTS.md` 并完成开发前 Concept Convergence。
 
 ### M4-A — Protocol 驱动的决策增强契约实验（#42，当前 blocked）
 
@@ -439,13 +466,14 @@ ArcheOS 的职责是增强外部 Agent / Human 的长期认知和决策依据，
 Signal / Event / Human request
 → Protocol
 → Context Builder
-→ 候选 Action + 预期结果 + 工作假设（Derived Artifact）
-→ Judgment：基于 Goal / Preference / Constraint / Policy / Evidence / Pattern
+→ 候选 Action + 预期结果 + Hypothesis
+→ Judgment：基于 Goal / Preference / Requirement / Policy / Evidence / Pattern
 → Challenge（Protocol 阶段标签）
 → Atomic Information Candidate（Agent recommendation / judgment）
 → Human Decision
 → Action / Commitment
 → Feedback
+→ Hypothesis revision / updated Context
 ```
 
 概念边界：
@@ -453,18 +481,19 @@ Signal / Event / Human request
 - `Protocol`：控制跨任务可复用的思考步骤、门禁和流转；
 - `Policy`：控制最少候选 Action 数、风险偏好、时间范围、是否强制 Challenge 等可调参数；
 - `Pattern`：承载反复问题对应的可复用解决结构；前端可以把 Pattern Library 显示为“模型库”；
-- `Context Builder`：提供 Goal / World Model / Information / Evidence / Preference / Constraint / previous Decision / Feedback 等 bounded Context；不建立 Decision Context Builder；
+- `Hypothesis`：记录会影响 Judgment / Decision、并可被后续 Evidence / Feedback 支持或反对的可检验命题；
+- `Context Builder`：提供 Goal / World Model / Information / Evidence / Preference / Requirement / previous Decision / Feedback 等 bounded Context；不建立 Decision Context Builder；
 - External Agent：执行真正推理；
 - `Derived Artifact`：保存 Protocol 阶段的结构化中间结果；
 - `Audit Event`：记录关键运行和版本 provenance；
 - `Judgment`：表达 Agent 对候选 Action 的比较和推荐；
 - Human `Decision`：正式决策，继续受治理且 human-in-the-loop。
 
-“候选 Action”与“工作假设”不是同一维度：前者回答“可以做什么”，后者回答“为什么认为这么做会产生某个结果”。当前都只作为 Protocol 阶段输出，不新增 `Option` 或 `Hypothesis` Core；只有真实实验证明需要独立长期生命周期时，才提交 concept change。
+候选 Action 回答“可以做什么”；Hypothesis 回答“为什么预期该 Action 会产生某个结果”。两者不需要新的 `Option` Core；Hypothesis 已由 `CONCEPTS.md` / ADR-005 定义为 Atomic Information 的 canonical 语义形态。
 
 类似“先提出 3 个可行方案”不得写死为经营业务代码；它属于可版本化 `Policy` 与 Prompt 约束。代码只控制阶段顺序、权限、输入输出 contract、预算、失败处理与 human gate。
 
-不要求、不展示、不长期保存外部模型的私有 chain-of-thought；系统只保存可检查的 `Derived Artifact`、Judgment、Evidence、工作假设、候选 Action 与 Feedback。
+不要求、不展示、不长期保存外部模型的私有 chain-of-thought；系统只保存可检查的 `Derived Artifact`、Hypothesis、Judgment、Evidence、候选 Action 与 Feedback。
 
 ### M4-B — Protocol Governance（规划，未启动）
 
@@ -494,7 +523,7 @@ Pattern Library 至少需要回答：
 4. Pattern 需要哪些输入、产生哪些结构化输出；
 5. assumptions / constraints / applicability；
 6. 当前版本、状态、owner、来源与变更历史；
-7. 哪些真实 Decision / Feedback 支持或挑战该 Pattern；
+7. 哪些真实 Decision / Feedback / Hypothesis 支持或挑战该 Pattern；
 8. 某次 Decision 实际使用的是哪个 Pattern version。
 
 已经参与历史 Decision 的 Pattern version 不原地覆盖；修订产生新版本，并允许 compare / deprecate / rollback。
@@ -510,6 +539,7 @@ Decision
 → Protocol version
 → Policy snapshot
 → Pattern version(s)
+→ Hypothesis
 → 阶段 Derived Artifacts
 → Agent Judgment / Atomic Information Candidate
 → Context / Evidence
@@ -517,7 +547,7 @@ Decision
 → Feedback
 ```
 
-前端应让用户清楚看到：为什么启动、使用了哪版 Protocol / Pattern、产生了哪些候选 Action、依赖哪些工作假设和 Evidence、经过什么 Judgment / Challenge、Human Decision 与 Agent 推荐有何差异、后续 Feedback 是否支持原判断。
+前端应让用户清楚看到：为什么启动、使用了哪版 Protocol / Pattern、产生了哪些候选 Action、依赖哪些 Hypothesis 和 Evidence、经过什么 Judgment / Challenge、Human Decision 与 Agent 推荐有何差异、后续 Feedback 是否支持或反对原 Hypothesis。
 
 这一能力与 Human View / Frontend 同步规划，但**当前不启动前端开发**。
 
@@ -528,7 +558,7 @@ Decision
 ```text
 Goal
 + Health / State
-+ Constraint / Red Line
++ Requirement / Red Line
 + Signal / Event / opportunity
 + Policy
 → 启动 Protocol
@@ -542,31 +572,47 @@ Goal
 
 以下顺序是**当前 Product Stage 下关闭 Evidence Gap 的最佳已知技术顺序**，不是不可修改的长期产品承诺。若真实实验产生 Roadmap Feedback，应先判断影响范围，再按权威链修正 Product / Development Roadmap。
 
-已完成阶段不再重复执行；当前主线从 #31 继续：
+当前主线：
 
 ```text
-#31 Representation → Atomic Information
- ↓
-#48 微信 Conversation → 统一信息消化
- ↓
-#32 Information Consolidation 真实实验
- ↓
-#33 Information Consolidation 运行时
- ↓
-#34 Object Emergence
- ↓
-#17 真实旧数据压力测试 / clean-cut readiness
+                     #31
+       Representation → Information contract
+                     ↓
+           ┌─────────┴─────────┐
+           ↓                   ↓
+          #48                 #50
+ WeChat Conversation      Semantic Provider
+  Representation            validation
+           │                   │
+           └─────────┬─────────┘
+                     ↓
+         微信真实 Semantic Digestion
+              （后续最小 Issue）
+                     ↓
+                    #32
+     Information Consolidation 真实实验
+                     ↓
+                    #33
+       Information Consolidation runtime
+                     ↓
+                    #34
+              Object Emergence
+                     ↓
+                    #17
+       真实旧数据压力测试 / clean-cut
+                     ↓
+             Stage 1 Gate Review
 ```
 
 并行 / 后置：
 
 ```text
-#47 Conversation 跨 Provider 研究       后续继续，不阻塞 #48
+#47 Conversation 跨 Provider 研究       微信 v1 后继续，不阻塞 #48
 #43 Codex Conversation production       等 #47 收敛
 #44 Workspace portability               后置
-Human View / Frontend                    已写入 Roadmap，不启动
-#42 Protocol 驱动的决策增强实验          blocked；真实认知链稳定后再启动
-Protocol / Pattern Governance            M4 后置规划，不启动
+Human View / Frontend                    已规划，不启动
+#42 Protocol 驱动的决策增强实验          Product Stage 2；当前 blocked
+Protocol / Pattern Governance            Stage 2 后置规划，不启动
 ```
 
 旧 `sunward-operating-system` 从现在起不再承担产品主线；新输入、新认知、新 Agent Context 与新功能均进入 ArcheOS。#17 只负责完成最后的旧数据 / UI 资产盘点和仓库正式 Archive 条件确认，而不是维持旧系统继续运行。
@@ -584,7 +630,7 @@ ArcheOS / 新向阳经营系统始终沿一条主线演化：
 1. `PRODUCT_SPEC.md` 定义长期产品方向与边界；`PRODUCT_ROADMAP.md` 定义 Product Stage 与 Stage Gate；本文件只能在该上游方向内安排技术演化；
 2. 新的重大能力、集成、UI 或平台基础设施进入 Ready 前必须通过 `AGENTS.md` 的 Roadmap Alignment Check，说明它关闭哪个当前 Evidence Gap；
 3. Experiment / Issue / PR / Real-world Validation 可以产生 Roadmap Feedback；失败实验只要获得了预期 Evidence，也可以是有效产品进展；
-4. Core 概念以 `CONCEPTS.md` 为准；
+4. Core 概念以 `CONCEPTS.md` 为准；未开发概念必须在实现前完成收敛，不用 mapping table 延后概念决策；
 5. 产品行为规则以 `INFORMATION_GOVERNANCE.md` 为准；
 6. 优先复用已有概念，不建立平行模型；
 7. Object ID 稳定，Name / Role / View 可以演化；
@@ -594,14 +640,14 @@ ArcheOS / 新向阳经营系统始终沿一条主线演化：
 11. Change Journal 保留自动和人工变更的审计链，但不成为第二份事实源；
 12. Context Builder 是统一上下文组装能力，默认 bounded / provenance-aware / truncation-aware；
 13. 真实数据验收是阶段门槛，不以 synthetic tests 代替真实语义验证；
-14. 迁移采用 clean-cut / 单向导入，除非出现真实不可丢数据或外部消费者才重新讨论 compatibility；
+14. 迁移采用 clean-cut / 单向导入；mapping 只解释已经存在的 legacy code/data/API，不为未开发设计保留平行术语；
 15. Human View 只消费 canonical read contracts，不建立第二份 truth；
-16. ArcheOS 不开发自己的 Agent，而是增强外部 Agent / Human 的认知与决策能力；
+16. ArcheOS 不开发自己的 Agent，而是增强 External Agent / Human 的认知与决策能力；
 17. 长期产品名回归“向阳经营系统”，但工程改名不得早于真实使用稳定和旧系统 clean-cut；
-18. M4 设计必须先执行 Concept Convergence Check；流程阶段名、UI 名称、Prompt 字段和运行记录不得自动升级为 Core concept；
-19. 使用 canonical `Protocol` 控制流程 / 门禁，`Policy` 控制可调参数，`Pattern` 承载可复用解决结构，Prompt 只作为实现 artifact，不把经营判断硬编码进 runtime；
-20. 历史 Decision 必须固定引用当时使用的 Protocol / Policy / Pattern 版本或 snapshot，不允许后来修改规则而改写历史；
+18. M4 实现必须在 Product Stage 2 到来时再次执行 Concept Convergence Check；流程阶段名、UI 名称、Prompt 字段和运行记录不得自动升级为 Core concept；
+19. 使用 canonical `Protocol` 控制流程 / 门禁，`Policy` 控制可调参数，`Pattern` 承载可复用解决结构，`Hypothesis` 保存可检验命题，Prompt 只作为实现 artifact；
+20. 历史 Decision 必须固定引用当时使用的 Protocol / Policy / Pattern 版本或 snapshot，并能追溯关键 Hypothesis / Evidence；
 21. 决策可观测性通过 `Derived Artifact / Audit Event / Projection / View / Evidence` 实现，不新建 ThinkingRun / DecisionTrace truth，也不存储模型私有 chain-of-thought；
-22. 前端“模型库”第一版映射到 canonical Pattern Library；只有真实实验证明 Pattern 无法表达时，才考虑新增 Model concept；
+22. 前端“模型库”是 canonical Pattern Library 的业务显示名称，不创建第二套 Model truth；
 23. 用户未来可以观察、比较、调整 Protocol / Pattern，但编辑与激活必须分离，变更先验证再生效，并保留回滚能力；
 24. 不因为未来可能需要某个能力，就提前建设完整框架。

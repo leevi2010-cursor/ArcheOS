@@ -103,7 +103,7 @@ Product Stage 不是固定发布日期，也不是瀑布式项目计划。允许
 
 ### 当前已有依据
 
-ArcheOS 已形成稳定的核心方向：Input → Information → Structured World Model → Context → Decision / Feedback，并明确不把 Agent 推断自动当成长期事实、不把 Core 绑定到单一 Domain Agent。
+ArcheOS 已形成稳定的核心方向：Input → Information → Structured World Model → Context → Decision / Feedback，并明确不把 Agent 推断自动当成长期事实、不把 Core 绑定到单一 External Agent 或 Domain Product。
 
 ### Stage Gate
 
@@ -180,10 +180,10 @@ Stage Gate 不以 synthetic tests 替代真实语义验证。任何未解决的�
 
 使用多个真实、边界清楚的决策场景，验证：
 
-- Context 能提供相关 Goal、Evidence、历史 Decision、Constraint、Preference、Pattern 与未确定事项；
+- Context 能提供相关 Goal、Evidence、历史 Decision、Requirement、Preference、Hypothesis、Pattern 与未确定事项；
 - Agent recommendation 与 Human Decision 清楚分离；
-- 关键假设、候选 Action、反证和不确定性可以被检查；
-- 决策后 Feedback 能重新进入同一信息生命周期；
+- 关键 Hypothesis、候选 Action、反证和不确定性可以被检查；
+- 决策后 Feedback 能重新进入同一信息生命周期，并能够支持、反对或修订相关 Hypothesis；
 - 用户认为这套流程比“临时把背景再讲给 AI”更有效；
 - 能观察 Human edit / reject / defer、missing evidence、goal misalignment、rationale traceability、feedback traceability 等指标，而不是制造单一“AI 决策准确率”。
 
