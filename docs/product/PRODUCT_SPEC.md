@@ -28,14 +28,14 @@ GITHUB ISSUE
 
 ## 2. 产品定义
 
-ArcheOS 是一个开放、可治理的长期认知与信息系统，用于把混乱、异构、持续变化的信息输入逐步转化为可追溯、可复用的长期认知，并支持 Human 与外部 Agent 基于这些认知进行判断、决策、行动与反馈。
+ArcheOS 是一个开放、可治理的长期认知与信息系统，用于把混乱、异构、持续变化的信息输入逐步转化为可追溯、可复用的长期认知，并支持 Human 与 External Agent 基于这些认知进行判断、决策、行动与反馈。
 
 ArcheOS 的核心不是某一种业务应用，也不是单纯的文件管理、向量检索或聊天记忆，而是一条统一、可审计的信息与认知生命周期：
 
 ```text
 Input
 → Processing / Representation
-→ Atomic Information + Claim + Evidence
+→ Atomic Information + Claim + Hypothesis + Evidence
 → Structured World Model
 → Context
 → Judgment / Decision / Action
@@ -53,10 +53,11 @@ ArcheOS 希望帮助个人或组织获得一套自己能够长期拥有和治理
 - **统一沉淀**：让重要信息不再散落于聊天、文件夹、录音、业务系统和不同 Agent 的私有记忆中；
 - **来源可追溯**：重要结论能够回到 Source、Evidence、时间、责任主体与历史版本；
 - **长期可演化**：允许修订、补充、时间变化、冲突、不确定和失效，而不是只保存一个被覆盖后的“最终答案”；
+- **可检验认知**：重要 Hypothesis 能够显式保留，并被后续 Evidence / Feedback 支持、反对或修订，而不是藏在一次性 Prompt 中；
 - **跨模型复用**：同一套受治理 Context 可以被 Codex、GPT、Claude、本地模型或未来 Agent 使用；
 - **减少重复解释**：用户不需要在每一次新会话中重新讲述长期背景；
 - **提高判断质量**：系统最终价值不止是“记住”，而是让 Human + Agent 在更完整、更可靠、更可检查的 Context 上思考和行动；
-- **保留控制权**：Agent 可以整理、建议和执行获授权的操作，但不能把自己的推断静默升级为长期事实、正式 Goal 或 consequential Decision。
+- **保留控制权**：Agent 可以整理、建议和执行获授权的操作，但不能把自己的推断或 Hypothesis 静默升级为长期事实、正式 Goal 或 consequential Decision。
 
 ---
 
@@ -98,7 +99,7 @@ ArcheOS 不是：
 - 一个随意堆放文件的总目录；
 - 某个模型私有、不可迁移的黑盒记忆；
 - 只依靠 embedding 相似度工作的普通 RAG 知识库；
-- 把 Agent inference 自动当成用户事实或 World Model truth 的自动知识库；
+- 把 Agent inference / Hypothesis 自动当成用户事实或 World Model truth 的自动知识库；
 - 为每个业务场景分别维护一套 Person / Company / Project / Note / Decision 数据模型的平台；
 - 为了“完整”而提前建设所有 SaaS、企业协作、billing、marketplace 和 orchestration 能力的通用框架；
 - 一个必须自己拥有模型或 Agent runtime 才能成立的封闭产品。
@@ -111,7 +112,7 @@ ArcheOS 不是：
 
 1. **用户长期资产优先于模型生命周期**：模型、SDK、Agent 和 UI 可以替换，长期认知不能因此丢失或重建一遍。
 2. **来源与历史优先于方便覆盖**：重要认知必须能够回到 Evidence；修改不应抹掉关键历史。
-3. **事实、Claim、Judgment、Decision 分层**：系统知道“谁说了什么”不等于系统认定“现实就是这样”。
+3. **事实、Claim、Hypothesis、Judgment、Decision 分层**：系统知道“谁说了什么”、提出一个可检验解释或做出当前判断，都不等于现实已经成为既定事实。
 4. **Human 保留 consequential authority**：重要 Goal、Decision、删除、权限和高风险变化保留人工裁决边界。
 5. **一个长期认知 Core**：Domain Product、输入格式、Provider 和 Agent 不建立平行 truth。
 6. **开放、可迁移、storage-independent**：优先采用开放、可读、可替换的 contract，避免被单个存储、模型或软件锁定。
