@@ -1,0 +1,10 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["candidates", "residue"],
+  "properties": {
+    "candidates": {"type": "array", "items": {"type": "object", "additionalProperties": false, "required": ["statement", "semantic_type", "evidence_unit_ids"], "properties": {"statement": {"type": "string", "minLength": 1}, "semantic_type": {"type": "string", "enum": ["observation", "requirement", "judgment", "decision", "commitment", "action", "other"]}, "evidence_unit_ids": {"type": "array", "minItems": 1, "items": {"type": "string", "minLength": 1}}}}},
+    "residue": {"type": "array", "items": {"type": "object", "additionalProperties": false, "required": ["evidence_unit_ids", "reason_not_absorbed"], "properties": {"evidence_unit_ids": {"type": "array", "minItems": 1, "items": {"type": "string", "minLength": 1}}, "reason_not_absorbed": {"type": "string", "minLength": 1}}}}
+  }
+}
