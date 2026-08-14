@@ -301,12 +301,32 @@ Hypothesis 与相邻概念的边界：
 
 - `Observation / Evidence` 回答“观察到了什么 / 依据在哪里”；Hypothesis 回答“当前有哪些可被未来事实验证或反驳的解释、预测或条件性命题”；
 - `Claim` 回答“谁以什么立场说了什么”；某个 Claim 可以提出 Hypothesis，但归因与命题是否被现实支持是两个维度；
-- `Judgment` 表示在当前 Goal / Evidence / Constraint 下作出的判断；Judgment 可以依赖多个 Hypothesis，但不等于这些 Hypothesis；
+- `Judgment` 表示在当前 Goal / Evidence / Requirement 下作出的判断；Judgment 可以依赖多个 Hypothesis，但不等于这些 Hypothesis；
 - `Action` 回答“做什么”；Hypothesis 可以表达“为什么预期该 Action 会产生某种 Outcome”；
 - `Decision` 是 Human 受治理确认的取舍；Decision 可以依赖 Hypothesis，但不会把 Hypothesis 自动升级为事实；
 - `Pattern / Protocol / Policy / Principle` 是更稳定、可复用的方法或治理结构；被反复验证的 Hypothesis 可以为它们的新版本提供依据，但不能通过原地改类型的方式“变身”为这些概念。
 
 影响 Judgment / Decision 的关键 Hypothesis 应能够追溯到 supporting Evidence、challenging Evidence、预期可观察结果与后续 Feedback。Hypothesis 被现实支持到什么程度，**不得复用 `Atomic Information.confidence` 表示**；后者继续只表示信息提取 / 语义理解正确性的置信程度。第一版优先保留支持/反对 Evidence、验证结果、适用条件和 Revision，不提前制造“真实性概率”。
+
+### Atomic Information semantic types
+
+`semantic_type` 是 Atomic Information 的**语义标签**，不是一组拥有独立 Store、ID、生命周期或基类的平行 Core concepts。
+
+当前 production 已实现并验证的 vocabulary 为：
+
+- `observation`：来源明确表达或系统提取到的观察 / 状态描述；
+- `preference`：主体对选择、结果或方式的偏好；
+- `requirement`：必须满足、必须避免或构成边界条件的要求；业务界面可以自然表达为“要求 / 约束”，但 Core 不另建 `constraint` semantic type；
+- `judgment`：主体基于当前信息作出的判断、评估或推荐；
+- `decision`：已经作出的选择 / 决定的原子记录；需要长期身份、责任、状态和复盘时，可进一步由 Object + `decision` Role 表达正式 Decision；
+- `commitment`：主体已承诺承担或完成的事项；
+- `action`：已经发生、正在发生或明确提出的动作；
+- `question`：仍需回答或调查的问题；
+- `other`：重要但当前不适合更具体标签的信息。
+
+这些 label 的边界属于现有 production contract。以后若要合并、重命名或新增已持久化 semantic type，必须按**已开发兼容迁移**处理，不能只改文档导致历史 Atomic Information 失去可读性。
+
+`Hypothesis` 已是 canonical Information 语义，但当前 production `SEMANTIC_TYPES` 尚未实现对应 label。未来实现 Hypothesis 时，应扩展同一 Atomic Information semantic mechanism，并先定义兼容 / schema 变更；不得为 Hypothesis 建立第二个 Store 或生命周期。
 
 ---
 
@@ -577,13 +597,15 @@ Evidence Fragment 负责回答“依据在原文哪里”；Atomic Information C
 
 `Goal` 是希望达到、并可用于判断行动方向的结果状态。
 
-- 一次性提到的目标可以先作为 Atomic Information 的 semantic type；
-- 需要长期责任、状态、关系和复盘时，建立 Object 并赋予 `goal` Role。
+- 一次性提到的目标性表达可以先作为普通 Atomic Information 保存，不要求为了“出现一个目标句子”立即新增 Goal Object；
+- 当该目标需要长期责任、状态、关系、完成条件和复盘时，建立 Object 并赋予 `goal` Role；
 - `Vision` 是更长期的 Goal 层级；`Objective` 作为 Goal 别名，不新增概念。
 
 ### Roadmap
 
-`Roadmap` 是 Workspace 基于 Goal、现实、资产、约束和 Decision 形成的长期路径 View。它不是 Project 内部必须存在的层级，也不作为独立 Core 身份重复保存底层对象。
+`Roadmap` 是 Workspace 基于 Goal、现实、资产、Requirement 和 Decision 形成的长期路径 View。它不是 Project 内部必须存在的层级，也不作为独立 Core 身份重复保存底层对象。
+
+这里的业务 `Roadmap` 是 World Model / View 语义；仓库中的 `PRODUCT_ROADMAP.md` / Development Roadmap 是开发治理文档，不因此创建运行时 Roadmap Object。
 
 ### Project
 
@@ -668,7 +690,7 @@ State、Status、Lifecycle、Health、Freshness 不得互相替代。Signal、Fe
 
 - `Constitution`：最高层、稳定、跨任务的治理基线。
 - `Principle`：用于判断取舍的稳定原则。
-- `Policy`：某一明确范围内版本化、可执行的业务参数和约束。
+- `Policy`：某一明确范围内版本化、可执行的业务参数和要求。
 - `Protocol`：跨任务可复用的交互、判断、门禁与流转规则。
 - `Pattern`：反复问题对应的可复用解决结构。
 
