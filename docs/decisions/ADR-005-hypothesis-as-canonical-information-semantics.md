@@ -2,18 +2,18 @@
 
 ## 状态
 
-Proposed / Architect + Product Owner agreed direction
+Accepted — 2026-08-14
 
 ## 背景
 
 ArcheOS 已经用 `Atomic Information` 表达可独立理解、可追溯的长期信息，并明确区分 `Claim`、`Evidence`、`Judgment`、`Decision` 等语义。
 
-在 M4 决策增强设计中，曾尝试把“工作假设”仅作为 Protocol 阶段 `Derived Artifact` 的字段，以避免增加概念。但真实产品需求表明这不足以表达假设的长期业务意义：
+在 M4 决策增强设计中，曾尝试把“工作假设”仅作为 Protocol 阶段 `Derived Artifact` 的字段，以避免增加概念。但产品设计进一步确认，这不足以表达假设的长期业务意义：
 
-- 每次系统性思考都需要明确记录其关键假设；
-- 后续行动和 Feedback 的复盘应围绕这些假设展开，而不只看 Decision 本身成功或失败；
+- 系统性思考需要明确记录影响 Judgment / Decision 的关键假设；
+- 后续 Action 和 Feedback 的复盘应围绕这些假设展开，而不只看 Decision 本身成功或失败；
 - 同一假设可以被多次真实结果支持、反对或修订；
-- 某些假设经过跨场景、反复验证后，可以成为更稳定、可复用的知识结构；
+- 某些假设经过跨场景、反复验证后，可以为更稳定、可复用的知识结构提供依据；
 - 假设即使被否定，其历史仍然有长期学习价值，不能被删除或覆盖。
 
 因此 `Hypothesis` 不是为了代码方便新增的名词，而具有独立且稳定的认知语义。
@@ -26,11 +26,11 @@ ArcheOS 已经用 `Atomic Information` 表达可独立理解、可追溯的长�
 
 Hypothesis 属于 Information Layer。
 
-第一版不建立独立 `HypothesisStore`、独立 Object 或平行生命周期；它复用 `Atomic Information` 的稳定身份、Revision、Evidence、context 与 provenance，并通过 canonical hypothesis 语义区分于普通 observation / judgment / claim。
+第一版不建立独立 `HypothesisStore`、独立 Object、独立 ID 或平行生命周期；它复用 `Atomic Information` 的稳定身份、Revision、Evidence、context 与 provenance，并作为 Atomic Information 的 canonical 语义形态存在。
 
 ### 2. Hypothesis 与相邻概念边界
 
-- `Observation / Evidence`：回答“观察到了什么 / 依据在哪里”；Hypothesis 回答“我们暂时认为可能是什么、为什么、未来可如何验证”。
+- `Observation / Evidence`：回答“观察到了什么 / 依据在哪里”；Hypothesis 回答“当前有哪些可被未来事实验证或反驳的解释、预测或条件性命题”。
 - `Claim`：回答“谁以什么立场说了什么”；Hypothesis 可以来源于某个 Claim，也可以由 Agent / Human 基于多个 Evidence 提出，但提出不意味着已经成立。
 - `Judgment`：是在当前 Goal / Evidence / Constraint 下作出的判断；Judgment 可以依赖 Hypothesis，但二者不等同。
 - `Action`：回答“做什么”；Hypothesis 可以表达“为什么认为该 Action 会产生某个 Outcome”。
@@ -39,7 +39,7 @@ Hypothesis 属于 Information Layer。
 
 ### 3. 每次系统性思考必须记录关键 Hypothesis
 
-未来 Protocol 驱动的决策增强中，凡影响 Judgment / Decision 的工作假设都必须被显式记录，并可追溯到：
+未来 Protocol 驱动的决策增强中，凡影响 Judgment / Decision 的关键假设都必须被显式记录，并可追溯到：
 
 - 它针对的 scope / Object / Goal；
 - supporting Evidence；
@@ -89,8 +89,8 @@ ArcheOS 不新增泛化 `Knowledge` Core 作为第二套 truth。
 
 ## Consequences
 
-- `docs/architecture/CONCEPTS.md` 需要新增 Hypothesis 的 canonical 定义，并在 Information Layer 列表中纳入它；
-- M4 / Issue #42 的 Concept Convergence Check 要从“Hypothesis 不是 Core”修订为“Hypothesis 是 Atomic Information 的 canonical specialization”；
-- 后续 runtime 需要先通过真实决策实验确定最小字段和状态枚举，不在本 ADR 中提前设计完整 Hypothesis engine；
+- `docs/architecture/CONCEPTS.md` 以本 ADR 为依据纳入 Hypothesis canonical 定义；
+- M4 / Issue #42 必须直接使用 canonical `Hypothesis`，不再把它作为未开发临时术语通过映射表保留；
+- 后续 runtime 仍需先通过真实决策实验确定最小字段和状态枚举，不在本 ADR 中提前设计完整 Hypothesis engine；
 - Human View 未来需要支持从 Decision / Pattern / Protocol 反查其历史 Hypothesis 与验证证据；
 - 不建立 `Hypothesis Object`、`HypothesisStore`、`KnowledgeStore` 或自动升格引擎。
