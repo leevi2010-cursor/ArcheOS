@@ -4,7 +4,7 @@
 
 ## 结论
 
-当前结论是 **no production provider yet**。三条路线都能在一次长、多批次的公开合成输入上返回严格结构化输出，并完整覆盖 13 个单元；但对故意设计的不确定/冲突单元，候选与 Residue 的分类仍有波动。更重要的是，这不能解释或替代此前真实 text-PDF 的失败，因而不能据此恢复 production semantic default。
+当前结论是 **no production provider yet**。三条路线都能在五次独立的公开合成调用（short/table、long、multi-a、multi-b、multi-c）中返回严格结构化输出，并跨调用完整覆盖 13 个单元；但对故意设计的不确定/冲突单元，候选与 Residue 的分类仍有波动。更重要的是，这不能解释或替代此前真实 text-PDF 的失败，因而不能据此恢复 production semantic default。
 
 ## 范围与隐私
 
@@ -46,7 +46,7 @@ python3 run_synthetic_benchmark.py \
 
 ## 产物
 
-- [fixture](fixtures/synthetic-analysis-units.json)：13 个公开合成单元，含短文本、表格、长上下文和三个 batch；
+- [fixture](fixtures/synthetic-analysis-units.json)：13 个公开合成单元，含短文本、表格、长上下文和五个实际执行 batch；
 - [strict schema](schemas/external-agent-result.schema.json)：外部执行器的最小输出边界；
 - [harness](run_synthetic_benchmark.py)：执行、验证 coverage、120 秒终止与临时清理；
 - [manifest](manifest.json)：可重复性记录与结果摘要。

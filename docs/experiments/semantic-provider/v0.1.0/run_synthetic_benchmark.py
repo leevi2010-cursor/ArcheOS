@@ -33,6 +33,7 @@ SEMANTIC_TYPES = {
     "other",
 }
 LONG_BATCH_REPEAT = 24
+BENCHMARK_BATCHES = ("short-table", "long", "multi-a", "multi-b", "multi-c")
 
 
 def _load_json(path: Path) -> dict[str, Any]:
@@ -42,13 +43,22 @@ def _load_json(path: Path) -> dict[str, Any]:
     return value
 
 
-def _package() -> tuple[dict[str, Any], dict[str, str]]:
+def _batch_name(raw: dict[str, Any]) -> str:
+    batch_id = raw.get("batch_id")
+    if batch_id in {"short", "table"}:
+        return "short-table"
+    if batch_id in {"long", "multi-a", "multi-b", "multi-c"}:
+        return batch_id
+    raise ValueError("fixture contains an unsupported benchmark batch")
+
+
+def _packages() -> list[tuple[str, dict[str, Any], dict[str, str]]]:
     fixture = _load_json(FIXTURE_PATH)
     raw_units = fixture.get("units")
     if not isinstance(raw_units, list) or not raw_units:
         raise ValueError("fixture must contain non-empty units")
-    units: list[dict[str, Any]] = []
-    expected: dict[str, str] = {}
+    grouped_units: dict[str, list[dict[str, Any]]] = {name: [] for name in BENCHMARK_BATCHES}
+    grouped_expected: dict[str, dict[str, str]] = {name: {} for name in BENCHMARK_BATCHES}
     for raw in raw_units:
         if not isinstance(raw, dict):
             raise ValueError("fixture unit must be an object")
@@ -65,9 +75,23 @@ def _package() -> tuple[dict[str, Any], dict[str, str]]:
             # Keep the fixture readable while making the transmitted package a
             # deterministic long-context input (>10k Chinese characters).
             presentation["text"] = "\n".join([presentation["text"]] * LONG_BATCH_REPEAT)
-        units.append(presentation)
-        expected[unit_id] = disposition
-    return {"fixture_version": fixture.get("fixture_version"), "units": units}, expected
+        batch_name = _batch_name(raw)
+        grouped_units[batch_name].append(presentation)
+        grouped_expected[batch_name][unit_id] = disposition
+    if any(not grouped_units[name] for name in BENCHMARK_BATCHES):
+        raise ValueError("fixture does not populate every required benchmark batch")
+    return [
+        (
+            name,
+            {
+                "fixture_version": fixture.get("fixture_version"),
+                "benchmark_batch_id": name,
+                "units": grouped_units[name],
+            },
+            grouped_expected[name],
+        )
+        for name in BENCHMARK_BATCHES
+    ]
 
 
 def _prompt(package: dict[str, Any]) -> str:
@@ -193,64 +217,103 @@ def _version(command: list[str]) -> str | None:
     return (completed.stdout or completed.stderr).strip() or None
 
 
+def _percentile(values: list[float], fraction: float) -> float:
+    if not values:
+        return 0.0
+    ordered = sorted(values)
+    return ordered[min(len(ordered) - 1, int((len(ordered) - 1) * fraction + 0.999999))]
+
+
 def run(args: argparse.Namespace) -> dict[str, Any]:
-    package, expected = _package()
+    packages = _packages()
+    total_expected_units = sum(len(expected) for _, _, expected in packages)
     schema = _load_json(SCHEMA_PATH)
-    prompt = _prompt(package)
     cleanup_verified = False
     with tempfile.TemporaryDirectory(prefix="archeos-semantic-provider-") as run_dir:
         run_path = Path(run_dir)
         if args.route in {"pinned-sdk", "latest-sdk"}:
             if not args.python:
                 raise ValueError("--python is required for SDK routes")
-            request = json.dumps({"cwd": run_dir, "prompt": prompt, "schema": schema})
-            stdout, stderr, exit_code, failure, elapsed = _run_command(
-                [args.python, "-c", SDK_CHILD], input_text=request, timeout=args.timeout
-            )
             route_version = _version([args.python, "-c", "import importlib.metadata as m; print(m.version('openai-codex'))"])
         else:
             if not args.codex_bin:
                 raise ValueError("--codex-bin is required for external-agent route")
-            result_path = run_path / "external-result.json"
-            stdout, stderr, exit_code, failure, elapsed = _run_command(
-                [
-                    args.codex_bin, "exec", "--ephemeral", "--sandbox", "read-only",
-                    "--skip-git-repo-check",
-                    "--output-schema", str(SCHEMA_PATH), "--output-last-message", str(result_path),
-                    "--cd", run_dir, prompt,
-                ],
-                input_text=None,
-                timeout=args.timeout,
-            )
-            stdout = result_path.read_text(encoding="utf-8") if result_path.exists() else ""
             route_version = _version([args.codex_bin, "--version"])
+        batch_results: list[dict[str, Any]] = []
+        for batch_name, package, expected in packages:
+            prompt = _prompt(package)
+            if args.route in {"pinned-sdk", "latest-sdk"}:
+                request = json.dumps({"cwd": run_dir, "prompt": prompt, "schema": schema})
+                stdout, stderr, exit_code, failure, elapsed = _run_command(
+                    [args.python, "-c", SDK_CHILD], input_text=request, timeout=args.timeout
+                )
+            else:
+                result_path = run_path / f"external-result-{batch_name}.json"
+                stdout, stderr, exit_code, failure, elapsed = _run_command(
+                    [
+                        args.codex_bin, "exec", "--ephemeral", "--sandbox", "read-only",
+                        "--skip-git-repo-check",
+                        "--output-schema", str(SCHEMA_PATH), "--output-last-message", str(result_path),
+                        "--cd", run_dir, prompt,
+                    ],
+                    input_text=None,
+                    timeout=args.timeout,
+                )
+                stdout = result_path.read_text(encoding="utf-8") if result_path.exists() else ""
+            result: dict[str, Any] = {
+                "batch_id": batch_name,
+                "elapsed_seconds": round(elapsed, 3),
+                "completed": failure is None and exit_code == 0,
+                "failure_category": failure,
+                "process_exit_code": exit_code,
+            }
+            if result["completed"]:
+                try:
+                    result.update(_validate(json.loads(stdout), expected))
+                    result["structured_output_valid"] = True
+                except (json.JSONDecodeError, ValueError, TypeError) as exc:
+                    result.update({
+                        "structured_output_valid": False,
+                        "failure_category": "schema_or_contract_failure",
+                        "failure_detail": str(exc),
+                    })
+            else:
+                result["structured_output_valid"] = False
+                result["failure_category"] = failure or "runtime_failure"
+                detail = stderr.strip() or "provider process did not complete"
+                result["failure_detail"] = detail[-500:]
+            batch_results.append(result)
         metrics: dict[str, Any] = {
             "provider_route": args.route,
             "provider_version_runtime_version": route_version,
             "timeout_seconds": args.timeout,
-            "elapsed_seconds": round(elapsed, 3),
-            "completed": failure is None and exit_code == 0,
+            "calls_total": len(batch_results),
+            "calls_completed": sum(result["completed"] for result in batch_results),
+            "elapsed_seconds_total": round(sum(result["elapsed_seconds"] for result in batch_results), 3),
+            "latency_p50_seconds": round(_percentile([result["elapsed_seconds"] for result in batch_results], 0.5), 3),
+            "latency_p95_seconds": round(_percentile([result["elapsed_seconds"] for result in batch_results], 0.95), 3),
+            "completed": all(result["completed"] and result["structured_output_valid"] for result in batch_results),
             "privacy_route": "synthetic_only; local temporary package; no Managed Source; no World Model write",
             "auth_credential_requirement": "existing local Codex authentication; experiment reads no credential material",
             "cost_if_applicable": "not measured; account-dependent Codex usage",
-            "failure_category": failure,
-            "process_exit_code": exit_code,
+            "timeout_calls": sum(result["failure_category"] == "timeout" for result in batch_results),
+            "runtime_failure_calls": sum(result["failure_category"] == "runtime_failure" for result in batch_results),
+            "schema_failure_calls": sum(result["failure_category"] == "schema_or_contract_failure" for result in batch_results),
+            "batch_results": batch_results,
         }
-        if metrics["completed"]:
-            try:
-                metrics.update(_validate(json.loads(stdout), expected))
-                metrics["structured_output_valid"] = True
-            except (json.JSONDecodeError, ValueError, TypeError) as exc:
-                metrics.update({
-                    "structured_output_valid": False,
-                    "failure_category": "schema_or_contract_failure",
-                    "failure_detail": str(exc),
-                })
-        else:
-            metrics["structured_output_valid"] = False
-            metrics["failure_category"] = failure or "runtime_failure"
-            detail = stderr.strip() or "provider process did not complete"
-            metrics["failure_detail"] = detail[-500:]
+        metrics.update({
+            "units_total": total_expected_units,
+            "eligible": total_expected_units,
+            "excluded": 0,
+            "candidate_count": sum(result.get("candidate_count", 0) for result in batch_results),
+            "residue_count": sum(result.get("residue_count", 0) for result in batch_results),
+            "covered_eligible_units": sum(result.get("covered_eligible_units", 0) for result in batch_results),
+            "unaccounted_eligible_units": total_expected_units - sum(
+                result.get("covered_eligible_units", 0) for result in batch_results
+            ),
+            "expected_disposition_mismatches": sum(result.get("expected_disposition_mismatches", 0) for result in batch_results),
+            "structured_output_valid_calls": sum(result["structured_output_valid"] for result in batch_results),
+        })
         # The temporary directory is still present here; do not expose its path.
     cleanup_verified = not run_path.exists()
     metrics["temporary_artifacts_cleanup_verified"] = cleanup_verified

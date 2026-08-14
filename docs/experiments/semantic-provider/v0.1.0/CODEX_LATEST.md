@@ -8,7 +8,7 @@
 
 ## 结果
 
-一次正式合成运行在 16.942 秒完成，严格输出和完整 coverage 均通过：13/13 单元已覆盖，`unaccounted_eligible_units=0`，没有 timeout 或 runtime failure。fixture oracle 中 3 个刻意不确定/冲突单元被归入不符合预期的一侧。
+5 次正式合成调用总计 84.236 秒完成（p50 15.384 秒，p95 25.330 秒）。每次严格输出和跨调用 coverage 均通过：13/13 单元已覆盖，`unaccounted_eligible_units=0`，没有 timeout 或 runtime failure。fixture oracle 中 3 个刻意不确定/冲突单元被归入不符合预期的一侧。
 
 ## 结论
 

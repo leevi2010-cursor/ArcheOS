@@ -6,11 +6,11 @@
 - 独立 Python 3.13 环境；
 - `ApprovalMode.deny_all`、`Sandbox.read_only`、ephemeral thread；
 - 120 秒硬 deadline；
-- 一次长、多批次合成 package；不读取 Source 或任何工作区业务数据。
+- 5 次独立合成 package 调用：short/table、long、multi-a、multi-b、multi-c；不读取 Source 或任何工作区业务数据。
 
 ## 结果
 
-一次正式合成运行在 43.021 秒完成。输出通过 harness 的严格 JSON 与 coverage 验证：13/13 eligible unit 都恰好归入 Candidate 或 Residue，`unaccounted_eligible_units=0`，没有 timeout 或 runtime failure。fixture oracle 中有 1 个刻意不确定/冲突单元被归入不符合预期的一侧。
+5 次正式合成调用总计 69.063 秒完成（p50 12.874 秒，p95 20.771 秒）。每次输出都通过严格 JSON 验证，跨调用 coverage 为 13/13，`unaccounted_eligible_units=0`，没有 timeout 或 runtime failure。fixture oracle 中有 3 个刻意不确定/冲突单元被归入不符合预期的一侧。
 
 这证明当前 pinned SDK 能在本环境完成本实验的合成 structured output；它**不**证明真实 Representation package 的语义质量，也不能推翻此前真实 text-PDF 未完成的观察。
 

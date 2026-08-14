@@ -4,14 +4,14 @@
 
 **no production provider yet**。
 
-当前不存在足以作为 ArcheOS 默认 semantic provider 的路线。三条路线已证明：统一 package → strict structured result → Candidate/Residue coverage 的执行边界可行；但它们没有证明真实 document / conversation 的稳定语义质量，也没有解释此前真实 text-PDF 的两次未完成。
+当前不存在足以作为 ArcheOS 默认 semantic provider 的路线。三条路线已证明：多个独立 package → strict structured result → 跨调用 Candidate/Residue coverage 的执行边界可行；但它们没有证明真实 document / conversation 的稳定语义质量，也没有解释此前真实 text-PDF 的两次未完成。
 
 ## 对必须回答问题的答复
 
 1. **当前失败主因**：不可确定。合成长输入成功排除了“所有长输入必然失败”，但不能区分 SDK/runtime、模型执行、schema 或 document input shape。
 2. **pinned SDK 是否适合作为正式 provider**：尚不适合。合成门禁通过不等于真实可用。
 3. **latest SDK 是否显著改善**：没有可比较升级；运行时可安装 latest 仍为 `0.144.4`。
-4. **external Agent handoff 是否更符合产品边界**：是，结构上更一致；但 `n=1` synthetic 不能证明足够可靠。
+4. **external Agent handoff 是否更符合产品边界**：是，结构上更一致；但 `n=5` synthetic 仍不能证明足够可靠。
 5. **是否需要 direct model API**：当前不需要。若以后比较，只承担 Semantic Provider Adapter 执行层，不接管 Source、Representation、Evidence、Candidate/Residue 或 World Model。
 6. **v1 正式路线**：尚未选择。
 7. **fallback / timeout / retry**：单次尝试、120 秒 deadline、立即 interrupt、fail closed；不自动 retry/fallback，不把 runtime failure 转 Residue。

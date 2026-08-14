@@ -13,13 +13,13 @@ ArcheOS 在此路线中只拥有 package、schema、coverage 验证与失败记�
 
 ## 结果
 
-本机 `codex-cli 0.147.0` 对一次长、多 batch 合成 package 在 29.113 秒返回可验证 structured output：13/13 单元被完整且不重复地覆盖，`unaccounted_eligible_units=0`，没有 timeout/runtime failure。fixture oracle 中有 1 个不确定/冲突单元的分类不符合预期。
+本机 `codex-cli 0.147.0` 对 5 个独立 package 总计 145.537 秒完成（p50 27.915 秒，p95 43.334 秒）。每个 package 都返回可验证 structured output，跨调用 13/13 单元被完整且不重复地覆盖，`unaccounted_eligible_units=0`，没有 timeout/runtime failure。fixture oracle 中有 2 个不确定/冲突单元的分类不符合预期。
 
 ## 产品边界判断
 
 该路线在结构上符合“ArcheOS 作为长期记忆、认知和 Context 增强层，而非自建 Agent runtime”的方向：执行由外部 Agent 承担，ArcheOS 保持统一输入、Evidence unit、Candidate/Residue 与 strict validation contract。
 
-但一次合成成功不等于自动化可靠性。它仍依赖本机 Agent 安装、登录态和运行环境，尚无真实样本、重复性、并发、成本或审计保持期证据。因此不能直接成为 v1 production default。
+但 5 次合成成功不等于自动化可靠性。它仍依赖本机 Agent 安装、登录态和运行环境，尚无真实样本、并发、成本或审计保持期证据。因此不能直接成为 v1 production default。
 
 ## 最小失败规则
 
