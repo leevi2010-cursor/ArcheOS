@@ -1,0 +1,60 @@
+{
+  "experiment": "semantic-provider",
+  "version": "v0.1.0",
+  "issue": 50,
+  "status": "complete_no_production_provider",
+  "scope": "synthetic compatibility experiment only",
+  "input": {
+    "fixture": "fixtures/synthetic-analysis-units.json",
+    "unit_count": 13,
+    "long_batch_repeat": 24,
+    "contains_real_source": false,
+    "contains_credentials": false
+  },
+  "controls": {
+    "deadline_seconds": 120,
+    "automatic_retry": false,
+    "automatic_fallback": false,
+    "world_model_write": false,
+    "temporary_artifacts_cleanup": true
+  },
+  "routes": [
+    {
+      "route": "pinned-sdk",
+      "provider_version_runtime_version": "openai-codex 0.144.4",
+      "completed": true,
+      "structured_output_valid": true,
+      "elapsed_seconds": 43.021,
+      "units_total": 13,
+      "covered_eligible_units": 13,
+      "unaccounted_eligible_units": 0,
+      "fixture_disposition_mismatches": 1,
+      "temporary_artifacts_cleanup_verified": true
+    },
+    {
+      "route": "latest-sdk",
+      "provider_version_runtime_version": "openai-codex 0.144.4",
+      "completed": true,
+      "structured_output_valid": true,
+      "elapsed_seconds": 16.942,
+      "units_total": 13,
+      "covered_eligible_units": 13,
+      "unaccounted_eligible_units": 0,
+      "fixture_disposition_mismatches": 3,
+      "temporary_artifacts_cleanup_verified": true
+    },
+    {
+      "route": "external-agent",
+      "provider_version_runtime_version": "codex-cli 0.147.0",
+      "completed": true,
+      "structured_output_valid": true,
+      "elapsed_seconds": 29.113,
+      "units_total": 13,
+      "covered_eligible_units": 13,
+      "unaccounted_eligible_units": 0,
+      "fixture_disposition_mismatches": 1,
+      "temporary_artifacts_cleanup_verified": true
+    }
+  ],
+  "recommendation": "no production provider yet"
+}
