@@ -1,0 +1,97 @@
+{
+  "fixture_version": "v0.1.0",
+  "purpose": "公开、匿名、可重复的 semantic provider compatibility benchmark；不含真实资料、路径、身份或凭证。",
+  "units": [
+    {
+      "unit_id": "short-01",
+      "batch_id": "short",
+      "kind": "paragraph",
+      "text": "合成参与者甲确认，下一次内部演示安排在下周三。",
+      "expected_disposition": "candidate"
+    },
+    {
+      "unit_id": "short-02",
+      "batch_id": "short",
+      "kind": "paragraph",
+      "text": "合成参与者乙要求在演示前补齐验收清单。",
+      "expected_disposition": "candidate"
+    },
+    {
+      "unit_id": "short-03",
+      "batch_id": "short",
+      "kind": "paragraph",
+      "text": "他们之后再确认。",
+      "expected_disposition": "residue"
+    },
+    {
+      "unit_id": "table-01",
+      "batch_id": "table",
+      "kind": "table_row",
+      "structured_value": {"item": "合成条目 A", "status": "待复核", "owner": "未提供"},
+      "expected_disposition": "candidate"
+    },
+    {
+      "unit_id": "table-02",
+      "batch_id": "table",
+      "kind": "table_row",
+      "structured_value": {"item": "合成条目 B", "status": "数量不一致", "owner": "未提供"},
+      "expected_disposition": "residue"
+    },
+    {
+      "unit_id": "long-01",
+      "batch_id": "long",
+      "kind": "paragraph",
+      "text": "合成材料说明：本轮只验证最小信息处理契约。参与者同意保留证据定位，并把不确定事项单独列出。该说明重复用于构成长度压力输入：最小信息处理契约不自动创建长期对象，证据定位必须可读回，不确定事项必须保留。",
+      "expected_disposition": "candidate"
+    },
+    {
+      "unit_id": "long-02",
+      "batch_id": "long",
+      "kind": "paragraph",
+      "text": "合成材料说明：审阅人指出，任何冲突信息不能被静默覆盖；应同时保存表达立场和来源定位。该说明重复用于构成长度压力输入：冲突不等于错误，系统不替代人工选择，缺少依据时必须标为未解决。",
+      "expected_disposition": "candidate"
+    },
+    {
+      "unit_id": "long-03",
+      "batch_id": "long",
+      "kind": "paragraph",
+      "text": "合成材料说明：某个代词没有可解析的前文，也没有稳定身份或关系可供绑定。该说明重复用于构成长度压力输入：不得猜测身份，不得为了建立关系而创建对象，应将该点作为未解决信息保留。",
+      "expected_disposition": "residue"
+    },
+    {
+      "unit_id": "long-04",
+      "batch_id": "long",
+      "kind": "paragraph",
+      "text": "合成材料说明：已记录下一步为补充证据样本，再由人工复核是否进入后续阶段。该说明重复用于构成长度压力输入：这是明确行动，但不表达任何外部业务实体、客户或项目。",
+      "expected_disposition": "candidate"
+    },
+    {
+      "unit_id": "long-05",
+      "batch_id": "long",
+      "kind": "paragraph",
+      "text": "合成材料说明：一个数字与另一处数字相互矛盾，缺少可判定的权威来源。该说明重复用于构成长度压力输入：应保留矛盾和证据，不可选择其中一个数字作为事实。",
+      "expected_disposition": "residue"
+    },
+    {
+      "unit_id": "multi-01",
+      "batch_id": "multi-a",
+      "kind": "paragraph",
+      "text": "合成批次 A：处理器必须把每个可分析单元归入候选或残留，不得遗漏。",
+      "expected_disposition": "candidate"
+    },
+    {
+      "unit_id": "multi-02",
+      "batch_id": "multi-b",
+      "kind": "paragraph",
+      "text": "合成批次 B：附件的业务内容尚未提供，因此不能推断附件内容。",
+      "expected_disposition": "residue"
+    },
+    {
+      "unit_id": "multi-03",
+      "batch_id": "multi-c",
+      "kind": "paragraph",
+      "text": "合成批次 C：输出必须只使用提供的单元编号，且不得执行工具、写入或联网动作。",
+      "expected_disposition": "candidate"
+    }
+  ]
+}
