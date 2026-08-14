@@ -24,7 +24,6 @@ from .pyannote_speakers import PyannoteSpeakerProvider
 from .representation import LocalRepresentationRepository, RepresentationError, RepresentationService
 from .representation.registry import production_adapter
 from .representation_information import (
-    CodexRepresentationAnalysisProvider,
     FileRepresentationAnalysisProvider,
     RepresentationInformationError,
     RepresentationInformationService,
@@ -174,8 +173,13 @@ def build_parser() -> argparse.ArgumentParser:
         "--output-root", type=Path, default=DEFAULT_REPRESENTATION_INFORMATION_ROOT
     )
     extract.add_argument(
-        "--analysis-file", type=Path,
-        help="Development/testing only: deterministic read-only analysis fixture.",
+        "--analysis-file",
+        type=Path,
+        required=True,
+        help=(
+            "Required explicit deterministic fixture or reviewed structured-result "
+            "handoff; no production semantic model provider is registered."
+        ),
     )
     extract.add_argument("--batch-size", type=int, default=100)
 
@@ -518,11 +522,6 @@ def _information_command(args: argparse.Namespace) -> int:
             print(json.dumps(asdict(result), ensure_ascii=False, indent=2))
             return 0
         if args.information_command == "extract":
-            analysis_provider = (
-                FileRepresentationAnalysisProvider(args.analysis_file)
-                if args.analysis_file
-                else CodexRepresentationAnalysisProvider()
-            )
             package = RepresentationInformationService(
                 LocalManagedSourceRepository(args.managed_root),
                 LocalRepresentationRepository(args.representation_root),
@@ -530,7 +529,7 @@ def _information_command(args: argparse.Namespace) -> int:
                 batch_size=args.batch_size,
             ).extract(
                 args.representation_id,
-                analysis_provider,
+                FileRepresentationAnalysisProvider(args.analysis_file),
             )
             result = ingest_processing_package(
                 package, JsonlAtomicInformationStore(args.store)

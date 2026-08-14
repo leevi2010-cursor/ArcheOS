@@ -84,7 +84,7 @@ class RepresentationAnalysisProvider(Protocol):
 
 
 class FileRepresentationAnalysisProvider:
-    """Deterministic development/test provider; never reads a Source or writes state."""
+    """Deterministic dev/test or reviewed structured-result handoff provider."""
 
     name = "file"
 
@@ -218,7 +218,7 @@ Representation units:
 
 
 class CodexRepresentationAnalysisProvider:
-    """Official Codex app-server provider with no persistence capabilities."""
+    """Experimental provider, not approved for production ingestion; see #50."""
 
     name = "codex-app-server"
 

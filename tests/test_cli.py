@@ -5,7 +5,7 @@ import json
 import tempfile
 import unittest
 import wave
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from io import StringIO
 from pathlib import Path
 from unittest.mock import Mock, patch
@@ -21,7 +21,6 @@ from archeos.codex_app_server import CodexAnalysisProvider
 from archeos.pipeline import ProcessingError
 from archeos.pyannote_speakers import PyannoteSpeakerProvider
 from archeos.representation_information import (
-    CodexRepresentationAnalysisProvider,
     FileRepresentationAnalysisProvider,
 )
 from archeos.world_model import SQLiteWorldModelRepository
@@ -85,7 +84,7 @@ class CliTest(unittest.TestCase):
 
     @patch("archeos.cli.ingest_processing_package")
     @patch("archeos.cli.RepresentationInformationService.extract")
-    def test_representation_extract_uses_codex_by_default_and_file_for_fixtures(
+    def test_representation_extract_requires_an_explicit_file_provider(
         self,
         extract: Mock,
         ingest_processing_package: Mock,
@@ -105,10 +104,11 @@ class CliTest(unittest.TestCase):
             "--output-root",
             "information",
         ]
-        with redirect_stdout(StringIO()):
-            self.assertEqual(main(arguments), 0)
-        default_provider = extract.call_args.args[-1]
-        self.assertIsInstance(default_provider, CodexRepresentationAnalysisProvider)
+        with redirect_stdout(StringIO()), redirect_stderr(StringIO()):
+            with self.assertRaises(SystemExit) as error:
+                main(arguments)
+        self.assertEqual(error.exception.code, 2)
+        extract.assert_not_called()
 
         with redirect_stdout(StringIO()):
             self.assertEqual(main([*arguments, "--analysis-file", "fixture.json"]), 0)
