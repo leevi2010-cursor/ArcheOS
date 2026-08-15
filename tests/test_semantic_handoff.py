@@ -231,18 +231,20 @@ class SemanticHandoffTest(unittest.TestCase):
         self.assertEqual(outcome.failure_category, "runtime_nonzero_exit")
         self.assertIn(representation_information.signal.SIGTERM, signals)
 
-    def build_service(self, *, blocks: int = 1):
-        external = self.root / "synthetic.txt"
+    def build_service(self, *, blocks: int = 1, root: Path | None = None):
+        root = self.root if root is None else root
+        root.mkdir(parents=True, exist_ok=True)
+        external = root / "synthetic.txt"
         external.write_text("synthetic", encoding="utf-8")
         sources = LocalManagedSourceRepository(
-            self.root / "managed",
+            root / "managed",
             id_factory=lambda: "src_" + "1" * 32,
             clock=lambda: "2026-08-15T00:00:00.000Z",
         )
         source = sources.admit(
             external, metadata={"media_type": "application/synthetic"}
         ).source
-        representations = LocalRepresentationRepository(self.root / "representations")
+        representations = LocalRepresentationRepository(root / "representations")
         representation = (
             RepresentationService(sources, representations)
             .build(source.source_id, JsonAdapter(blocks))
@@ -251,7 +253,7 @@ class SemanticHandoffTest(unittest.TestCase):
         service = RepresentationInformationService(
             sources,
             representations,
-            self.root / "information",
+            root / "information",
             clock=lambda: "2026-08-15T00:00:00.000Z",
         )
         return representation, service
@@ -529,6 +531,129 @@ class SemanticHandoffTest(unittest.TestCase):
         self.assertTrue(store_path.exists())
         replay = ExternalAgentSemanticHandoffService(
             service, JsonlAtomicInformationStore(store_path), audit_root
+        ).execute(
+            representation.representation_id,
+            CodexCliRepresentationAnalysisProvider(
+                provider_version="0.147.0", runner=FakeRunner()
+            ),
+        )
+        self.assertEqual(replay.ingestion.existing, 1)
+        completed = json.loads(replay.audit_paths[0].read_text())
+        self.assertEqual(completed["durable_ingestion_status"], "completed")
+        self.assertEqual(completed["audit_readback_status"], "verified")
+
+    def test_replay_rejects_tampered_audit_bindings_before_store_write(self) -> None:
+        representation, service = self.build_service()
+        audit_root = self.root / "audits"
+        provider = CodexCliRepresentationAnalysisProvider(
+            provider_version="0.147.0", runner=FakeRunner()
+        )
+        ExternalAgentSemanticHandoffService(
+            service,
+            JsonlAtomicInformationStore(self.root / "initial-atomic.jsonl"),
+            audit_root,
+        ).execute(representation.representation_id, provider)
+        audit_path = next(audit_root.glob("*/processing-run-audit.json"))
+        original = json.loads(audit_path.read_text())
+        tampered_values = {
+            "protocol_version": "synthetic/invalid",
+            "input_fingerprint": "sha256:" + "0" * 64,
+            "provider_route": "synthetic-route",
+            "provider_version": "0.0.0",
+            "eligible_units": 99,
+            "covered_units": 99,
+            "unaccounted_units": 1,
+            "failure_category": "synthetic_failure",
+            "handoff_status": "synthetic_status",
+            "result_readback_status": "pending",
+        }
+        for field, value in tampered_values.items():
+            with self.subTest(field=field):
+                payload = dict(original)
+                payload[field] = value
+                audit_path.write_text(json.dumps(payload), encoding="utf-8")
+                replay_store = self.root / f"replay-{field}.jsonl"
+                with self.assertRaisesRegex(Exception, "未能安全重放"):
+                    ExternalAgentSemanticHandoffService(
+                        service, JsonlAtomicInformationStore(replay_store), audit_root
+                    ).execute(
+                        representation.representation_id,
+                        CodexCliRepresentationAnalysisProvider(
+                            provider_version="0.147.0", runner=FakeRunner()
+                        ),
+                    )
+                self.assertFalse(replay_store.exists())
+        audit_path.write_text(json.dumps(original), encoding="utf-8")
+
+    def test_reused_provider_persists_only_current_package_records(self) -> None:
+        first_representation, first_service = self.build_service(root=self.root / "first")
+        second_representation, second_service = self.build_service(root=self.root / "second")
+        provider = CodexCliRepresentationAnalysisProvider(
+            provider_version="0.147.0", runner=SequenceRunner("valid", "valid")
+        )
+        ExternalAgentSemanticHandoffService(
+            first_service,
+            JsonlAtomicInformationStore(self.root / "first-atomic.jsonl"),
+            self.root / "first-audits",
+        ).execute(first_representation.representation_id, provider)
+        second = ExternalAgentSemanticHandoffService(
+            second_service,
+            JsonlAtomicInformationStore(self.root / "second-atomic.jsonl"),
+            self.root / "second-audits",
+        ).execute(second_representation.representation_id, provider)
+        self.assertEqual(len(provider.execution_records), 2)
+        self.assertEqual(len(second.audit_paths), 1)
+        self.assertEqual(
+            len(list((self.root / "second-audits").glob("*/processing-run-audit.json"))),
+            1,
+        )
+
+    def test_written_pending_marker_is_recovered_by_exact_replay(self) -> None:
+        representation, service = self.build_service()
+        audit_root = self.root / "audits"
+        import archeos.semantic_handoff as handoff_module
+
+        original_write = handoff_module._private_json_write
+        failed = False
+
+        def fail_written_verified_marker(path, payload):
+            nonlocal failed
+            if (
+                payload.get("durable_ingestion_status") == "written_readback_pending"
+                and payload.get("audit_readback_status") == "verified"
+                and not failed
+            ):
+                failed = True
+                raise OSError("synthetic written marker failure")
+            original_write(path, payload)
+
+        with (
+            patch.object(
+                handoff_module, "_private_json_write", fail_written_verified_marker
+            ),
+            self.assertRaisesRegex(Exception, "已写入或正在读回"),
+        ):
+            ExternalAgentSemanticHandoffService(
+                service,
+                JsonlAtomicInformationStore(self.root / "atomic.jsonl"),
+                audit_root,
+            ).execute(
+                representation.representation_id,
+                CodexCliRepresentationAnalysisProvider(
+                    provider_version="0.147.0", runner=FakeRunner()
+                ),
+            )
+        pending = json.loads(
+            next(audit_root.glob("*/processing-run-audit.json")).read_text()
+        )
+        self.assertEqual(
+            pending["durable_ingestion_status"], "written_readback_pending"
+        )
+        self.assertEqual(pending["audit_readback_status"], "pending")
+        replay = ExternalAgentSemanticHandoffService(
+            service,
+            JsonlAtomicInformationStore(self.root / "atomic.jsonl"),
+            audit_root,
         ).execute(
             representation.representation_id,
             CodexCliRepresentationAnalysisProvider(

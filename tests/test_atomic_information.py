@@ -13,13 +13,13 @@ from pathlib import Path
 from unittest.mock import patch
 
 import archeos.atomic_information.ingestion as atomic_information_ingestion
-from archeos.cli import main
 from archeos.atomic_information import (
     AtomicInformationRevision,
     IngestionResult,
     JsonlAtomicInformationStore,
     ingest_processing_package,
 )
+from archeos.cli import main
 
 SOURCE_ID = "synthetic-source-123456789abc"
 MANAGED_SOURCE_ID = "src_" + "a" * 32
@@ -174,7 +174,7 @@ class AtomicInformationIngestionTest(unittest.TestCase):
             def ingest(package: Path) -> None:
                 try:
                     ingest_processing_package(package, PausingStore(store_path))
-                except Exception as exc:  # pragma: no cover - asserted below
+                except (OSError, TypeError, ValueError) as exc:  # pragma: no cover - asserted below
                     errors.append(exc)
 
             first = threading.Thread(target=ingest, args=(first_package,))

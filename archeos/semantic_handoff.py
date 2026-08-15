@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
@@ -12,10 +13,15 @@ from pathlib import Path
 from .atomic_information import IngestionResult, ingest_processing_package
 from .atomic_information.store import AtomicInformationStore
 from .representation_information import (
+    EXTERNAL_AGENT_PROTOCOL_VERSION,
+    EXTERNAL_AGENT_ROUTE,
     CodexCliRepresentationAnalysisProvider,
     ExternalAgentExecutionRecord,
     RepresentationInformationError,
     RepresentationInformationService,
+    _analysis_batches,
+    _external_agent_request,
+    _units_from_representation,
     validate_representation_information_package,
 )
 
@@ -54,12 +60,22 @@ class ExternalAgentSemanticHandoffService:
         representation_id: str,
         provider: CodexCliRepresentationAnalysisProvider,
     ) -> SemanticHandoffResult:
+        record_offset = len(provider.execution_records)
         package = self.representation_service.output_root / representation_id
         if os.path.lexists(package):
             try:
                 manifest = self._verify_replay_input(representation_id, package)
-                audit_paths = self._matching_audit_paths(_package_fingerprint(package))
-                self._validate_replay_audits(audit_paths, manifest)
+                package_fingerprint = _package_fingerprint(package)
+                expected_batches = self._expected_batch_contracts(
+                    representation_id, manifest, provider
+                )
+                audit_paths = self._matching_audit_paths(package_fingerprint)
+                self._validate_replay_audits(
+                    audit_paths,
+                    expected_batches,
+                    provider,
+                    package_fingerprint,
+                )
                 self._mark_durable_attempt(audit_paths)
                 ingestion = ingest_processing_package(package, self.store)
                 self._mark_durable_write(audit_paths)
@@ -81,10 +97,15 @@ class ExternalAgentSemanticHandoffService:
         ingestion: IngestionResult | None = None
         try:
             package = self.representation_service.extract(representation_id, provider)
-            validate_representation_information_package(package)
+            manifest = self._verify_replay_input(representation_id, package)
             package_fingerprint = _package_fingerprint(package)
+            records = provider.execution_records[record_offset:]
+            expected_batches = self._expected_batch_contracts(
+                representation_id, manifest, provider
+            )
+            self._validate_execution_records(records, expected_batches, provider)
             audit_paths = self._persist_audits(
-                provider.execution_records,
+                records,
                 package_published=True,
                 information_ingested=False,
                 durable_ingestion_status="pending",
@@ -115,7 +136,7 @@ class ExternalAgentSemanticHandoffService:
                     "Durable Atomic Information 写入结果待核验；Processing Run 审计需要 exact replay 恢复。"
                 ) from exc
             audit_paths = self._persist_audits(
-                provider.execution_records,
+                provider.execution_records[record_offset:],
                 package_published=package.is_dir(),
                 information_ingested=False,
                 durable_ingestion_status="ingestion_not_completed",
@@ -124,7 +145,7 @@ class ExternalAgentSemanticHandoffService:
                 ),
                 handoff_status="failed",
             )
-            if not audit_paths and provider.execution_records:
+            if not audit_paths and provider.execution_records[record_offset:]:
                 raise SemanticHandoffError("External Agent 审计无法安全保存。") from exc
             raise SemanticHandoffError(
                 "External Agent 语义交接失败；未确认新增 Durable Atomic Information。"
@@ -233,14 +254,77 @@ class ExternalAgentSemanticHandoffService:
                 matches.append(path)
         return tuple(matches)
 
-    def _validate_replay_audits(
-        self, paths: tuple[Path, ...], manifest: dict[str, object]
-    ) -> None:
-        batches = manifest.get("batches")
-        if not isinstance(batches, list):
+    def _expected_batch_contracts(
+        self,
+        representation_id: str,
+        manifest: dict[str, object],
+        provider: CodexCliRepresentationAnalysisProvider,
+    ) -> tuple[tuple[tuple[str, ...], str], ...]:
+        package_provider = manifest.get("provider")
+        if (
+            not isinstance(package_provider, dict)
+            or package_provider.get("name") != provider.name
+        ):
+            raise SemanticHandoffError("已存在的信息包 Provider 不匹配当前交接合同。")
+        manifest_batches = manifest.get("batches")
+        if not isinstance(manifest_batches, list):
             raise SemanticHandoffError("已存在的信息包批次清单不可读。")
-        expected = [tuple(batch["unit_ids"]) for batch in batches]
-        if len(paths) != len(expected):
+        representation = self.representation_service.representation_repository.get(
+            representation_id
+        )
+        batches = _analysis_batches(
+            _units_from_representation(
+                representation, self.representation_service.representation_repository
+            ),
+            self.representation_service.batch_size,
+        )
+        if len(batches) != len(manifest_batches):
+            raise SemanticHandoffError("当前 canonical Analysis Unit 批次不再匹配信息包。")
+        contracts: list[tuple[tuple[str, ...], str]] = []
+        for package_batch, batch in zip(manifest_batches, batches, strict=True):
+            if not isinstance(package_batch, dict):
+                raise SemanticHandoffError("已存在的信息包批次清单不可读。")
+            anchor_unit_ids = tuple(unit.unit_id for unit in batch.anchor_units)
+            if package_batch.get("unit_ids") != list(anchor_unit_ids):
+                raise SemanticHandoffError("当前 canonical Analysis Unit 批次不再匹配信息包。")
+            _, fingerprint = _external_agent_request(batch)
+            contracts.append((anchor_unit_ids, fingerprint))
+        return tuple(contracts)
+
+    def _validate_execution_records(
+        self,
+        records: list[ExternalAgentExecutionRecord],
+        expected_batches: tuple[tuple[tuple[str, ...], str], ...],
+        provider: CodexCliRepresentationAnalysisProvider,
+    ) -> None:
+        if len(records) != len(expected_batches):
+            raise SemanticHandoffError("当前信息包 Processing Run 审计数量不匹配。")
+        for record, (anchor_unit_ids, input_fingerprint) in zip(
+            records, expected_batches, strict=True
+        ):
+            if (
+                record.protocol_version != EXTERNAL_AGENT_PROTOCOL_VERSION
+                or record.input_fingerprint != input_fingerprint
+                or record.anchor_unit_ids != anchor_unit_ids
+                or record.provider_route != EXTERNAL_AGENT_ROUTE
+                or record.provider_version != provider.provider_version
+                or record.execution_status != "succeeded"
+                or record.failure_category is not None
+                or record.strict_validation_status != "passed"
+                or not _sha256_fingerprint(record.result_fingerprint)
+                or record.eligible_units != len(anchor_unit_ids)
+                or record.covered_units != len(anchor_unit_ids)
+            ):
+                raise SemanticHandoffError("当前信息包 Processing Run 审计不匹配。")
+
+    def _validate_replay_audits(
+        self,
+        paths: tuple[Path, ...],
+        expected_batches: tuple[tuple[tuple[str, ...], str], ...],
+        provider: CodexCliRepresentationAnalysisProvider,
+        package_fingerprint: str,
+    ) -> None:
+        if len(paths) != len(expected_batches):
             raise SemanticHandoffError("已存在的信息包缺少完整的 Processing Run 审计集合。")
         required_fields = {
             "schema_version",
@@ -269,6 +353,7 @@ class ExternalAgentSemanticHandoffService:
             "audit_readback_status",
         }
         observed_batches: set[tuple[str, ...]] = set()
+        expected_by_anchor = dict(expected_batches)
         for path in paths:
             audit = _private_json_read(path)
             if set(audit) != required_fields:
@@ -281,7 +366,8 @@ class ExternalAgentSemanticHandoffService:
             ):
                 raise SemanticHandoffError("已存在的信息包审计缺少批次锚点。")
             batch = tuple(anchor_unit_ids)
-            if batch not in expected or batch in observed_batches:
+            expected_fingerprint = expected_by_anchor.get(batch)
+            if expected_fingerprint is None or batch in observed_batches:
                 raise SemanticHandoffError("已存在的信息包审计批次集合不完整或冲突。")
             observed_batches.add(batch)
             durable_status = audit.get("durable_ingestion_status")
@@ -290,27 +376,47 @@ class ExternalAgentSemanticHandoffService:
                 durable_status == "pending"
                 and audit.get("information_ingested") is False
                 and audit_readback_status == "verified"
+                and audit.get("handoff_status") == "pending"
             ) or (
                 durable_status == "write_attempt_started"
                 and audit.get("information_ingested") is False
                 and audit_readback_status == "verified"
+                and audit.get("handoff_status") == "pending_durable_write"
             ) or (
                 durable_status == "written_readback_pending"
                 and audit.get("information_ingested") is True
-                and audit_readback_status == "verified"
+                and audit_readback_status in {"pending", "verified"}
+                and audit.get("handoff_status") == "pending_readback"
             ) or (
                 durable_status == "completed"
                 and audit.get("information_ingested") is True
                 and audit_readback_status in {"pending", "verified"}
+                and audit.get("handoff_status") == "completed"
             )
             if (
-                audit.get("execution_status") != "succeeded"
+                audit.get("schema_version") != "processing-run-audit/1.0"
+                or audit.get("artifact_kind") != "processing_run_audit"
+                or not _processing_run_id(audit.get("processing_run_id"))
+                or audit.get("protocol_version") != EXTERNAL_AGENT_PROTOCOL_VERSION
+                or audit.get("input_fingerprint") != expected_fingerprint
+                or audit.get("provider_route") != EXTERNAL_AGENT_ROUTE
+                or audit.get("provider_version") != provider.provider_version
+                or not _timestamp(audit.get("started_at"))
+                or not _timestamp(audit.get("finished_at"))
+                or audit.get("execution_status") != "succeeded"
+                or audit.get("failure_category") is not None
                 or audit.get("strict_validation_status") != "passed"
+                or not _sha256_fingerprint(audit.get("result_fingerprint"))
+                or audit.get("eligible_units") != len(batch)
+                or audit.get("covered_units") != len(batch)
+                or audit.get("unaccounted_units") != 0
+                or audit.get("result_readback_status") != "verified"
                 or audit.get("package_published") is not True
+                or audit.get("package_fingerprint") != package_fingerprint
                 or not valid_completion_state
             ):
                 raise SemanticHandoffError("已存在的信息包审计状态不能安全重放。")
-        if observed_batches != set(expected):
+        if observed_batches != set(expected_by_anchor):
             raise SemanticHandoffError("已存在的信息包审计集合不完整。")
 
     def _readback_store(self, ingestion: IngestionResult) -> None:
@@ -324,6 +430,8 @@ class ExternalAgentSemanticHandoffService:
         for path in paths:
             try:
                 payload = _private_json_read(path)
+                if payload.get("information_ingested") is True:
+                    continue
                 payload["durable_ingestion_status"] = "write_attempt_started"
                 payload["handoff_status"] = "pending_durable_write"
                 payload["audit_readback_status"] = "pending"
@@ -405,6 +513,20 @@ def _private_json_read(path: Path) -> dict[str, object]:
     if not isinstance(value, dict):
         raise SemanticHandoffError("Processing Run 审计不是对象。")
     return value
+
+
+def _sha256_fingerprint(value: object) -> bool:
+    return isinstance(value, str) and re.fullmatch(r"sha256:[0-9a-f]{64}", value) is not None
+
+
+def _processing_run_id(value: object) -> bool:
+    return isinstance(value, str) and re.fullmatch(r"run_[0-9a-f]{32}", value) is not None
+
+
+def _timestamp(value: object) -> bool:
+    return isinstance(value, str) and re.fullmatch(
+        r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z", value
+    ) is not None
 
 
 def _package_fingerprint(package: Path) -> str:

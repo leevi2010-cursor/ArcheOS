@@ -585,7 +585,7 @@ def _run_external_agent_once(
         return _ExternalAgentProcessOutcome(
             "timeout" if _terminate_process_group(process) else "process_cleanup_failure"
         )
-    except Exception:
+    except (OSError, TypeError, UnicodeError, ValueError, subprocess.SubprocessError):
         return _ExternalAgentProcessOutcome(
             "runtime_execution_failure"
             if _terminate_process_group(process)
@@ -622,6 +622,13 @@ def _wait_for_process_group_absence(pid: int, timeout_seconds: float) -> bool:
         time.sleep(0.02)
 
 
+def _best_effort_process_wait(process: Any, timeout_seconds: float) -> None:
+    try:
+        process.communicate(timeout=timeout_seconds)
+    except (OSError, TypeError, UnicodeError, ValueError, subprocess.SubprocessError):
+        return
+
+
 def _terminate_process_group(process: Any) -> bool:
     try:
         os.killpg(process.pid, signal.SIGTERM)
@@ -629,10 +636,7 @@ def _terminate_process_group(process: Any) -> bool:
         return True
     except PermissionError:
         return False
-    try:
-        process.communicate(timeout=1)
-    except Exception:
-        pass
+    _best_effort_process_wait(process, 1)
     if _wait_for_process_group_absence(process.pid, 1):
         return True
     try:
@@ -641,10 +645,7 @@ def _terminate_process_group(process: Any) -> bool:
         return True
     except PermissionError:
         return False
-    try:
-        process.communicate(timeout=2)
-    except Exception:
-        pass
+    _best_effort_process_wait(process, 2)
     return _wait_for_process_group_absence(process.pid, 1)
 
 
