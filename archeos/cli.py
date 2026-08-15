@@ -31,19 +31,20 @@ from .representation import (
 )
 from .representation.registry import production_adapter
 from .representation_information import (
+    CodexCliRepresentationAnalysisProvider,
     FileRepresentationAnalysisProvider,
     RepresentationInformationError,
     RepresentationInformationService,
 )
-from .speakers import FileSpeakerProvider
+from .semantic_handoff import ExternalAgentSemanticHandoffService, SemanticHandoffError
 from .source import (
     HandoffMarkerService,
     LocalManagedSourceRepository,
     ManagedSourceService,
     SourceError,
 )
+from .speakers import FileSpeakerProvider
 from .transcription import FileTranscriptionProvider, MlxWhisperTranscriptionProvider
-from .world_model import ObjectResolver, SQLiteWorldModelRepository
 from .workspace import (
     codex_integration_status,
     doctor,
@@ -52,6 +53,7 @@ from .workspace import (
     load_workspace_config,
     remove_codex_integration,
 )
+from .world_model import ObjectResolver, SQLiteWorldModelRepository
 
 DEFAULT_WORLD_MODEL_DATABASE = Path("04_core/archeos.sqlite3")
 DEFAULT_ATOMIC_INFORMATION_STORE = Path("03_information/atomic_information.jsonl")
@@ -60,6 +62,7 @@ DEFAULT_CHANGE_JOURNAL = Path("03_information/change_journal.jsonl")
 DEFAULT_MANAGED_SOURCE_ROOT = Path("01_inbox")
 DEFAULT_REPRESENTATION_ROOT = Path("02_processing/representations")
 DEFAULT_REPRESENTATION_INFORMATION_ROOT = Path("02_processing/information")
+DEFAULT_SEMANTIC_HANDOFF_AUDIT_ROOT = Path("02_processing/semantic_handoff_runs")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -179,14 +182,25 @@ def build_parser() -> argparse.ArgumentParser:
     extract.add_argument(
         "--output-root", type=Path, default=DEFAULT_REPRESENTATION_INFORMATION_ROOT
     )
-    extract.add_argument(
+    provider = extract.add_mutually_exclusive_group(required=True)
+    provider.add_argument(
         "--analysis-file",
         type=Path,
-        required=True,
         help=(
             "Required explicit deterministic fixture or reviewed structured-result "
-            "handoff; no production semantic model provider is registered."
+            "handoff."
         ),
+    )
+    provider.add_argument(
+        "--external-agent-route",
+        choices=("codex-cli",),
+        help="Explicit approved External Agent route; no automatic fallback.",
+    )
+    extract.add_argument("--provider-version", help="Required safe provider version label for the External Agent audit.")
+    extract.add_argument("--codex-bin", default="codex", help="Explicit Codex CLI executable for the approved route.")
+    extract.add_argument("--timeout-seconds", type=float, default=120.0)
+    extract.add_argument(
+        "--audit-root", type=Path, default=DEFAULT_SEMANTIC_HANDOFF_AUDIT_ROOT
     )
     extract.add_argument("--batch-size", type=int, default=100)
 
@@ -552,18 +566,33 @@ def _information_command(args: argparse.Namespace) -> int:
             print(json.dumps(asdict(result), ensure_ascii=False, indent=2))
             return 0
         if args.information_command == "extract":
-            package = RepresentationInformationService(
+            service = RepresentationInformationService(
                 LocalManagedSourceRepository(args.managed_root),
                 LocalRepresentationRepository(args.representation_root),
                 args.output_root,
                 batch_size=args.batch_size,
-            ).extract(
-                args.representation_id,
-                FileRepresentationAnalysisProvider(args.analysis_file),
             )
-            result = ingest_processing_package(
-                package, JsonlAtomicInformationStore(args.store)
-            )
+            if args.analysis_file is not None:
+                package = service.extract(
+                    args.representation_id,
+                    FileRepresentationAnalysisProvider(args.analysis_file),
+                )
+                result = ingest_processing_package(
+                    package, JsonlAtomicInformationStore(args.store)
+                )
+            else:
+                if args.provider_version is None:
+                    raise ValueError("--provider-version is required with --external-agent-route")
+                provider = CodexCliRepresentationAnalysisProvider(
+                    codex_binary=args.codex_bin,
+                    provider_version=args.provider_version,
+                    timeout_seconds=args.timeout_seconds,
+                )
+                handoff = ExternalAgentSemanticHandoffService(
+                    service, JsonlAtomicInformationStore(args.store), args.audit_root
+                ).execute(args.representation_id, provider)
+                package = handoff.package
+                result = handoff.ingestion
             print(package)
             print(json.dumps(asdict(result), ensure_ascii=False))
             return 0
@@ -572,6 +601,7 @@ def _information_command(args: argparse.Namespace) -> int:
         OSError,
         RepresentationError,
         RepresentationInformationError,
+        SemanticHandoffError,
         SourceError,
         TypeError,
         ValueError,

@@ -4,6 +4,7 @@ import hashlib
 import inspect
 import json
 import tempfile
+import threading
 import unittest
 from contextlib import redirect_stdout
 from dataclasses import replace
@@ -12,13 +13,13 @@ from pathlib import Path
 from unittest.mock import patch
 
 import archeos.atomic_information.ingestion as atomic_information_ingestion
-from archeos.cli import main
 from archeos.atomic_information import (
     AtomicInformationRevision,
     IngestionResult,
     JsonlAtomicInformationStore,
     ingest_processing_package,
 )
+from archeos.cli import main
 
 SOURCE_ID = "synthetic-source-123456789abc"
 MANAGED_SOURCE_ID = "src_" + "a" * 32
@@ -144,6 +145,54 @@ class RecordingAtomicInformationStore:
 
 
 class AtomicInformationIngestionTest(unittest.TestCase):
+    def test_concurrent_store_writes_do_not_drop_distinct_origins(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            (root / "first").mkdir()
+            (root / "second").mkdir()
+            first_package = write_package(root / "first", [candidate()])
+            second_package = write_package(
+                root / "second",
+                [candidate("synthetic-source-123456789abc-0002", segment=2)],
+            )
+            store_path = root / "atomic_information.jsonl"
+            entered = threading.Event()
+            release = threading.Event()
+            read_calls = 0
+
+            class PausingStore(JsonlAtomicInformationStore):
+                def _read_all(self):
+                    nonlocal read_calls
+                    read_calls += 1
+                    if read_calls == 1:
+                        entered.set()
+                        release.wait(timeout=3)
+                    return super()._read_all()
+
+            errors: list[Exception] = []
+
+            def ingest(package: Path) -> None:
+                try:
+                    ingest_processing_package(package, PausingStore(store_path))
+                except (OSError, TypeError, ValueError) as exc:  # pragma: no cover - asserted below
+                    errors.append(exc)
+
+            first = threading.Thread(target=ingest, args=(first_package,))
+            second = threading.Thread(target=ingest, args=(second_package,))
+            first.start()
+            self.assertTrue(entered.wait(timeout=3))
+            second.start()
+            self.assertEqual(read_calls, 1)
+            release.set()
+            first.join(timeout=3)
+            second.join(timeout=3)
+            self.assertFalse(first.is_alive())
+            self.assertFalse(second.is_alive())
+            self.assertEqual(errors, [])
+            self.assertEqual(
+                len(JsonlAtomicInformationStore(store_path).list_atomic_information()), 2
+            )
+
     def test_valid_candidate_becomes_durable_information_with_exact_evidence(
         self,
     ) -> None:

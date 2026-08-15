@@ -1,14 +1,16 @@
 from __future__ import annotations
 
+import fcntl
 import json
 import os
 import tempfile
 from collections.abc import Sequence
+from contextlib import contextmanager
 from pathlib import Path
 
 from .models import (
-    IngestionResult,
     AtomicInformationRevision,
+    IngestionResult,
     atomic_information_revision_from_dict,
     atomic_information_revision_to_dict,
     validate_atomic_information_revision,
@@ -20,6 +22,12 @@ class JsonlAtomicInformationStore:
         self.path = Path(path).expanduser()
 
     def ingest_batch(
+        self, revisions: Sequence[AtomicInformationRevision]
+    ) -> IngestionResult:
+        with self._exclusive_lock():
+            return self._ingest_batch_locked(revisions)
+
+    def _ingest_batch_locked(
         self, revisions: Sequence[AtomicInformationRevision]
     ) -> IngestionResult:
         candidates = tuple(revisions)
@@ -93,6 +101,12 @@ class JsonlAtomicInformationStore:
         )
 
     def append_revision(
+        self, revision: AtomicInformationRevision
+    ) -> AtomicInformationRevision:
+        with self._exclusive_lock():
+            return self._append_revision_locked(revision)
+
+    def _append_revision_locked(
         self, revision: AtomicInformationRevision
     ) -> AtomicInformationRevision:
         validate_atomic_information_revision(revision)
@@ -223,3 +237,16 @@ class JsonlAtomicInformationStore:
         finally:
             if temporary_path is not None and temporary_path.exists():
                 temporary_path.unlink()
+
+    @contextmanager
+    def _exclusive_lock(self):
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        lock_path = self.path.parent / f".{self.path.name}.lock"
+        descriptor = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+        try:
+            os.fchmod(descriptor, 0o600)
+            fcntl.flock(descriptor, fcntl.LOCK_EX)
+            yield
+        finally:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+            os.close(descriptor)
