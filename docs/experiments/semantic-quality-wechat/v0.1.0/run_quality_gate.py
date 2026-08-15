@@ -8,6 +8,7 @@ its lifecycle with a fake subprocess only.
 from __future__ import annotations
 
 import argparse
+import errno
 import hashlib
 import json
 import os
@@ -226,8 +227,10 @@ def _cleanup_process_group(process: Any) -> None:
             os.killpg(process.pid, 0)
         except ProcessLookupError:
             return True
-        except OSError:
-            return True
+        except OSError as exc:
+            if exc.errno == errno.ESRCH:
+                return True
+            raise GateError("provider process-group absence cannot be verified") from exc
         return False
 
     if absent():
@@ -296,7 +299,7 @@ def run_real_call(batch: RepresentationAnalysisBatch, *, marker_path: Path = MAR
             result = parse_and_validate(raw, batch, fingerprint)
             if review_root is not None:
                 packet = write_local_review_packet(batch, result, review_root)
-                if not review_packet_readback(packet) or packet.stat().st_mode & 0o777 != 0o600:
+                if not review_packet_readback(packet, batch, result) or packet.stat().st_mode & 0o777 != 0o600:
                     raise GateError("local review packet readback failed")
         update_marker(marker_path, "completed")
         return result
@@ -352,13 +355,41 @@ def write_local_review_packet(
     return path
 
 
-def review_packet_readback(path: Path) -> bool:
+def review_packet_readback(
+    path: Path, batch: RepresentationAnalysisBatch | None = None,
+    result: RepresentationAnalysisResult | None = None,
+) -> bool:
     try:
         packet = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return False
-    return isinstance(packet, dict) and all(isinstance(packet.get(key), list) for key in (
-        "anchor_view", "candidate_view", "context_support_view"))
+    if not isinstance(packet, dict) or set(packet) != {"anchor_view", "candidate_view", "context_support_view"}:
+        return False
+    if not all(isinstance(packet[key], list) for key in packet):
+        return False
+    if batch is None or result is None:
+        return bool(packet["anchor_view"])
+    supplied = {unit.unit_id: unit for unit in (*batch.anchor_units, *batch.context_support_units)}
+    anchors = {unit.unit_id for unit in batch.anchor_units}
+    if {item.get("unit_id") for item in packet["anchor_view"]} != anchors:
+        return False
+    for item in packet["anchor_view"]:
+        unit = supplied[item["unit_id"]]
+        if item.get("content") != unit.content or item.get("locator") != unit.locator:
+            return False
+    if len(packet["candidate_view"]) != len(result.candidates):
+        return False
+    for shown, candidate in zip(packet["candidate_view"], result.candidates, strict=True):
+        if shown.get("evidence_unit_ids") != list(candidate.evidence_unit_ids):
+            return False
+        evidence = shown.get("canonical_evidence")
+        if not isinstance(evidence, list) or len(evidence) != len(candidate.evidence_unit_ids):
+            return False
+        for item, unit_id in zip(evidence, candidate.evidence_unit_ids, strict=True):
+            unit = supplied.get(unit_id)
+            if unit is None or item.get("unit_id") != unit_id or item.get("content") != unit.content or item.get("locator") != unit.locator:
+                return False
+    return True
 
 
 def cleanup_local_review_packet(directory: Path) -> None:

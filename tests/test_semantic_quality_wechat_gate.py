@@ -120,6 +120,10 @@ class SemanticQualityWechatGateTest(unittest.TestCase):
                 gate.parse_and_validate(json.dumps(payload), value, gate.input_fingerprint(gate.provider_input(value)))
             else:
                 with self.assertRaises(Exception): gate.parse_and_validate(json.dumps(payload), value, gate.input_fingerprint(gate.provider_input(value)))
+        value = batch(context=(capable,)); payload = result_for(value)
+        payload["candidates"][0]["evidence_unit_ids"] = [capable.unit_id]
+        with self.assertRaises(Exception):
+            gate.parse_and_validate(json.dumps(payload), value, gate.input_fingerprint(gate.provider_input(value)))
 
     def test_timeout_and_nonzero_fail_closed(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -186,7 +190,10 @@ class SemanticQualityWechatGateTest(unittest.TestCase):
             packet = json.loads(path.read_text(encoding="utf-8"))
             self.assertEqual(len(packet["anchor_view"]), 19)
             self.assertEqual(path.stat().st_mode & 0o777, 0o600)
-            self.assertTrue(gate.review_packet_readback(path))
+            self.assertTrue(gate.review_packet_readback(path, value, parsed))
+            path.write_text("{}", encoding="utf-8")
+            self.assertFalse(gate.review_packet_readback(path, value, parsed))
+            path = gate.write_local_review_packet(value, parsed, path.parent)
             gate.cleanup_local_review_packet(path.parent)
             self.assertFalse(path.exists())
 
