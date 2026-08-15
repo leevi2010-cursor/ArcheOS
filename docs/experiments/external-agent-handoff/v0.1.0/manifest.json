@@ -1,0 +1,63 @@
+{
+  "experiment": "external-agent-handoff-privacy-audit",
+  "version": "v0.1.0",
+  "issue": 66,
+  "status": "route_fail_not_production_viable",
+  "scope": "public synthetic-only transport/privacy/audit gate",
+  "protocol_version": "external-agent-handoff/1.0",
+  "input": {
+    "fixture": "fixtures/synthetic-handoff-package.json",
+    "input_fingerprint": "sha256:eed41def9a10a95a15528f83ba3a13e58f81db52789f2b8cce8396ab13ea4069",
+    "fingerprint_pin": "hardcoded_in_harness",
+    "eligible_units": 2,
+    "synthetic_sensitive_value_classes": 5,
+    "contains_real_source": false,
+    "contains_real_representation": false,
+    "contains_real_path": false,
+    "contains_real_credential": false
+  },
+  "controls": {
+    "transport": "stdin",
+    "process_tree_observation": "sampling_fail_closed",
+    "global_discovery": "pid_ppid_topology_only",
+    "selected_process_metadata": "combined_argv_environment",
+    "zero_hit_status": "unavailable",
+    "temporary_directory_mode": "0700",
+    "temporary_file_mode": "0600",
+    "deadline_seconds": 120,
+    "automatic_retry": false,
+    "automatic_provider_fallback": false,
+    "failure_audit_fallback": true,
+    "artifact_publish": "staged_bundle_atomic_rename",
+    "package_published": false,
+    "information_ingested": false,
+    "world_model_write": false,
+    "raw_process_metadata_persisted": false
+  },
+  "synthetic_matrix": {
+    "tests": 23,
+    "passed": 23,
+    "failed": 0
+  },
+  "external_agent_route": {
+    "provider_route": "external-agent-codex-cli",
+    "provider_version": "codex-cli 0.147.0",
+    "post_review_runs": 1,
+    "strict_validation_passed_runs": 1,
+    "privacy_passed_runs": 0,
+    "metadata_sensitive_hits_per_run": [9],
+    "metadata_read_failures_per_run": [9],
+    "observation_complete_per_run": [false],
+    "observed_processes_per_run": [6],
+    "snapshots_per_run": [1151],
+    "cleanup_verified_runs": 1,
+    "audit_readback_verified_runs": 1,
+    "result_published_runs": 0,
+    "package_published_runs": 0,
+    "information_ingested_runs": 0,
+    "execution_status": "failed",
+    "failure_category": "privacy_boundary_violation",
+    "superseded_channel_attribution": "pre-review argv/environment split is non-authoritative"
+  },
+  "recommendation": "External Agent Handoff transport not production viable; Architecture and Product Alignment Review required before any new route or real-data gate"
+}
