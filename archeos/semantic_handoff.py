@@ -189,6 +189,19 @@ class ExternalAgentSemanticHandoffService:
                 "eligible_units": record.eligible_units,
                 "covered_units": record.covered_units,
                 "unaccounted_units": record.eligible_units - record.covered_units,
+                "diagnostic_schema_version": record.diagnostic_schema_version,
+                "elapsed_ms": record.elapsed_ms,
+                "deadline_ms": record.deadline_ms,
+                "exit_code": record.exit_code,
+                "termination_signal": record.termination_signal,
+                "timeout_phase": record.timeout_phase,
+                "provider_error_category": record.provider_error_category,
+                "result_file_present": record.result_file_present,
+                "result_size_bytes": record.result_size_bytes,
+                "stdout_bytes": record.stdout_bytes,
+                "stderr_bytes": record.stderr_bytes,
+                "process_cleanup_status": record.process_cleanup_status,
+                "diagnostic_cleanup_status": record.diagnostic_cleanup_status,
                 "result_readback_status": (
                     "verified"
                     if record.execution_status == "succeeded"
@@ -344,6 +357,19 @@ class ExternalAgentSemanticHandoffService:
             "eligible_units",
             "covered_units",
             "unaccounted_units",
+            "diagnostic_schema_version",
+            "elapsed_ms",
+            "deadline_ms",
+            "exit_code",
+            "termination_signal",
+            "timeout_phase",
+            "provider_error_category",
+            "result_file_present",
+            "result_size_bytes",
+            "stdout_bytes",
+            "stderr_bytes",
+            "process_cleanup_status",
+            "diagnostic_cleanup_status",
             "result_readback_status",
             "package_published",
             "package_fingerprint",
@@ -352,12 +378,29 @@ class ExternalAgentSemanticHandoffService:
             "handoff_status",
             "audit_readback_status",
         }
+        diagnostic_fields = {
+            "diagnostic_schema_version",
+            "elapsed_ms",
+            "deadline_ms",
+            "exit_code",
+            "termination_signal",
+            "timeout_phase",
+            "provider_error_category",
+            "result_file_present",
+            "result_size_bytes",
+            "stdout_bytes",
+            "stderr_bytes",
+            "process_cleanup_status",
+            "diagnostic_cleanup_status",
+        }
+        legacy_required_fields = required_fields - diagnostic_fields
         observed_batches: set[tuple[str, ...]] = set()
         expected_by_anchor = dict(expected_batches)
         for path in paths:
             audit = _private_json_read(path)
-            if set(audit) != required_fields:
+            if set(audit) not in {frozenset(required_fields), frozenset(legacy_required_fields)}:
                 raise SemanticHandoffError("已存在的信息包审计不完整。")
+            has_diagnostics = diagnostic_fields.issubset(audit)
             anchor_unit_ids = audit.get("anchor_unit_ids")
             if (
                 not isinstance(anchor_unit_ids, list)
@@ -410,6 +453,31 @@ class ExternalAgentSemanticHandoffService:
                 or audit.get("eligible_units") != len(batch)
                 or audit.get("covered_units") != len(batch)
                 or audit.get("unaccounted_units") != 0
+                or has_diagnostics
+                and (
+                    audit.get("diagnostic_schema_version")
+                    != "external-agent-diagnostics/1.0"
+                    or not isinstance(audit.get("elapsed_ms"), int)
+                    or audit.get("elapsed_ms") < 0
+                    or not isinstance(audit.get("deadline_ms"), int)
+                    or audit.get("deadline_ms") <= 0
+                    or audit.get("exit_code") is not None
+                    and not isinstance(audit.get("exit_code"), int)
+                    or audit.get("termination_signal") is not None
+                    and not isinstance(audit.get("termination_signal"), int)
+                    or audit.get("timeout_phase") is not None
+                    or audit.get("provider_error_category") is not None
+                    or audit.get("result_file_present") is not True
+                    or not isinstance(audit.get("result_size_bytes"), int)
+                    or audit.get("result_size_bytes") < 0
+                    or not isinstance(audit.get("stdout_bytes"), int)
+                    or audit.get("stdout_bytes") < 0
+                    or not isinstance(audit.get("stderr_bytes"), int)
+                    or audit.get("stderr_bytes") < 0
+                    or audit.get("process_cleanup_status") != "verified"
+                    or audit.get("diagnostic_cleanup_status")
+                    not in {"verified", "failed"}
+                )
                 or audit.get("result_readback_status") != "verified"
                 or audit.get("package_published") is not True
                 or audit.get("package_fingerprint") != package_fingerprint

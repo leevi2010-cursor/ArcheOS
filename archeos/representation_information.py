@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import signal
 import subprocess
 import tempfile
@@ -14,7 +15,7 @@ import time
 import uuid
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
-from datetime import datetime, timezone
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -374,8 +375,8 @@ def _run_codex_turn_with_deadline(turn: object, timeout_seconds: float) -> objec
 
     def collect() -> None:
         try:
-            outcome["result"] = getattr(turn, "run")()
-        except Exception as exc:  # pragma: no cover - tested through the provider
+            outcome["result"] = turn.run()  # type: ignore[attr-defined]
+        except Exception as exc:  # noqa: BLE001 - provider errors cross this boundary.
             outcome["error"] = exc
         finally:
             completed.set()
@@ -402,7 +403,7 @@ def _run_codex_turn_with_deadline(turn: object, timeout_seconds: float) -> objec
 
 def _best_effort_turn_interrupt(turn: object) -> None:
     try:
-        getattr(turn, "interrupt")()
+        turn.interrupt()  # type: ignore[attr-defined]
     except (OSError, subprocess.SubprocessError):
         pass
 
@@ -425,6 +426,24 @@ class ExternalAgentExecutionRecord:
     result_fingerprint: str | None
     eligible_units: int
     covered_units: int
+    diagnostic_schema_version: str
+    elapsed_ms: int
+    deadline_ms: int
+    exit_code: int | None
+    termination_signal: int | None
+    timeout_phase: str | None
+    provider_error_category: str | None
+    result_file_present: bool
+    result_size_bytes: int
+    stdout_bytes: int
+    stderr_bytes: int
+    process_cleanup_status: str
+    diagnostic_cleanup_status: str
+
+
+DIAGNOSTIC_SCHEMA_VERSION = "external-agent-diagnostics/1.0"
+_MAX_DIAGNOSTIC_STREAM_BYTES = 64 * 1024
+_DIAGNOSTIC_TTL_SECONDS = 24 * 60 * 60
 
 
 class CodexCliRepresentationAnalysisProvider:
@@ -443,6 +462,7 @@ class CodexCliRepresentationAnalysisProvider:
         provider_version: str,
         timeout_seconds: float = DEFAULT_CODEX_ANALYSIS_TIMEOUT_SECONDS,
         runner: Callable[..., Any] = subprocess.Popen,
+        diagnostic_root: Path | None = None,
     ) -> None:
         if not isinstance(codex_binary, str) or not codex_binary.strip():
             raise ValueError("codex_binary must be a non-empty string")
@@ -460,9 +480,29 @@ class CodexCliRepresentationAnalysisProvider:
         self.provider_version = provider_version
         self.timeout_seconds = float(timeout_seconds)
         self.runner = runner
+        self.diagnostic_root = (
+            Path(tempfile.gettempdir()) / "archeos-external-agent-diagnostics"
+            if diagnostic_root is None
+            else Path(diagnostic_root).expanduser()
+        )
         self.execution_records: list[ExternalAgentExecutionRecord] = []
 
+    def cleanup_failure_diagnostics(self) -> bool:
+        """Explicitly remove local-only failure diagnostics after review."""
+        try:
+            if self.diagnostic_root.exists():
+                shutil.rmtree(self.diagnostic_root)
+            return True
+        except OSError:
+            return False
+
     def analyze(self, batch: RepresentationAnalysisBatch) -> RepresentationAnalysisResult:
+        started_monotonic = time.monotonic()
+        diagnostic_cleanup_status = (
+            "verified"
+            if _purge_expired_diagnostic_bundles(self.diagnostic_root)
+            else "failed"
+        )
         request, fingerprint = _external_agent_request(batch)
         record_base = {
             "processing_run_id": "run_" + uuid.uuid4().hex,
@@ -475,6 +515,8 @@ class CodexCliRepresentationAnalysisProvider:
         }
         schema = external_agent_representation_analysis_schema()
         _require_codex_schema_compatibility(schema)
+        result_file_present = False
+        result_size_bytes = 0
         with tempfile.TemporaryDirectory(prefix="archeos-external-agent-") as directory:
             temp = Path(directory)
             os.chmod(temp, 0o700)
@@ -511,6 +553,8 @@ class CodexCliRepresentationAnalysisProvider:
                     raise RepresentationInformationError(outcome.failure_category)
                 if result_path.is_symlink() or not result_path.is_file():
                     raise RepresentationInformationError("no_result")
+                result_file_present = True
+                result_size_bytes = result_path.stat().st_size
                 raw = result_path.read_text(encoding="utf-8")
                 result = _parse_external_agent_result(raw, batch, fingerprint)
             except (OSError, RuntimeError, ValueError, json.JSONDecodeError) as exc:
@@ -526,18 +570,36 @@ class CodexCliRepresentationAnalysisProvider:
                     "result_contract_failure",
                 }:
                     category = "runtime_execution_failure"
-                self.execution_records.append(
-                    ExternalAgentExecutionRecord(
-                        **record_base,
-                        finished_at=_utc_timestamp(),
-                        execution_status="failed",
-                        failure_category=category,
-                        strict_validation_status="failed",
-                        result_fingerprint=None,
-                        eligible_units=len(batch.anchor_units),
-                        covered_units=0,
-                    )
+                if "outcome" not in locals():
+                    outcome = _ExternalAgentProcessOutcome.runtime_error()
+                record = ExternalAgentExecutionRecord(
+                    **record_base,
+                    finished_at=_utc_timestamp(),
+                    execution_status="failed",
+                    failure_category=category,
+                    strict_validation_status="failed",
+                    result_fingerprint=None,
+                    eligible_units=len(batch.anchor_units),
+                    covered_units=0,
+                    diagnostic_schema_version=DIAGNOSTIC_SCHEMA_VERSION,
+                    elapsed_ms=_elapsed_ms(started_monotonic),
+                    deadline_ms=round(self.timeout_seconds * 1000),
+                    exit_code=outcome.exit_code,
+                    termination_signal=outcome.termination_signal,
+                    timeout_phase=outcome.timeout_phase,
+                    provider_error_category=outcome.provider_error_category,
+                    result_file_present=result_file_present,
+                    result_size_bytes=result_size_bytes,
+                    stdout_bytes=_stream_bytes(outcome.stdout),
+                    stderr_bytes=_stream_bytes(outcome.stderr),
+                    process_cleanup_status=outcome.process_cleanup_status,
+                    diagnostic_cleanup_status=diagnostic_cleanup_status,
                 )
+                if not _write_failure_diagnostic_bundle(
+                    self.diagnostic_root, record, outcome
+                ):
+                    record = replace(record, diagnostic_cleanup_status="failed")
+                self.execution_records.append(record)
                 raise RepresentationInformationError(
                     "External Agent 未产生可验证的结构化结果；未发布信息包。"
                 ) from exc
@@ -552,6 +614,19 @@ class CodexCliRepresentationAnalysisProvider:
                 + hashlib.sha256(raw.encode("utf-8")).hexdigest(),
                 eligible_units=len(batch.anchor_units),
                 covered_units=len(batch.anchor_units),
+                diagnostic_schema_version=DIAGNOSTIC_SCHEMA_VERSION,
+                elapsed_ms=_elapsed_ms(started_monotonic),
+                deadline_ms=round(self.timeout_seconds * 1000),
+                exit_code=outcome.exit_code,
+                termination_signal=outcome.termination_signal,
+                timeout_phase=outcome.timeout_phase,
+                provider_error_category=None,
+                result_file_present=result_file_present,
+                result_size_bytes=result_size_bytes,
+                stdout_bytes=_stream_bytes(outcome.stdout),
+                stderr_bytes=_stream_bytes(outcome.stderr),
+                process_cleanup_status=outcome.process_cleanup_status,
+                diagnostic_cleanup_status=diagnostic_cleanup_status,
             )
         )
         return result
@@ -560,6 +635,26 @@ class CodexCliRepresentationAnalysisProvider:
 @dataclass(frozen=True)
 class _ExternalAgentProcessOutcome:
     failure_category: str | None
+    stdout: str
+    stderr: str
+    exit_code: int | None
+    termination_signal: int | None
+    timeout_phase: str | None
+    provider_error_category: str | None
+    process_cleanup_status: str
+
+    @classmethod
+    def runtime_error(cls) -> _ExternalAgentProcessOutcome:
+        return cls(
+            "runtime_execution_failure",
+            "",
+            "",
+            None,
+            None,
+            None,
+            None,
+            "failed",
+        )
 
 
 def _run_external_agent_once(
@@ -578,28 +673,62 @@ def _run_external_agent_once(
             start_new_session=True,
         )
     except OSError:
-        return _ExternalAgentProcessOutcome("runtime_start_failure")
-    try:
-        process.communicate(input=prompt, timeout=timeout_seconds)
-    except subprocess.TimeoutExpired:
         return _ExternalAgentProcessOutcome(
-            "timeout" if _terminate_process_group(process) else "process_cleanup_failure"
+            "runtime_start_failure", "", "", None, None, None, None, "not_started"
+        )
+    try:
+        stdout, stderr = process.communicate(input=prompt, timeout=timeout_seconds)
+    except subprocess.TimeoutExpired as exc:
+        stdout = _stream_text(exc.output)
+        stderr = _stream_text(exc.stderr)
+        cleanup = _terminate_process_group(process, stdout, stderr)
+        return _ExternalAgentProcessOutcome(
+            "timeout" if cleanup.verified else "process_cleanup_failure",
+            cleanup.stdout,
+            cleanup.stderr,
+            _return_code(process),
+            cleanup.termination_signal,
+            cleanup.timeout_phase or "initial_communicate",
+            _provider_error_category(cleanup.stderr),
+            "verified" if cleanup.verified else "failed",
         )
     except Exception:  # noqa: BLE001 - post-Popen cleanup must contain unknown errors.
+        cleanup = _terminate_process_group(process, "", "")
         return _ExternalAgentProcessOutcome(
-            "runtime_execution_failure"
-            if _terminate_process_group(process)
-            else "process_cleanup_failure"
+            "runtime_execution_failure" if cleanup.verified else "process_cleanup_failure",
+            cleanup.stdout,
+            cleanup.stderr,
+            _return_code(process),
+            cleanup.termination_signal,
+            cleanup.timeout_phase,
+            _provider_error_category(cleanup.stderr),
+            "verified" if cleanup.verified else "failed",
         )
+    stdout = _stream_text(stdout)
+    stderr = _stream_text(stderr)
     if process.returncode != 0:
+        cleanup = _ensure_process_group_absent(process, stdout, stderr)
         return _ExternalAgentProcessOutcome(
-            "runtime_nonzero_exit"
-            if _process_group_absent(process.pid) or _terminate_process_group(process)
-            else "process_cleanup_failure"
+            "runtime_nonzero_exit" if cleanup.verified else "process_cleanup_failure",
+            cleanup.stdout,
+            cleanup.stderr,
+            _return_code(process),
+            cleanup.termination_signal,
+            cleanup.timeout_phase,
+            _provider_error_category(cleanup.stderr),
+            "verified" if cleanup.verified else "failed",
         )
-    if not _process_group_absent(process.pid) and not _terminate_process_group(process):
-        return _ExternalAgentProcessOutcome("process_cleanup_failure")
-    return _ExternalAgentProcessOutcome(None)
+    cleanup = _ensure_process_group_absent(process, stdout, stderr)
+    return _ExternalAgentProcessOutcome(
+        None if cleanup.verified else "process_cleanup_failure",
+        cleanup.stdout,
+        cleanup.stderr,
+        _return_code(process),
+        cleanup.termination_signal,
+        cleanup.timeout_phase,
+        None,
+        "verified" if cleanup.verified else "failed",
+    )
 
 
 def _process_group_absent(pid: int) -> bool:
@@ -612,6 +741,15 @@ def _process_group_absent(pid: int) -> bool:
     return False
 
 
+@dataclass(frozen=True)
+class _ProcessCleanupOutcome:
+    verified: bool
+    stdout: str
+    stderr: str
+    termination_signal: int | None
+    timeout_phase: str | None
+
+
 def _wait_for_process_group_absence(pid: int, timeout_seconds: float) -> bool:
     deadline = time.monotonic() + timeout_seconds
     while True:
@@ -622,31 +760,228 @@ def _wait_for_process_group_absence(pid: int, timeout_seconds: float) -> bool:
         time.sleep(0.02)
 
 
-def _best_effort_process_wait(process: Any, timeout_seconds: float) -> None:
+def _drain_process_output(
+    process: Any, timeout_seconds: float, stdout: str, stderr: str
+) -> tuple[str, str, bool]:
     try:
-        process.communicate(timeout=timeout_seconds)
+        drained_stdout, drained_stderr = process.communicate(timeout=timeout_seconds)
+        return (
+            _merge_stream_output(stdout, _stream_text(drained_stdout)),
+            _merge_stream_output(stderr, _stream_text(drained_stderr)),
+            True,
+        )
+    except subprocess.TimeoutExpired as exc:
+        return (
+            _merge_stream_output(stdout, _stream_text(exc.output)),
+            _merge_stream_output(stderr, _stream_text(exc.stderr)),
+            False,
+        )
     except Exception:  # noqa: BLE001 - cleanup must not leak a live process group.
-        return
+        return stdout, stderr, False
 
 
-def _terminate_process_group(process: Any) -> bool:
+def _ensure_process_group_absent(
+    process: Any, stdout: str, stderr: str
+) -> _ProcessCleanupOutcome:
+    if _process_group_absent(process.pid):
+        return _ProcessCleanupOutcome(True, stdout, stderr, None, None)
+    return _terminate_process_group(process, stdout, stderr)
+
+
+def _terminate_process_group(
+    process: Any, stdout: str, stderr: str
+) -> _ProcessCleanupOutcome:
     try:
         os.killpg(process.pid, signal.SIGTERM)
     except (AttributeError, ProcessLookupError):
-        return True
+        return _ProcessCleanupOutcome(True, stdout, stderr, None, None)
     except PermissionError:
-        return False
-    _best_effort_process_wait(process, 1)
+        return _ProcessCleanupOutcome(False, stdout, stderr, None, None)
+    stdout, stderr, drained = _drain_process_output(process, 1, stdout, stderr)
     if _wait_for_process_group_absence(process.pid, 1):
-        return True
+        return _ProcessCleanupOutcome(True, stdout, stderr, signal.SIGTERM, None)
     try:
         os.killpg(process.pid, signal.SIGKILL)
     except (AttributeError, ProcessLookupError):
-        return True
+        return _ProcessCleanupOutcome(True, stdout, stderr, signal.SIGTERM, None)
     except PermissionError:
+        return _ProcessCleanupOutcome(False, stdout, stderr, signal.SIGTERM, None)
+    stdout, stderr, killed_drained = _drain_process_output(process, 2, stdout, stderr)
+    return _ProcessCleanupOutcome(
+        _wait_for_process_group_absence(process.pid, 1),
+        stdout,
+        stderr,
+        signal.SIGKILL,
+        "term_drain" if not drained else ("kill_drain" if not killed_drained else None),
+    )
+
+
+def _stream_text(value: object) -> str:
+    if isinstance(value, str):
+        return value
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+    return ""
+
+
+def _stream_bytes(value: str) -> int:
+    return len(value.encode("utf-8", errors="replace"))
+
+
+def _merge_stream_output(existing: str, incoming: str) -> str:
+    if not incoming:
+        return existing
+    if incoming.startswith(existing):
+        return incoming
+    if existing.endswith(incoming):
+        return existing
+    return existing + incoming
+
+
+def _return_code(process: Any) -> int | None:
+    value = getattr(process, "returncode", None)
+    return value if isinstance(value, int) else None
+
+
+def _elapsed_ms(started_monotonic: float) -> int:
+    return max(0, round((time.monotonic() - started_monotonic) * 1000))
+
+
+def _provider_error_category(stderr: str) -> str:
+    normalized = stderr.lower()
+    patterns = (
+        ("auth_or_permission", r"\b(401|403|unauthori[sz]ed|forbidden|authentication|permission denied|access denied)\b"),
+        ("rate_limited", r"\b(429|rate limit|too many requests)\b"),
+        ("network_or_transport", r"\b(network|transport|connection|dns|tls|socket|econn|connection reset)\b"),
+        ("service_unavailable", r"\b(503|service unavailable|temporarily unavailable|overloaded)\b"),
+        ("structured_output_rejected", r"\b(output schema|json schema|structured output|schema validation)\b"),
+        ("provider_internal_error", r"\b(500|internal error|server error)\b"),
+        ("cancelled", r"\b(cancelled|canceled|interrupted)\b"),
+    )
+    for category, pattern in patterns:
+        if re.search(pattern, normalized):
+            return category
+    return "unknown"
+
+
+_BEARER_CREDENTIAL = re.compile(
+    r"(?i)(?:authorization\s*[:=]\s*)?bearer\s+[^\s\"']+"
+)
+_KEY_VALUE_CREDENTIAL = re.compile(
+    r"(?i)((?:api[_ -]?key|token|password|authorization)\s*[:=]\s*)[^\s\"']+"
+)
+
+
+def _redact_credential_like(value: str) -> str:
+    return _KEY_VALUE_CREDENTIAL.sub(
+        r"\1[REDACTED]", _BEARER_CREDENTIAL.sub("[REDACTED]", value)
+    )
+
+
+def _bounded_redacted_tail(value: str) -> str:
+    encoded = _redact_credential_like(value).encode("utf-8", errors="replace")
+    return encoded[-_MAX_DIAGNOSTIC_STREAM_BYTES :].decode("utf-8", errors="replace")
+
+
+def _purge_expired_diagnostic_bundles(root: Path) -> bool:
+    try:
+        if not root.exists():
+            return True
+        if root.is_symlink():
+            return False
+        for path in root.iterdir():
+            if not path.is_dir() or path.is_symlink():
+                continue
+            metadata_path = path / "metadata.json"
+            try:
+                payload = json.loads(metadata_path.read_text(encoding="utf-8"))
+                expires_at = payload.get("expires_at") if isinstance(payload, dict) else None
+                expired = (
+                    isinstance(expires_at, str)
+                    and _parse_timestamp(expires_at) <= datetime.now(UTC)
+                )
+            except (OSError, TypeError, ValueError, json.JSONDecodeError):
+                expired = (
+                    datetime.now(UTC)
+                    - datetime.fromtimestamp(path.stat().st_mtime, UTC)
+                    >= timedelta(seconds=_DIAGNOSTIC_TTL_SECONDS)
+                )
+            if expired:
+                shutil.rmtree(path)
+        return True
+    except OSError:
         return False
-    _best_effort_process_wait(process, 2)
-    return _wait_for_process_group_absence(process.pid, 1)
+
+
+def _parse_timestamp(value: str) -> datetime:
+    return datetime.fromisoformat(value)
+
+
+def _write_failure_diagnostic_bundle(
+    root: Path,
+    record: ExternalAgentExecutionRecord,
+    outcome: _ExternalAgentProcessOutcome,
+) -> bool:
+    try:
+        root.mkdir(mode=0o700, parents=True, exist_ok=True)
+        os.chmod(root, 0o700)
+        bundle = root / record.processing_run_id
+        staging = root / f".{record.processing_run_id}.{uuid.uuid4().hex}.tmp"
+        staging.mkdir(mode=0o700)
+        os.chmod(staging, 0o700)
+        expires_at = (
+            datetime.now(UTC)
+            + timedelta(seconds=_DIAGNOSTIC_TTL_SECONDS)
+        ).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+        metadata = {
+            "diagnostic_schema_version": DIAGNOSTIC_SCHEMA_VERSION,
+            "provider_route": record.provider_route,
+            "provider_version": record.provider_version,
+            "protocol_version": record.protocol_version,
+            "input_fingerprint": record.input_fingerprint,
+            "eligible_units": record.eligible_units,
+            "covered_units": record.covered_units,
+            "started_at": record.started_at,
+            "finished_at": record.finished_at,
+            "created_at": record.finished_at,
+            "expires_at": expires_at,
+            "elapsed_ms": record.elapsed_ms,
+            "deadline_ms": record.deadline_ms,
+            "exit_code": record.exit_code,
+            "termination_signal": record.termination_signal,
+            "timeout_phase": record.timeout_phase,
+            "failure_category": record.failure_category,
+            "provider_error_category": record.provider_error_category,
+            "result_file_present": record.result_file_present,
+            "result_size_bytes": record.result_size_bytes,
+            "stdout_bytes": record.stdout_bytes,
+            "stderr_bytes": record.stderr_bytes,
+            "process_cleanup_status": record.process_cleanup_status,
+        }
+        _private_diagnostic_write(
+            staging / "stdout.tail", _bounded_redacted_tail(outcome.stdout)
+        )
+        _private_diagnostic_write(
+            staging / "stderr.tail", _bounded_redacted_tail(outcome.stderr)
+        )
+        _private_diagnostic_write(
+            staging / "metadata.json",
+            json.dumps(metadata, ensure_ascii=False, sort_keys=True) + "\n",
+        )
+        os.rename(staging, bundle)
+        return True
+    except OSError:
+        if "staging" in locals() and staging.exists():
+            shutil.rmtree(staging, ignore_errors=True)
+        return False
+
+
+def _private_diagnostic_write(path: Path, value: str) -> None:
+    with path.open("w", encoding="utf-8") as target:
+        os.chmod(path, 0o600)
+        target.write(value)
+        target.flush()
+        os.fsync(target.fileno())
 
 
 def _canonical_fingerprint(value: object) -> str:
@@ -657,7 +992,7 @@ def _canonical_fingerprint(value: object) -> str:
 
 
 def _utc_timestamp() -> str:
-    return datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace(
+    return datetime.now(UTC).isoformat(timespec="milliseconds").replace(
         "+00:00", "Z"
     )
 
@@ -959,7 +1294,7 @@ class RepresentationInformationService:
     def _timestamp(self) -> str:
         if self.clock is not None:
             return self.clock()
-        return datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+        return datetime.now(UTC).isoformat(timespec="milliseconds").replace("+00:00", "Z")
 
 
 def _artifact_payload(repository: RepresentationRepository, representation_id: str, artifact: RepresentationArtifact) -> object:
