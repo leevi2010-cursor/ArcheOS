@@ -1,0 +1,10 @@
+{
+  "experiment": "codex-cli-schema-compat",
+  "issue": 80,
+  "version": "v0.1.0",
+  "scope": "public-synthetic-only",
+  "maximum_model_calls": 3,
+  "provider_route": "codex-cli",
+  "production_runtime_modified": false,
+  "long_term_information_written": false
+}
