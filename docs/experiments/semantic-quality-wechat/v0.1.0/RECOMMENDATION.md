@@ -1,3 +1,3 @@
 # 建议
 
-当前结论为 `fail`（尚未评估），不是语义质量 FAIL。`REAL_CALL_APPROVED` 尚未获得；必须由 Reviewer 在 PR 留下该标记后，才可执行唯一一次真实调用。
+当前结论为 `fail`：唯一授权调用已消耗但未获得有效 strict output，因此这不是语义质量 FAIL 结论。不得 retry、fallback 或切换 Provider；后续路线须 `LEAD_DECISION_REQUIRED`。
