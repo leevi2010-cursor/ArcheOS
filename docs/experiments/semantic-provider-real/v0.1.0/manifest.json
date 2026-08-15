@@ -1,0 +1,26 @@
+{
+  "experiment": "semantic-provider-real",
+  "version": "v0.1.0",
+  "issue": 60,
+  "status": "complete_no_production_provider",
+  "route": "external_agent_handoff",
+  "sample_count": 1,
+  "samples": [
+    {
+      "label": "sample-A",
+      "shape": "structured_spreadsheet",
+      "eligible_units": 105,
+      "excluded_units": 34,
+      "provider_completed": false,
+      "structured_output_valid": false,
+      "candidate_count": "not_assessed_without_valid_output",
+      "residue_count": "not_assessed_without_valid_output",
+      "unaccounted_units": 105,
+      "runtime_failure": "privacy_boundary_violation_and_unverifiable_result",
+      "temporary_artifacts_cleanup": true,
+      "privacy_boundary_passed": false
+    }
+  ],
+  "recommendation": "no production provider yet",
+  "roadmap_feedback": "review"
+}
