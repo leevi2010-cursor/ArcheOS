@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import json
 import re
 from collections.abc import Iterable, Mapping
@@ -18,7 +17,6 @@ from .models import AdapterArtifact, AdapterBuildResult
 WECHAT_CONVERSATION_KIND = "wechat_conversation"
 WECHAT_CONVERSATION_SCHEMA_VERSION = "1.0"
 DEFAULT_CONTEXT_MESSAGES = 1
-DEFAULT_ANALYSIS_BATCH_SIZE = 20
 
 _EXPORT_FIELDS = {
     "chat",
@@ -64,7 +62,7 @@ class WechatConversationError(ValueError):
 
 class WechatConversationRepresentationAdapter:
     name = "wechat-conversation"
-    version = "1.0.1"
+    version = "1.0.2"
     kind = WECHAT_CONVERSATION_KIND
     supported_media_types = ("application/json",)
 
@@ -119,30 +117,11 @@ def build_wechat_conversation_artifact(
 ) -> dict[str, object]:
     payload = _strict_export(value)
     parsed_messages = tuple(
-        _parse_message(item, sequence)
+        _parse_message(item, sequence, source_id=source_id)
         for sequence, item in enumerate(payload["messages"], start=1)
     )
     participant_labels = tuple(
         dict.fromkeys(message["sender_label"] for message in parsed_messages)
-    )
-    analysis_units = tuple(
-        _analysis_unit(
-            message,
-            parsed_messages,
-            source_id=source_id,
-            source_content_hash=source_content_hash,
-        )
-        for message in parsed_messages
-    )
-    eligible_ids = tuple(
-        unit["unit_id"] for unit in analysis_units if unit["analysis_eligible"]
-    )
-    batches = tuple(
-        {
-            "batch_id": f"batch_{index // DEFAULT_ANALYSIS_BATCH_SIZE + 1:04d}",
-            "unit_ids": list(eligible_ids[index : index + DEFAULT_ANALYSIS_BATCH_SIZE]),
-        }
-        for index in range(0, len(eligible_ids), DEFAULT_ANALYSIS_BATCH_SIZE)
     )
     sent_at_values = tuple(message["sent_at"] for message in parsed_messages)
     external_conversation_id = payload["username"] or "unavailable"
@@ -182,15 +161,6 @@ def build_wechat_conversation_artifact(
                 "failures": payload["failures"],
             },
         },
-        "analysis_policy": {
-            "previous_messages": DEFAULT_CONTEXT_MESSAGES,
-            "next_messages": DEFAULT_CONTEXT_MESSAGES,
-            "batch_size": DEFAULT_ANALYSIS_BATCH_SIZE,
-            "anchor_overlap": 0,
-            "context_role": "context_only",
-        },
-        "analysis_units": list(analysis_units),
-        "analysis_batches": list(batches),
     }
     return artifact
 
@@ -198,15 +168,7 @@ def build_wechat_conversation_artifact(
 def validate_wechat_conversation_artifact(value: object) -> dict[str, object]:
     root = _exact_object(
         value,
-        {
-            "schema_version",
-            "provider",
-            "source",
-            "conversation",
-            "analysis_policy",
-            "analysis_units",
-            "analysis_batches",
-        },
+        {"schema_version", "provider", "source", "conversation"},
         "Conversation artifact",
     )
     if root["schema_version"] != WECHAT_CONVERSATION_SCHEMA_VERSION:
@@ -284,110 +246,73 @@ def validate_wechat_conversation_artifact(value: object) -> dict[str, object]:
         )
     if provider_metadata["count"] != len(messages):
         raise WechatConversationError("provider count does not match messages")
-    policy = _exact_object(
-        root["analysis_policy"],
-        {
-            "previous_messages",
-            "next_messages",
-            "batch_size",
-            "anchor_overlap",
-            "context_role",
-        },
-        "analysis_policy",
-    )
-    if policy != {
-        "previous_messages": DEFAULT_CONTEXT_MESSAGES,
-        "next_messages": DEFAULT_CONTEXT_MESSAGES,
-        "batch_size": DEFAULT_ANALYSIS_BATCH_SIZE,
-        "anchor_overlap": 0,
-        "context_role": "context_only",
-    }:
-        raise WechatConversationError("analysis_policy is not v1")
-    units = _array(root["analysis_units"], "analysis_units")
-    if len(units) != len(messages):
-        raise WechatConversationError("every message must have one Analysis Unit")
-    unit_ids: set[str] = set()
-    eligible_ids: list[str] = []
-    for expected_order, unit in enumerate(units, start=1):
-        item = _validate_analysis_unit(
-            unit,
-            expected_order,
-            message_by_sequence,
-            source_id=source["source_id"],
-            source_content_hash=source["content_hash"],
-        )
-        if item["unit_id"] in unit_ids:
-            raise WechatConversationError("Analysis Unit IDs must be unique")
-        unit_ids.add(item["unit_id"])
-        if item["analysis_eligible"]:
-            eligible_ids.append(item["unit_id"])
-    _validate_batches(root["analysis_batches"], eligible_ids)
     return root
 
 
 def wechat_conversation_analysis_rows(
     value: object,
-) -> Iterable[tuple[str, str | None, object | None, object, str, bool, str | None]]:
+) -> Iterable[
+    tuple[
+        str,
+        str | None,
+        object | None,
+        object,
+        str,
+        bool,
+        str | None,
+        tuple[object, ...],
+    ]
+]:
     root = validate_wechat_conversation_artifact(value)
     conversation = root["conversation"]
     assert isinstance(conversation, dict)
     messages = conversation["messages"]
-    units = root["analysis_units"]
-    assert isinstance(messages, list) and isinstance(units, list)
+    assert isinstance(messages, list)
     message_by_sequence = {
         message["sequence"]: message
         for message in messages
         if isinstance(message, dict)
     }
-    for unit in units:
-        assert isinstance(unit, dict)
-        anchor = message_by_sequence[unit["anchor_sequence"]]
-        context_messages = [
-            {
-                "role": "context_only",
-                "sequence": message_by_sequence[sequence]["sequence"],
-                "sender_label": message_by_sequence[sequence]["sender_label"],
-                "sent_at": message_by_sequence[sequence]["sent_at"],
-                "message_type": message_by_sequence[sequence]["message_type"],
-                "visible_content": message_by_sequence[sequence]["visible_content"],
-                "source_locator": message_by_sequence[sequence]["source_locator"],
-                "evidence_capable": False,
-            }
-            for sequence in unit["context_sequences"]
-        ]
-        locator = {
-            **anchor["source_locator"],
-            "analysis_unit_id": unit["unit_id"],
-            "sender_label": anchor["sender_label"],
-            "sent_at": anchor["sent_at"],
-        }
+    for sequence in sorted(message_by_sequence):
+        anchor = message_by_sequence[sequence]
+        eligible = anchor["message_type"] == "text" and bool(
+            str(anchor["visible_content"]).strip()
+        )
+        classification, reason = _classification(str(anchor["message_type"]), eligible)
+        context_sequences = (
+            tuple(
+                nearby
+                for nearby in range(
+                    max(1, sequence - DEFAULT_CONTEXT_MESSAGES),
+                    min(len(messages), sequence + DEFAULT_CONTEXT_MESSAGES) + 1,
+                )
+                if nearby != sequence
+            )
+            if eligible
+            else ()
+        )
         structured = {
             "sender_label": anchor["sender_label"],
             "sent_at": anchor["sent_at"],
             "message_type": anchor["message_type"],
-            "processing_classification": unit["classification"],
+            "processing_classification": classification,
             "external_message_id": anchor["external_message_id"],
             "reply_to": anchor["reply_to"],
             "attachment_refs": anchor["attachment_refs"],
             "unresolved_references": anchor["unresolved_references"],
         }
-        context = json.dumps(
-            {
-                "anchor_role": "evidence_capable",
-                "context_messages": context_messages,
-            },
-            ensure_ascii=False,
-            sort_keys=True,
-            separators=(",", ":"),
-        )
         yield (
             "wechat_message",
             anchor["visible_content"],
             structured,
-            locator,
-            context,
-            unit["analysis_eligible"],
-            unit["exclusion_reason"],
+            anchor["source_locator"],
+            "WeChat message; bounded context support is supplied separately.",
+            eligible,
+            reason,
+            tuple(
+                message_by_sequence[nearby]["source_locator"]
+                for nearby in context_sequences
+            ),
         )
 
 
@@ -396,12 +321,23 @@ def wechat_conversation_metrics(value: object) -> dict[str, int]:
     conversation = root["conversation"]
     assert isinstance(conversation, dict)
     messages = conversation["messages"]
-    units = root["analysis_units"]
     participants = conversation["participants"]
     assert isinstance(messages, list)
-    assert isinstance(units, list)
     assert isinstance(participants, list)
     locators = [message["source_locator"] for message in messages]
+    classifications = [
+        _classification(
+            str(message["message_type"]),
+            message["message_type"] == "text"
+            and bool(str(message["visible_content"]).strip()),
+        )
+        for message in messages
+    ]
+    eligible_sequences = [
+        index
+        for index, (classification, _reason) in enumerate(classifications, start=1)
+        if classification == "business_semantic"
+    ]
     return {
         "message_total": len(messages),
         "replayable_messages": sum(
@@ -410,15 +346,17 @@ def wechat_conversation_metrics(value: object) -> dict[str, int]:
         ),
         "stable_locator_failures": len(messages)
         - len({(locator["source_id"], locator["sequence"]) for locator in locators}),
-        "participant_binding_attempts_should_be_zero": sum(
+        "participant_object_bindings": sum(
             participant["object_identity"] != "unavailable"
             for participant in participants
         ),
-        "unaccounted_analysis_units": len(messages)
-        - len({unit["anchor_sequence"] for unit in units}),
-        "analysis_eligible": sum(unit["analysis_eligible"] for unit in units),
-        "context_only": sum(len(unit["context_sequences"]) for unit in units),
-        "excluded_or_unsupported": sum(not unit["analysis_eligible"] for unit in units),
+        "analysis_eligible": len(eligible_sequences),
+        "context_support_references": sum(
+            min(len(messages), sequence + DEFAULT_CONTEXT_MESSAGES)
+            - max(1, sequence - DEFAULT_CONTEXT_MESSAGES)
+            for sequence in eligible_sequences
+        ),
+        "excluded_or_unsupported": len(messages) - len(eligible_sequences),
         "unresolved_reference_count": sum(
             len(message["unresolved_references"]) for message in messages
         ),
@@ -458,7 +396,9 @@ def _strict_export(value: object) -> dict[str, object]:
     return payload
 
 
-def _parse_message(value: object, sequence: int) -> dict[str, object]:
+def _parse_message(
+    value: object, sequence: int, *, source_id: str
+) -> dict[str, object]:
     if not isinstance(value, str):
         raise WechatConversationError("message must be a string")
     match = _MESSAGE_PATTERN.fullmatch(value)
@@ -489,7 +429,7 @@ def _parse_message(value: object, sequence: int) -> dict[str, object]:
         "visible_content": content,
         "reply_to": "unavailable",
         "attachment_refs": [],
-        "source_locator": {"source_id": "__SOURCE_ID__", "sequence": sequence},
+        "source_locator": {"source_id": source_id, "sequence": sequence},
         "unresolved_references": references,
         "metadata_availability": {
             "external_message_id": "unavailable",
@@ -497,55 +437,6 @@ def _parse_message(value: object, sequence: int) -> dict[str, object]:
             "attachments": "unavailable",
             "participant_identity": "unavailable",
         },
-    }
-
-
-def _analysis_unit(
-    message: dict[str, object],
-    messages: tuple[dict[str, object], ...],
-    *,
-    source_id: str,
-    source_content_hash: str,
-) -> dict[str, object]:
-    sequence = message["sequence"]
-    assert isinstance(sequence, int)
-    message["source_locator"] = {"source_id": source_id, "sequence": sequence}
-    eligible = message["message_type"] == "text" and bool(
-        str(message["visible_content"]).strip()
-    )
-    classification, reason = _classification(str(message["message_type"]), eligible)
-    context_sequences = (
-        [
-            nearby
-            for nearby in range(
-                max(1, sequence - DEFAULT_CONTEXT_MESSAGES),
-                min(len(messages), sequence + DEFAULT_CONTEXT_MESSAGES) + 1,
-            )
-            if nearby != sequence
-        ]
-        if eligible
-        else []
-    )
-    identity = json.dumps(
-        {
-            "source_id": source_id,
-            "source_content_hash": source_content_hash,
-            "anchor_sequence": sequence,
-            "context_sequences": context_sequences,
-            "classification": classification,
-        },
-        sort_keys=True,
-        separators=(",", ":"),
-    )
-    return {
-        "unit_id": "conversation_unit_"
-        + hashlib.sha256(identity.encode("utf-8")).hexdigest(),
-        "order": sequence,
-        "anchor_sequence": sequence,
-        "context_sequences": context_sequences,
-        "classification": classification,
-        "analysis_eligible": eligible,
-        "exclusion_reason": reason,
     }
 
 
@@ -651,63 +542,6 @@ def _validate_message(
     if set(availability.values()) != {"unavailable"}:
         raise WechatConversationError("missing metadata must remain unavailable")
     return item
-
-
-def _validate_analysis_unit(
-    value: object,
-    expected_order: int,
-    messages: Mapping[int, dict[str, object]],
-    *,
-    source_id: object,
-    source_content_hash: object,
-) -> dict[str, object]:
-    item = _exact_object(
-        value,
-        {
-            "unit_id",
-            "order",
-            "anchor_sequence",
-            "context_sequences",
-            "classification",
-            "analysis_eligible",
-            "exclusion_reason",
-        },
-        "Analysis Unit",
-    )
-    if item["order"] != expected_order or item["anchor_sequence"] != expected_order:
-        raise WechatConversationError("Analysis Unit order is not replayable")
-    context_sequences = _array(item["context_sequences"], "context_sequences")
-    if any(
-        isinstance(sequence, bool)
-        or not isinstance(sequence, int)
-        or sequence not in messages
-        or sequence == expected_order
-        or abs(sequence - expected_order) > DEFAULT_CONTEXT_MESSAGES
-        for sequence in context_sequences
-    ):
-        raise WechatConversationError("Analysis Unit context is not bounded")
-    expected = _analysis_unit(
-        messages[expected_order],
-        tuple(messages[index] for index in sorted(messages)),
-        source_id=str(source_id),
-        source_content_hash=str(source_content_hash),
-    )
-    if item != expected:
-        raise WechatConversationError("Analysis Unit is not deterministic")
-    return item
-
-
-def _validate_batches(value: object, eligible_ids: list[str]) -> None:
-    batches = _array(value, "analysis_batches")
-    expected = [
-        {
-            "batch_id": f"batch_{index // DEFAULT_ANALYSIS_BATCH_SIZE + 1:04d}",
-            "unit_ids": eligible_ids[index : index + DEFAULT_ANALYSIS_BATCH_SIZE],
-        }
-        for index in range(0, len(eligible_ids), DEFAULT_ANALYSIS_BATCH_SIZE)
-    ]
-    if batches != expected:
-        raise WechatConversationError("Analysis Unit batching is not deterministic")
 
 
 def _validate_provider_metadata(value: object) -> dict[str, object]:

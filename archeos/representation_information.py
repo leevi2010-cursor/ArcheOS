@@ -8,7 +8,7 @@ import os
 import tempfile
 import re
 import threading
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Mapping, Protocol, Sequence
@@ -49,6 +49,21 @@ class RepresentationAnalysisUnit:
     artifact_locator: str
     analysis_eligible: bool
     exclusion_reason: str | None = None
+    context_support_unit_ids: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class RepresentationAnalysisBatch(Sequence[RepresentationAnalysisUnit]):
+    """Canonical anchors plus bounded context supplied for this provider call."""
+
+    anchor_units: tuple[RepresentationAnalysisUnit, ...]
+    context_support_units: tuple[RepresentationAnalysisUnit, ...] = ()
+
+    def __len__(self) -> int:
+        return len(self.anchor_units)
+
+    def __getitem__(self, index):
+        return self.anchor_units[index]
 
 
 @dataclass(frozen=True)
@@ -80,7 +95,7 @@ class RepresentationAnalysisProvider(Protocol):
     name: str
 
     def analyze(
-        self, units: Sequence[RepresentationAnalysisUnit]
+        self, batch: RepresentationAnalysisBatch
     ) -> RepresentationAnalysisResult: ...
 
 
@@ -94,7 +109,7 @@ class FileRepresentationAnalysisProvider:
         self._batch_index = 0
 
     def analyze(
-        self, units: Sequence[RepresentationAnalysisUnit]
+        self, batch: RepresentationAnalysisBatch
     ) -> RepresentationAnalysisResult:
         try:
             payload = json.loads(self.path.read_text(encoding="utf-8"))
@@ -182,18 +197,42 @@ def representation_analysis_schema() -> dict[str, object]:
     }
 
 
-def _representation_analysis_prompt(units: Sequence[RepresentationAnalysisUnit]) -> str:
-    payload = [
-        {
-            "unit_id": unit.unit_id,
-            "unit_kind": unit.kind,
-            "content": unit.content,
-            "structured_value": unit.structured_value,
-            "locator": unit.locator,
-            "context": unit.context,
-        }
-        for unit in units
-    ]
+def _provider_unit(unit: RepresentationAnalysisUnit, *, role: str) -> dict[str, object]:
+    return {
+        "unit_id": unit.unit_id,
+        "role": role,
+        "unit_kind": unit.kind,
+        "content": unit.content,
+        "structured_value": unit.structured_value,
+        "locator": unit.locator,
+        "context": unit.context,
+        "evidence_capable": unit.analysis_eligible,
+        "exclusion_reason": unit.exclusion_reason,
+        "context_support_unit_ids": list(unit.context_support_unit_ids),
+    }
+
+
+def _as_analysis_batch(
+    value: RepresentationAnalysisBatch | Sequence[RepresentationAnalysisUnit],
+) -> RepresentationAnalysisBatch:
+    if isinstance(value, RepresentationAnalysisBatch):
+        return value
+    return RepresentationAnalysisBatch(tuple(value))
+
+
+def _representation_analysis_prompt(
+    value: RepresentationAnalysisBatch | Sequence[RepresentationAnalysisUnit],
+) -> str:
+    batch = _as_analysis_batch(value)
+    payload = {
+        "anchor_units": [
+            _provider_unit(unit, role="anchor") for unit in batch.anchor_units
+        ],
+        "context_support_units": [
+            _provider_unit(unit, role="context_support")
+            for unit in batch.context_support_units
+        ],
+    }
     return f"""You are the semantic analysis provider for the ArcheOS Processing
 layer. Analyze the complete batch of Normalized Representation units below.
 
@@ -205,15 +244,19 @@ Requirements:
   state.
 - Produce Atomic Information Candidates only when an independently traceable
   business statement is supported by the cited unit(s).
-- Every eligible unit in this batch must be cited by at least one Candidate or
-  Residue item. Do not omit units.
+- Every anchor unit in this batch must be cited by at least one Candidate or
+  Residue item. Context support units do not require coverage.
+- Context support is interpretation-only by default. Cite an evidence-capable
+  context support unit only when the Candidate actually depends on it.
+- If a conclusion depends on context support that is not evidence-capable,
+  do not produce a Candidate; preserve the anchor in Residue as unresolved.
 - Cite only supplied unit_id values. Do not invent excerpts, locators,
   identities, facts, or relationships.
 - Put ambiguity, insufficient evidence, unsupported structure, and material
   not safely atomized into Residue.
 - concerns names who or what the statement concerns; it is not an Object ID.
 
-Representation units:
+Representation analysis input:
 {json.dumps(payload, ensure_ascii=False, indent=2)}
 """
 
@@ -239,7 +282,8 @@ class CodexRepresentationAnalysisProvider:
         self.timeout_seconds = float(timeout_seconds)
 
     def analyze(
-        self, units: Sequence[RepresentationAnalysisUnit]
+        self,
+        batch: RepresentationAnalysisBatch | Sequence[RepresentationAnalysisUnit],
     ) -> RepresentationAnalysisResult:
         codex_type, deny_all, read_only = self.sdk_loader()
         with tempfile.TemporaryDirectory(prefix="archeos-representation-codex-") as temp_dir:
@@ -256,7 +300,7 @@ class CodexRepresentationAnalysisProvider:
                         sandbox=read_only,
                     )
                     turn = thread.turn(
-                        _representation_analysis_prompt(units),
+                        _representation_analysis_prompt(batch),
                         output_schema=representation_analysis_schema(),
                         sandbox=read_only,
                     )
@@ -415,6 +459,10 @@ class RepresentationInformationService:
         try:
             representation_id = require_representation_id(representation_id)
             representation = self.representation_repository.get(representation_id)
+            if representation.kind == "wechat_conversation":
+                raise RepresentationInformationError(
+                    "Conversation 目前只允许生成 Representation；真实语义吸收尚未开放。"
+                )
             verification = self.representation_repository.verify(representation_id)
             if not verification.verified:
                 raise RepresentationInformationError("Representation failed verification")
@@ -486,11 +534,9 @@ class RepresentationInformationService:
     ) -> tuple[list[dict[str, object]], list[dict[str, object]], list[dict[str, object]]]:
         if not isinstance(getattr(provider, "name", None), str) or not provider.name.strip():
             raise RepresentationInformationError("Representation analysis provider must have a name")
-        eligible = tuple(unit for unit in units if unit.analysis_eligible)
         outputs: list[RepresentationAnalysisResult] = []
         batches: list[dict[str, object]] = []
-        for index in range(0, len(eligible), self.batch_size):
-            batch = eligible[index : index + self.batch_size]
+        for batch in _analysis_batches(units, self.batch_size):
             try:
                 result = provider.analyze(batch)
             except Exception as exc:
@@ -500,16 +546,23 @@ class RepresentationInformationService:
             self._validate_batch_result(batch, result)
             outputs.append(result)
             batches.append(
-                {"batch_id": f"batch_{len(batches) + 1:04d}", "unit_ids": [unit.unit_id for unit in batch]}
+                {"batch_id": f"batch_{len(batches) + 1:04d}", "unit_ids": [unit.unit_id for unit in batch.anchor_units]}
             )
         candidates, residue = _output_records(units, outputs, self._timestamp())
         return candidates, residue, batches
 
     @staticmethod
     def _validate_batch_result(
-        batch: Sequence[RepresentationAnalysisUnit], result: RepresentationAnalysisResult
+        batch: RepresentationAnalysisBatch, result: RepresentationAnalysisResult
     ) -> None:
-        allowed = {unit.unit_id for unit in batch}
+        anchor_ids = {unit.unit_id for unit in batch.anchor_units}
+        supplied = {
+            unit.unit_id: unit
+            for unit in (*batch.anchor_units, *batch.context_support_units)
+        }
+        allowed = {
+            unit_id for unit_id, unit in supplied.items() if unit.analysis_eligible
+        }
         covered: set[str] = set()
         for item in (*result.candidates, *result.residue):
             if not isinstance(item, (RepresentationCandidateDraft, RepresentationResidueDraft)):
@@ -517,8 +570,10 @@ class RepresentationInformationService:
             references = item.evidence_unit_ids
             if len(set(references)) != len(references) or any(reference not in allowed for reference in references):
                 raise RepresentationInformationError("Representation analysis references an invalid unit")
-            covered.update(references)
-        missing = allowed - covered
+            if not anchor_ids.intersection(references):
+                raise RepresentationInformationError("Representation analysis result must account for an anchor unit")
+            covered.update(anchor_ids.intersection(references))
+        missing = anchor_ids - covered
         if missing:
             raise RepresentationInformationError("eligible Representation units were not covered")
 
@@ -584,12 +639,17 @@ def _units_from_representation(
     representation: NormalizedRepresentation, repository: RepresentationRepository
 ) -> tuple[RepresentationAnalysisUnit, ...]:
     units: list[RepresentationAnalysisUnit] = []
+    context_locator_requests: list[tuple[object, ...]] = []
     ordinal = 0
     for artifact in representation.artifacts:
         payload = _artifact_payload(repository, representation.representation_id, artifact)
-        for kind, content, structured, locator, context, eligible, reason in _map_artifact(
-            representation.kind, payload
-        ):
+        for row in _map_artifact(representation.kind, payload):
+            if not isinstance(row, tuple) or len(row) not in {7, 8}:
+                raise RepresentationInformationError("Representation analysis row is invalid")
+            kind, content, structured, locator, context, eligible, reason = row[:7]
+            requested_locators = () if len(row) == 7 else row[7]
+            if not isinstance(requested_locators, tuple):
+                raise RepresentationInformationError("Representation context locator request is invalid")
             ordinal += 1
             units.append(
                 _unit(
@@ -605,9 +665,57 @@ def _units_from_representation(
                     exclusion_reason=reason,
                 )
             )
+            context_locator_requests.append(requested_locators)
     if not units:
         raise RepresentationInformationError("Representation has no stable analysis units")
-    return tuple(units)
+    by_locator: dict[str, list[str]] = {}
+    for unit in units:
+        by_locator.setdefault(_locator_key(unit.locator), []).append(unit.unit_id)
+    linked: list[RepresentationAnalysisUnit] = []
+    for unit, requested_locators in zip(units, context_locator_requests, strict=True):
+        support_ids: list[str] = []
+        for locator in requested_locators:
+            matches = by_locator.get(_locator_key(locator), [])
+            if len(matches) != 1 or matches[0] == unit.unit_id:
+                raise RepresentationInformationError("Representation context support is not uniquely replayable")
+            if matches[0] not in support_ids:
+                support_ids.append(matches[0])
+        linked.append(replace(unit, context_support_unit_ids=tuple(support_ids)))
+    return tuple(linked)
+
+
+def _locator_key(locator: object) -> str:
+    try:
+        return json.dumps(locator, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    except (TypeError, ValueError) as exc:
+        raise RepresentationInformationError("Representation locator is not deterministic") from exc
+
+
+def _analysis_batches(
+    units: Sequence[RepresentationAnalysisUnit], batch_size: int
+) -> tuple[RepresentationAnalysisBatch, ...]:
+    if isinstance(batch_size, bool) or not isinstance(batch_size, int) or batch_size < 1:
+        raise ValueError("batch_size must be a positive integer")
+    eligible = tuple(unit for unit in units if unit.analysis_eligible)
+    by_id = {unit.unit_id: unit for unit in units}
+    batches: list[RepresentationAnalysisBatch] = []
+    for index in range(0, len(eligible), batch_size):
+        anchors = eligible[index : index + batch_size]
+        anchor_ids = {unit.unit_id for unit in anchors}
+        support_ids: list[str] = []
+        for anchor in anchors:
+            for unit_id in anchor.context_support_unit_ids:
+                if unit_id not in by_id:
+                    raise RepresentationInformationError("Representation context support unit is unavailable")
+                if unit_id not in anchor_ids and unit_id not in support_ids:
+                    support_ids.append(unit_id)
+        batches.append(
+            RepresentationAnalysisBatch(
+                anchor_units=anchors,
+                context_support_units=tuple(by_id[unit_id] for unit_id in support_ids),
+            )
+        )
+    return tuple(batches)
 
 
 def _map_artifact(kind: str, payload: object):

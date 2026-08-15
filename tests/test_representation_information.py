@@ -396,7 +396,9 @@ class RepresentationInformationTest(unittest.TestCase):
         assert turn_kwargs is not None
         self.assertEqual(turn_kwargs["sandbox"], "read-only")
         self.assertIn("output_schema", turn_kwargs)
-        self.assertIn("Every eligible unit", turn_kwargs["prompt"])
+        self.assertIn("Every anchor unit", turn_kwargs["prompt"])
+        self.assertIn('"anchor_units"', turn_kwargs["prompt"])
+        self.assertIn('"context_support_units"', turn_kwargs["prompt"])
         self.assertNotIn(unit.source_id, turn_kwargs["prompt"])
 
     def test_codex_provider_rejects_invalid_structured_output(self) -> None:
