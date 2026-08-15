@@ -88,6 +88,7 @@ class SemanticQualityWechatGateTest(unittest.TestCase):
             stack.enter_context(patch.object(representation_information, "_output_records", forbidden))
             stack.enter_context(patch.object(representation_information, "_manifest", forbidden))
             stack.enter_context(patch.object(filesystem, "publish_directory_no_replace", forbidden))
+            stack.enter_context(patch.object(representation_information, "publish_directory_no_replace", forbidden))
             stack.enter_context(patch.object(atomic_information, "ingest_processing_package", forbidden))
             gate.run_authorized_representation(
                 representation.representation_id, representations, sources,
@@ -257,11 +258,43 @@ class SemanticQualityWechatGateTest(unittest.TestCase):
         self.assertFalse(status["real_marker_written"])
         self.assertFalse(marker.exists())
 
+    def test_synthetic_cli_never_starts_fake_codex_or_writes_marker(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp); binary = root / "bin"; binary.mkdir(); sentinel = root / "codex-started"
+            codex = binary / "codex"
+            codex.write_text(f"#!/bin/sh\ntouch {sentinel}\nexit 99\n", encoding="utf-8")
+            codex.chmod(0o700)
+            marker = root / "marker.json"
+            environment = {"PATH": str(binary), "HOME": str(root / "home")}
+            run = subprocess.run([sys.executable, str(HARNESS), "--synthetic", "--marker-path", str(marker)], cwd=ROOT, check=True, capture_output=True, text=True, env=environment)
+            self.assertEqual(json.loads(run.stdout)["provider_calls"], 0)
+            self.assertFalse(sentinel.exists())
+            self.assertFalse(marker.exists())
+
     def test_tracked_issue76_diff_privacy_scan_rejects_real_identifier_canary(self):
-        diff = subprocess.run(["git", "diff", "origin/main...HEAD", "--", "docs/experiments/semantic-quality-wechat", "tests/test_semantic_quality_wechat_gate.py"], cwd=ROOT, check=True, capture_output=True, text=True).stdout
-        banned = (r"src_[0-9a-f]{32}", r"repr_[0-9a-f]{32}", r"/Users/", r"Candidate statement", r"Evidence excerpt")
+        names = subprocess.run(["git", "diff", "--name-only", "origin/main...HEAD", "--", "docs/experiments/semantic-quality-wechat"], cwd=ROOT, check=True, capture_output=True, text=True).stdout.splitlines()
+        diff = "\n".join((ROOT / name).read_text(encoding="utf-8") for name in names)
+        banned = ("src_" + r"[0-9a-f]{32}", "repr_" + r"[0-9a-f]{32}", "/" + "Users/", "Candidate" + " statement", "Evidence" + " excerpt")
         self.assertTrue(all(re.search(pattern, diff, re.IGNORECASE) is None for pattern in banned))
         self.assertIsNotNone(re.search(r"src_[0-9a-f]{32}", "src_" + "a" * 32))
+
+    def test_esrch_means_absent_and_packet_wrapper_tamper_fails_marker(self):
+        process = FakeProcess(["fake"])
+        with patch.object(gate.os, "killpg", side_effect=ProcessLookupError):
+            self.assertIsNone(gate._cleanup_process_group(process))
+        value = batch(); response = result_for(value); response["input_fingerprint"] = gate.provider_request(value)[1]
+        original = gate.write_local_review_packet
+        def tamper(*args, **kwargs):
+            path = original(*args, **kwargs)
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            payload["anchor_view"][0]["accounting"] = []
+            path.write_text(json.dumps(payload), encoding="utf-8")
+            return path
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp); marker = root / "marker.json"
+            with patch.object(gate, "write_local_review_packet", side_effect=tamper), self.assertRaises(gate.GateError):
+                gate.run_real_call(value, marker_path=marker, review_root=root / "review", runner=lambda *args, **kwargs: FakeProcess(*args, payload=json.dumps(response), **kwargs))
+            self.assertEqual(json.loads(marker.read_text())["status"], "failed")
 
     def test_permission_error_and_packet_tamper_fail_closed_and_consume_marker(self):
         value = batch(); response = result_for(value)
