@@ -1,0 +1,21 @@
+{
+  "fixture_version": "v0.1.0",
+  "protocol_version": "external-agent-handoff/1.0",
+  "canary": "SYNTHETIC_CANARY_ISSUE66_7F3A9C_BODY_ONLY",
+  "source_id": "src_synthetic_issue66_7f3a9c",
+  "representation_id": "repr_synthetic_issue66_7f3a9c",
+  "business_path": "/synthetic-only/issue-66/canary-business-record.md",
+  "credential_canary": "SYNTHETIC_CREDENTIAL_ISSUE66_NOT_REAL",
+  "units": [
+    {
+      "unit_id": "unit_synthetic_001",
+      "kind": "paragraph",
+      "content": "公开合成材料：参与者甲要求每个可分析单元必须被完整覆盖。SYNTHETIC_CANARY_ISSUE66_7F3A9C_BODY_ONLY"
+    },
+    {
+      "unit_id": "unit_synthetic_002",
+      "kind": "paragraph",
+      "content": "公开合成材料：参与者乙确认失败不得生成 Candidate、Residue package 或长期信息。"
+    }
+  ]
+}
