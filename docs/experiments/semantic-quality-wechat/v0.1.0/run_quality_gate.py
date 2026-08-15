@@ -84,13 +84,14 @@ def provider_input(batch: RepresentationAnalysisBatch) -> dict[str, object]:
 
 def provider_request(batch: RepresentationAnalysisBatch) -> tuple[dict[str, object], str]:
     """Canonical request; its bound input is exactly the JSON sent via stdin."""
-    payload = provider_input(batch)
-    fingerprint = input_fingerprint(payload)
-    return ({"protocol_version": PROTOCOL_VERSION, "expected_input_fingerprint": fingerprint,
+    payload = {"protocol_version": PROTOCOL_VERSION,
              "rules": ["Return only the strict schema result.", "Account for every anchor exactly once with Candidate or Residue.",
                        "Candidate must cite an anchor; context is Evidence only when explicitly cited and evidence-capable.",
                        "Use Residue for unresolved or insufficiently supported anchors; never invent identity or facts."],
-             "input": payload}, fingerprint)
+             **provider_input(batch)}
+    payload["rules"][1] = "Account for every anchor with Candidate or Residue."
+    fingerprint = input_fingerprint(payload)
+    return ({**payload, "input_fingerprint": fingerprint}, fingerprint)
 
 
 def require_one_batch(units: tuple[Any, ...]) -> RepresentationAnalysisBatch:
@@ -147,24 +148,37 @@ def parse_and_validate(raw: str | None, batch: RepresentationAnalysisBatch, expe
     return result
 
 
+def _unsafe_symlink_ancestor(path: Path) -> bool:
+    for ancestor in (path, *path.parents):
+        if ancestor in {Path("/"), Path("/var"), Path("/tmp")}:
+            break
+        if ancestor.is_symlink():
+            return True
+    return False
+
+
 def _write_private_json(path: Path, value: object) -> None:
-    if path.is_symlink() or path.parent.is_symlink():
+    if _unsafe_symlink_ancestor(path):
         raise GateError("private artifact path must not traverse a symlink")
     path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     os.chmod(path.parent, 0o700)
     fd, raw_temporary = tempfile.mkstemp(prefix=".issue76-", dir=path.parent)
     temporary = Path(raw_temporary)
     os.chmod(temporary, 0o600)
-    with os.fdopen(fd, "wb") as handle:
-        handle.write(canonical_bytes(value))
-        handle.flush()
-        os.fsync(handle.fileno())
-    os.replace(temporary, path)
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(canonical_bytes(value))
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    except Exception:
+        temporary.unlink(missing_ok=True)
+        raise
     os.chmod(path, 0o600)
 
 
 def consume_marker(marker_path: Path, fingerprint: str, provider_version: str = "codex-cli-unverified") -> None:
-    if marker_path.is_symlink() or marker_path.parent.is_symlink():
+    if _unsafe_symlink_ancestor(marker_path):
         raise GateError("marker path must not traverse a symlink")
     marker_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     os.chmod(marker_path.parent, 0o700)
@@ -183,7 +197,7 @@ def consume_marker(marker_path: Path, fingerprint: str, provider_version: str = 
 def update_marker(marker_path: Path, status: str) -> None:
     if status not in {"completed", "failed"}:
         raise GateError("invalid marker status")
-    if marker_path.is_symlink() or marker_path.parent.is_symlink():
+    if _unsafe_symlink_ancestor(marker_path):
         raise GateError("marker path must not traverse a symlink")
     value = json.loads(marker_path.read_text(encoding="utf-8"))
     value["status"] = status
@@ -195,19 +209,44 @@ def codex_invocation(schema_path: Path, result_path: Path, cwd: Path) -> list[st
             "--output-schema", str(schema_path), "--output-last-message", str(result_path), "--cd", str(cwd), "-"]
 
 
+def read_codex_version() -> str:
+    try:
+        result = subprocess.run(["codex", "--version"], check=True, capture_output=True, text=True, timeout=15)
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise GateError("codex version preflight failed") from exc
+    version = (result.stdout or result.stderr).strip()
+    if not version:
+        raise GateError("codex version preflight returned no version")
+    return version
+
+
 def _cleanup_process_group(process: Any) -> None:
+    def absent() -> bool:
+        try:
+            os.killpg(process.pid, 0)
+        except ProcessLookupError:
+            return True
+        except OSError:
+            return True
+        return False
+
+    if absent():
+        return
     for sig in (signal.SIGTERM, signal.SIGKILL):
         try:
             os.killpg(process.pid, sig)
-        except ProcessLookupError:
-            break
-        except OSError:
-            break
+        except (ProcessLookupError, OSError):
+            if absent():
+                return
+            continue
         try:
             process.communicate(timeout=5)
-            break
         except subprocess.TimeoutExpired:
-            continue
+            pass
+        if absent():
+            return
+    if not absent():
+        raise GateError("provider process group still exists after cleanup")
 
 
 def run_codex_cli(prompt: str, schema_path: Path, result_path: Path, *, runner: Callable[..., Any] = subprocess.Popen) -> str:
@@ -257,7 +296,7 @@ def run_real_call(batch: RepresentationAnalysisBatch, *, marker_path: Path = MAR
             result = parse_and_validate(raw, batch, fingerprint)
             if review_root is not None:
                 packet = write_local_review_packet(batch, result, review_root)
-                if not packet.is_file() or packet.stat().st_mode & 0o777 != 0o600:
+                if not review_packet_readback(packet) or packet.stat().st_mode & 0o777 != 0o600:
                     raise GateError("local review packet readback failed")
         update_marker(marker_path, "completed")
         return result
@@ -275,6 +314,8 @@ def write_local_review_packet(
     batch: RepresentationAnalysisBatch, result: RepresentationAnalysisResult, directory: Path
 ) -> Path:
     """Write raw local review material only after strict validation succeeds."""
+    if directory.resolve().is_relative_to(REPO_ROOT.resolve()):
+        raise GateError("review packet root must be local-only outside the repository")
     directory.mkdir(mode=0o700, parents=True, exist_ok=True)
     os.chmod(directory, 0o700)
     accounted: dict[str, list[str]] = {unit.unit_id: [] for unit in batch.anchor_units}
@@ -311,6 +352,24 @@ def write_local_review_packet(
     return path
 
 
+def review_packet_readback(path: Path) -> bool:
+    try:
+        packet = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    return isinstance(packet, dict) and all(isinstance(packet.get(key), list) for key in (
+        "anchor_view", "candidate_view", "context_support_view"))
+
+
+def cleanup_local_review_packet(directory: Path) -> None:
+    path = directory / "review-packet.json"
+    if path.is_symlink() or not path.exists():
+        raise GateError("local review packet is unavailable for cleanup")
+    path.unlink()
+    if path.exists():
+        raise GateError("local review packet cleanup could not be verified")
+
+
 def synthetic_status() -> dict[str, object]:
     return {"issue": 76, "mode": "synthetic", "provider_calls": 0, "provider_completed": False,
             "semantic_quality": "not_assessed_without_valid_output", "real_marker_written": False,
@@ -334,7 +393,7 @@ def main() -> int:
             raise SystemExit("--representation-id, --representation-root, --source-root and --review-root are required")
         run_authorized_representation(args.representation_id, LocalRepresentationRepository(args.representation_root),
                                       LocalManagedSourceRepository(args.source_root), marker_path=args.marker_path,
-                                      review_root=args.review_root)
+                                      review_root=args.review_root, provider_version=read_codex_version())
         return 0
     print(json.dumps(synthetic_status(), ensure_ascii=False, sort_keys=True))
     return 0

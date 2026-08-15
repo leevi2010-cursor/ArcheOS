@@ -134,7 +134,9 @@ class SemanticQualityWechatGateTest(unittest.TestCase):
             with self.assertRaises(gate.GateError): gate.run_codex_cli("x", schema, output, runner=lambda *a, **kw: FakeProcess(*a, code=9, **kw))
 
     def test_real_marker_is_one_shot_and_failure_consumes_it(self):
-        value = batch(); payload = json.dumps(result_for(value))
+        value = batch(); response = result_for(value)
+        response["input_fingerprint"] = gate.provider_request(value)[1]
+        payload = json.dumps(response)
         with tempfile.TemporaryDirectory() as temp:
             marker = Path(temp) / "marker.json"
             gate.run_real_call(value, marker_path=marker, runner=lambda *a, **kw: FakeProcess(*a, payload=payload, **kw))
@@ -157,9 +159,11 @@ class SemanticQualityWechatGateTest(unittest.TestCase):
             root = Path(temp); sources, representations, representation = build_synthetic_representation(root, quality_export())
             value = gate.build_real_preflight(representation.representation_id, representations, sources)
             request, fingerprint = gate.provider_request(value)
-            self.assertEqual(request["expected_input_fingerprint"], fingerprint)
+            self.assertEqual(request["input_fingerprint"], fingerprint)
+            self.assertEqual(gate.input_fingerprint({key: value for key, value in request.items() if key != "input_fingerprint"}), fingerprint)
             self.assertIn("Residue", " ".join(request["rules"]))
             payload = result_for(value)
+            payload["input_fingerprint"] = fingerprint
             marker, review = root / "marker.json", root / "local-review-packet"
             gate.run_authorized_representation(representation.representation_id, representations, sources, marker_path=marker,
                                               review_root=review, runner=lambda *a, **kw: FakeProcess(*a, payload=json.dumps(payload), **kw))
@@ -182,6 +186,9 @@ class SemanticQualityWechatGateTest(unittest.TestCase):
             packet = json.loads(path.read_text(encoding="utf-8"))
             self.assertEqual(len(packet["anchor_view"]), 19)
             self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+            self.assertTrue(gate.review_packet_readback(path))
+            gate.cleanup_local_review_packet(path.parent)
+            self.assertFalse(path.exists())
 
     def test_synthetic_mode_never_writes_marker_and_tracked_outputs_are_anonymous(self):
         self.assertFalse(gate.synthetic_status()["real_marker_written"])
