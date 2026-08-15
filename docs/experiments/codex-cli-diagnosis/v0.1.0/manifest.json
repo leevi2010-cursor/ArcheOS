@@ -1,0 +1,9 @@
+{
+  "experiment": "codex-cli-diagnosis",
+  "issue": 78,
+  "version": "v0.1.0",
+  "scope": "public-synthetic-only",
+  "maximum_model_calls": 6,
+  "production_runtime_modified": false,
+  "long_term_information_written": false
+}
