@@ -560,19 +560,32 @@ class RepresentationInformationService:
             unit.unit_id: unit
             for unit in (*batch.anchor_units, *batch.context_support_units)
         }
-        allowed = {
+        candidate_evidence_ids = {
             unit_id for unit_id, unit in supplied.items() if unit.analysis_eligible
         }
         covered: set[str] = set()
-        for item in (*result.candidates, *result.residue):
-            if not isinstance(item, (RepresentationCandidateDraft, RepresentationResidueDraft)):
+        for item in result.candidates:
+            if not isinstance(item, RepresentationCandidateDraft):
                 raise RepresentationInformationError("Representation analysis result item is invalid")
             references = item.evidence_unit_ids
-            if len(set(references)) != len(references) or any(reference not in allowed for reference in references):
+            if len(set(references)) != len(references) or any(
+                reference not in candidate_evidence_ids for reference in references
+            ):
                 raise RepresentationInformationError("Representation analysis references an invalid unit")
             if not anchor_ids.intersection(references):
                 raise RepresentationInformationError("Representation analysis result must account for an anchor unit")
             covered.update(anchor_ids.intersection(references))
+        for item in result.residue:
+            if not isinstance(item, RepresentationResidueDraft):
+                raise RepresentationInformationError("Representation analysis result item is invalid")
+            references = item.evidence_unit_ids
+            if len(set(references)) != len(references) or any(
+                reference not in anchor_ids for reference in references
+            ):
+                raise RepresentationInformationError("Representation Residue references an invalid unit")
+            if not references:
+                raise RepresentationInformationError("Representation analysis result must account for an anchor unit")
+            covered.update(references)
         missing = anchor_ids - covered
         if missing:
             raise RepresentationInformationError("eligible Representation units were not covered")

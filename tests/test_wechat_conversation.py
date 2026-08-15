@@ -184,6 +184,26 @@ class UnavailableContextProvider:
         return RepresentationAnalysisResult(tuple(candidates), tuple(residue))
 
 
+class ResidueContextProvider:
+    name = "synthetic-residue-context"
+
+    def analyze(self, batch: RepresentationAnalysisBatch):
+        anchor = batch.anchor_units[0]
+        support = next(
+            unit for unit in batch.context_support_units if unit.analysis_eligible
+        )
+        return RepresentationAnalysisResult(
+            (),
+            (
+                RepresentationResidueDraft(
+                    evidence_unit_ids=(anchor.unit_id, support.unit_id),
+                    reason_not_absorbed="Synthetic invalid context promotion.",
+                    future_value_or_uncertainty="Must fail closed.",
+                ),
+            ),
+        )
+
+
 class WechatConversationTest(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
@@ -472,6 +492,28 @@ class WechatConversationTest(unittest.TestCase):
         self.assertEqual(len(unresolved["source_evidence"]), 1)
         self.assertIn("unresolved", unresolved["future_value_or_uncertainty"])
         self.assertFalse((self.root / "must-not-publish").exists())
+
+    def test_residue_cannot_reference_eligible_context_or_publish(self) -> None:
+        sources, representations, representation = build_synthetic_representation(
+            self.root / "residue-context", synthetic_multi_batch_export()
+        )
+        units = _units_from_representation(representation, representations)
+        output_root = self.root / "must-not-publish-residue-context"
+        service = RepresentationInformationService(
+            sources,
+            representations,
+            output_root,
+            batch_size=1,
+            clock=lambda: TIMESTAMP,
+        )
+
+        with self.assertRaisesRegex(
+            RepresentationInformationError,
+            "Residue references an invalid unit",
+        ):
+            service._analyze(units, ResidueContextProvider())
+
+        self.assertFalse(output_root.exists())
 
     def test_information_extract_fails_before_provider_or_durable_write(self) -> None:
         representation = self.build().representation
