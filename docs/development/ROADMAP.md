@@ -267,27 +267,45 @@ Issue #21 只固化 Managed Source 的权威边界，不实现 runtime。后续�
 
 已按统一 contract 实现 Markdown、text PDF、XLSX、PPTX 与 image structural preflight；OCR / 复杂视觉语义继续后置。
 
-#### #31 — M2-C2d Representation → Atomic Information contract（当前）
+#### #31 — M2-C2d Representation → Atomic Information contract（已完成）
 
 把具有可分析业务内容的 Normalized Representation 接入唯一 Atomic Information 生命周期，建立 stable Analysis Units、Candidate / Residue coverage、Evidence、strict package 与 durable ingestion contract。
 
-#31 **不再承担正式 semantic execution provider 的选择**；其 production semantic provider 已拆到 #50。#31 可以在不选择 live Provider 的前提下完成 contract / plumbing，并保持 fail-closed。
+#31 **不承担正式 semantic execution provider 的选择**；已完成 contract / plumbing，并在没有 live Provider 时保持 fail-closed。
 
-#### #50 — M2-C2e Semantic Analysis Provider 验证（当前，可与 #48 并行）
+#### #50 — M2-C2e Semantic Analysis Provider 验证（已完成 synthetic experiment）
 
-独立验证正式 semantic execution path：比较 pinned/latest Codex、External Agent handoff 以及必要的其他成熟 Provider，回答哪条路线能够稳定、可审计、隐私可控地产生严格 structured result。
+已通过 synthetic experiment 比较 pinned/latest Codex、External Agent handoff 以及必要的其他成熟 Provider；结论是 `no production provider yet`。
 
-#50 不修改 Atomic Information / World Model 语义；其结论是后续真实多格式和微信 semantic digestion 的执行门禁。
+#50 没有修改 Atomic Information / World Model 语义，也没有形成 production provider 承诺。
 
-#### #48 — M3-B1a 微信 Conversation Representation v1（#31 后，可与 #50 并行）
+#### #60 — M2-C2f 真实 External Agent Semantic Handoff Gate（已完成，FAIL）
+
+#60 的失败点是 privacy transport 与 result audit 没有通过真实 Gate；这不表示 External Agent 的语义能力已被证明失败。
+
+#60 的 Roadmap Feedback 把当前 Evidence Gap 收敛到可在 synthetic 条件下验证的隐私与审计 Protocol Gate。
+
+#### #66 — M2-C2f2 synthetic privacy / audit Protocol Gate（Ready）
+
+#66 是当前 Ready Evidence Gate，只验证 External Agent Handoff Protocol 的 privacy transport 与 result audit 边界。#66 不实现 production runtime，也不使用真实资料证明语义质量。
+
+#### 新真实 Semantic Handoff Gate（#66 PASS 后由 Architect 创建）
+
+只有 #66 PASS 后，才由 Architect 创建新的真实 Gate，并由 Product Owner 重新授权真实资料。当前不预建 Issue 编号，也不提前承诺 production provider。
+
+#### #61 — M2-C2g production two-stage Handoff runtime（Blocked）
+
+#61 等待 #66 与新的真实 Semantic Handoff Gate 均 PASS；门禁通过前不启动实现。
+
+#### #48 — M3-B1a 微信 Conversation Representation v1（Ready / 进行中，可与 #66 并行）
 
 以现有真实微信 Source 验证 Conversation Representation、stable message locator、message-level Evidence、bounded context-only units、metadata preservation、analysis eligibility 与 deterministic batching。
 
 #48 只把微信稳定地转换成可交给 #31 `RepresentationAnalysisProvider` contract 的 Analysis Units，**不负责选择 production semantic provider，也不在本 Issue 宣称真实微信已经完成长期 Atomic Information 消化**。
 
-#### 微信真实 Semantic Digestion（#48 + #50 后，后续最小 Issue）
+#### #62 — M3-B1b 微信真实 Semantic Digestion v1（等待 #48 + #61）
 
-当 #48 的 Conversation Representation 通过 Architecture Review，且 #50 给出正式 provider route 后，再创建最小 Issue 完成：
+当 #48 的 Conversation Representation 与 #61 production two-stage Handoff runtime 均完成后，再执行：
 
 ```text
 Conversation Analysis Units
@@ -296,9 +314,9 @@ Conversation Analysis Units
 → Durable Atomic Information
 ```
 
-真实 50 条微信的语义质量、遗漏/错误信息、Evidence 与 unresolved referent 在此阶段验收，而不是提前塞回 #48。
+真实微信的语义质量、遗漏/错误信息、Evidence 与 unresolved referent 在此阶段验收，而不是提前塞回 #48 或 synthetic Gate。
 
-#### #32 — M2-C3a Information Consolidation 真实实验
+#### #32 — M2-C3a Information Consolidation 真实实验（等待 #62）
 
 在统一 Atomic Information 能稳定承接真实多格式 / Conversation 数据后，以真实、受控样本验证跨 Source 的 equivalent、derived、complementary、temporal_update、conflict、uncertain 等整理边界，不直接扩大为正式 runtime。
 
@@ -419,10 +437,14 @@ Conversation 是输入 / Representation 形态，不是新的业务 Core。
 当前顺序：
 
 ```text
-#48 微信 Conversation Representation v1
-↓
-#50 gate 后的微信真实 Semantic Digestion
-↓
+#48 微信 Conversation Representation v1 ──────────────┐
+                                                     ├→ #62 微信真实 Semantic Digestion v1
+#66 synthetic privacy / audit Protocol Gate          │
+↓ PASS                                               │
+新真实 Semantic Handoff Gate + Product Owner 新授权   │
+↓ PASS                                               │
+#61 production two-stage Handoff runtime ────────────┘
+                                                     ↓
 #47 继续完成 Codex / ChatGPT 跨 Provider 对照研究
 ↓
 #43 Codex Conversation production（按 #47 结论收敛）
@@ -575,33 +597,34 @@ Goal
 当前主线：
 
 ```text
-                     #31
-       Representation → Information contract
-                     ↓
-           ┌─────────┴─────────┐
-           ↓                   ↓
-          #48                 #50
- WeChat Conversation      Semantic Provider
-  Representation            validation
-           │                   │
-           └─────────┬─────────┘
-                     ↓
-         微信真实 Semantic Digestion
-              （后续最小 Issue）
-                     ↓
-                    #32
-     Information Consolidation 真实实验
-                     ↓
-                    #33
-       Information Consolidation runtime
-                     ↓
-                    #34
-              Object Emergence
-                     ↓
-                    #17
-       真实旧数据压力测试 / clean-cut
-                     ↓
-             Stage 1 Gate Review
+                 #31 ✅
+      Representation → Information contract
+                 ↓
+        ┌────────┴──────────┐
+        ↓                   ↓
+      #48                #60 ✅ FAIL
+ WeChat Conversation     real Handoff Gate v0.1
+ Representation          no production provider yet
+   Ready / 进行中            ↓ Roadmap Feedback
+        │                   #66 Ready
+        │         synthetic privacy / audit Protocol Gate
+        │                   ↓ PASS
+        │         新真实 Semantic Handoff Gate
+        │         + Product Owner 新授权
+        │                   ↓ PASS
+        │                  #61
+        │         production two-stage Handoff runtime
+        └──────────┬────────┘
+                   ↓
+                  #62
+       真实微信 Semantic Digestion
+                   ↓
+                  #32
+       Consolidation 真实实验
+                   ↓
+              #33 → #34 → #17
+                   ↓
+            Stage 1 Gate Review
 ```
 
 并行 / 后置：
@@ -609,6 +632,7 @@ Goal
 ```text
 #47 Conversation 跨 Provider 研究       微信 v1 后继续，不阻塞 #48
 #43 Codex Conversation production       等 #47 收敛
+#63 Ruff F401 修复                       maintenance；不进入产品主线
 #44 Workspace portability               后置
 Human View / Frontend                    已规划，不启动
 #42 Protocol 驱动的决策增强实验          Product Stage 2；当前 blocked
