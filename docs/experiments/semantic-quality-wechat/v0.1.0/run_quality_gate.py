@@ -16,21 +16,21 @@ import signal
 import subprocess
 import sys
 import tempfile
+from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 REPO_ROOT = Path(__file__).resolve().parents[4]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from archeos.representation_information import (  # noqa: E402
+from archeos.representation import LocalRepresentationRepository
+from archeos.representation_information import (
     RepresentationAnalysisBatch,
     RepresentationAnalysisResult,
-    RepresentationCandidateDraft,
     RepresentationInformationError,
     RepresentationInformationService,
-    RepresentationResidueDraft,
     _analysis_batches,
     _candidate_draft,
     _provider_unit,
@@ -38,8 +38,7 @@ from archeos.representation_information import (  # noqa: E402
     _units_from_representation,
     representation_analysis_schema,
 )
-from archeos.representation import LocalRepresentationRepository  # noqa: E402
-from archeos.source import LocalManagedSourceRepository  # noqa: E402
+from archeos.source import LocalManagedSourceRepository
 
 ROOT = Path(__file__).resolve().parent
 SCHEMA_PATH = ROOT / "schemas" / "result.schema.json"
@@ -321,6 +320,13 @@ def write_local_review_packet(
         raise GateError("review packet root must be local-only outside the repository")
     directory.mkdir(mode=0o700, parents=True, exist_ok=True)
     os.chmod(directory, 0o700)
+    path = directory / "review-packet.json"
+    _write_private_json(path, build_review_packet(batch, result))
+    return path
+
+
+def build_review_packet(batch: RepresentationAnalysisBatch, result: RepresentationAnalysisResult) -> dict[str, object]:
+    """The sole local packet contract; readback compares this exact structure."""
     accounted: dict[str, list[str]] = {unit.unit_id: [] for unit in batch.anchor_units}
     for label, entries in (("candidate", result.candidates), ("residue", result.residue)):
         for index, entry in enumerate(entries, start=1):
@@ -328,7 +334,7 @@ def write_local_review_packet(
                 if unit_id in accounted:
                     accounted[unit_id].append(f"{label}_{index}")
     supplied = {unit.unit_id: unit for unit in (*batch.anchor_units, *batch.context_support_units)}
-    packet = {
+    return {
         "anchor_view": [
             {"unit_id": unit.unit_id, "locator": unit.locator, "content": unit.content,
              "context_support_unit_ids": list(unit.context_support_unit_ids), "accounting": accounted[unit.unit_id]}
@@ -350,9 +356,6 @@ def write_local_review_packet(
             for unit in batch.context_support_units
         ],
     }
-    path = directory / "review-packet.json"
-    _write_private_json(path, packet)
-    return path
 
 
 def review_packet_readback(
@@ -369,27 +372,7 @@ def review_packet_readback(
         return False
     if batch is None or result is None:
         return bool(packet["anchor_view"])
-    supplied = {unit.unit_id: unit for unit in (*batch.anchor_units, *batch.context_support_units)}
-    anchors = {unit.unit_id for unit in batch.anchor_units}
-    if {item.get("unit_id") for item in packet["anchor_view"]} != anchors:
-        return False
-    for item in packet["anchor_view"]:
-        unit = supplied[item["unit_id"]]
-        if item.get("content") != unit.content or item.get("locator") != unit.locator:
-            return False
-    if len(packet["candidate_view"]) != len(result.candidates):
-        return False
-    for shown, candidate in zip(packet["candidate_view"], result.candidates, strict=True):
-        if shown.get("evidence_unit_ids") != list(candidate.evidence_unit_ids):
-            return False
-        evidence = shown.get("canonical_evidence")
-        if not isinstance(evidence, list) or len(evidence) != len(candidate.evidence_unit_ids):
-            return False
-        for item, unit_id in zip(evidence, candidate.evidence_unit_ids, strict=True):
-            unit = supplied.get(unit_id)
-            if unit is None or item.get("unit_id") != unit_id or item.get("content") != unit.content or item.get("locator") != unit.locator:
-                return False
-    return True
+    return packet == build_review_packet(batch, result)
 
 
 def cleanup_local_review_packet(directory: Path) -> None:

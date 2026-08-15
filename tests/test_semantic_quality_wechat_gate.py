@@ -3,13 +3,19 @@ from __future__ import annotations
 import importlib.util
 import json
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
 
-from archeos.representation_information import RepresentationAnalysisBatch, RepresentationAnalysisUnit
-from tests.test_wechat_conversation import build_synthetic_representation, synthetic_multi_batch_export
-
+from archeos.representation_information import (
+    RepresentationAnalysisBatch,
+    RepresentationAnalysisUnit,
+)
+from tests.test_wechat_conversation import (
+    build_synthetic_representation,
+    synthetic_multi_batch_export,
+)
 
 ROOT = Path(__file__).resolve().parents[1]
 HARNESS = ROOT / "docs/experiments/semantic-quality-wechat/v0.1.0/run_quality_gate.py"
@@ -97,19 +103,19 @@ class SemanticQualityWechatGateTest(unittest.TestCase):
         value = batch(); fingerprint = gate.input_fingerprint(gate.provider_input(value))
         for raw in (None, "", "[", json.dumps({"protocol_version": gate.PROTOCOL_VERSION, "input_fingerprint": fingerprint, "candidates": [], "residue": [], "extra": 1}),
                     json.dumps({"protocol_version": gate.PROTOCOL_VERSION, "input_fingerprint": fingerprint, "candidates": [{"statement": "x"}], "residue": []})):
-            with self.subTest(raw=raw):
-                with self.assertRaises(gate.GateError): gate.parse_and_validate(raw, value, fingerprint)
+            with self.subTest(raw=raw), self.assertRaises(gate.GateError):
+                gate.parse_and_validate(raw, value, fingerprint)
 
     def test_unknown_duplicate_no_anchor_and_incomplete_coverage_fail_closed(self):
         value = batch(); fingerprint = gate.input_fingerprint(gate.provider_input(value)); payload = result_for(value)
         payload["candidates"][0]["evidence_unit_ids"] = ["unknown"]
-        with self.assertRaises(Exception): gate.parse_and_validate(json.dumps(payload), value, fingerprint)
+        with self.assertRaises((gate.GateError, gate.RepresentationInformationError)): gate.parse_and_validate(json.dumps(payload), value, fingerprint)
         payload = result_for(value); payload["candidates"][0]["evidence_unit_ids"] *= 2
-        with self.assertRaises(Exception): gate.parse_and_validate(json.dumps(payload), value, fingerprint)
+        with self.assertRaises((gate.GateError, gate.RepresentationInformationError)): gate.parse_and_validate(json.dumps(payload), value, fingerprint)
         payload = result_for(value); payload["candidates"][0]["evidence_unit_ids"] = [unit(30).unit_id]
-        with self.assertRaises(Exception): gate.parse_and_validate(json.dumps(payload), value, fingerprint)
+        with self.assertRaises((gate.GateError, gate.RepresentationInformationError)): gate.parse_and_validate(json.dumps(payload), value, fingerprint)
         payload = result_for(value); payload["candidates"] = payload["candidates"][:-1]
-        with self.assertRaises(Exception): gate.parse_and_validate(json.dumps(payload), value, fingerprint)
+        with self.assertRaises((gate.GateError, gate.RepresentationInformationError)): gate.parse_and_validate(json.dumps(payload), value, fingerprint)
 
     def test_eligible_context_can_be_explicit_evidence_but_non_evidence_cannot(self):
         capable, incapable = unit(20, eligible=True), unit(21, eligible=False)
@@ -119,10 +125,10 @@ class SemanticQualityWechatGateTest(unittest.TestCase):
             if should_pass:
                 gate.parse_and_validate(json.dumps(payload), value, gate.input_fingerprint(gate.provider_input(value)))
             else:
-                with self.assertRaises(Exception): gate.parse_and_validate(json.dumps(payload), value, gate.input_fingerprint(gate.provider_input(value)))
+                with self.assertRaises((gate.GateError, gate.RepresentationInformationError)): gate.parse_and_validate(json.dumps(payload), value, gate.input_fingerprint(gate.provider_input(value)))
         value = batch(context=(capable,)); payload = result_for(value)
         payload["candidates"][0]["evidence_unit_ids"] = [capable.unit_id]
-        with self.assertRaises(Exception):
+        with self.assertRaises((gate.GateError, gate.RepresentationInformationError)):
             gate.parse_and_validate(json.dumps(payload), value, gate.input_fingerprint(gate.provider_input(value)))
 
     def test_timeout_and_nonzero_fail_closed(self):
@@ -191,8 +197,22 @@ class SemanticQualityWechatGateTest(unittest.TestCase):
             self.assertEqual(len(packet["anchor_view"]), 19)
             self.assertEqual(path.stat().st_mode & 0o777, 0o600)
             self.assertTrue(gate.review_packet_readback(path, value, parsed))
-            path.write_text("{}", encoding="utf-8")
-            self.assertFalse(gate.review_packet_readback(path, value, parsed))
+            original = json.loads(path.read_text(encoding="utf-8"))
+            mutations = (
+                ("anchor_view", 0, "accounting", []),
+                ("anchor_view", 0, "context_support_unit_ids", ["wrong"]),
+                ("candidate_view", 0, "statement", "wrong"),
+                ("candidate_view", 0, "canonical_evidence", []),
+                ("context_support_view", None, None, [{}]),
+            )
+            for section, index, field, replacement in mutations:
+                mutated = json.loads(json.dumps(original))
+                if index is None:
+                    mutated[section] = replacement
+                else:
+                    mutated[section][index][field] = replacement
+                path.write_text(json.dumps(mutated), encoding="utf-8")
+                self.assertFalse(gate.review_packet_readback(path, value, parsed))
             path = gate.write_local_review_packet(value, parsed, path.parent)
             gate.cleanup_local_review_packet(path.parent)
             self.assertFalse(path.exists())
@@ -202,6 +222,10 @@ class SemanticQualityWechatGateTest(unittest.TestCase):
         tracked = [ROOT / "docs/experiments/semantic-quality-wechat/v0.1.0" / item for item in ("manifest.json", "RESULTS.md", "RECOMMENDATION.md")]
         forbidden = ("synthetic-source", "synthetic-representation", "unit_", "raw result", "sender")
         self.assertTrue(all(token not in path.read_text(encoding="utf-8") for path in tracked for token in forbidden))
+        run = subprocess.run([sys.executable, str(HARNESS), "--synthetic"], cwd=ROOT, check=True, capture_output=True, text=True)
+        status = json.loads(run.stdout)
+        self.assertEqual(status["provider_calls"], 0)
+        self.assertFalse(status["real_marker_written"])
 
     def test_production_wechat_gate_remains_covered_by_existing_test(self):
         existing = (ROOT / "tests/test_wechat_conversation.py").read_text(encoding="utf-8")
