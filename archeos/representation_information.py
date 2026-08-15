@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import re
 import shutil
 import signal
+import stat
 import subprocess
 import tempfile
 import threading
@@ -28,6 +30,8 @@ from .representation.models import NormalizedRepresentation, RepresentationArtif
 from .representation.wechat import wechat_conversation_analysis_rows
 from .source.contracts import ManagedSourceAccess
 from .source.identity import require_managed_source_id
+
+_LOGGER = logging.getLogger(__name__)
 
 PACKAGE_SCHEMA_VERSION = "2.0"
 PACKAGE_KIND = "representation_information"
@@ -438,7 +442,6 @@ class ExternalAgentExecutionRecord:
     stdout_bytes: int
     stderr_bytes: int
     process_cleanup_status: str
-    diagnostic_cleanup_status: str
 
 
 DIAGNOSTIC_SCHEMA_VERSION = "external-agent-diagnostics/1.0"
@@ -481,7 +484,8 @@ class CodexCliRepresentationAnalysisProvider:
         self.timeout_seconds = float(timeout_seconds)
         self.runner = runner
         self.diagnostic_root = (
-            Path(tempfile.gettempdir()) / "archeos-external-agent-diagnostics"
+            Path(tempfile.gettempdir()).resolve()
+            / "archeos-external-agent-diagnostics"
             if diagnostic_root is None
             else Path(diagnostic_root).expanduser()
         )
@@ -490,6 +494,8 @@ class CodexCliRepresentationAnalysisProvider:
     def cleanup_failure_diagnostics(self) -> bool:
         """Explicitly remove local-only failure diagnostics after review."""
         try:
+            if not _diagnostic_root_is_safe(self.diagnostic_root):
+                return False
             if self.diagnostic_root.exists():
                 shutil.rmtree(self.diagnostic_root)
             return True
@@ -498,10 +504,8 @@ class CodexCliRepresentationAnalysisProvider:
 
     def analyze(self, batch: RepresentationAnalysisBatch) -> RepresentationAnalysisResult:
         started_monotonic = time.monotonic()
-        diagnostic_cleanup_status = (
-            "verified"
-            if _purge_expired_diagnostic_bundles(self.diagnostic_root)
-            else "failed"
+        diagnostic_root_ready = _purge_expired_diagnostic_bundles(
+            self.diagnostic_root
         )
         request, fingerprint = _external_agent_request(batch)
         record_base = {
@@ -513,6 +517,34 @@ class CodexCliRepresentationAnalysisProvider:
             "provider_version": self.provider_version,
             "started_at": _utc_timestamp(),
         }
+        if not diagnostic_root_ready:
+            self.execution_records.append(
+                ExternalAgentExecutionRecord(
+                    **record_base,
+                    finished_at=_utc_timestamp(),
+                    execution_status="failed",
+                    failure_category="runtime_execution_failure",
+                    strict_validation_status="failed",
+                    result_fingerprint=None,
+                    eligible_units=len(batch.anchor_units),
+                    covered_units=0,
+                    diagnostic_schema_version=DIAGNOSTIC_SCHEMA_VERSION,
+                    elapsed_ms=_elapsed_ms(started_monotonic),
+                    deadline_ms=round(self.timeout_seconds * 1000),
+                    exit_code=None,
+                    termination_signal=None,
+                    timeout_phase=None,
+                    provider_error_category=None,
+                    result_file_present=False,
+                    result_size_bytes=0,
+                    stdout_bytes=0,
+                    stderr_bytes=0,
+                    process_cleanup_status="not_started",
+                )
+            )
+            raise RepresentationInformationError(
+                "External Agent 诊断目录不安全；未启动 Provider。"
+            )
         schema = external_agent_representation_analysis_schema()
         _require_codex_schema_compatibility(schema)
         result_file_present = False
@@ -549,12 +581,13 @@ class CodexCliRepresentationAnalysisProvider:
                     self.timeout_seconds,
                     self.runner,
                 )
+                result_file_present, result_size_bytes = _result_file_metadata(
+                    result_path
+                )
                 if outcome.failure_category is not None:
                     raise RepresentationInformationError(outcome.failure_category)
-                if result_path.is_symlink() or not result_path.is_file():
+                if not result_file_present:
                     raise RepresentationInformationError("no_result")
-                result_file_present = True
-                result_size_bytes = result_path.stat().st_size
                 raw = result_path.read_text(encoding="utf-8")
                 result = _parse_external_agent_result(raw, batch, fingerprint)
             except (OSError, RuntimeError, ValueError, json.JSONDecodeError) as exc:
@@ -593,12 +626,13 @@ class CodexCliRepresentationAnalysisProvider:
                     stdout_bytes=_stream_bytes(outcome.stdout),
                     stderr_bytes=_stream_bytes(outcome.stderr),
                     process_cleanup_status=outcome.process_cleanup_status,
-                    diagnostic_cleanup_status=diagnostic_cleanup_status,
                 )
                 if not _write_failure_diagnostic_bundle(
                     self.diagnostic_root, record, outcome
                 ):
-                    record = replace(record, diagnostic_cleanup_status="failed")
+                    # Keep this local-only: the durable run audit is intentionally
+                    # limited to its approved allowlist.
+                    _LOGGER.warning("External Agent 本机失败诊断材料写入失败")
                 self.execution_records.append(record)
                 raise RepresentationInformationError(
                     "External Agent 未产生可验证的结构化结果；未发布信息包。"
@@ -626,7 +660,6 @@ class CodexCliRepresentationAnalysisProvider:
                 stdout_bytes=_stream_bytes(outcome.stdout),
                 stderr_bytes=_stream_bytes(outcome.stderr),
                 process_cleanup_status=outcome.process_cleanup_status,
-                diagnostic_cleanup_status=diagnostic_cleanup_status,
             )
         )
         return result
@@ -672,9 +705,16 @@ def _run_external_agent_once(
             text=True,
             start_new_session=True,
         )
-    except OSError:
+    except OSError as exc:
         return _ExternalAgentProcessOutcome(
-            "runtime_start_failure", "", "", None, None, None, None, "not_started"
+            "runtime_start_failure",
+            "",
+            str(exc),
+            None,
+            None,
+            None,
+            None,
+            "not_started",
         )
     try:
         stdout, stderr = process.communicate(input=prompt, timeout=timeout_seconds)
@@ -843,6 +883,16 @@ def _return_code(process: Any) -> int | None:
     return value if isinstance(value, int) else None
 
 
+def _result_file_metadata(path: Path) -> tuple[bool, int]:
+    try:
+        if path.is_symlink() or not path.is_file():
+            return False, 0
+        size = path.stat().st_size
+    except OSError:
+        return False, 0
+    return (size >= 0, max(size, 0))
+
+
 def _elapsed_ms(started_monotonic: float) -> int:
     return max(0, round((time.monotonic() - started_monotonic) * 1000))
 
@@ -850,13 +900,55 @@ def _elapsed_ms(started_monotonic: float) -> int:
 def _provider_error_category(stderr: str) -> str:
     normalized = stderr.lower()
     patterns = (
-        ("auth_or_permission", r"\b(401|403|unauthori[sz]ed|forbidden|authentication|permission denied|access denied)\b"),
-        ("rate_limited", r"\b(429|rate limit|too many requests)\b"),
-        ("network_or_transport", r"\b(network|transport|connection|dns|tls|socket|econn|connection reset)\b"),
-        ("service_unavailable", r"\b(503|service unavailable|temporarily unavailable|overloaded)\b"),
-        ("structured_output_rejected", r"\b(output schema|json schema|structured output|schema validation)\b"),
-        ("provider_internal_error", r"\b(500|internal error|server error)\b"),
-        ("cancelled", r"\b(cancelled|canceled|interrupted)\b"),
+        (
+            "auth_or_permission",
+            (
+                r"\b(?:codex|provider|api|http)\b[^\n]{0,80}"
+                r"\b(?:401|403|unauthori[sz]ed|forbidden|authentication)\b"
+            ),
+        ),
+        (
+            "rate_limited",
+            (
+                r"\b(?:codex|provider|api|http)\b[^\n]{0,80}"
+                r"\b(?:429|rate limit|too many requests)\b"
+            ),
+        ),
+        (
+            "service_unavailable",
+            (
+                r"\b(?:codex|provider|api|http)\b[^\n]{0,80}"
+                r"\b(?:503|service unavailable|temporarily unavailable|overloaded)\b"
+            ),
+        ),
+        (
+            "structured_output_rejected",
+            (
+                r"\b(?:codex|provider|api)\b[^\n]{0,80}"
+                r"\b(?:output schema|json schema|structured output|schema validation)\b"
+            ),
+        ),
+        (
+            "provider_internal_error",
+            (
+                r"\b(?:codex|provider|api|http)\b[^\n]{0,80}"
+                r"\b(?:500|internal error|server error)\b"
+            ),
+        ),
+        (
+            "cancelled",
+            (
+                r"\b(?:codex|provider|api|request)\b[^\n]{0,80}"
+                r"\b(?:cancelled|canceled|interrupted)\b"
+            ),
+        ),
+        (
+            "network_or_transport",
+            (
+                r"\b(?:codex|provider|api|http request|transport)\b[^\n]{0,80}"
+                r"\b(?:network|transport|connection|dns|tls|socket|econn)\b"
+            ),
+        ),
     )
     for category, pattern in patterns:
         if re.search(pattern, normalized):
@@ -867,27 +959,72 @@ def _provider_error_category(stderr: str) -> str:
 _BEARER_CREDENTIAL = re.compile(
     r"(?i)(?:authorization\s*[:=]\s*)?bearer\s+[^\s\"']+"
 )
+_BASIC_CREDENTIAL = re.compile(
+    r"(?i)(authorization\s*[:=]\s*)basic\s+[^\s\"']+"
+)
+_QUOTED_CREDENTIAL = re.compile(
+    r"(?i)((?:[\"']?(?:access[_ -]?token|api[_ -]?key|token|password|authorization)"
+    r"[\"']?)\s*[:=]\s*)([\"'])[^\"']*\2"
+)
 _KEY_VALUE_CREDENTIAL = re.compile(
-    r"(?i)((?:api[_ -]?key|token|password|authorization)\s*[:=]\s*)[^\s\"']+"
+    r"(?i)((?:access[_ -]?token|api[_ -]?key|token|password|authorization)"
+    r"\s*[:=]\s*)[^\s\"']+"
 )
 
 
 def _redact_credential_like(value: str) -> str:
     return _KEY_VALUE_CREDENTIAL.sub(
-        r"\1[REDACTED]", _BEARER_CREDENTIAL.sub("[REDACTED]", value)
+        r"\1[REDACTED]",
+        _QUOTED_CREDENTIAL.sub(
+            r"\1\2[REDACTED]\2",
+            _BASIC_CREDENTIAL.sub(
+                r"\1[REDACTED]", _BEARER_CREDENTIAL.sub("[REDACTED]", value)
+            ),
+        ),
     )
 
 
 def _bounded_redacted_tail(value: str) -> str:
     encoded = _redact_credential_like(value).encode("utf-8", errors="replace")
-    return encoded[-_MAX_DIAGNOSTIC_STREAM_BYTES :].decode("utf-8", errors="replace")
+    return encoded[-_MAX_DIAGNOSTIC_STREAM_BYTES :].decode("utf-8", errors="ignore")
+
+
+def _diagnostic_root_is_safe(root: Path, *, require_private_root: bool = True) -> bool:
+    """Reject symlink traversal and unsafe directory ownership boundaries."""
+    root = Path(os.path.abspath(root))
+    existing: list[Path] = []
+    current = root
+    while True:
+        if current.exists() or current.is_symlink():
+            existing.append(current)
+        if current == current.parent:
+            break
+        current = current.parent
+    if root.parent not in existing:
+        return False
+    for path in existing:
+        try:
+            mode = path.lstat().st_mode
+        except OSError:
+            return False
+        if stat.S_ISLNK(mode) or not stat.S_ISDIR(mode):
+            return False
+        permissions = stat.S_IMODE(mode)
+        if path == root and require_private_root:
+            if permissions != 0o700:
+                return False
+        elif permissions & 0o022 and not permissions & stat.S_ISVTX:
+            return False
+    return True
 
 
 def _purge_expired_diagnostic_bundles(root: Path) -> bool:
     try:
-        if not root.exists():
-            return True
         if root.is_symlink():
+            return False
+        if not root.exists():
+            return _diagnostic_root_is_safe(root.parent, require_private_root=False)
+        if not _diagnostic_root_is_safe(root):
             return False
         for path in root.iterdir():
             if not path.is_dir() or path.is_symlink():
@@ -895,17 +1032,9 @@ def _purge_expired_diagnostic_bundles(root: Path) -> bool:
             metadata_path = path / "metadata.json"
             try:
                 payload = json.loads(metadata_path.read_text(encoding="utf-8"))
-                expires_at = payload.get("expires_at") if isinstance(payload, dict) else None
-                expired = (
-                    isinstance(expires_at, str)
-                    and _parse_timestamp(expires_at) <= datetime.now(UTC)
-                )
+                expired = _diagnostic_bundle_expired(path, payload)
             except (OSError, TypeError, ValueError, json.JSONDecodeError):
-                expired = (
-                    datetime.now(UTC)
-                    - datetime.fromtimestamp(path.stat().st_mtime, UTC)
-                    >= timedelta(seconds=_DIAGNOSTIC_TTL_SECONDS)
-                )
+                expired = _diagnostic_bundle_deadline(path) <= datetime.now(UTC)
             if expired:
                 shutil.rmtree(path)
         return True
@@ -914,7 +1043,41 @@ def _purge_expired_diagnostic_bundles(root: Path) -> bool:
 
 
 def _parse_timestamp(value: str) -> datetime:
-    return datetime.fromisoformat(value)
+    parsed = datetime.fromisoformat(value)
+    if parsed.tzinfo is None:
+        raise ValueError("timestamp must include timezone")
+    return parsed.astimezone(UTC)
+
+
+def _diagnostic_bundle_deadline(path: Path, created_at: datetime | None = None) -> datetime:
+    mtime_deadline = datetime.fromtimestamp(path.stat().st_mtime, UTC) + timedelta(
+        seconds=_DIAGNOSTIC_TTL_SECONDS
+    )
+    if created_at is None:
+        return mtime_deadline
+    return min(created_at + timedelta(seconds=_DIAGNOSTIC_TTL_SECONDS), mtime_deadline)
+
+
+def _diagnostic_bundle_expired(path: Path, payload: object) -> bool:
+    if not isinstance(payload, dict):
+        raise TypeError("diagnostic metadata must be an object")
+    created_value = payload.get("created_at")
+    expires_value = payload.get("expires_at")
+    created_at = _optional_timestamp(created_value)
+    expires_at = _optional_timestamp(expires_value)
+    deadline = _diagnostic_bundle_deadline(path, created_at)
+    if expires_at is not None:
+        deadline = min(deadline, expires_at)
+    return deadline <= datetime.now(UTC)
+
+
+def _optional_timestamp(value: object) -> datetime | None:
+    if not isinstance(value, str):
+        return None
+    try:
+        return _parse_timestamp(value)
+    except ValueError:
+        return None
 
 
 def _write_failure_diagnostic_bundle(
@@ -923,16 +1086,20 @@ def _write_failure_diagnostic_bundle(
     outcome: _ExternalAgentProcessOutcome,
 ) -> bool:
     try:
-        root.mkdir(mode=0o700, parents=True, exist_ok=True)
-        os.chmod(root, 0o700)
+        if not root.exists():
+            if not _diagnostic_root_is_safe(root.parent, require_private_root=False):
+                return False
+            root.mkdir(mode=0o700)
+        if not _diagnostic_root_is_safe(root):
+            return False
         bundle = root / record.processing_run_id
         staging = root / f".{record.processing_run_id}.{uuid.uuid4().hex}.tmp"
         staging.mkdir(mode=0o700)
         os.chmod(staging, 0o700)
-        expires_at = (
-            datetime.now(UTC)
-            + timedelta(seconds=_DIAGNOSTIC_TTL_SECONDS)
-        ).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+        created_at = _parse_timestamp(record.finished_at)
+        expires_at = (created_at + timedelta(seconds=_DIAGNOSTIC_TTL_SECONDS)).isoformat(
+            timespec="milliseconds"
+        ).replace("+00:00", "Z")
         metadata = {
             "diagnostic_schema_version": DIAGNOSTIC_SCHEMA_VERSION,
             "provider_route": record.provider_route,

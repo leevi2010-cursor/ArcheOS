@@ -361,7 +361,6 @@ class SemanticHandoffTest(unittest.TestCase):
             "stdout_bytes",
             "stderr_bytes",
             "process_cleanup_status",
-            "diagnostic_cleanup_status",
         ):
             legacy.pop(field)
         audit_path.write_text(json.dumps(legacy), encoding="utf-8")
@@ -436,6 +435,7 @@ class SemanticHandoffTest(unittest.TestCase):
         self.assertGreaterEqual(audit["stdout_bytes"], 0)
         self.assertGreater(audit["stderr_bytes"], 0)
         self.assertEqual(audit["provider_error_category"], "unknown")
+        self.assertNotIn("diagnostic_cleanup_status", audit)
         self.assertNotIn("stdout", set(audit) - {"stdout_bytes"})
         self.assertNotIn("stderr", set(audit) - {"stderr_bytes"})
 

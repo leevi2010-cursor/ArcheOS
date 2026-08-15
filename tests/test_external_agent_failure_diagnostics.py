@@ -16,6 +16,8 @@ from archeos.representation_information import (
     CodexCliRepresentationAnalysisProvider,
     RepresentationAnalysisBatch,
     RepresentationAnalysisUnit,
+    _bounded_redacted_tail,
+    _provider_error_category,
 )
 
 
@@ -52,6 +54,13 @@ class _Process:
         if self.mode == "unknown_error":
             self.returncode = 1
             return "", "unrecognized synthetic condition"
+        if self.mode == "nonzero_with_result":
+            result_path = Path(
+                self.command[self.command.index("--output-last-message") + 1]
+            )
+            result_path.write_text("synthetic partial result", encoding="utf-8")
+            self.returncode = 1
+            return "", "Codex provider returned HTTP 500"
         raise AssertionError(f"unexpected mode {self.mode}")
 
 
@@ -66,7 +75,7 @@ class _Runner:
 class ExternalAgentFailureDiagnosticsTest(unittest.TestCase):
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory()
-        self.root = Path(self.temp.name)
+        self.root = Path(self.temp.name).resolve()
 
     def tearDown(self) -> None:
         self.temp.cleanup()
@@ -120,7 +129,6 @@ class ExternalAgentFailureDiagnosticsTest(unittest.TestCase):
         )
         provider.analyze(self.batch())
         self.assertFalse(root.exists())
-        self.assertEqual(provider.execution_records[0].diagnostic_cleanup_status, "verified")
 
     def test_timeout_captures_partial_and_drain_with_cleaned_process(self) -> None:
         provider = self.provider("timeout")
@@ -209,6 +217,64 @@ class ExternalAgentFailureDiagnosticsTest(unittest.TestCase):
         for child in bundle.iterdir():
             self.assertEqual(stat.S_IMODE(child.stat().st_mode), 0o600)
 
+    def test_credential_redaction_covers_json_quoted_and_basic_forms(self) -> None:
+        raw = (
+            '{"access_token":"token-one","api_key":"key-two"} '
+            'password="password-three" Authorization: Basic basic-four'
+        )
+        tail = _bounded_redacted_tail(raw)
+        for secret in ("token-one", "key-two", "password-three", "basic-four"):
+            self.assertNotIn(secret, tail)
+        self.assertGreaterEqual(tail.count("[REDACTED]"), 4)
+
+    def test_multibyte_tail_never_exceeds_64_kib_after_encoding(self) -> None:
+        tail = _bounded_redacted_tail("前" + "界" * _MAX_DIAGNOSTIC_STREAM_BYTES)
+        self.assertLessEqual(len(tail.encode("utf-8")), _MAX_DIAGNOSTIC_STREAM_BYTES)
+
+    def test_symlink_diagnostic_root_fails_closed_without_touching_target(self) -> None:
+        target = self.root / "external-target"
+        target.mkdir(mode=0o755)
+        root = self.root / "diagnostics-link"
+        root.symlink_to(target, target_is_directory=True)
+        provider = CodexCliRepresentationAnalysisProvider(
+            provider_version="synthetic-1",
+            runner=lambda *_args, **_kwargs: self.fail("Provider must not start"),
+            diagnostic_root=root,
+        )
+        with self.assertRaisesRegex(Exception, "诊断目录不安全"):
+            provider.analyze(self.batch())
+        self.assertEqual(stat.S_IMODE(target.stat().st_mode), 0o755)
+        self.assertEqual(list(target.iterdir()), [])
+        self.assertFalse(provider.cleanup_failure_diagnostics())
+
+    def test_symlink_diagnostic_parent_fails_closed_without_touching_target(self) -> None:
+        target = self.root / "external-parent-target"
+        target.mkdir(mode=0o755)
+        parent = self.root / "diagnostics-parent-link"
+        parent.symlink_to(target, target_is_directory=True)
+        provider = CodexCliRepresentationAnalysisProvider(
+            provider_version="synthetic-1",
+            runner=lambda *_args, **_kwargs: self.fail("Provider must not start"),
+            diagnostic_root=parent / "diagnostics",
+        )
+        with self.assertRaisesRegex(Exception, "诊断目录不安全"):
+            provider.analyze(self.batch())
+        self.assertEqual(stat.S_IMODE(target.stat().st_mode), 0o755)
+        self.assertEqual(list(target.iterdir()), [])
+
+    def test_nonprivate_parent_fails_closed_before_provider_start(self) -> None:
+        parent = self.root / "unsafe-parent"
+        parent.mkdir(mode=0o700)
+        os.chmod(parent, 0o777)
+        provider = CodexCliRepresentationAnalysisProvider(
+            provider_version="synthetic-1",
+            runner=lambda *_args, **_kwargs: self.fail("Provider must not start"),
+            diagnostic_root=parent / "diagnostics",
+        )
+        with self.assertRaisesRegex(Exception, "诊断目录不安全"):
+            provider.analyze(self.batch())
+        self.assertFalse((parent / "diagnostics").exists())
+
     def test_durable_record_has_no_free_text_and_known_error_is_mapped(self) -> None:
         _provider, record = self._run_failure("known_error")
         self.assertEqual(record.provider_error_category, "rate_limited")
@@ -221,6 +287,45 @@ class ExternalAgentFailureDiagnosticsTest(unittest.TestCase):
     def test_unknown_error_is_not_guessed(self) -> None:
         _provider, record = self._run_failure("unknown_error")
         self.assertEqual(record.provider_error_category, "unknown")
+
+    def test_provider_error_mapping_requires_explicit_provider_context(self) -> None:
+        known = {
+            "Codex provider returned HTTP 401": "auth_or_permission",
+            "Codex provider returned HTTP 429": "rate_limited",
+            "Codex provider transport connection reset": "network_or_transport",
+            "Codex provider returned HTTP 503": "service_unavailable",
+            "Codex provider HTTP 503 connection reset": "service_unavailable",
+            "Codex provider rejected output schema": "structured_output_rejected",
+            "Codex provider returned HTTP 500": "provider_internal_error",
+            "Codex request cancelled": "cancelled",
+        }
+        for stderr, expected in known.items():
+            with self.subTest(stderr=stderr):
+                self.assertEqual(_provider_error_category(stderr), expected)
+        for stderr in ("401", "业务网络项目", "network rate limit", "server error"):
+            with self.subTest(stderr=stderr):
+                self.assertEqual(_provider_error_category(stderr), "unknown")
+
+    def test_bundle_write_failure_leaves_local_only_audit_signal(self) -> None:
+        provider = self.provider("unknown_error")
+        with (
+            patch(
+                "archeos.representation_information._private_diagnostic_write",
+                side_effect=OSError("synthetic write failure"),
+            ),
+            self.assertLogs("archeos.representation_information", "WARNING") as logs,
+            self.assertRaisesRegex(Exception, "未产生可验证"),
+        ):
+            provider.analyze(self.batch())
+        self.assertEqual(provider.execution_records[0].failure_category, "runtime_nonzero_exit")
+        self.assertIn("本机失败诊断材料写入失败", "\n".join(logs.output))
+
+    def test_nonzero_result_file_is_truthed_after_process_cleanup(self) -> None:
+        _provider, record = self._run_failure("nonzero_with_result")
+        self.assertEqual(record.failure_category, "runtime_nonzero_exit")
+        self.assertTrue(record.result_file_present)
+        self.assertGreater(record.result_size_bytes, 0)
+        self.assertEqual(record.provider_error_category, "provider_internal_error")
 
     def test_runtime_start_failure_is_auditable(self) -> None:
         root = self.root / "diagnostics"
@@ -235,6 +340,10 @@ class ExternalAgentFailureDiagnosticsTest(unittest.TestCase):
         self.assertEqual(record.failure_category, "runtime_start_failure")
         self.assertEqual(record.process_cleanup_status, "not_started")
         self.assertTrue((root / record.processing_run_id / "metadata.json").is_file())
+        self.assertIn(
+            "synthetic",
+            (root / record.processing_run_id / "stderr.tail").read_text(encoding="utf-8"),
+        )
 
     def test_process_cleanup_failure_is_auditable(self) -> None:
         provider = self.provider("nonzero")
@@ -254,12 +363,17 @@ class ExternalAgentFailureDiagnosticsTest(unittest.TestCase):
         root = self.root / "diagnostics"
         expired = root / "run_expired"
         expired.mkdir(parents=True, mode=0o700)
+        os.chmod(root, 0o700)
         (expired / "metadata.json").write_text(
             json.dumps(
                 {
+                    "created_at": (
+                        datetime.now(UTC)
+                        - timedelta(seconds=24 * 60 * 60 + 1)
+                    ).isoformat().replace("+00:00", "Z"),
                     "expires_at": (
-                        datetime.now(UTC) - timedelta(seconds=1)
-                    ).isoformat().replace("+00:00", "Z")
+                        datetime.now(UTC) + timedelta(days=365)
+                    ).isoformat().replace("+00:00", "Z"),
                 }
             ),
             encoding="utf-8",
@@ -270,6 +384,26 @@ class ExternalAgentFailureDiagnosticsTest(unittest.TestCase):
         self.assertTrue((root / record.processing_run_id).is_dir())
         self.assertTrue(provider.cleanup_failure_diagnostics())
         self.assertFalse(root.exists())
+
+    def test_malformed_metadata_cannot_extend_bundle_retention(self) -> None:
+        root = self.root / "diagnostics"
+        expired = root / "run_malformed"
+        expired.mkdir(parents=True, mode=0o700)
+        os.chmod(root, 0o700)
+        (expired / "metadata.json").write_text(
+            json.dumps(
+                {
+                    "created_at": "not-a-timestamp",
+                    "expires_at": (
+                        datetime.now(UTC) - timedelta(seconds=1)
+                    ).isoformat().replace("+00:00", "Z"),
+                }
+            ),
+            encoding="utf-8",
+        )
+        os.chmod(expired / "metadata.json", 0o600)
+        self._run_failure("unknown_error")
+        self.assertFalse(expired.exists())
 
 
 if __name__ == "__main__":

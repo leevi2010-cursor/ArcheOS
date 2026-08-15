@@ -201,7 +201,6 @@ class ExternalAgentSemanticHandoffService:
                 "stdout_bytes": record.stdout_bytes,
                 "stderr_bytes": record.stderr_bytes,
                 "process_cleanup_status": record.process_cleanup_status,
-                "diagnostic_cleanup_status": record.diagnostic_cleanup_status,
                 "result_readback_status": (
                     "verified"
                     if record.execution_status == "succeeded"
@@ -369,7 +368,6 @@ class ExternalAgentSemanticHandoffService:
             "stdout_bytes",
             "stderr_bytes",
             "process_cleanup_status",
-            "diagnostic_cleanup_status",
             "result_readback_status",
             "package_published",
             "package_fingerprint",
@@ -391,7 +389,6 @@ class ExternalAgentSemanticHandoffService:
             "stdout_bytes",
             "stderr_bytes",
             "process_cleanup_status",
-            "diagnostic_cleanup_status",
         }
         legacy_required_fields = required_fields - diagnostic_fields
         observed_batches: set[tuple[str, ...]] = set()
@@ -475,8 +472,6 @@ class ExternalAgentSemanticHandoffService:
                     or not isinstance(audit.get("stderr_bytes"), int)
                     or audit.get("stderr_bytes") < 0
                     or audit.get("process_cleanup_status") != "verified"
-                    or audit.get("diagnostic_cleanup_status")
-                    not in {"verified", "failed"}
                 )
                 or audit.get("result_readback_status") != "verified"
                 or audit.get("package_published") is not True
