@@ -2,7 +2,11 @@ from __future__ import annotations
 
 import inspect
 import json
+import os
+import subprocess
+import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -691,6 +695,67 @@ class SemanticHandoffTest(unittest.TestCase):
             )
         self.assertEqual(outcome.failure_category, "runtime_execution_failure")
         self.assertIn(representation_information.signal.SIGTERM, signals)
+
+    def test_unknown_communicate_error_cleans_up_real_synthetic_group(self) -> None:
+        from archeos import representation_information
+
+        child_pid_path = self.root / "runtime-error-child.pid"
+        script = (
+            "import pathlib, subprocess, sys, time\n"
+            "child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)'], "
+            "stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)\n"
+            "pathlib.Path(sys.argv[1]).write_text(str(child.pid), encoding='utf-8')\n"
+            "time.sleep(30)\n"
+        )
+
+        class RuntimeErrorProcess:
+            def __init__(self) -> None:
+                self.inner = subprocess.Popen(
+                    [sys.executable, "-c", script, str(child_pid_path)],
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    start_new_session=True,
+                )
+                deadline = time.monotonic() + 1
+                while not child_pid_path.exists() and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                if not child_pid_path.exists():
+                    self.inner.kill()
+                    self.inner.wait(timeout=1)
+                    raise AssertionError("synthetic child did not start")
+                self.first_communicate = True
+
+            @property
+            def pid(self) -> int:
+                return self.inner.pid
+
+            @property
+            def returncode(self) -> int | None:
+                return self.inner.returncode
+
+            def communicate(self, **kwargs):
+                if self.first_communicate:
+                    self.first_communicate = False
+                    raise RuntimeError("synthetic unknown communicate error")
+                return self.inner.communicate(**kwargs)
+
+        outcome = representation_information._run_external_agent_once(
+            ["synthetic"],
+            "synthetic",
+            1,
+            lambda *_args, **_kwargs: RuntimeErrorProcess(),
+        )
+        child_pid = int(child_pid_path.read_text(encoding="utf-8"))
+        try:
+            os.kill(child_pid, 0)
+        except ProcessLookupError:
+            child_absent = True
+        else:
+            child_absent = False
+            os.kill(child_pid, 9)
+        self.assertEqual(outcome.failure_category, "runtime_execution_failure")
+        self.assertTrue(child_absent)
 
     def test_nonzero_permission_error_is_cleanup_failure_not_exception(self) -> None:
         from archeos import representation_information

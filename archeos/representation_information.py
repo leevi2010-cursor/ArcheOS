@@ -585,7 +585,7 @@ def _run_external_agent_once(
         return _ExternalAgentProcessOutcome(
             "timeout" if _terminate_process_group(process) else "process_cleanup_failure"
         )
-    except (OSError, TypeError, UnicodeError, ValueError, subprocess.SubprocessError):
+    except Exception:  # noqa: BLE001 - post-Popen cleanup must contain unknown errors.
         return _ExternalAgentProcessOutcome(
             "runtime_execution_failure"
             if _terminate_process_group(process)
@@ -625,7 +625,7 @@ def _wait_for_process_group_absence(pid: int, timeout_seconds: float) -> bool:
 def _best_effort_process_wait(process: Any, timeout_seconds: float) -> None:
     try:
         process.communicate(timeout=timeout_seconds)
-    except (OSError, TypeError, UnicodeError, ValueError, subprocess.SubprocessError):
+    except Exception:  # noqa: BLE001 - cleanup must not leak a live process group.
         return
 
 
