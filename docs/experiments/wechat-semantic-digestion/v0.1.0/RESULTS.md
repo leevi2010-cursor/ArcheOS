@@ -32,7 +32,7 @@ Agent 调用。调用在固定 120 秒上限内未完成，按 fail-closed 结�
 | failure_category | `timeout` |
 | structured_output_valid | not available after timeout |
 | Candidate / Residue | not available after timeout |
-| unaccounted anchors | not available after timeout |
+| unaccounted_anchor_units | 19（Provider 在覆盖完成前超时） |
 | package published | false |
 | Durable Atomic Information written | false |
 | processing-run audit Readback | passed |
