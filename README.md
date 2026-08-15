@@ -109,6 +109,14 @@ archeos process <source_id> --language zh
 - partial / unsupported content 必须显式 warning，不能静默丢失；
 - image structural preflight 不等于 OCR 或视觉语义理解。
 
+已准入并校验通过的微信 JSON Source 可以生成 strict Conversation Representation：
+
+```bash
+archeos conversation wechat represent <source_id>
+```
+
+该命令只产生私有、Git-ignored 的 Representation 与匿名覆盖指标，不调用 semantic provider，也不写入 Atomic Information 或 World Model。
+
 ## Codex 只读接入
 
 初始化 Workspace 后，可显式安装 ArcheOS 管理的本地 MCP 配置：

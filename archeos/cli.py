@@ -21,7 +21,14 @@ from .digestion import (
 )
 from .pipeline import ProcessingError, process_managed_audio
 from .pyannote_speakers import PyannoteSpeakerProvider
-from .representation import LocalRepresentationRepository, RepresentationError, RepresentationService
+from .representation import (
+    LocalRepresentationRepository,
+    RepresentationError,
+    RepresentationService,
+    WechatConversationError,
+    WechatConversationRepresentationAdapter,
+    wechat_conversation_metrics,
+)
 from .representation.registry import production_adapter
 from .representation_information import (
     FileRepresentationAnalysisProvider,
@@ -409,6 +416,29 @@ def build_parser() -> argparse.ArgumentParser:
             default=argparse.SUPPRESS,
             help="Representation root (default: 02_processing/representations).",
         )
+
+    conversation = subparsers.add_parser(
+        "conversation", help="Build provider-specific Conversation Representations."
+    )
+    conversation_providers = conversation.add_subparsers(
+        dest="conversation_provider", required=True
+    )
+    wechat = conversation_providers.add_parser(
+        "wechat", help="Build the strict local WeChat Conversation Representation."
+    )
+    wechat_commands = wechat.add_subparsers(
+        dest="conversation_command", required=True
+    )
+    wechat_represent = wechat_commands.add_parser(
+        "represent", help="Represent one verified WeChat Managed Source."
+    )
+    wechat_represent.add_argument("source_id")
+    wechat_represent.add_argument(
+        "--managed-root", type=Path, default=DEFAULT_MANAGED_SOURCE_ROOT
+    )
+    wechat_represent.add_argument(
+        "--representation-root", type=Path, default=DEFAULT_REPRESENTATION_ROOT
+    )
     return parser
 
 
@@ -740,6 +770,52 @@ def _representation_command(args: argparse.Namespace) -> int:
         return 1
 
 
+def _conversation_command(args: argparse.Namespace) -> int:
+    if (
+        args.conversation_provider != "wechat"
+        or args.conversation_command != "represent"
+    ):
+        return 2  # pragma: no cover - argparse enforces this
+    repository = LocalRepresentationRepository(args.representation_root)
+    try:
+        result = RepresentationService(
+            LocalManagedSourceRepository(args.managed_root), repository
+        ).build(
+            args.source_id,
+            WechatConversationRepresentationAdapter(),
+            {},
+        )
+        artifact = result.representation.artifacts[0]
+        payload = json.loads(
+            repository.read_artifact(
+                result.representation.representation_id, artifact.artifact_id
+            ).decode("utf-8")
+        )
+        output = {
+            "status": result.status,
+            "representation_id": result.representation.representation_id,
+            "representation_kind": result.representation.kind,
+            "metrics": wechat_conversation_metrics(payload),
+            "semantic_provider_called": False,
+            "atomic_information_written": False,
+            "world_model_written": False,
+        }
+        print(json.dumps(output, ensure_ascii=False, indent=2))
+        return 0
+    except (
+        OSError,
+        UnicodeDecodeError,
+        json.JSONDecodeError,
+        RepresentationError,
+        SourceError,
+        WechatConversationError,
+        TypeError,
+        ValueError,
+    ) as exc:
+        print(f"error: {exc}")
+        return 1
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     if args.command in {"init", "doctor", "config", "integration"}:
@@ -760,4 +836,6 @@ def main(argv: list[str] | None = None) -> int:
         return _source_command(args)
     if args.command == "representation":
         return _representation_command(args)
+    if args.command == "conversation":
+        return _conversation_command(args)
     return 2  # pragma: no cover - argparse enforces this
