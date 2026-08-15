@@ -7,8 +7,11 @@ import tempfile
 import unittest
 from contextlib import redirect_stdout
 from pathlib import Path
-from unittest.mock import patch
 
+from archeos.atomic_information import (
+    JsonlAtomicInformationStore,
+    ingest_processing_package,
+)
 from archeos.cli import main
 from archeos.representation import (
     LocalRepresentationRepository,
@@ -31,7 +34,6 @@ from archeos.representation_information import (
     _units_from_representation,
 )
 from archeos.source import LocalManagedSourceRepository
-
 
 SOURCE_ID = "src_" + "a" * 32
 TIMESTAMP = "2026-08-15T00:00:00.000Z"
@@ -104,17 +106,6 @@ def build_synthetic_representation(
     return sources, representations, representation
 
 
-class NeverCalledProvider:
-    name = "must-not-run"
-
-    def __init__(self) -> None:
-        self.calls = 0
-
-    def analyze(self, batch):
-        self.calls += 1
-        raise AssertionError("WeChat service gate must run before the provider")
-
-
 class CrossBatchContextProvider:
     name = "synthetic-cross-batch"
 
@@ -150,6 +141,26 @@ class CrossBatchContextProvider:
                     )
                 )
         return RepresentationAnalysisResult(tuple(candidates), tuple(residue))
+
+
+class CoveringConversationProvider:
+    name = "synthetic-conversation-covering"
+
+    def analyze(self, batch: RepresentationAnalysisBatch):
+        return RepresentationAnalysisResult(
+            candidates=tuple(
+                RepresentationCandidateDraft(
+                    statement="Synthetic conversation message is retained.",
+                    semantic_type="observation",
+                    concerns=("Synthetic",),
+                    evidence_unit_ids=(unit.unit_id,),
+                    context=unit.context,
+                    confidence=1.0,
+                )
+                for unit in batch.anchor_units
+            ),
+            residue=(),
+        )
 
 
 class UnavailableContextProvider:
@@ -515,62 +526,33 @@ class WechatConversationTest(unittest.TestCase):
 
         self.assertFalse(output_root.exists())
 
-    def test_information_extract_fails_before_provider_or_durable_write(self) -> None:
+    def test_information_extract_uses_the_unified_information_lifecycle(self) -> None:
         representation = self.build().representation
-        provider = NeverCalledProvider()
         output_root = self.root / "representation-information"
         service = RepresentationInformationService(
-            self.sources, self.representations, output_root
-        )
-        with self.assertRaisesRegex(
-            RepresentationInformationError,
-            "Conversation 目前只允许生成 Representation；真实语义吸收尚未开放",
-        ):
-            service.extract(representation.representation_id, provider)
-        self.assertEqual(provider.calls, 0)
-        self.assertFalse(output_root.exists())
-        self.assertFalse((self.root / "03_information").exists())
-        self.assertFalse((self.root / "04_core").exists())
-
-        analysis_file = self.root / "analysis.json"
-        analysis_file.write_text(
-            json.dumps({"candidates": [], "residue": []}), encoding="utf-8"
+            self.sources,
+            self.representations,
+            output_root,
+            clock=lambda: TIMESTAMP,
         )
         store = self.root / "03_information" / "atomic_information.jsonl"
-        cli_output = io.StringIO()
-        with (
-            redirect_stdout(cli_output),
-            patch("archeos.cli.ingest_processing_package") as ingest,
-            patch("archeos.cli.JsonlAtomicInformationStore") as store_builder,
-            patch("archeos.cli.FileRepresentationAnalysisProvider.analyze") as analyze,
-            patch("archeos.cli.SQLiteWorldModelRepository") as world_repository,
-        ):
-            return_code = main(
-                [
-                    "information",
-                    "--store",
-                    str(store),
-                    "extract",
-                    representation.representation_id,
-                    "--managed-root",
-                    str(self.managed_root),
-                    "--representation-root",
-                    str(self.representation_root),
-                    "--output-root",
-                    str(output_root),
-                    "--analysis-file",
-                    str(analysis_file),
-                ]
-            )
-        ingest.assert_not_called()
-        store_builder.assert_not_called()
-        analyze.assert_not_called()
-        world_repository.assert_not_called()
-        self.assertEqual(return_code, 1)
-        self.assertIn("真实语义吸收尚未开放", cli_output.getvalue())
-        self.assertFalse(output_root.exists())
-        self.assertFalse(store.exists())
+        package = service.extract(
+            representation.representation_id,
+            CoveringConversationProvider(),
+        )
+        first = ingest_processing_package(package, JsonlAtomicInformationStore(store))
+        second = ingest_processing_package(package, JsonlAtomicInformationStore(store))
+
+        self.assertEqual(first.created, 2)
+        self.assertEqual(second.existing, 2)
+        self.assertTrue((package / "manifest.json").is_file())
+        self.assertTrue(store.is_file())
         self.assertFalse((self.root / "04_core").exists())
+        candidates = (package / "atomic_information_candidates.jsonl").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn('"representation_kind": "wechat_conversation"', candidates)
+        self.assertNotIn('"object_id"', candidates)
 
     def test_cli_reports_only_safe_aggregate_state(self) -> None:
         output = io.StringIO()
@@ -627,7 +609,7 @@ class WechatConversationTest(unittest.TestCase):
                 external.write_text(json.dumps(payload), encoding="utf-8")
                 source_id = f"src_{index:032x}"
                 sources = LocalManagedSourceRepository(
-                    root / "01_inbox", id_factory=lambda: source_id
+                    root / "01_inbox", id_factory=lambda source_id=source_id: source_id
                 )
                 source = sources.admit(
                     external, metadata={"media_type": "application/json"}
