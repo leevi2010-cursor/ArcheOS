@@ -332,6 +332,47 @@ class SemanticHandoffTest(unittest.TestCase):
         self.assertEqual(second.ingestion.existing, 1)
         self.assertEqual(replay_provider.execution_records, [])
 
+    def test_replay_accepts_pre_diagnostics_processing_run_audit(self) -> None:
+        representation, service = self.build_service()
+        audit_root = self.root / "audits"
+        handoff = ExternalAgentSemanticHandoffService(
+            service,
+            JsonlAtomicInformationStore(self.root / "atomic.jsonl"),
+            audit_root,
+        )
+        handoff.execute(
+            representation.representation_id,
+            CodexCliRepresentationAnalysisProvider(
+                provider_version="0.147.0", runner=FakeRunner()
+            ),
+        )
+        audit_path = next(audit_root.glob("*/processing-run-audit.json"))
+        legacy = json.loads(audit_path.read_text(encoding="utf-8"))
+        for field in (
+            "diagnostic_schema_version",
+            "elapsed_ms",
+            "deadline_ms",
+            "exit_code",
+            "termination_signal",
+            "timeout_phase",
+            "provider_error_category",
+            "result_file_present",
+            "result_size_bytes",
+            "stdout_bytes",
+            "stderr_bytes",
+            "process_cleanup_status",
+        ):
+            legacy.pop(field)
+        audit_path.write_text(json.dumps(legacy), encoding="utf-8")
+        replay = handoff.execute(
+            representation.representation_id,
+            CodexCliRepresentationAnalysisProvider(
+                provider_version="0.147.0", runner=FakeRunner()
+            ),
+        )
+        self.assertTrue(replay.replayed_existing_package)
+        self.assertEqual(replay.ingestion.existing, 1)
+
     def test_wechat_representation_uses_the_production_handoff_and_exact_replay(self) -> None:
         representation, service = self.build_wechat_service()
         store_path = self.root / "wechat" / "atomic.jsonl"
@@ -387,6 +428,16 @@ class SemanticHandoffTest(unittest.TestCase):
         self.assertEqual(
             json.loads(audits[0].read_text())["execution_status"], "failed"
         )
+        audit_text = audits[0].read_text(encoding="utf-8")
+        audit = json.loads(audit_text)
+        self.assertNotIn("synthetic nonzero", audit_text)
+        self.assertEqual(audit["diagnostic_schema_version"], "external-agent-diagnostics/1.0")
+        self.assertGreaterEqual(audit["stdout_bytes"], 0)
+        self.assertGreater(audit["stderr_bytes"], 0)
+        self.assertEqual(audit["provider_error_category"], "unknown")
+        self.assertNotIn("diagnostic_cleanup_status", audit)
+        self.assertNotIn("stdout", set(audit) - {"stdout_bytes"})
+        self.assertNotIn("stderr", set(audit) - {"stderr_bytes"})
 
     def test_replay_rechecks_managed_source_before_store_write(self) -> None:
         representation, service = self.build_service()
