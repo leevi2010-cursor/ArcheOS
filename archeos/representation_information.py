@@ -19,6 +19,7 @@ from .filesystem import publish_directory_no_replace
 from .representation import RepresentationRepository
 from .representation.identity import require_representation_id
 from .representation.models import NormalizedRepresentation, RepresentationArtifact
+from .representation.wechat import wechat_conversation_analysis_rows
 from .source.contracts import ManagedSourceAccess
 from .source.identity import require_managed_source_id
 
@@ -662,6 +663,9 @@ def _map_artifact(kind: str, payload: object):
         return
     if kind == "image_structural_preflight":
         yield ("image_structural_preflight", None, payload, payload, "Image structural preflight", False, "IMAGE_STRUCTURAL_PREFLIGHT_HAS_NO_BUSINESS_SEMANTICS")
+        return
+    if kind == "wechat_conversation":
+        yield from wechat_conversation_analysis_rows(payload)
         return
     raise RepresentationInformationError("Representation kind has no approved analysis unit mapping")
 

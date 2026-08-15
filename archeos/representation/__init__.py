@@ -19,6 +19,13 @@ from .models import (
     RepresentationWarning,
 )
 from .service import RepresentationService
+from .wechat import (
+    WechatConversationError,
+    WechatConversationRepresentationAdapter,
+    validate_wechat_conversation_artifact,
+    wechat_conversation_analysis_rows,
+    wechat_conversation_metrics,
+)
 
 __all__ = [
     "AdapterArtifact",
@@ -37,4 +44,9 @@ __all__ = [
     "RepresentationValidationError",
     "RepresentationVerificationResult",
     "RepresentationWarning",
+    "WechatConversationError",
+    "WechatConversationRepresentationAdapter",
+    "validate_wechat_conversation_artifact",
+    "wechat_conversation_analysis_rows",
+    "wechat_conversation_metrics",
 ]

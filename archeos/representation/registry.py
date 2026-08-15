@@ -11,6 +11,7 @@ from .adapters import (
 )
 from .contracts import RepresentationAdapter
 from .local_repository import RepresentationValidationError
+from .wechat import WechatConversationRepresentationAdapter
 
 
 def production_adapter(name: str) -> RepresentationAdapter:
@@ -20,6 +21,7 @@ def production_adapter(name: str) -> RepresentationAdapter:
         "xlsx": XlsxRepresentationAdapter(),
         "pptx": PptxRepresentationAdapter(),
         "image-preflight": ImagePreflightRepresentationAdapter(),
+        "wechat-conversation": WechatConversationRepresentationAdapter(),
     }
     try:
         return adapters[name]
