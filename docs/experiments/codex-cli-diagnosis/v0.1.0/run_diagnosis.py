@@ -16,9 +16,10 @@ import shutil
 import subprocess
 import tempfile
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 ROOT = Path(__file__).resolve().parent
 REPO_ROOT = ROOT.parents[3]
@@ -78,13 +79,21 @@ def safe_environment() -> dict[str, str]:
     return environment
 
 
-def classify(*, exit_code: int | None, timed_out: bool, stderr: str, result_present: bool,
-             json_status: str, strict_status: str) -> str | None:
+def classify(
+    *,
+    exit_code: int | None,
+    timed_out: bool,
+    startup_error: bool,
+    stderr: str,
+    result_present: bool,
+    json_status: str,
+    strict_status: str,
+) -> str | None:
     material = stderr.lower()
-    if strict_status == "passed":
-        return None
     if timed_out:
         return "transient_or_unreproduced_failure"
+    if startup_error:
+        return "runtime_or_auth_failure"
     if exit_code not in (0, None):
         # A non-fatal MCP/auth sidecar warning can co-occur with a definitive
         # response-format rejection. Prefer the deterministic request error.
@@ -99,6 +108,8 @@ def classify(*, exit_code: int | None, timed_out: bool, stderr: str, result_pres
         if any(token in material for token in ("sandbox", "permission denied", "output-last-message", "no such file")):
             return "filesystem_or_sandbox_output_path_failure"
         return "other_reproducible_runtime_failure"
+    if strict_status == "passed":
+        return None
     if not result_present:
         return "filesystem_or_sandbox_output_path_failure"
     if json_status != "valid" or strict_status != "passed":
@@ -229,9 +240,14 @@ def run_case(spec: CaseSpec, *, codex_bin: str, timeout: int,
         try:
             os.chmod(cwd, 0o700)
             result_path = outer / "result.json"
-            command = [codex_bin, "exec", "--ephemeral", "--sandbox", "read-only", "--skip-git-repo-check", "--cd", str(cwd)]
+            schema_path: Path | None = None
             if spec.schema is not None:
-                command.extend(["--output-schema", str(spec.schema), "--output-last-message", str(result_path)])
+                schema_path = outer / "schema.json"
+                shutil.copyfile(spec.schema, schema_path)
+                os.chmod(schema_path, 0o600)
+            command = [codex_bin, "exec", "--ephemeral", "--sandbox", "read-only", "--skip-git-repo-check", "--cd", str(cwd)]
+            if schema_path is not None:
+                command.extend(["--output-schema", str(schema_path), "--output-last-message", str(result_path)])
             command.append("-")
             timed_out = False
             startup_error: str | None = None
@@ -273,8 +289,15 @@ def run_case(spec: CaseSpec, *, codex_bin: str, timeout: int,
                 strict_status = "passed"
             elif spec.validator is None:
                 strict_status = "failed"
-            category = classify(exit_code=exit_code, timed_out=timed_out, stderr=stderr + "\n" + (startup_error or ""),
-                                result_present=result_present, json_status=json_status, strict_status=strict_status)
+            category = classify(
+                exit_code=exit_code,
+                timed_out=timed_out,
+                startup_error=startup_error is not None,
+                stderr=stderr + "\n" + (startup_error or ""),
+                result_present=result_present,
+                json_status=json_status,
+                strict_status=strict_status,
+            )
             return {
                 "case_id": spec.case_id,
                 "called": True,

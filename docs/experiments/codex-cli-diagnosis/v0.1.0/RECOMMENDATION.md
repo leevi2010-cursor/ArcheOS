@@ -9,5 +9,6 @@
 决定是否批准一个仅修正 #76 experiment schema 兼容形态（例如为每个 `const` property 补上明确 `type`）的
 后续 Issue/合同；不能由本实验或 Reviewer 静默修改已合并 #76 harness。
 
-证据同时表明：Codex CLI auth/基础执行正常，#66 同目录形态正常，#76 的 split-directory 形态也正常。#61
-仍保持 Blocked，直至新的受审查 synthetic baseline 成功，并取得新的真实样本授权。
+证据表明 Codex CLI auth/基础执行正常；但已执行历史调用没有严格把 schema 放入同一/分离受控目录，不能
+就目录变量下结论。修正后的 harness 已以回归测试构造这些路径，不能使用剩余预算补跑。#61 仍保持
+Blocked，直至新的受审查 synthetic baseline 成功，并取得新的真实样本授权。

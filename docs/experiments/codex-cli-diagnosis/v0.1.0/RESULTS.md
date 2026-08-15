@@ -3,7 +3,8 @@
 ## 结论
 
 **FAIL：尚未恢复 #76 所需的 strict structured-output baseline。** 根因已收敛为
-`structured_output_schema_failure`，而不是 auth、Codex CLI 基础执行或 #76 的双目录布局。
+`structured_output_schema_failure`。A 证明基础执行正常；本次历史调用没有严格把 schema 路径放入
+same/split 受控目录，因此不能据此排除目录布局变量。
 
 当前 `codex-cli 0.147.0` 的 response-format endpoint 拒绝 schema 中只有 `const` 而没有显式
 `type` 的 property。#76 的 `protocol_version` 使用该形态，因此在 Provider 开始生成结果前即被
@@ -16,8 +17,8 @@
 | --- | ---: | --- | --- |
 | A runtime/auth smoke | 是 | PASS，15.028s | `codex exec`、已登录 route 与基础模型执行正常。 |
 | B minimal strict schema | 是 | FAIL，20.141s | `invalid_json_schema`：`answer` property 的 `const` 缺少 `type`。 |
-| C #66 same-directory | 是 | PASS，28.678s | result file 存在、JSON 有效、strict binding/coverage 均通过。 |
-| D #76 split-directory contrast | 是 | PASS，33.568s | 与 C 同样 strict-valid；双目录布局未复现失败。 |
+| C #66 same-directory target | 是 | PASS，28.678s | result file 存在、JSON 有效、strict binding/coverage 均通过；历史调用未严格隔离 schema 路径。 |
+| D #76 split-directory target | 是 | PASS，33.568s | strict-valid；历史调用未严格隔离 schema 路径，不能据此排除双目录变量。 |
 | E corrected #76 small contract | 是 | FAIL，21.877s | `invalid_json_schema`：`protocol_version` property 的 `const` 缺少 `type`。 |
 | F corrected #76 19-anchor | 否 | 未调用 | E 已在请求 schema 提交阶段失败；扩大 anchor/context 不会提供新证据。 |
 
