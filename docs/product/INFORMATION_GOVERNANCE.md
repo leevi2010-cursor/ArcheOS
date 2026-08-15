@@ -129,7 +129,11 @@ Hypothesis 与当前 World Model 不一致时，首先把它当作待验证命�
 
 ---
 
-## 7. 安全自动更新
+## 7. 安全自动 World Model 变更
+
+World Model 的自动变更不再以“是否涉及新建 Object”作为一刀切门槛，而按**身份风险**与**结构变更风险**分别治理。
+
+### 7.1 已有 Object 的安全自动更新
 
 已有 Object 的更新在同时满足以下条件时可以自动执行：
 
@@ -138,16 +142,20 @@ Hypothesis 与当前 World Model 不一致时，首先把它当作待验证命�
 - 新信息与已有可信信息 / Claim 不冲突；
 - 业务含义清楚，没有明显歧义；
 - 使用的是已经批准的 Role / Relationship / Lifecycle 语义；
-- 不需要创建新 Object；
-- 不涉及删除 Object；
-- 不会使仍需保留的 Object 变成孤立对象；
+- 不涉及删除、合并 Object；
 - 不需要模型猜测一条不确定的 Relationship；
 - 如果信息带有 Claim，其结构变化不依赖尚未解决的“该相信谁”判断；
 - 如果结构变化依赖某个尚未验证的 Hypothesis，则不能仅凭该 Hypothesis 自动执行。
 
 例如：系统已经明确知道“展厅经营”是哪一个长期对象，新的可靠信息说明“9 月 1 日正式启动”，且与已有信息不冲突，可以直接补充其开始时间，不要求人类再次确认。
 
-自动更新仍必须保存来源、Evidence、Atomic Information / Claim / Hypothesis 和历史。
+### 7.2 新 Object 的安全自动创建
+
+新 Object 可以在通过第 10 节的 **Identity Gate** 后自动创建，但自动创建只确认“存在一个值得长期稳定引用的身份”，不同时自动确认不必要的 Role、Relationship、Lifecycle 或其他业务事实。
+
+自动创建和后续结构更新必须分别留痕；不能因为 Object 已自动创建，就把同一轮模型推断的其他结构全部视为已确认。
+
+所有自动 World Model 变更仍必须保存来源、Evidence、Atomic Information / Claim / Hypothesis 和历史，并写入 Change Journal 或等价审计链。
 
 ---
 
@@ -155,18 +163,22 @@ Hypothesis 与当前 World Model 不一致时，首先把它当作待验证命�
 
 以下情况停止自动修改，并请求人类判断：
 
-- 新建 Object；
-- 删除 Object；
-- 新旧可信信息或不同 Claim 发生冲突，且 World Model 更新依赖选择其中一方；
-- 无法确定新的 Atomic Information 对应哪个已有 Object；
+- 删除或合并 Object；
+- 新 Object 身份与一个或多个已有 Object 存在合理重复候选；
+- 无法唯一判断新的 Atomic Information 对应哪个已有 Object；
+- 新 Object 的身份只能依赖模糊名称、代词、弱上下文或模型猜测；
+- 冲突 Evidence 直接影响“这是同一个对象还是不同对象”的身份判断；
+- 创建 Object 的同时必须决定高影响 Role、Relationship、Lifecycle 或其他 consequential structure；
 - Relationship 的对象或业务含义不确定；
 - 新增或调整 Role 时，无法清楚说明它与对象当前业务上下文、现有关系的联系；
-- 变更可能使仍需保留的 Object 变成孤立对象；
 - 涉及真正的业务取舍，而不是证据明确的信息更新；
 - 需要比较不同 claimant / source 的可信度才能得出结论；
-- 需要把尚未验证的 Hypothesis 当作既定事实才能完成 consequential change。
+- 需要把尚未验证的 Hypothesis 当作既定事实才能完成 consequential change；
+- 错误身份会直接影响 consequential Decision / Action，且当前 Evidence 不能把风险降到可接受范围。
 
 人类判断可以直接通过 AI 对话或 prompt 完成，不要求专门审核前端。
+
+如果 Human 在正常工作中已经明确引用、命名或纠正一个长期对象，并且当前上下文能唯一确定该身份，这个明确表达本身可以作为人类判断；系统不应再追加一次“是否创建这个 Object”的重复确认。
 
 ---
 
@@ -193,21 +205,120 @@ related_to
 - 能用更具体已批准关系表达时，不应为了省事全部写成 `related_to`；
 - 现有词汇不足时保留 Atomic Information / Claim / Hypothesis，并交由 Architect 判断是否需要扩展；在 `CONCEPTS.md` 修改通过前，不允许 Agent 临时发明新的 relation 值。
 
+Object 通过 Identity Gate 自动创建，不等于任何 Relationship 自动成立。Relationship 仍按本节独立判断。
+
 是否增加新的通用 Relationship，只以真实数据反复证明的缺口为依据，不提前扩展。
 
 ---
 
-## 10. 新建 Object 与孤立对象
+## 10. 新建 Object：Identity Gate
 
-ArcheOS 应尽量避免创建没有业务联系的孤立 Object。
+ArcheOS 不要求每一个新 Object 都经过人工审批。新建 Object 的核心问题是：**是否已经有足够 Evidence 证明这里存在一个值得长期保持稳定身份、并且与已有 Object 不重复的对象。**
 
-新建 Object 时：
+`Identity Gate` 是治理规则名称，不是新的 Core concept，不创建独立 ID、Store 或生命周期。
 
-- 优先同时说明它与已有 Object 的业务关系；
-- 如果暂时无法建立关系，应向人类说明为什么这个对象仍值得单独长期保留；
-- 人类确认后才进入长期 World Model。
+### 10.1 五种处理结果
 
-系统不能因为录音、文档、Conversation 或 Hypothesis 里出现了一个名词，就自动把它升级成 Object。
+系统遇到可能的长期对象时，优先按以下顺序处理：
+
+```text
+明确已有身份
+→ 自动绑定已有 Object
+
+明确新身份 + 值得长期保持 + 低风险
+→ 自动创建最小 Object
+
+证据暂时不足
+→ 继续积累未匹配 Atomic Information / 技术性 emergence candidate
+
+身份歧义 / 重复风险 / consequential
+→ 人类判断
+
+不值得长期保持身份
+→ 只保留 Atomic Information
+```
+
+Object 不是所有 Information 最终必须挂载的容器。信息无法安全绑定 Object 时，可以长期保持未绑定状态。
+
+### 10.2 自动创建只建立“最小 Object”
+
+自动创建首先只确认稳定身份。第一步最多建立：
+
+```text
+stable object_id
++ 最小 Name（仅当 Evidence 明确支持）
++ supporting Atomic Information / Evidence / provenance
+```
+
+创建 Object **不等于**确认：
+
+- 它一定属于某个 Role；
+- 它与某个 Object 一定存在某条 Relationship；
+- 某个 Lifecycle 状态已经成立；
+- 关于它的所有 Claim / Hypothesis 都是真的。
+
+Role、Relationship、Lifecycle 与其他结构事实继续分别走各自的 Evidence 和 Governance。
+
+### 10.3 自动创建最低条件
+
+只有同时满足以下条件，才可以自动创建最小 Object：
+
+1. **长期身份价值明确**：它预计会被后续 Information、Context、Decision 或 Action 再次引用，而不是一次性动作、普通主题、属性值或模糊代词；
+2. **身份 Evidence 明确**：Evidence 能支持“这是哪个对象”，不能只依赖模型 confidence；
+3. **先查重**：已执行 current Name、historical Name / alias、稳定 external ID、已知关系与安全 normalization 等 existing-object resolution，没有合理的已有 Object 候选；
+4. **不要求猜结构**：创建最小 Object 不需要同时猜测关键 Role、Relationship 或 Lifecycle；
+5. **低业务后果**：创建这个身份本身不会直接触发 consequential Decision / Action 或外部写入；
+6. **provenance 完整**：能够说明为什么认为它是长期对象、依据哪些 Atomic Information / Evidence；
+7. **幂等**：相同身份 Evidence 的精确重试不能制造第二个 Object。
+
+强身份信号可以包括稳定 external ID、项目 / 合同 / 客户编号、明确系统 identity 等。没有强 ID 时，可以由多次一致出现、稳定名称、相同上下文、相容关系与多条 Evidence 逐步积累到 Identity Gate。
+
+不得把 `Atomic Information.confidence > 某阈值` 直接等价为“可以建 Object”。confidence 主要表达抽取 / 语义理解正确性，不是身份真实性概率。
+
+### 10.4 Evidence 不足时先积累，不急着审核
+
+潜在 Object 第一次出现时，如果身份价值或查重证据还不足，不要求立即创建，也不要求立即把问题推给 Human。
+
+系统可以继续保留未匹配 Atomic Information，并使用技术性的 emergence candidate / grouping 积累：
+
+- supporting Information；
+- 不同 Source / 时间的重复出现；
+- 稳定名称 / external ID；
+- possible existing matches；
+- unresolved identity questions。
+
+这些技术性 candidate 不成为新的业务 Core，也不要求每条进入人工审核队列。
+
+当后续 Evidence 足够时：
+
+- 明确已有 → 自动绑定；
+- 明确新身份且低风险 → 自动创建最小 Object；
+- 仍有真正歧义 / 高风险 → 再升级给 Human。
+
+### 10.5 Relationship 与孤立对象
+
+ArcheOS 仍应尽量避免无业务意义的孤立 Object，但**“暂时没有 Relationship”不再自动成为禁止创建的理由**。
+
+如果一个新身份本身已经明确、具有长期引用价值且 provenance 完整，可以先创建最小 Object，Relationship 等后续 Evidence 足够时再建立。
+
+这类 Object 至少必须有 supporting Atomic Information / Evidence，不能因为模型觉得“以后可能有用”就凭空创建。
+
+### 10.6 Human 明确表达避免重复确认
+
+如果 Human 在正常业务对话、纠正或命名中已经清楚表达某个长期对象，并且系统能够唯一解析该身份，则该 Human 表达可以直接满足人工判断要求。
+
+例如 Human 已明确说“海丝金融中心这个项目……”，且上下文不存在第二个合理身份候选，系统不应再问一次“是否创建海丝金融中心 Object？”才能继续。
+
+如果 Human 的表达本身仍有多个合理候选，则继续请求澄清，而不是把“来自 Human”误当作身份必然唯一。
+
+### 10.7 自动创建后的纠错
+
+自动创建不意味着 Object 永远正确。后续 Evidence 若显示身份重复、拆分错误或错误绑定：
+
+- 保留原 supporting Information / Evidence 与 Change Journal；
+- 停止继续扩大有问题的结构；
+- merge / delete / 需要改变稳定身份边界的操作交给 Human 判断；
+- 不通过静默删除或原地改 `object_id` 抹掉历史。
 
 ---
 
@@ -281,6 +392,7 @@ add_role(business_line)
 无论底层使用 JSONL、SQLite 或未来其他数据库：
 
 - 自动更新边界一致；
+- 自动创建 Object 的 Identity Gate 一致；
 - 人工判断边界一致；
 - Claim / Hypothesis / Evidence 与历史要求一致；
 - 孤立对象保护规则一致；
