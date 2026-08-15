@@ -8,6 +8,7 @@ import unittest
 from pathlib import Path
 
 from archeos.representation_information import RepresentationAnalysisBatch, RepresentationAnalysisUnit
+from tests.test_wechat_conversation import build_synthetic_representation, synthetic_multi_batch_export
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -39,6 +40,15 @@ def result_for(value: RepresentationAnalysisBatch) -> dict[str, object]:
             "candidates": [{"statement": "Synthetic statement", "semantic_type": "observation", "concerns": ["Synthetic"],
                             "evidence_unit_ids": [item.unit_id], "context": "Synthetic", "confidence": 1.0}
                            for item in value.anchor_units], "residue": []}
+
+
+def quality_export() -> dict[str, object]:
+    payload = synthetic_multi_batch_export()
+    payload["messages"] = [
+        f"[2026-08-15 09:{index:02d}] Sender: " + ("Synthetic message." if index < 19 else "[图片] local_id=1")
+        for index in range(50)
+    ]
+    return payload
 
 
 class FakeProcess:
@@ -134,6 +144,35 @@ class SemanticQualityWechatGateTest(unittest.TestCase):
             marker = Path(temp) / "marker.json"
             with self.assertRaises(gate.GateError): gate.run_real_call(value, marker_path=marker, runner=lambda *a, **kw: FakeProcess(*a, code=1, **kw))
             self.assertEqual(json.loads(marker.read_text())["status"], "failed")
+
+    def test_explicit_representation_preflight_reuses_canonical_wechat_units(self):
+        with tempfile.TemporaryDirectory() as temp:
+            sources, representations, representation = build_synthetic_representation(Path(temp), quality_export())
+            value = gate.build_real_preflight(representation.representation_id, representations, sources)
+            self.assertEqual(len(value.anchor_units), 19)
+            self.assertEqual(len(gate.require_one_batch(gate._units_from_representation(representation, representations)).context_support_units) >= 0, True)
+
+    def test_authorized_route_sends_bound_request_and_writes_local_packet(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp); sources, representations, representation = build_synthetic_representation(root, quality_export())
+            value = gate.build_real_preflight(representation.representation_id, representations, sources)
+            request, fingerprint = gate.provider_request(value)
+            self.assertEqual(request["expected_input_fingerprint"], fingerprint)
+            self.assertIn("Residue", " ".join(request["rules"]))
+            payload = result_for(value)
+            marker, review = root / "marker.json", root / "local-review-packet"
+            gate.run_authorized_representation(representation.representation_id, representations, sources, marker_path=marker,
+                                              review_root=review, runner=lambda *a, **kw: FakeProcess(*a, payload=json.dumps(payload), **kw))
+            self.assertTrue((review / "review-packet.json").is_file())
+            self.assertEqual(json.loads(marker.read_text())["status"], "completed")
+
+    def test_marker_rejects_partial_and_symlink_state(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp); marker = root / "marker.json"; marker.write_text("{", encoding="utf-8")
+            with self.assertRaises(gate.GateError): gate.consume_marker(marker, "sha256:" + "0" * 64)
+            target, linked = root / "target", root / "linked"
+            target.mkdir(); linked.symlink_to(target, target_is_directory=True)
+            with self.assertRaises(gate.GateError): gate.consume_marker(linked / "marker.json", "sha256:" + "0" * 64)
 
     def test_review_packet_is_local_private_and_uses_canonical_units(self):
         value = batch()

@@ -34,8 +34,11 @@ from archeos.representation_information import (  # noqa: E402
     _candidate_draft,
     _provider_unit,
     _residue_draft,
+    _units_from_representation,
     representation_analysis_schema,
 )
+from archeos.representation import LocalRepresentationRepository  # noqa: E402
+from archeos.source import LocalManagedSourceRepository  # noqa: E402
 
 ROOT = Path(__file__).resolve().parent
 SCHEMA_PATH = ROOT / "schemas" / "result.schema.json"
@@ -79,11 +82,46 @@ def provider_input(batch: RepresentationAnalysisBatch) -> dict[str, object]:
     }
 
 
+def provider_request(batch: RepresentationAnalysisBatch) -> tuple[dict[str, object], str]:
+    """Canonical request; its bound input is exactly the JSON sent via stdin."""
+    payload = provider_input(batch)
+    fingerprint = input_fingerprint(payload)
+    return ({"protocol_version": PROTOCOL_VERSION, "expected_input_fingerprint": fingerprint,
+             "rules": ["Return only the strict schema result.", "Account for every anchor exactly once with Candidate or Residue.",
+                       "Candidate must cite an anchor; context is Evidence only when explicitly cited and evidence-capable.",
+                       "Use Residue for unresolved or insufficiently supported anchors; never invent identity or facts."],
+             "input": payload}, fingerprint)
+
+
 def require_one_batch(units: tuple[Any, ...]) -> RepresentationAnalysisBatch:
     batches = _analysis_batches(units, 19)
     if len(batches) != 1 or len(batches[0].anchor_units) != 19:
         raise GateError("expected exactly one batch with 19 eligible anchors")
     return batches[0]
+
+
+def build_real_preflight(representation_id: str, representations: Any, sources: Any) -> RepresentationAnalysisBatch:
+    """Read-only #76 gate from an explicit representation ID; no provider or writes."""
+    representation = representations.get(representation_id)
+    if representation.kind != "wechat_conversation":
+        raise GateError("representation kind is not wechat_conversation")
+    verification = representations.verify(representation_id)
+    if not verification.verified:
+        raise GateError("representation verification failed")
+    source = sources.get(representation.source_id)
+    if source.availability != "available" or source.content_hash != representation.source_content_hash:
+        raise GateError("managed source is unavailable or hash-mismatched")
+    source_verification = sources.verify(representation.source_id)
+    if not source_verification.verified or source_verification.observed_content_hash != representation.source_content_hash:
+        raise GateError("managed source verification failed")
+    units = _units_from_representation(representation, representations)
+    if len(units) != 50:
+        raise GateError("expected exactly 50 canonical message units")
+    batch = require_one_batch(units)
+    # Re-verify immediately before an authorized process can be started.
+    if not representations.verify(representation_id).verified or not sources.verify(representation.source_id).verified:
+        raise GateError("input changed before provider invocation")
+    return batch
 
 
 def parse_and_validate(raw: str | None, batch: RepresentationAnalysisBatch, expected_fingerprint: str) -> RepresentationAnalysisResult:
@@ -110,10 +148,13 @@ def parse_and_validate(raw: str | None, batch: RepresentationAnalysisBatch, expe
 
 
 def _write_private_json(path: Path, value: object) -> None:
+    if path.is_symlink() or path.parent.is_symlink():
+        raise GateError("private artifact path must not traverse a symlink")
     path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     os.chmod(path.parent, 0o700)
-    temporary = path.with_suffix(path.suffix + ".tmp")
-    fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    fd, raw_temporary = tempfile.mkstemp(prefix=".issue76-", dir=path.parent)
+    temporary = Path(raw_temporary)
+    os.chmod(temporary, 0o600)
     with os.fdopen(fd, "wb") as handle:
         handle.write(canonical_bytes(value))
         handle.flush()
@@ -122,11 +163,13 @@ def _write_private_json(path: Path, value: object) -> None:
     os.chmod(path, 0o600)
 
 
-def consume_marker(marker_path: Path, fingerprint: str) -> None:
+def consume_marker(marker_path: Path, fingerprint: str, provider_version: str = "codex-cli-unverified") -> None:
+    if marker_path.is_symlink() or marker_path.parent.is_symlink():
+        raise GateError("marker path must not traverse a symlink")
     marker_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     os.chmod(marker_path.parent, 0o700)
-    value = {"issue": 76, "started_at": datetime.now(UTC).isoformat(),
-             "provider_route": "codex-cli", "input_fingerprint": fingerprint, "status": "started"}
+    value = {"issue": 76, "started_at": datetime.now(UTC).isoformat(), "provider_route": "codex-cli",
+             "provider_version": provider_version, "input_fingerprint": fingerprint, "status": "started"}
     try:
         fd = os.open(marker_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     except FileExistsError as exc:
@@ -138,6 +181,10 @@ def consume_marker(marker_path: Path, fingerprint: str) -> None:
 
 
 def update_marker(marker_path: Path, status: str) -> None:
+    if status not in {"completed", "failed"}:
+        raise GateError("invalid marker status")
+    if marker_path.is_symlink() or marker_path.parent.is_symlink():
+        raise GateError("marker path must not traverse a symlink")
     value = json.loads(marker_path.read_text(encoding="utf-8"))
     value["status"] = status
     _write_private_json(marker_path, value)
@@ -146,6 +193,21 @@ def update_marker(marker_path: Path, status: str) -> None:
 def codex_invocation(schema_path: Path, result_path: Path, cwd: Path) -> list[str]:
     return ["codex", "exec", "--ephemeral", "--sandbox", "read-only", "--skip-git-repo-check",
             "--output-schema", str(schema_path), "--output-last-message", str(result_path), "--cd", str(cwd), "-"]
+
+
+def _cleanup_process_group(process: Any) -> None:
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        try:
+            os.killpg(process.pid, sig)
+        except ProcessLookupError:
+            break
+        except OSError:
+            break
+        try:
+            process.communicate(timeout=5)
+            break
+        except subprocess.TimeoutExpired:
+            continue
 
 
 def run_codex_cli(prompt: str, schema_path: Path, result_path: Path, *, runner: Callable[..., Any] = subprocess.Popen) -> str:
@@ -160,28 +222,30 @@ def run_codex_cli(prompt: str, schema_path: Path, result_path: Path, *, runner: 
         try:
             _stdout, _stderr = process.communicate(input=prompt, timeout=TIMEOUT_SECONDS)
         except subprocess.TimeoutExpired as exc:
-            os.killpg(process.pid, signal.SIGTERM)
-            try:
-                process.communicate(timeout=5)
-            except subprocess.TimeoutExpired:
-                os.killpg(process.pid, signal.SIGKILL)
-                process.communicate()
+            _cleanup_process_group(process)
             raise GateError("provider timeout") from exc
+        except Exception as exc:
+            _cleanup_process_group(process)
+            raise GateError("provider process failed") from exc
         if process.returncode != 0:
+            _cleanup_process_group(process)
             raise GateError("provider exited non-zero")
         try:
             os.chmod(result_path, 0o600)
-            return result_path.read_text(encoding="utf-8")
+            raw = result_path.read_text(encoding="utf-8")
         except OSError as exc:
+            _cleanup_process_group(process)
             raise GateError("provider produced no result file") from exc
+        _cleanup_process_group(process)
+        return raw
 
 
 def run_real_call(batch: RepresentationAnalysisBatch, *, marker_path: Path = MARKER_PATH,
-                  runner: Callable[..., Any] = subprocess.Popen) -> RepresentationAnalysisResult:
+                  review_root: Path | None = None, runner: Callable[..., Any] = subprocess.Popen,
+                  provider_version: str = "codex-cli-unverified") -> RepresentationAnalysisResult:
     """The only real-call path.  It consumes the marker before process start."""
-    payload = provider_input(batch)
-    fingerprint = input_fingerprint(payload)
-    consume_marker(marker_path, fingerprint)
+    request, fingerprint = provider_request(batch)
+    consume_marker(marker_path, fingerprint, provider_version)
     try:
         with tempfile.TemporaryDirectory(prefix="archeos-issue76-result-") as directory:
             private_directory = Path(directory)
@@ -189,13 +253,22 @@ def run_real_call(batch: RepresentationAnalysisBatch, *, marker_path: Path = MAR
             result_path = private_directory / "result.json"
             schema_path = private_directory / "schema.json"
             _write_private_json(schema_path, strict_schema())
-            raw = run_codex_cli(json.dumps(payload, ensure_ascii=False), schema_path, result_path, runner=runner)
+            raw = run_codex_cli(canonical_bytes(request).decode("utf-8"), schema_path, result_path, runner=runner)
             result = parse_and_validate(raw, batch, fingerprint)
+            if review_root is not None:
+                packet = write_local_review_packet(batch, result, review_root)
+                if not packet.is_file() or packet.stat().st_mode & 0o777 != 0o600:
+                    raise GateError("local review packet readback failed")
         update_marker(marker_path, "completed")
         return result
     except Exception:
         update_marker(marker_path, "failed")
         raise
+
+
+def run_authorized_representation(representation_id: str, representations: Any, sources: Any, **kwargs: Any) -> RepresentationAnalysisResult:
+    """The explicit real CLI route; callers must already have reviewer authorization."""
+    return run_real_call(build_real_preflight(representation_id, representations, sources), **kwargs)
 
 
 def write_local_review_packet(
@@ -210,6 +283,7 @@ def write_local_review_packet(
             for unit_id in entry.evidence_unit_ids:
                 if unit_id in accounted:
                     accounted[unit_id].append(f"{label}_{index}")
+    supplied = {unit.unit_id: unit for unit in (*batch.anchor_units, *batch.context_support_units)}
     packet = {
         "anchor_view": [
             {"unit_id": unit.unit_id, "locator": unit.locator, "content": unit.content,
@@ -219,8 +293,17 @@ def write_local_review_packet(
         "candidate_view": [
             {"statement": candidate.statement, "semantic_type": candidate.semantic_type,
              "concerns": list(candidate.concerns), "evidence_unit_ids": list(candidate.evidence_unit_ids),
-             "context": candidate.context}
+             "context": candidate.context,
+             "canonical_evidence": [{"unit_id": unit_id, "content": supplied[unit_id].content,
+                                      "locator": supplied[unit_id].locator,
+                                      "role": "anchor" if unit_id in accounted else "context_support"}
+                                    for unit_id in candidate.evidence_unit_ids]}
             for candidate in result.candidates
+        ],
+        "context_support_view": [
+            {"unit_id": unit.unit_id, "content": unit.content, "locator": unit.locator,
+             "evidence_capable": unit.analysis_eligible}
+            for unit in batch.context_support_units
         ],
     }
     path = directory / "review-packet.json"
@@ -238,11 +321,21 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--synthetic", action="store_true")
     parser.add_argument("--real", action="store_true")
+    parser.add_argument("--representation-id")
+    parser.add_argument("--representation-root", type=Path)
+    parser.add_argument("--source-root", type=Path)
+    parser.add_argument("--review-root", type=Path)
+    parser.add_argument("--marker-path", type=Path, default=MARKER_PATH)
     args = parser.parse_args()
     if args.real:
         if os.environ.get("REAL_CALL_APPROVED") != "1":
             raise SystemExit("REAL_CALL_APPROVED is required before any real call")
-        raise SystemExit("real mode requires the authorized local representation adapter; not run by preflight")
+        if not all((args.representation_id, args.representation_root, args.source_root, args.review_root)):
+            raise SystemExit("--representation-id, --representation-root, --source-root and --review-root are required")
+        run_authorized_representation(args.representation_id, LocalRepresentationRepository(args.representation_root),
+                                      LocalManagedSourceRepository(args.source_root), marker_path=args.marker_path,
+                                      review_root=args.review_root)
+        return 0
     print(json.dumps(synthetic_status(), ensure_ascii=False, sort_keys=True))
     return 0
 

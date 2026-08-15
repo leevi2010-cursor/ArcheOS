@@ -8,4 +8,4 @@
 python docs/experiments/semantic-quality-wechat/v0.1.0/run_quality_gate.py --synthetic
 ```
 
-真实流程仅可在 Reviewer 的 `REAL_CALL_APPROVED` 后使用受控本地适配器执行。one-shot marker 会在 `codex exec` 前以 0600 原子落盘；timeout、非零退出或无效输出均消耗调用。真实 request/result/review packet 仅保存于 0700 临时目录及用户本地位置，不能提交。
+真实流程仅可在 Reviewer 的 `REAL_CALL_APPROVED` 后使用显式 `representation_id`、Source/Representation roots 与 local-only review root 执行。harness 会 verify Representation/Source/hash/kind，复用 #31 canonical units/batch，断言 50/19/唯一 batch，并在进程前再次 verify。one-shot marker 会在 `codex exec` 前以 0600 原子落盘；timeout、非零退出或无效输出均消耗调用。真实 request/result/review packet 仅保存于 0700 临时目录及用户本地位置，不能提交。
