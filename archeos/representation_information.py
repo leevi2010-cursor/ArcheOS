@@ -10,6 +10,7 @@ import signal
 import subprocess
 import tempfile
 import threading
+import time
 import uuid
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
@@ -413,6 +414,7 @@ class ExternalAgentExecutionRecord:
     processing_run_id: str
     protocol_version: str
     input_fingerprint: str
+    anchor_unit_ids: tuple[str, ...]
     provider_route: str
     provider_version: str
     started_at: str
@@ -466,6 +468,7 @@ class CodexCliRepresentationAnalysisProvider:
             "processing_run_id": "run_" + uuid.uuid4().hex,
             "protocol_version": EXTERNAL_AGENT_PROTOCOL_VERSION,
             "input_fingerprint": fingerprint,
+            "anchor_unit_ids": tuple(unit.unit_id for unit in batch.anchor_units),
             "provider_route": EXTERNAL_AGENT_ROUTE,
             "provider_version": self.provider_version,
             "started_at": _utc_timestamp(),
@@ -582,7 +585,7 @@ def _run_external_agent_once(
         return _ExternalAgentProcessOutcome(
             "timeout" if _terminate_process_group(process) else "process_cleanup_failure"
         )
-    except (OSError, subprocess.SubprocessError):
+    except Exception:
         return _ExternalAgentProcessOutcome(
             "runtime_execution_failure"
             if _terminate_process_group(process)
@@ -609,26 +612,40 @@ def _process_group_absent(pid: int) -> bool:
     return False
 
 
+def _wait_for_process_group_absence(pid: int, timeout_seconds: float) -> bool:
+    deadline = time.monotonic() + timeout_seconds
+    while True:
+        if _process_group_absent(pid):
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.02)
+
+
 def _terminate_process_group(process: Any) -> bool:
     try:
         os.killpg(process.pid, signal.SIGTERM)
     except (AttributeError, ProcessLookupError):
         return True
+    except PermissionError:
+        return False
     try:
         process.communicate(timeout=1)
-    except subprocess.TimeoutExpired:
+    except Exception:
         pass
-    if _process_group_absent(process.pid):
+    if _wait_for_process_group_absence(process.pid, 1):
         return True
     try:
         os.killpg(process.pid, signal.SIGKILL)
     except (AttributeError, ProcessLookupError):
         return True
+    except PermissionError:
+        return False
     try:
         process.communicate(timeout=2)
-    except subprocess.TimeoutExpired:
+    except Exception:
         pass
-    return _process_group_absent(process.pid)
+    return _wait_for_process_group_absence(process.pid, 1)
 
 
 def _canonical_fingerprint(value: object) -> str:

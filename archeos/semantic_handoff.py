@@ -57,15 +57,12 @@ class ExternalAgentSemanticHandoffService:
         package = self.representation_service.output_root / representation_id
         if os.path.lexists(package):
             try:
-                self._verify_replay_input(representation_id, package)
-                validate_representation_information_package(package)
+                manifest = self._verify_replay_input(representation_id, package)
                 audit_paths = self._matching_audit_paths(_package_fingerprint(package))
-                if not audit_paths:
-                    raise SemanticHandoffError(
-                        "已存在的信息包缺少可读回的 Processing Run 审计。"
-                    )
-                self._validate_replay_audits(audit_paths)
+                self._validate_replay_audits(audit_paths, manifest)
+                self._mark_durable_attempt(audit_paths)
                 ingestion = ingest_processing_package(package, self.store)
+                self._mark_durable_write(audit_paths)
                 self._readback_store(ingestion)
                 self._finalize_audits(audit_paths)
             except (
@@ -73,12 +70,15 @@ class ExternalAgentSemanticHandoffService:
                 ValueError,
                 TypeError,
                 RepresentationInformationError,
+                SemanticHandoffError,
             ) as exc:
                 raise SemanticHandoffError(
                     "已存在的信息包未能安全重放；未执行 External Agent。"
                 ) from exc
             return SemanticHandoffResult(package, ingestion, audit_paths, True)
 
+        audit_paths: tuple[Path, ...] = ()
+        ingestion: IngestionResult | None = None
         try:
             package = self.representation_service.extract(representation_id, provider)
             validate_representation_information_package(package)
@@ -95,14 +95,30 @@ class ExternalAgentSemanticHandoffService:
                 raise SemanticHandoffError(
                     "External Agent 未生成可读回的 Processing Run 审计。"
                 )
+            self._mark_durable_attempt(audit_paths)
             ingestion = ingest_processing_package(package, self.store)
+            self._mark_durable_write(audit_paths)
             self._readback_store(ingestion)
-        except (OSError, ValueError, TypeError, RepresentationInformationError) as exc:
+        except (
+            OSError,
+            ValueError,
+            TypeError,
+            RepresentationInformationError,
+            SemanticHandoffError,
+        ) as exc:
+            if ingestion is not None:
+                raise SemanticHandoffError(
+                    "Durable Atomic Information 已写入或正在读回；Processing Run 审计需要 exact replay 恢复。"
+                ) from exc
+            if audit_paths:
+                raise SemanticHandoffError(
+                    "Durable Atomic Information 写入结果待核验；Processing Run 审计需要 exact replay 恢复。"
+                ) from exc
             audit_paths = self._persist_audits(
                 provider.execution_records,
                 package_published=package.is_dir(),
                 information_ingested=False,
-                durable_ingestion_status="not_completed",
+                durable_ingestion_status="ingestion_not_completed",
                 package_fingerprint=(
                     _package_fingerprint(package) if package.is_dir() else None
                 ),
@@ -111,7 +127,7 @@ class ExternalAgentSemanticHandoffService:
             if not audit_paths and provider.execution_records:
                 raise SemanticHandoffError("External Agent 审计无法安全保存。") from exc
             raise SemanticHandoffError(
-                "External Agent 语义交接失败；未新增 Durable Atomic Information。"
+                "External Agent 语义交接失败；未确认新增 Durable Atomic Information。"
             ) from exc
         try:
             self._finalize_audits(audit_paths)
@@ -119,6 +135,7 @@ class ExternalAgentSemanticHandoffService:
             raise SemanticHandoffError(
                 "Durable Atomic Information 已写入，但 Processing Run 审计仍为待完成；需要人工恢复审计读回。"
             ) from exc
+        assert ingestion is not None
         return SemanticHandoffResult(package, ingestion, audit_paths, False)
 
     def _persist_audits(
@@ -139,6 +156,7 @@ class ExternalAgentSemanticHandoffService:
                 "processing_run_id": record.processing_run_id,
                 "protocol_version": record.protocol_version,
                 "input_fingerprint": record.input_fingerprint,
+                "anchor_unit_ids": list(record.anchor_unit_ids),
                 "provider_route": record.provider_route,
                 "provider_version": record.provider_version,
                 "started_at": record.started_at,
@@ -176,7 +194,9 @@ class ExternalAgentSemanticHandoffService:
             paths.append(path)
         return tuple(paths)
 
-    def _verify_replay_input(self, representation_id: str, package: Path) -> None:
+    def _verify_replay_input(
+        self, representation_id: str, package: Path
+    ) -> dict[str, object]:
         representation = self.representation_service.representation_repository.get(
             representation_id
         )
@@ -198,6 +218,7 @@ class ExternalAgentSemanticHandoffService:
             or source.get("content_hash") != representation.source_content_hash
         ):
             raise SemanticHandoffError("已存在的信息包不再匹配当前受管输入。")
+        return manifest
 
     def _matching_audit_paths(self, package_fingerprint: str) -> tuple[Path, ...]:
         if not self.audit_root.is_dir():
@@ -212,23 +233,128 @@ class ExternalAgentSemanticHandoffService:
                 matches.append(path)
         return tuple(matches)
 
-    def _validate_replay_audits(self, paths: tuple[Path, ...]) -> None:
+    def _validate_replay_audits(
+        self, paths: tuple[Path, ...], manifest: dict[str, object]
+    ) -> None:
+        batches = manifest.get("batches")
+        if not isinstance(batches, list):
+            raise SemanticHandoffError("已存在的信息包批次清单不可读。")
+        expected = [tuple(batch["unit_ids"]) for batch in batches]
+        if len(paths) != len(expected):
+            raise SemanticHandoffError("已存在的信息包缺少完整的 Processing Run 审计集合。")
+        required_fields = {
+            "schema_version",
+            "artifact_kind",
+            "processing_run_id",
+            "protocol_version",
+            "input_fingerprint",
+            "anchor_unit_ids",
+            "provider_route",
+            "provider_version",
+            "started_at",
+            "finished_at",
+            "execution_status",
+            "failure_category",
+            "strict_validation_status",
+            "result_fingerprint",
+            "eligible_units",
+            "covered_units",
+            "unaccounted_units",
+            "result_readback_status",
+            "package_published",
+            "package_fingerprint",
+            "information_ingested",
+            "durable_ingestion_status",
+            "handoff_status",
+            "audit_readback_status",
+        }
+        observed_batches: set[tuple[str, ...]] = set()
         for path in paths:
             audit = _private_json_read(path)
+            if set(audit) != required_fields:
+                raise SemanticHandoffError("已存在的信息包审计不完整。")
+            anchor_unit_ids = audit.get("anchor_unit_ids")
+            if (
+                not isinstance(anchor_unit_ids, list)
+                or not anchor_unit_ids
+                or any(not isinstance(item, str) for item in anchor_unit_ids)
+            ):
+                raise SemanticHandoffError("已存在的信息包审计缺少批次锚点。")
+            batch = tuple(anchor_unit_ids)
+            if batch not in expected or batch in observed_batches:
+                raise SemanticHandoffError("已存在的信息包审计批次集合不完整或冲突。")
+            observed_batches.add(batch)
+            durable_status = audit.get("durable_ingestion_status")
+            audit_readback_status = audit.get("audit_readback_status")
+            valid_completion_state = (
+                durable_status == "pending"
+                and audit.get("information_ingested") is False
+                and audit_readback_status == "verified"
+            ) or (
+                durable_status == "write_attempt_started"
+                and audit.get("information_ingested") is False
+                and audit_readback_status == "verified"
+            ) or (
+                durable_status == "written_readback_pending"
+                and audit.get("information_ingested") is True
+                and audit_readback_status == "verified"
+            ) or (
+                durable_status == "completed"
+                and audit.get("information_ingested") is True
+                and audit_readback_status in {"pending", "verified"}
+            )
             if (
                 audit.get("execution_status") != "succeeded"
                 or audit.get("strict_validation_status") != "passed"
                 or audit.get("package_published") is not True
-                or audit.get("audit_readback_status") != "verified"
-                or audit.get("durable_ingestion_status") not in {"pending", "completed"}
+                or not valid_completion_state
             ):
                 raise SemanticHandoffError("已存在的信息包审计状态不能安全重放。")
+        if observed_batches != set(expected):
+            raise SemanticHandoffError("已存在的信息包审计集合不完整。")
 
     def _readback_store(self, ingestion: IngestionResult) -> None:
         for atomic_information_id in ingestion.atomic_information_ids:
             observed = self.store.get_current(atomic_information_id)
             if observed.atomic_information_id != atomic_information_id:
                 raise SemanticHandoffError("Durable Atomic Information 读回不一致。")
+
+    def _mark_durable_attempt(self, paths: tuple[Path, ...]) -> None:
+        """Record an auditable Store-write boundary before the unique Store call."""
+        for path in paths:
+            try:
+                payload = _private_json_read(path)
+                payload["durable_ingestion_status"] = "write_attempt_started"
+                payload["handoff_status"] = "pending_durable_write"
+                payload["audit_readback_status"] = "pending"
+                _private_json_write(path, payload)
+                if _private_json_read(path) != payload:
+                    raise SemanticHandoffError("Processing Run 审计写入边界读回失败。")
+                payload["audit_readback_status"] = "verified"
+                _private_json_write(path, payload)
+                if _private_json_read(path) != payload:
+                    raise SemanticHandoffError("Processing Run 审计写入边界读回失败。")
+            except (OSError, ValueError, TypeError, json.JSONDecodeError):
+                raise SemanticHandoffError("Processing Run 审计写入边界读回失败。")
+
+    def _mark_durable_write(self, paths: tuple[Path, ...]) -> None:
+        """Persist the truthful recovery state before durable Store readback."""
+        for path in paths:
+            try:
+                payload = _private_json_read(path)
+                payload["information_ingested"] = True
+                payload["durable_ingestion_status"] = "written_readback_pending"
+                payload["handoff_status"] = "pending_readback"
+                payload["audit_readback_status"] = "pending"
+                _private_json_write(path, payload)
+                if _private_json_read(path) != payload:
+                    raise SemanticHandoffError("Processing Run 审计写入状态读回失败。")
+                payload["audit_readback_status"] = "verified"
+                _private_json_write(path, payload)
+                if _private_json_read(path) != payload:
+                    raise SemanticHandoffError("Processing Run 审计写入状态读回失败。")
+            except (OSError, ValueError, TypeError, json.JSONDecodeError):
+                raise SemanticHandoffError("Processing Run 审计写入状态读回失败。")
 
     def _finalize_audits(self, paths: tuple[Path, ...]) -> None:
         for path in paths:

@@ -296,7 +296,7 @@ class SemanticHandoffTest(unittest.TestCase):
             JsonlAtomicInformationStore(self.root / "atomic.jsonl"),
             self.root / "audits",
         )
-        with self.assertRaisesRegex(Exception, "未新增 Durable"):
+        with self.assertRaisesRegex(Exception, "未确认新增 Durable"):
             handoff.execute(representation.representation_id, provider)
         self.assertFalse(
             (self.root / "information" / representation.representation_id).exists()
@@ -354,7 +354,11 @@ class SemanticHandoffTest(unittest.TestCase):
 
         def fail_final_write(path, payload):
             nonlocal failed
-            if payload.get("durable_ingestion_status") == "completed" and not failed:
+            if (
+                payload.get("durable_ingestion_status") == "completed"
+                and payload.get("audit_readback_status") == "verified"
+                and not failed
+            ):
                 failed = True
                 raise OSError("synthetic final audit failure")
             original_write(path, payload)
@@ -372,7 +376,8 @@ class SemanticHandoffTest(unittest.TestCase):
         pending = json.loads(
             next(audit_root.glob("*/processing-run-audit.json")).read_text()
         )
-        self.assertEqual(pending["durable_ingestion_status"], "pending")
+        self.assertEqual(pending["durable_ingestion_status"], "completed")
+        self.assertEqual(pending["audit_readback_status"], "pending")
         replay = handoff.execute(
             representation.representation_id,
             CodexCliRepresentationAnalysisProvider(
@@ -395,7 +400,7 @@ class SemanticHandoffTest(unittest.TestCase):
         provider = CodexCliRepresentationAnalysisProvider(
             provider_version="0.147.0", runner=SequenceRunner("valid", "nonzero")
         )
-        with self.assertRaisesRegex(Exception, "未新增 Durable"):
+        with self.assertRaisesRegex(Exception, "未确认新增 Durable"):
             handoff.execute(representation.representation_id, provider)
         audits = sorted((self.root / "audits").glob("*/processing-run-audit.json"))
         self.assertEqual(len(audits), 2)
@@ -423,7 +428,9 @@ class SemanticHandoffTest(unittest.TestCase):
                 case.assertEqual(len(audits), 1)
                 observed = json.loads(audits[0].read_text())
                 case.assertEqual(observed["audit_readback_status"], "verified")
-                case.assertEqual(observed["durable_ingestion_status"], "pending")
+                case.assertEqual(
+                    observed["durable_ingestion_status"], "write_attempt_started"
+                )
                 return super().ingest_batch(revisions)
 
         provider = CodexCliRepresentationAnalysisProvider(
@@ -433,6 +440,153 @@ class SemanticHandoffTest(unittest.TestCase):
             service, InspectingStore(self.root / "atomic.jsonl"), audit_root
         )
         handoff.execute(representation.representation_id, provider)
+
+    def test_replay_requires_the_complete_batch_audit_set_before_store_write(
+        self,
+    ) -> None:
+        representation, service = self.build_service(blocks=2)
+        service.batch_size = 1
+        audit_root = self.root / "audits"
+        handoff = ExternalAgentSemanticHandoffService(
+            service,
+            JsonlAtomicInformationStore(self.root / "initial-atomic.jsonl"),
+            audit_root,
+        )
+        handoff.execute(
+            representation.representation_id,
+            CodexCliRepresentationAnalysisProvider(
+                provider_version="0.147.0", runner=SequenceRunner("valid", "valid")
+            ),
+        )
+        next(audit_root.glob("*/processing-run-audit.json")).unlink()
+        replay_store = self.root / "replay-atomic.jsonl"
+        with self.assertRaisesRegex(Exception, "未能安全重放"):
+            ExternalAgentSemanticHandoffService(
+                service, JsonlAtomicInformationStore(replay_store), audit_root
+            ).execute(
+                representation.representation_id,
+                CodexCliRepresentationAnalysisProvider(
+                    provider_version="0.147.0", runner=FakeRunner()
+                ),
+            )
+        self.assertFalse(replay_store.exists())
+
+    def test_replay_rejects_corrupt_batch_audit_before_store_write(self) -> None:
+        representation, service = self.build_service(blocks=2)
+        service.batch_size = 1
+        audit_root = self.root / "audits"
+        handoff = ExternalAgentSemanticHandoffService(
+            service,
+            JsonlAtomicInformationStore(self.root / "initial-atomic.jsonl"),
+            audit_root,
+        )
+        handoff.execute(
+            representation.representation_id,
+            CodexCliRepresentationAnalysisProvider(
+                provider_version="0.147.0", runner=SequenceRunner("valid", "valid")
+            ),
+        )
+        next(audit_root.glob("*/processing-run-audit.json")).write_text(
+            "{synthetic corruption", encoding="utf-8"
+        )
+        replay_store = self.root / "replay-atomic.jsonl"
+        with self.assertRaisesRegex(Exception, "未能安全重放"):
+            ExternalAgentSemanticHandoffService(
+                service, JsonlAtomicInformationStore(replay_store), audit_root
+            ).execute(
+                representation.representation_id,
+                CodexCliRepresentationAnalysisProvider(
+                    provider_version="0.147.0", runner=FakeRunner()
+                ),
+            )
+        self.assertFalse(replay_store.exists())
+
+    def test_store_readback_failure_keeps_truthful_recovery_audit(self) -> None:
+        representation, service = self.build_service()
+        store_path = self.root / "atomic.jsonl"
+        audit_root = self.root / "audits"
+
+        class ReadbackFailingStore(JsonlAtomicInformationStore):
+            def get_current(self, _atomic_information_id):
+                raise OSError("synthetic store readback failure")
+
+        with self.assertRaisesRegex(Exception, "已写入或正在读回"):
+            ExternalAgentSemanticHandoffService(
+                service, ReadbackFailingStore(store_path), audit_root
+            ).execute(
+                representation.representation_id,
+                CodexCliRepresentationAnalysisProvider(
+                    provider_version="0.147.0", runner=FakeRunner()
+                ),
+            )
+        pending = json.loads(
+            next(audit_root.glob("*/processing-run-audit.json")).read_text()
+        )
+        self.assertTrue(pending["information_ingested"])
+        self.assertEqual(
+            pending["durable_ingestion_status"], "written_readback_pending"
+        )
+        self.assertTrue(store_path.exists())
+        replay = ExternalAgentSemanticHandoffService(
+            service, JsonlAtomicInformationStore(store_path), audit_root
+        ).execute(
+            representation.representation_id,
+            CodexCliRepresentationAnalysisProvider(
+                provider_version="0.147.0", runner=FakeRunner()
+            ),
+        )
+        self.assertEqual(replay.ingestion.existing, 1)
+        completed = json.loads(replay.audit_paths[0].read_text())
+        self.assertEqual(completed["durable_ingestion_status"], "completed")
+        self.assertEqual(completed["audit_readback_status"], "verified")
+
+    def test_communicate_value_error_cleans_up_process_group(self) -> None:
+        from archeos import representation_information
+
+        class BrokenProcess:
+            pid = 12345
+            returncode = None
+
+            def communicate(self, **_kwargs):
+                raise ValueError("synthetic encoding failure")
+
+        signals: list[int] = []
+
+        def kill_group(_pid: int, signal: int) -> None:
+            signals.append(signal)
+            if signal == 0:
+                raise ProcessLookupError
+
+        with patch.object(representation_information.os, "killpg", kill_group):
+            outcome = representation_information._run_external_agent_once(
+                ["synthetic"],
+                "synthetic",
+                1,
+                lambda *_args, **_kwargs: BrokenProcess(),
+            )
+        self.assertEqual(outcome.failure_category, "runtime_execution_failure")
+        self.assertIn(representation_information.signal.SIGTERM, signals)
+
+    def test_nonzero_permission_error_is_cleanup_failure_not_exception(self) -> None:
+        from archeos import representation_information
+
+        class NonzeroProcess:
+            pid = 12345
+            returncode = 7
+
+            def communicate(self, **_kwargs):
+                return "", "synthetic nonzero"
+
+        with patch.object(
+            representation_information.os, "killpg", side_effect=PermissionError
+        ):
+            outcome = representation_information._run_external_agent_once(
+                ["synthetic"],
+                "synthetic",
+                1,
+                lambda *_args, **_kwargs: NonzeroProcess(),
+            )
+        self.assertEqual(outcome.failure_category, "process_cleanup_failure")
 
     def test_handoff_does_not_import_world_model_or_offer_fallback(self) -> None:
         import archeos.semantic_handoff as handoff_module
