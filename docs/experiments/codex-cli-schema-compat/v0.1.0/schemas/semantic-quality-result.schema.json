@@ -1,0 +1,39 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["protocol_version", "input_fingerprint", "candidates", "residue"],
+  "properties": {
+    "candidates": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["statement", "semantic_type", "concerns", "evidence_unit_ids", "context", "confidence"],
+        "properties": {
+          "statement": {"type": "string", "minLength": 1},
+          "semantic_type": {"type": "string", "enum": ["action", "commitment", "decision", "judgment", "observation", "other", "preference", "question", "requirement"]},
+          "concerns": {"type": "array", "items": {"type": "string", "minLength": 1}, "minItems": 1},
+          "evidence_unit_ids": {"type": "array", "items": {"type": "string"}, "minItems": 1},
+          "context": {"type": "string", "minLength": 1},
+          "confidence": {"type": "number", "minimum": 0, "maximum": 1}
+        }
+      }
+    },
+    "residue": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["evidence_unit_ids", "reason_not_absorbed", "future_value_or_uncertainty"],
+        "properties": {
+          "evidence_unit_ids": {"type": "array", "items": {"type": "string"}, "minItems": 1},
+          "reason_not_absorbed": {"type": "string", "minLength": 1},
+          "future_value_or_uncertainty": {"type": "string", "minLength": 1}
+        }
+      }
+    },
+    "protocol_version": {"type": "string", "const": "semantic-quality-wechat/1.0"},
+    "input_fingerprint": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"}
+  }
+}
