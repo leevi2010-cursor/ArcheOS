@@ -308,22 +308,51 @@ def _process_group_absent(pid: int) -> bool:
     return False
 
 
-def terminate_process_group(process: Any) -> str:
-    """Terminate, verify, kill, then verify a timed-out process group."""
+@dataclass(frozen=True)
+class CleanupOutcome:
+    status: str
+    stdout: str
+    stderr: str
+    drain_timed_out: bool
+    process_group_absent: bool
+
+
+def _bounded_drain(process: Any) -> tuple[str, str, bool]:
+    try:
+        stdout, stderr = process.communicate(timeout=5)
+        return stdout, stderr, False
+    except subprocess.TimeoutExpired as exc:
+        return str(exc.output or ""), str(exc.stderr or ""), True
+
+
+def _signal_process_group(process: Any, sig: signal.Signals) -> None:
+    try:
+        os.killpg(process.pid, sig)
+    except ProcessLookupError:
+        return
+    except OSError as exc:
+        if exc.errno != errno.ESRCH:
+            raise ProcessCleanupError("process-group signal failed") from exc
+
+
+def terminate_process_group(process: Any) -> CleanupOutcome:
+    """TERM, reap, verify; then KILL, reap, and finally verify if required."""
     if not isinstance(getattr(process, "pid", None), int):
         raise ProcessCleanupError("timed-out process has no valid process-group id")
     if _process_group_absent(process.pid):
-        return "already_absent"
-    for sig, status in ((signal.SIGTERM, "terminated"), (signal.SIGKILL, "killed")):
-        try:
-            os.killpg(process.pid, sig)
-        except ProcessLookupError:
-            return status
-        except OSError as exc:
-            if exc.errno != errno.ESRCH:
-                raise ProcessCleanupError("process-group signal failed") from exc
-        if _process_group_absent(process.pid):
-            return status
+        stdout, stderr, drain_timed_out = _bounded_drain(process)
+        return CleanupOutcome("already_absent", stdout, stderr, drain_timed_out, True)
+    _signal_process_group(process, signal.SIGTERM)
+    stdout, stderr, drain_timed_out = _bounded_drain(process)
+    if _process_group_absent(process.pid):
+        return CleanupOutcome("terminated", stdout, stderr, drain_timed_out, True)
+    _signal_process_group(process, signal.SIGKILL)
+    kill_stdout, kill_stderr, kill_drain_timed_out = _bounded_drain(process)
+    stdout += kill_stdout
+    stderr += kill_stderr
+    drain_timed_out = drain_timed_out or kill_drain_timed_out
+    if _process_group_absent(process.pid):
+        return CleanupOutcome("killed", stdout, stderr, drain_timed_out, True)
     raise ProcessCleanupError("timed-out process group remains after SIGKILL")
 
 
@@ -337,6 +366,8 @@ class ProcessOutcome:
     cleanup_status: str
     cleanup_error: str | None
     drain_timed_out: bool
+    process_group_id: int | None
+    process_group_absent: bool | None
 
 
 def run_bounded_process(
@@ -358,24 +389,46 @@ def run_bounded_process(
             env=safe_environment(),
         )
     except OSError as exc:
-        return ProcessOutcome("", "", None, False, f"{type(exc).__name__}: {exc}", "not_started", None, False)
+        return ProcessOutcome(
+            "",
+            "",
+            None,
+            False,
+            f"{type(exc).__name__}: {exc}",
+            "not_started",
+            None,
+            False,
+            None,
+            None,
+        )
     try:
         stdout, stderr = process.communicate(input=input_text, timeout=timeout)
-        return ProcessOutcome(stdout, stderr, process.returncode, False, None, "not_required", None, False)
-    except subprocess.TimeoutExpired as exc:
+        return ProcessOutcome(
+            stdout,
+            stderr,
+            process.returncode,
+            False,
+            None,
+            "not_required",
+            None,
+            False,
+            process.pid,
+            None,
+        )
+    except subprocess.TimeoutExpired:
         cleanup_status = "failed"
         cleanup_error: str | None = None
+        stdout = stderr = ""
+        drain_timed_out = True
+        process_group_absent = False
         try:
-            cleanup_status = terminate_process_group(process)
+            cleanup = terminate_process_group(process)
+            cleanup_status = cleanup.status
+            stdout, stderr = cleanup.stdout, cleanup.stderr
+            drain_timed_out = cleanup.drain_timed_out
+            process_group_absent = cleanup.process_group_absent
         except ProcessCleanupError as cleanup_exc:
             cleanup_error = str(cleanup_exc)
-        try:
-            stdout, stderr = process.communicate(timeout=5)
-            drain_timed_out = False
-        except subprocess.TimeoutExpired:
-            stdout = str(exc.output or "")
-            stderr = str(exc.stderr or "")
-            drain_timed_out = True
         return ProcessOutcome(
             stdout,
             stderr,
@@ -385,6 +438,8 @@ def run_bounded_process(
             cleanup_status,
             cleanup_error,
             drain_timed_out,
+            process.pid,
+            process_group_absent,
         )
 
 
@@ -410,6 +465,7 @@ def run_codex_version(
         "cleanup_status": outcome.cleanup_status,
         "cleanup_error": redact(outcome.cleanup_error or "") or None,
         "drain_timed_out": outcome.drain_timed_out,
+        "process_group_absent": outcome.process_group_absent,
         "failure_category": category,
         "codex_version": redact((outcome.stdout or outcome.stderr).strip()) or None,
     }
@@ -500,6 +556,7 @@ def run_one(spec: RunSpec, *, codex_bin: str, timeout: int, popen: Callable[...,
             "cleanup_status": outcome.cleanup_status,
             "cleanup_error": redact(outcome.cleanup_error or "") or None,
             "drain_timed_out": outcome.drain_timed_out,
+            "process_group_absent": outcome.process_group_absent,
             "result_file_present": result_present,
             "json_status": json_status,
             "strict_schema_status": validation,

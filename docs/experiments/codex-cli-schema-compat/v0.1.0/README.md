@@ -25,4 +25,5 @@ python3 docs/experiments/codex-cli-schema-compat/v0.1.0/run_schema_compat.py \
 环境变量、token、本机路径或任何真实数据。
 
 `codex --version` 和每次执行都记录 startup、timeout、exit code 与受控 process-group cleanup 结果。timeout 时按
-`SIGTERM → absence verify → SIGKILL → absence verify` 收口，pipe drain 也有固定上限，避免无限等待或残留进程。
+`SIGTERM → bounded drain/reap → absence verify → SIGKILL（仅在仍存在时）→ bounded drain/reap → final verify`
+收口，避免把尚未回收的 zombie 误报为残留进程，pipe drain 也有固定上限。

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -199,10 +200,29 @@ class CodexCliSchemaCompatibilityTest(unittest.TestCase):
         self.assertEqual(result["status"], "failed")
         self.assertTrue(result["timed_out"])
         self.assertEqual(result["cleanup_status"], "killed")
+        self.assertTrue(result["process_group_absent"])
         self.assertEqual(
             controller.calls,
             [0, compat.signal.SIGTERM, 0, compat.signal.SIGKILL, 0],
         )
+
+    def test_real_local_synthetic_child_timeout_is_reaped_before_absence_check(self):
+        outcome = compat.run_bounded_process(
+            [
+                sys.executable,
+                "-c",
+                "import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(60)",
+            ],
+            input_text=None,
+            timeout=1,
+        )
+        self.assertTrue(outcome.timed_out)
+        self.assertEqual(outcome.cleanup_status, "killed")
+        self.assertTrue(outcome.process_group_absent)
+        self.assertTrue(outcome.drain_timed_out)
+        self.assertIsNotNone(outcome.process_group_id)
+        with self.assertRaises(ProcessLookupError):
+            os.killpg(outcome.process_group_id, 0)
 
     def test_context_evidence_error_fails_closed(self):
         spec = compat.runs()[1]
