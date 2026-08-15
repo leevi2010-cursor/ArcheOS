@@ -7,7 +7,7 @@
     "input_fingerprint", "provider_route", "provider_version", "started_at", "finished_at",
     "execution_status", "failure_category", "result_present", "result_fingerprint",
     "strict_validation_status", "eligible_units", "covered_units", "unaccounted_units",
-    "package_published", "information_ingested", "cleanup_status",
+    "package_published", "information_ingested", "cleanup_status", "cleanup_observation",
     "privacy_observation_status", "privacy_observation", "temporary_permissions_status",
     "result_readback_status", "audit_readback_status"
   ],
@@ -17,8 +17,8 @@
     "processing_run_id": {"type": "string", "pattern": "^run_[0-9a-f]{32}$"},
     "protocol_version": {"type": "string", "const": "external-agent-handoff/1.0"},
     "input_fingerprint": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
-    "provider_route": {"type": "string", "minLength": 1},
-    "provider_version": {"type": "string", "minLength": 1},
+    "provider_route": {"type": "string", "pattern": "^[a-z0-9][a-z0-9._-]{0,63}$"},
+    "provider_version": {"type": "string", "pattern": "^(codex-cli [0-9]+(\\.[0-9A-Za-z-]+){1,3}|test-v[0-9]+|invalid-version-[0-9a-f]{12})$"},
     "started_at": {"type": "string", "minLength": 1},
     "finished_at": {"type": "string", "minLength": 1},
     "execution_status": {"type": "string", "enum": ["succeeded", "failed"]},
@@ -32,18 +32,30 @@
     "package_published": {"type": "boolean", "const": false},
     "information_ingested": {"type": "boolean", "const": false},
     "cleanup_status": {"type": "string", "enum": ["verified", "failed"]},
+    "cleanup_observation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["process_group_absent", "observed_processes_absent", "temporary_directory_absent", "terminated_processes"],
+      "properties": {
+        "process_group_absent": {"type": "boolean"},
+        "observed_processes_absent": {"type": "boolean"},
+        "temporary_directory_absent": {"type": "boolean"},
+        "terminated_processes": {"type": "integer", "minimum": 0}
+      }
+    },
     "privacy_observation_status": {"type": "string", "enum": ["passed", "failed", "unavailable"]},
     "privacy_observation": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["backend", "root_observed", "snapshots", "observed_processes", "argv_sensitive_hits", "environment_sensitive_hits"],
+      "required": ["backend", "root_observed", "snapshots", "observed_processes", "metadata_sensitive_hits", "metadata_read_failures", "observation_complete"],
       "properties": {
-        "backend": {"type": "string", "enum": ["procfs", "ps", "unsupported"]},
+        "backend": {"type": "string", "minLength": 1},
         "root_observed": {"type": "boolean"},
         "snapshots": {"type": "integer", "minimum": 0},
         "observed_processes": {"type": "integer", "minimum": 0},
-        "argv_sensitive_hits": {"type": "integer", "minimum": 0},
-        "environment_sensitive_hits": {"type": "integer", "minimum": 0}
+        "metadata_sensitive_hits": {"type": "integer", "minimum": 0},
+        "metadata_read_failures": {"type": "integer", "minimum": 0},
+        "observation_complete": {"type": "boolean"}
       }
     },
     "temporary_permissions_status": {"type": "string", "enum": ["verified", "failed"]},

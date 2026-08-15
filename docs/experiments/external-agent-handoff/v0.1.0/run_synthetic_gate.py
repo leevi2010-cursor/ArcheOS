@@ -1,11 +1,9 @@
 #!/usr/bin/env python3
 """Run the Issue #66 synthetic External Agent Handoff privacy/audit gate.
 
-This experiment is intentionally isolated from ``archeos/``. It accepts only
-the committed public synthetic fixture, launches one external process with the
-request on stdin, observes the controlled process tree without persisting raw
-argv/environment metadata, and publishes only a validated synthetic result and
-an anonymous Processing Run audit Derived Artifact.
+Only the pinned public fixture is accepted. Sampling process observation can
+detect a leak but can never prove absence, so a zero-hit live route remains
+``privacy_observation_unavailable`` and fails closed.
 """
 
 from __future__ import annotations
@@ -15,22 +13,28 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import signal
 import subprocess
 import sys
 import tempfile
 import threading
+import time
 import uuid
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Protocol
 
 ROOT = Path(__file__).resolve().parent
 FIXTURE_PATH = ROOT / "fixtures" / "synthetic-handoff-package.json"
 RESULT_SCHEMA_PATH = ROOT / "schemas" / "external-agent-result.schema.json"
 PROTOCOL_VERSION = "external-agent-handoff/1.0"
 AUDIT_SCHEMA_VERSION = "processing-run-audit/1.0"
+COMMITTED_FIXTURE_FINGERPRINT = (
+    "sha256:eed41def9a10a95a15528f83ba3a13e58f81db52789f2b8cce8396ab13ea4069"
+)
 SEMANTIC_TYPES = {
     "observation",
     "requirement",
@@ -41,6 +45,10 @@ SEMANTIC_TYPES = {
     "other",
 }
 FINGERPRINT_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
+SAFE_ROUTE_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
+SAFE_VERSION_RE = re.compile(
+    r"^(?:codex-cli [0-9]+(?:\.[0-9A-Za-z-]+){1,3}|test-v[0-9]+|invalid-version-[0-9a-f]{12})$"
+)
 
 
 class ResultContractError(ValueError):
@@ -49,6 +57,10 @@ class ResultContractError(ValueError):
 
 class ResultBindingError(ResultContractError):
     """The external result is not bound to this input/protocol."""
+
+
+class ArtifactPersistenceError(RuntimeError):
+    """No safe audit bundle could be published."""
 
 
 @dataclass(frozen=True)
@@ -64,11 +76,25 @@ class GateRun:
     audit_path: Path
     result_path: Path | None
     audit: dict[str, object]
+    observed_process_ids: tuple[int, ...]
+
+
+class PrivacyObserver(Protocol):
+    observed_pids: set[int]
+
+    def start(self) -> None: ...
+
+    def stop(self) -> None: ...
+
+    def summary(self) -> dict[str, object]: ...
 
 
 InvocationBuilder = Callable[
     [dict[str, object], Path, Path, Path], ExternalAgentInvocation
 ]
+ObserverFactory = Callable[[int, Sequence[str]], PrivacyObserver]
+ArtifactWriter = Callable[[Path, object], None]
+ArtifactReader = Callable[[Path], dict[str, object]]
 
 
 def _utc_now() -> str:
@@ -94,8 +120,7 @@ def _load_json_object(path: Path) -> dict[str, object]:
     return value
 
 
-def load_synthetic_package(path: Path = FIXTURE_PATH) -> dict[str, object]:
-    package = _load_json_object(path)
+def _validate_package_structure(package: object) -> dict[str, object]:
     required = {
         "fixture_version",
         "protocol_version",
@@ -106,8 +131,10 @@ def load_synthetic_package(path: Path = FIXTURE_PATH) -> dict[str, object]:
         "credential_canary",
         "units",
     }
-    if set(package) != required or package.get("protocol_version") != PROTOCOL_VERSION:
-        raise ValueError("synthetic package schema/protocol mismatch")
+    if not isinstance(package, dict) or set(package) != required:
+        raise ValueError("synthetic package schema mismatch")
+    if package.get("protocol_version") != PROTOCOL_VERSION:
+        raise ValueError("synthetic package protocol mismatch")
     for field in required - {"units"}:
         value = package[field]
         if not isinstance(value, str) or not value:
@@ -127,8 +154,17 @@ def load_synthetic_package(path: Path = FIXTURE_PATH) -> dict[str, object]:
     return package
 
 
+def load_synthetic_package(path: Path | None = None) -> dict[str, object]:
+    package = _validate_package_structure(
+        _load_json_object(FIXTURE_PATH if path is None else Path(path))
+    )
+    if fingerprint(package) != COMMITTED_FIXTURE_FINGERPRINT:
+        raise ValueError("synthetic fixture does not match the committed fingerprint")
+    return package
+
+
 def sensitive_values(package: Mapping[str, object]) -> tuple[str, ...]:
-    values = tuple(
+    values: list[str] = [
         str(package[field])
         for field in (
             "canary",
@@ -137,10 +173,13 @@ def sensitive_values(package: Mapping[str, object]) -> tuple[str, ...]:
             "business_path",
             "credential_canary",
         )
-    )
-    if len(set(values)) != len(values):
-        raise ValueError("synthetic sensitive values must be unique")
-    return values
+    ]
+    units = package["units"]
+    assert isinstance(units, list)
+    for unit in units:
+        assert isinstance(unit, dict)
+        values.extend((str(unit["unit_id"]), str(unit["content"])))
+    return tuple(dict.fromkeys(values))
 
 
 def _eligible_unit_ids(package: Mapping[str, object]) -> tuple[str, ...]:
@@ -236,8 +275,7 @@ def validate_result(
                 if reference in seen:
                     raise ResultContractError("result references a unit more than once")
                 seen.add(reference)
-    missing = allowed - seen
-    if missing:
+    if allowed - seen:
         raise ResultContractError("result does not cover every eligible unit")
     return {
         "eligible_units": len(allowed),
@@ -259,7 +297,13 @@ def _descendants(root_pid: int, parents: Mapping[int, int]) -> set[int]:
 
 
 class ProcessTreePrivacyObserver:
-    """Sample argv/environment of one controlled process tree without storing it."""
+    """Conservative selected-PID metadata sampler for one controlled tree.
+
+    Global enumeration reads PID/PPID topology only. Command/environment bytes
+    are requested only for PIDs already selected as root/descendants. Because
+    polling can miss a short-lived exec, ``observation_complete`` is always
+    false and zero hits can never produce a privacy PASS.
+    """
 
     def __init__(
         self, root_pid: int, forbidden_values: Sequence[str], *, interval: float = 0.01
@@ -268,17 +312,17 @@ class ProcessTreePrivacyObserver:
         self.forbidden = tuple(value.encode("utf-8") for value in forbidden_values)
         self.interval = interval
         self.backend = (
-            "procfs"
+            "procfs_sampling"
             if sys.platform.startswith("linux") and Path("/proc").is_dir()
-            else "ps"
+            else "ps_sampling"
             if sys.platform == "darwin"
             else "unsupported"
         )
         self.root_observed = False
         self.snapshots = 0
         self.observed_pids: set[int] = set()
-        self.argv_hits = 0
-        self.environment_hits = 0
+        self.metadata_hits: set[tuple[int, int]] = set()
+        self.metadata_read_failures = 0
         self.failed = self.backend == "unsupported"
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._loop, daemon=True)
@@ -296,81 +340,64 @@ class ProcessTreePrivacyObserver:
         while not self._stop.wait(self.interval):
             self._sample()
 
-    def _record(
-        self, parents: Mapping[int, int], argv: Mapping[int, bytes], environ: Mapping[int, bytes]
-    ) -> None:
-        process_ids = _descendants(self.root_pid, parents)
-        if self.root_pid in argv:
-            self.root_observed = True
-        self.observed_pids.update(process_ids & set(argv))
-        self.snapshots += 1
-        for pid in process_ids:
-            command = argv.get(pid, b"")
-            environment = environ.get(pid, b"")
-            self.argv_hits += sum(value in command for value in self.forbidden)
-            self.environment_hits += sum(value in environment for value in self.forbidden)
+    def _topology(self) -> dict[int, int]:
+        if self.backend in {"procfs_sampling", "ps_sampling"}:
+            # The global command requests topology columns only. Sensitive
+            # command/environment metadata is fetched separately per selected PID.
+            completed = subprocess.run(
+                ("/bin/ps", "-axo", "pid=,ppid="),
+                check=True,
+                capture_output=True,
+                timeout=2,
+            )
+            parents = {}
+            for raw_line in completed.stdout.splitlines():
+                parts = raw_line.strip().split()
+                if len(parts) == 2:
+                    parents[int(parts[0])] = int(parts[1])
+            return parents
+        raise OSError("process topology backend unavailable")
+
+    def _read_selected_metadata(self, pid: int) -> bytes:
+        if self.backend == "procfs_sampling":
+            root = Path("/proc") / str(pid)
+            return (root / "cmdline").read_bytes() + b"\0" + (
+                root / "environ"
+            ).read_bytes()
+        if self.backend == "ps_sampling":
+            completed = subprocess.run(
+                ("/bin/ps", "eww", "-p", str(pid), "-o", "command="),
+                check=True,
+                capture_output=True,
+                timeout=2,
+            )
+            return completed.stdout
+        raise OSError("process metadata backend unavailable")
 
     def _sample(self) -> None:
         if self.backend == "unsupported":
             return
         try:
-            if self.backend == "procfs":
-                self._sample_procfs()
-            else:
-                self._sample_ps()
+            parents = self._topology()
         except (OSError, subprocess.SubprocessError, ValueError):
             self.failed = True
-
-    def _sample_procfs(self) -> None:
-        parents: dict[int, int] = {}
-        argv: dict[int, bytes] = {}
-        environ: dict[int, bytes] = {}
-        for entry in Path("/proc").iterdir():
-            if not entry.name.isdigit():
+            return
+        selected = _descendants(self.root_pid, parents)
+        if self.root_pid in parents:
+            self.root_observed = True
+        self.snapshots += 1
+        for pid in selected:
+            if pid not in parents:
                 continue
-            pid = int(entry.name)
             try:
-                stat = (entry / "stat").read_text(encoding="utf-8", errors="replace")
-                fields = stat[stat.rfind(")") + 2 :].split()
-                parents[pid] = int(fields[1])
-                argv[pid] = (entry / "cmdline").read_bytes()
-                environ[pid] = (entry / "environ").read_bytes()
-            except (FileNotFoundError, PermissionError, ProcessLookupError, IndexError):
+                metadata = self._read_selected_metadata(pid)
+            except (OSError, subprocess.SubprocessError):
+                self.metadata_read_failures += 1
                 continue
-        self._record(parents, argv, environ)
-
-    @staticmethod
-    def _ps_map(arguments: Sequence[str]) -> tuple[dict[int, int], dict[int, bytes]]:
-        completed = subprocess.run(
-            arguments, check=True, capture_output=True, timeout=2
-        )
-        parents: dict[int, int] = {}
-        values: dict[int, bytes] = {}
-        for raw_line in completed.stdout.splitlines():
-            parts = raw_line.strip().split(maxsplit=2)
-            if len(parts) < 2:
-                continue
-            pid = int(parts[0])
-            parents[pid] = int(parts[1])
-            values[pid] = parts[2] if len(parts) == 3 else b""
-        return parents, values
-
-    def _sample_ps(self) -> None:
-        parents, argv = self._ps_map(
-            ("/bin/ps", "-axo", "pid=,ppid=,command=")
-        )
-        expanded_parents, expanded = self._ps_map(
-            ("/bin/ps", "eww", "-axo", "pid=,ppid=,command=")
-        )
-        if parents != expanded_parents:
-            parents.update(expanded_parents)
-        environment: dict[int, bytes] = {}
-        for pid, combined in expanded.items():
-            command = argv.get(pid, b"")
-            # macOS ps exposes argv+environment together. Remove the argv prefix
-            # so an argv hit is not double-counted as an environment hit.
-            environment[pid] = combined.removeprefix(command)
-        self._record(parents, argv, environment)
+            self.observed_pids.add(pid)
+            for index, value in enumerate(self.forbidden):
+                if value in metadata:
+                    self.metadata_hits.add((pid, index))
 
     def summary(self) -> dict[str, object]:
         return {
@@ -378,9 +405,25 @@ class ProcessTreePrivacyObserver:
             "root_observed": self.root_observed,
             "snapshots": self.snapshots,
             "observed_processes": len(self.observed_pids),
-            "argv_sensitive_hits": self.argv_hits,
-            "environment_sensitive_hits": self.environment_hits,
+            "metadata_sensitive_hits": len(self.metadata_hits),
+            "metadata_read_failures": self.metadata_read_failures,
+            "observation_complete": False,
         }
+
+
+def _privacy_status(summary: Mapping[str, object]) -> str:
+    hits = summary.get("metadata_sensitive_hits")
+    if isinstance(hits, int) and not isinstance(hits, bool) and hits > 0:
+        return "failed"
+    if (
+        summary.get("observation_complete") is True
+        and summary.get("root_observed") is True
+        and isinstance(summary.get("snapshots"), int)
+        and int(summary["snapshots"]) > 0
+        and summary.get("metadata_read_failures") == 0
+    ):
+        return "passed"
+    return "unavailable"
 
 
 def _sanitized_environment(
@@ -412,8 +455,7 @@ def _sanitized_environment(
 
 def _permissions_are_private(root: Path) -> bool:
     try:
-        paths = (root, *root.rglob("*"))
-        for path in paths:
+        for path in (root, *root.rglob("*")):
             mode = path.stat().st_mode & 0o777
             if mode & 0o077:
                 return False
@@ -428,7 +470,7 @@ def _permissions_are_private(root: Path) -> bool:
 
 def _private_write(path: Path, payload: object) -> None:
     encoded = _canonical_bytes(payload) + b"\n"
-    temporary = path.with_name(path.name + ".tmp")
+    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
     descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     try:
         with os.fdopen(descriptor, "wb") as handle:
@@ -437,14 +479,135 @@ def _private_write(path: Path, payload: object) -> None:
             os.fsync(handle.fileno())
         os.replace(temporary, path)
     except Exception:
-        try:
-            temporary.unlink()
-        except FileNotFoundError:
-            pass
+        temporary.unlink(missing_ok=True)
         raise
 
 
-def _validate_audit(audit: object, forbidden_values: Sequence[str]) -> None:
+def _process_group_exists(process_group_id: int) -> bool:
+    try:
+        os.killpg(process_group_id, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _pid_exists(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _signal_process_group(process_group_id: int, sig: signal.Signals) -> None:
+    try:
+        os.killpg(process_group_id, sig)
+    except ProcessLookupError:
+        pass
+
+
+def _signal_pids(process_ids: Sequence[int], sig: signal.Signals) -> None:
+    for pid in process_ids:
+        try:
+            os.kill(pid, sig)
+        except ProcessLookupError:
+            pass
+        except PermissionError:
+            continue
+
+
+def _terminate_and_verify_processes(
+    process_group_id: int | None, observed_pids: Sequence[int]
+) -> tuple[bool, bool, int]:
+    controlled_pids = tuple(
+        sorted(pid for pid in set(observed_pids) if pid != os.getpid())
+    )
+    initially_alive = [pid for pid in controlled_pids if _pid_exists(pid)]
+    group_initially_alive = (
+        process_group_id is not None and _process_group_exists(process_group_id)
+    )
+    if process_group_id is not None:
+        _signal_process_group(process_group_id, signal.SIGTERM)
+    _signal_pids(initially_alive, signal.SIGTERM)
+    deadline = time.monotonic() + 0.5
+    while time.monotonic() < deadline:
+        group_alive = (
+            process_group_id is not None and _process_group_exists(process_group_id)
+        )
+        pids_alive = any(_pid_exists(pid) for pid in controlled_pids)
+        if not group_alive and not pids_alive:
+            break
+        time.sleep(0.01)
+    group_alive = process_group_id is not None and _process_group_exists(
+        process_group_id
+    )
+    remaining = [pid for pid in controlled_pids if _pid_exists(pid)]
+    if group_alive:
+        _signal_process_group(process_group_id, signal.SIGKILL)
+    _signal_pids(remaining, signal.SIGKILL)
+    deadline = time.monotonic() + 2
+    while time.monotonic() < deadline:
+        group_alive = (
+            process_group_id is not None and _process_group_exists(process_group_id)
+        )
+        remaining = [pid for pid in controlled_pids if _pid_exists(pid)]
+        if not group_alive and not remaining:
+            break
+        time.sleep(0.01)
+    group_absent = process_group_id is None or not _process_group_exists(
+        process_group_id
+    )
+    observed_absent = not any(_pid_exists(pid) for pid in controlled_pids)
+    terminated_count = max(len(initially_alive), int(group_initially_alive))
+    return group_absent, observed_absent, terminated_count
+
+
+def _normalize_provider_metadata(
+    provider_route: str,
+    provider_version: str,
+    *,
+    forbidden_values: Sequence[str],
+) -> tuple[str, str, bool, tuple[str, ...]]:
+    raw_values = (str(provider_route), str(provider_version))
+    sensitive = tuple(value for value in forbidden_values if value)
+    credential_like = re.compile(
+        r"(?i)(?:^|[-_.])(?:sk|token|secret|credential|password)(?:[-_.]|$)"
+    )
+    contains_forbidden = tuple(
+        any(value in raw for value in sensitive) or credential_like.search(raw) is not None
+        for raw in raw_values
+    )
+    route_safe = bool(SAFE_ROUTE_RE.fullmatch(raw_values[0])) and not contains_forbidden[0]
+    version_safe = bool(SAFE_VERSION_RE.fullmatch(raw_values[1])) and not contains_forbidden[1]
+    normalized_route = (
+        raw_values[0]
+        if route_safe
+        else "invalid-route-" + hashlib.sha256(raw_values[0].encode()).hexdigest()[:12]
+    )
+    normalized_version = (
+        raw_values[1]
+        if version_safe
+        else "invalid-version-"
+        + hashlib.sha256(raw_values[1].encode()).hexdigest()[:12]
+    )
+    unsafe_values = tuple(
+        value
+        for value, safe in zip(raw_values, (route_safe, version_safe), strict=True)
+        if value and not safe
+    )
+    return normalized_route, normalized_version, not (route_safe and version_safe), unsafe_values
+
+
+def _validate_audit(
+    audit: object,
+    forbidden_values: Sequence[str],
+    *,
+    allow_pending_readback: bool = False,
+) -> None:
     fields = {
         "schema_version",
         "artifact_kind",
@@ -466,6 +629,7 @@ def _validate_audit(audit: object, forbidden_values: Sequence[str]) -> None:
         "package_published",
         "information_ingested",
         "cleanup_status",
+        "cleanup_observation",
         "privacy_observation_status",
         "privacy_observation",
         "temporary_permissions_status",
@@ -482,8 +646,12 @@ def _validate_audit(audit: object, forbidden_values: Sequence[str]) -> None:
         or not re.fullmatch(r"run_[0-9a-f]{32}", audit["processing_run_id"])
         or not isinstance(audit["input_fingerprint"], str)
         or not FINGERPRINT_RE.fullmatch(audit["input_fingerprint"])
+        or not isinstance(audit["provider_route"], str)
+        or not SAFE_ROUTE_RE.fullmatch(audit["provider_route"])
+        or not isinstance(audit["provider_version"], str)
+        or not SAFE_VERSION_RE.fullmatch(audit["provider_version"])
     ):
-        raise ValueError("audit identity/version mismatch")
+        raise ValueError("audit identity/version/provider metadata mismatch")
     if audit["package_published"] is not False or audit["information_ingested"] is not False:
         raise ValueError("synthetic gate must never publish a package or ingest information")
     counts = (
@@ -501,10 +669,24 @@ def _validate_audit(audit: object, forbidden_values: Sequence[str]) -> None:
         "root_observed",
         "snapshots",
         "observed_processes",
-        "argv_sensitive_hits",
-        "environment_sensitive_hits",
+        "metadata_sensitive_hits",
+        "metadata_read_failures",
+        "observation_complete",
     }:
         raise ValueError("audit privacy observation schema mismatch")
+    cleanup = audit["cleanup_observation"]
+    if not isinstance(cleanup, dict) or set(cleanup) != {
+        "process_group_absent",
+        "observed_processes_absent",
+        "temporary_directory_absent",
+        "terminated_processes",
+    }:
+        raise ValueError("audit cleanup observation schema mismatch")
+    expected_readback = {"verified"}
+    if allow_pending_readback:
+        expected_readback.add("pending")
+    if audit["audit_readback_status"] not in expected_readback:
+        raise ValueError("audit Readback status is not valid for this phase")
     if audit["execution_status"] == "succeeded":
         if not (
             audit["failure_category"] is None
@@ -530,8 +712,142 @@ def _validate_audit(audit: object, forbidden_values: Sequence[str]) -> None:
     else:
         raise ValueError("audit execution status is invalid")
     serialized = json.dumps(audit, ensure_ascii=False, sort_keys=True)
-    if any(value in serialized for value in forbidden_values):
+    if any(value and value in serialized for value in forbidden_values):
         raise ValueError("audit artifact contains synthetic sensitive material")
+
+
+def _failure_audit_from(audit: Mapping[str, object], category: str) -> dict[str, object]:
+    failed = dict(audit)
+    failed.update(
+        {
+            "execution_status": "failed",
+            "failure_category": category,
+            "result_present": False,
+            "result_fingerprint": None,
+            "covered_units": 0,
+            "unaccounted_units": failed["eligible_units"],
+            "result_readback_status": "not_applicable",
+            "audit_readback_status": "pending",
+        }
+    )
+    return failed
+
+
+def _publish_bundle_once(
+    *,
+    audit: dict[str, object],
+    result_payload: dict[str, object] | None,
+    output_root: Path,
+    eligible_ids: Sequence[str],
+    forbidden_values: Sequence[str],
+    writer: ArtifactWriter,
+    reader: ArtifactReader,
+) -> GateRun:
+    run_id = str(audit["processing_run_id"])
+    final = output_root / run_id
+    staging = output_root / f".{run_id}.{uuid.uuid4().hex}.staging"
+    staging.mkdir(mode=0o700)
+    result_name: str | None = None
+    try:
+        if result_payload is not None:
+            result_path = staging / "validated-result.json"
+            writer(result_path, result_payload)
+            result_readback = reader(result_path)
+            validate_result(
+                result_readback,
+                expected_input_fingerprint=str(audit["input_fingerprint"]),
+                eligible_unit_ids=eligible_ids,
+            )
+            if fingerprint(result_readback) != audit["result_fingerprint"]:
+                raise ResultBindingError("result changed during Readback")
+            result_name = result_path.name
+        pending_audit = dict(audit)
+        pending_audit["audit_readback_status"] = "pending"
+        _validate_audit(
+            pending_audit, forbidden_values, allow_pending_readback=True
+        )
+        audit_path = staging / "processing-run-audit.json"
+        writer(audit_path, pending_audit)
+        pending_readback = reader(audit_path)
+        _validate_audit(
+            pending_readback, forbidden_values, allow_pending_readback=True
+        )
+        if pending_readback != pending_audit:
+            raise ValueError("pending audit changed during Readback")
+        verified_audit = dict(pending_audit)
+        verified_audit["audit_readback_status"] = "verified"
+        writer(audit_path, verified_audit)
+        verified_readback = reader(audit_path)
+        _validate_audit(verified_readback, forbidden_values)
+        if verified_readback != verified_audit:
+            raise ValueError("verified audit changed during Readback")
+        if not _permissions_are_private(staging):
+            raise ValueError("staged artifacts are not private")
+        if final.exists():
+            raise FileExistsError("Processing Run artifact already exists")
+        os.replace(staging, final)
+        if not _permissions_are_private(final):
+            raise ValueError("published artifacts are not private")
+        return GateRun(
+            run_directory=final,
+            audit_path=final / audit_path.name,
+            result_path=final / result_name if result_name else None,
+            audit=verified_audit,
+            observed_process_ids=(),
+        )
+    except Exception:
+        if final.exists():
+            shutil.rmtree(final, ignore_errors=True)
+        shutil.rmtree(staging, ignore_errors=True)
+        raise
+
+
+def _publish_bundle(
+    *,
+    audit: dict[str, object],
+    result_payload: dict[str, object] | None,
+    output_root: Path,
+    eligible_ids: Sequence[str],
+    forbidden_values: Sequence[str],
+    writer: ArtifactWriter,
+    reader: ArtifactReader,
+    observed_process_ids: Sequence[int],
+) -> GateRun:
+    try:
+        published = _publish_bundle_once(
+            audit=audit,
+            result_payload=result_payload,
+            output_root=output_root,
+            eligible_ids=eligible_ids,
+            forbidden_values=forbidden_values,
+            writer=writer,
+            reader=reader,
+        )
+    except Exception as original_error:
+        fallback = _failure_audit_from(audit, "artifact_persistence_failure")
+        try:
+            published = _publish_bundle_once(
+                audit=fallback,
+                result_payload=None,
+                output_root=output_root,
+                eligible_ids=eligible_ids,
+                forbidden_values=forbidden_values,
+                writer=writer,
+                reader=reader,
+            )
+        except Exception as fallback_error:
+            raise ArtifactPersistenceError(
+                "synthetic failure audit could not be persisted"
+            ) from fallback_error
+        if published.result_path is not None:
+            raise AssertionError("fallback audit published an orphan result") from original_error
+    return GateRun(
+        run_directory=published.run_directory,
+        audit_path=published.audit_path,
+        result_path=published.result_path,
+        audit=published.audit,
+        observed_process_ids=tuple(sorted(set(observed_process_ids))),
+    )
 
 
 def codex_invocation_builder(codex_binary: str) -> InvocationBuilder:
@@ -587,25 +903,17 @@ def synthetic_invocation_builder(
         helper_copy = run_directory / "fake_external_agent.py"
         helper_copy.write_bytes(helper.read_bytes())
         os.chmod(helper_copy, 0o600)
-        command = [
-            python_binary,
-            str(helper_copy),
-            "--mode",
-            mode,
-            "--result-file",
-            str(raw_result_path),
-        ]
-        extras: dict[str, str] = {}
-        package = request["analysis_package"]
-        assert isinstance(package, dict)
-        if mode == "argv_leak":
-            command.extend(["--leaked-value", str(package["canary"])])
-        if mode == "env_leak":
-            extras["SYNTHETIC_ISSUE66_LEAK"] = str(package["canary"])
         return ExternalAgentInvocation(
-            command=tuple(command),
+            command=(
+                python_binary,
+                str(helper_copy),
+                "--mode",
+                mode,
+                "--result-file",
+                str(raw_result_path),
+            ),
             stdin_text=json.dumps(request, ensure_ascii=False, sort_keys=True),
-            environment_extras=extras,
+            environment_extras={},
         )
 
     return build
@@ -619,17 +927,29 @@ def execute_handoff(
     invocation_builder: InvocationBuilder,
     output_root: Path,
     timeout_seconds: float,
+    observer_factory: ObserverFactory = ProcessTreePrivacyObserver,
+    artifact_writer: ArtifactWriter = _private_write,
+    artifact_reader: ArtifactReader = _load_json_object,
 ) -> GateRun:
     if timeout_seconds <= 0:
         raise ValueError("timeout_seconds must be positive")
-    # Revalidate even when callers did not load through load_synthetic_package.
-    package = json.loads(json.dumps(package, ensure_ascii=False))
-    committed_package = load_synthetic_package()
-    if package != committed_package:
+    package = _validate_package_structure(
+        json.loads(json.dumps(package, ensure_ascii=False))
+    )
+    if fingerprint(package) != COMMITTED_FIXTURE_FINGERPRINT:
         raise ValueError("only the committed public synthetic package is accepted")
-    forbidden = sensitive_values(package)
-    eligible_ids = _eligible_unit_ids(package)
+    output_root = Path(output_root)
+    output_root.mkdir(parents=True, exist_ok=True)
+    normalized_route, normalized_version, unsafe_metadata, unsafe_values = (
+        _normalize_provider_metadata(
+            provider_route,
+            provider_version,
+            forbidden_values=sensitive_values(package),
+        )
+    )
     input_fingerprint = fingerprint(package)
+    eligible_ids = _eligible_unit_ids(package)
+    forbidden = (*sensitive_values(package), *unsafe_values)
     processing_run_id = "run_" + uuid.uuid4().hex
     started_at = _utc_now()
     request: dict[str, object] = {
@@ -637,154 +957,196 @@ def execute_handoff(
         "input_fingerprint": input_fingerprint,
         "analysis_package": package,
     }
-    raw_payload: dict[str, object] | None = None
-    raw_result_fingerprint: str | None = None
+    failure_category: str | None = (
+        "unsafe_provider_metadata" if unsafe_metadata else None
+    )
     strict_status = "not_run"
     covered_units = 0
-    failure_category: str | None = None
+    result_payload: dict[str, object] | None = None
+    result_fingerprint: str | None = None
+    permissions_status = "verified"
     privacy_summary: dict[str, object] = {
-        "backend": "unsupported",
+        "backend": "not_started",
         "root_observed": False,
         "snapshots": 0,
         "observed_processes": 0,
-        "argv_sensitive_hits": 0,
-        "environment_sensitive_hits": 0,
+        "metadata_sensitive_hits": 0,
+        "metadata_read_failures": 0,
+        "observation_complete": False,
     }
     privacy_status = "unavailable"
-    permissions_status = "failed"
+    process_group_absent = True
+    observed_processes_absent = True
+    terminated_processes = 0
+    observed_pids: set[int] = set()
     temp_path: Path | None = None
 
-    with tempfile.TemporaryDirectory(prefix="archeos-handoff-issue66-") as temporary:
-        temp_path = Path(temporary)
-        os.chmod(temp_path, 0o700)
-        input_path = temp_path / "input.json"
-        schema_path = temp_path / "result.schema.json"
-        raw_result_path = temp_path / "raw-result.json"
-        _private_write(input_path, request)
-        schema = _load_json_object(RESULT_SCHEMA_PATH)
-        _private_write(schema_path, schema)
-        permissions_status = "verified" if _permissions_are_private(temp_path) else "failed"
-        invocation = invocation_builder(request, temp_path, schema_path, raw_result_path)
-        environment = _sanitized_environment(temp_path, invocation.environment_extras)
-        process = subprocess.Popen(
-            invocation.command,
-            cwd=temp_path,
-            env=environment,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            start_new_session=True,
-            umask=0o077,
-        )
-        observer = ProcessTreePrivacyObserver(process.pid, forbidden)
-        observer.start()
-        timed_out = False
+    if failure_category is None:
         try:
-            process.communicate(
-                input=invocation.stdin_text.encode("utf-8"), timeout=timeout_seconds
+            temp_path = Path(tempfile.mkdtemp(prefix="archeos-handoff-issue66-"))
+            os.chmod(temp_path, 0o700)
+            input_path = temp_path / "input.json"
+            schema_path = temp_path / "result.schema.json"
+            raw_result_path = temp_path / "raw-result.json"
+            _private_write(input_path, request)
+            _private_write(schema_path, _load_json_object(RESULT_SCHEMA_PATH))
+            permissions_status = (
+                "verified" if _permissions_are_private(temp_path) else "failed"
             )
-        except subprocess.TimeoutExpired:
-            timed_out = True
-            os.killpg(process.pid, signal.SIGTERM)
+            invocation = invocation_builder(
+                request, temp_path, schema_path, raw_result_path
+            )
+            environment = _sanitized_environment(
+                temp_path, invocation.environment_extras
+            )
+            process: subprocess.Popen[bytes] | None = None
+            observer: PrivacyObserver | None = None
+            process_group_id: int | None = None
+            timed_out = False
             try:
-                process.communicate(timeout=2)
-            except subprocess.TimeoutExpired:
-                os.killpg(process.pid, signal.SIGKILL)
-                process.communicate()
-        finally:
-            observer.stop()
-        privacy_summary = observer.summary()
-        if observer.failed or not observer.root_observed or observer.snapshots < 1:
-            privacy_status = "unavailable"
-        elif observer.argv_hits or observer.environment_hits:
-            privacy_status = "failed"
-        else:
-            privacy_status = "passed"
-
-        permissions_status = (
-            "verified" if permissions_status == "verified" and _permissions_are_private(temp_path) else "failed"
-        )
-        if timed_out:
-            failure_category = "timeout"
-        elif process.returncode != 0:
-            failure_category = "runtime_failure"
-        elif not raw_result_path.exists():
-            failure_category = "no_result"
-        else:
-            raw_bytes = raw_result_path.read_bytes()
-            if not raw_bytes.strip():
-                failure_category = "empty_result"
-            else:
+                process = subprocess.Popen(
+                    invocation.command,
+                    cwd=temp_path,
+                    env=environment,
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    start_new_session=True,
+                    umask=0o077,
+                )
+                process_group_id = process.pid
+            except OSError:
+                failure_category = "runtime_start_failure"
+            if process is not None:
                 try:
-                    decoded = json.loads(raw_bytes)
-                except (UnicodeDecodeError, json.JSONDecodeError):
-                    failure_category = "invalid_json"
-                    strict_status = "failed"
+                    observer = observer_factory(process.pid, forbidden)
+                    observer.start()
+                except Exception:  # noqa: BLE001 - observer failures must become audit
+                    failure_category = "privacy_observation_unavailable"
+                    _signal_process_group(process.pid, signal.SIGTERM)
+                    try:
+                        process.communicate(timeout=0.5)
+                    except subprocess.TimeoutExpired:
+                        _signal_process_group(process.pid, signal.SIGKILL)
+                        process.communicate()
                 else:
                     try:
-                        counts = validate_result(
-                            decoded,
-                            expected_input_fingerprint=input_fingerprint,
-                            eligible_unit_ids=eligible_ids,
+                        process.communicate(
+                            input=invocation.stdin_text.encode("utf-8"),
+                            timeout=timeout_seconds,
                         )
-                    except ResultBindingError:
-                        failure_category = "result_binding_failure"
-                        strict_status = "failed"
-                    except ResultContractError:
-                        failure_category = "result_contract_failure"
-                        strict_status = "failed"
+                    except subprocess.TimeoutExpired:
+                        timed_out = True
+                        _signal_process_group(process.pid, signal.SIGTERM)
+                        try:
+                            process.communicate(timeout=0.5)
+                        except subprocess.TimeoutExpired:
+                            _signal_process_group(process.pid, signal.SIGKILL)
+                            process.communicate()
+                    except Exception:  # noqa: BLE001 - runtime failures must become audit
+                        failure_category = "runtime_execution_failure"
+                        _signal_process_group(process.pid, signal.SIGTERM)
+                    finally:
+                        try:
+                            observer.stop()
+                            observed_pids.update(observer.observed_pids)
+                            privacy_summary = observer.summary()
+                            privacy_status = _privacy_status(privacy_summary)
+                        except Exception:  # noqa: BLE001 - observer failures must become audit
+                            if failure_category is None:
+                                failure_category = "privacy_observation_unavailable"
+                            privacy_status = "unavailable"
+                if process.poll() is None:
+                    _signal_process_group(process.pid, signal.SIGTERM)
+                    try:
+                        process.wait(timeout=0.5)
+                    except subprocess.TimeoutExpired:
+                        _signal_process_group(process.pid, signal.SIGKILL)
+                        process.wait(timeout=2)
+                observed_pids.add(process.pid)
+                (
+                    process_group_absent,
+                    observed_processes_absent,
+                    terminated_processes,
+                ) = _terminate_and_verify_processes(
+                    process_group_id, tuple(observed_pids)
+                )
+                if failure_category is None:
+                    if timed_out:
+                        failure_category = "timeout"
+                    elif process.returncode != 0:
+                        failure_category = "runtime_failure"
+                    elif not raw_result_path.exists():
+                        failure_category = "no_result"
                     else:
-                        assert isinstance(decoded, dict)
-                        raw_payload = decoded
-                        raw_result_fingerprint = fingerprint(decoded)
-                        strict_status = "passed"
-                        covered_units = counts["covered_units"]
-        if failure_category is None and privacy_status != "passed":
-            failure_category = (
-                "privacy_boundary_violation"
-                if privacy_status == "failed"
-                else "privacy_observation_unavailable"
-            )
-        if failure_category is None and permissions_status != "verified":
-            failure_category = "temporary_permission_failure"
+                        raw_bytes = raw_result_path.read_bytes()
+                        if not raw_bytes.strip():
+                            failure_category = "empty_result"
+                        else:
+                            try:
+                                decoded = json.loads(raw_bytes)
+                            except (UnicodeDecodeError, json.JSONDecodeError):
+                                failure_category = "invalid_json"
+                                strict_status = "failed"
+                            else:
+                                try:
+                                    counts = validate_result(
+                                        decoded,
+                                        expected_input_fingerprint=input_fingerprint,
+                                        eligible_unit_ids=eligible_ids,
+                                    )
+                                except ResultBindingError:
+                                    failure_category = "result_binding_failure"
+                                    strict_status = "failed"
+                                except ResultContractError:
+                                    failure_category = "result_contract_failure"
+                                    strict_status = "failed"
+                                else:
+                                    assert isinstance(decoded, dict)
+                                    result_payload = decoded
+                                    result_fingerprint = fingerprint(decoded)
+                                    strict_status = "passed"
+                                    covered_units = counts["covered_units"]
+                if failure_category is None and privacy_status != "passed":
+                    failure_category = (
+                        "privacy_boundary_violation"
+                        if privacy_status == "failed"
+                        else "privacy_observation_unavailable"
+                    )
+                if failure_category is None and permissions_status != "verified":
+                    failure_category = "temporary_permission_failure"
+                if failure_category is None and not (
+                    process_group_absent and observed_processes_absent
+                ):
+                    failure_category = "process_cleanup_failure"
+        except Exception:  # noqa: BLE001 - all controlled failures require audit
+            if failure_category is None:
+                failure_category = "harness_execution_failure"
+        finally:
+            if temp_path is not None:
+                try:
+                    shutil.rmtree(temp_path)
+                except OSError:
+                    pass
 
-    assert temp_path is not None
-    cleanup_status = "verified" if not temp_path.exists() else "failed"
+    temporary_directory_absent = temp_path is None or not temp_path.exists()
+    cleanup_status = (
+        "verified"
+        if process_group_absent
+        and observed_processes_absent
+        and temporary_directory_absent
+        else "failed"
+    )
     if failure_category is None and cleanup_status != "verified":
         failure_category = "cleanup_failure"
-
-    output_root = Path(output_root)
-    output_root.mkdir(parents=True, exist_ok=True)
-    run_directory = output_root / processing_run_id
-    run_directory.mkdir(mode=0o700)
-    os.chmod(run_directory, 0o700)
-    result_path: Path | None = None
-    result_readback_status = "not_applicable"
-    if failure_category is None and raw_payload is not None and raw_result_fingerprint:
-        candidate_path = run_directory / "validated-result.json"
-        _private_write(candidate_path, raw_payload)
-        try:
-            readback_payload = _load_json_object(candidate_path)
-            validate_result(
-                readback_payload,
-                expected_input_fingerprint=input_fingerprint,
-                eligible_unit_ids=eligible_ids,
-            )
-            if fingerprint(readback_payload) != raw_result_fingerprint:
-                raise ResultBindingError("result changed during Readback")
-        except (OSError, ValueError, json.JSONDecodeError):
-            candidate_path.unlink(missing_ok=True)
-            failure_category = "result_readback_failure"
-            raw_result_fingerprint = None
-            result_readback_status = "not_applicable"
-        else:
-            result_path = candidate_path
-            result_readback_status = "verified"
-
-    succeeded = failure_category is None and result_path is not None
+    succeeded = (
+        failure_category is None
+        and result_payload is not None
+        and result_fingerprint is not None
+    )
     if not succeeded:
-        raw_result_fingerprint = None
-        result_path = None
+        result_payload = None
+        result_fingerprint = None
         covered_units = 0
     audit: dict[str, object] = {
         "schema_version": AUDIT_SCHEMA_VERSION,
@@ -792,14 +1154,14 @@ def execute_handoff(
         "processing_run_id": processing_run_id,
         "protocol_version": PROTOCOL_VERSION,
         "input_fingerprint": input_fingerprint,
-        "provider_route": provider_route,
-        "provider_version": provider_version,
+        "provider_route": normalized_route,
+        "provider_version": normalized_version,
         "started_at": started_at,
         "finished_at": _utc_now(),
         "execution_status": "succeeded" if succeeded else "failed",
         "failure_category": failure_category,
         "result_present": succeeded,
-        "result_fingerprint": raw_result_fingerprint,
+        "result_fingerprint": result_fingerprint,
         "strict_validation_status": strict_status,
         "eligible_units": len(eligible_ids),
         "covered_units": covered_units,
@@ -807,37 +1169,44 @@ def execute_handoff(
         "package_published": False,
         "information_ingested": False,
         "cleanup_status": cleanup_status,
+        "cleanup_observation": {
+            "process_group_absent": process_group_absent,
+            "observed_processes_absent": observed_processes_absent,
+            "temporary_directory_absent": temporary_directory_absent,
+            "terminated_processes": terminated_processes,
+        },
         "privacy_observation_status": privacy_status,
         "privacy_observation": privacy_summary,
         "temporary_permissions_status": permissions_status,
-        "result_readback_status": result_readback_status,
-        "audit_readback_status": "verified",
+        "result_readback_status": "verified" if succeeded else "not_applicable",
+        "audit_readback_status": "pending",
     }
-    _validate_audit(audit, forbidden)
-    audit_path = run_directory / "processing-run-audit.json"
-    _private_write(audit_path, audit)
-    readback_audit = _load_json_object(audit_path)
-    _validate_audit(readback_audit, forbidden)
-    if readback_audit != audit:
-        raise ValueError("audit artifact changed during Readback")
-    if not _permissions_are_private(run_directory):
-        raise ValueError("durable synthetic artifacts are not private")
-    return GateRun(
-        run_directory=run_directory,
-        audit_path=audit_path,
-        result_path=result_path,
+    _validate_audit(audit, forbidden, allow_pending_readback=True)
+    return _publish_bundle(
         audit=audit,
+        result_payload=result_payload,
+        output_root=output_root,
+        eligible_ids=eligible_ids,
+        forbidden_values=forbidden,
+        writer=artifact_writer,
+        reader=artifact_reader,
+        observed_process_ids=tuple(observed_pids),
     )
 
 
 def _runtime_version(codex_binary: str) -> str:
-    completed = subprocess.run(
-        [codex_binary, "--version"],
-        check=True,
-        capture_output=True,
-        text=True,
-        timeout=15,
-    )
+    try:
+        completed = subprocess.run(
+            [codex_binary, "--version"],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+    except (OSError, subprocess.SubprocessError):
+        # Keep the launch attempt inside execute_handoff so missing executables
+        # still produce a durable, anonymous runtime_start_failure audit.
+        return "codex-cli 0.0-unavailable"
     return (completed.stdout or completed.stderr).strip()
 
 

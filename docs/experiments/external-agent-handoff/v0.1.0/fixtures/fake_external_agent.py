@@ -38,23 +38,54 @@ def _valid_result(request: dict[str, object]) -> dict[str, object]:
     }
 
 
+def _child(
+    *,
+    seconds: float,
+    argv_value: str | None = None,
+    environment_value: str | None = None,
+) -> subprocess.Popen[bytes]:
+    command = [sys.executable, "-c", f"import time; time.sleep({seconds})"]
+    if argv_value is not None:
+        command.append(argv_value)
+    environment = os.environ.copy()
+    if environment_value is not None:
+        environment["SYNTHETIC_ISSUE66_DESCENDANT_LEAK"] = environment_value
+    return subprocess.Popen(
+        command,
+        env=environment,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--mode", required=True)
     parser.add_argument("--result-file", required=True)
-    parser.add_argument("--leaked-value")
     args = parser.parse_args()
 
     request = json.load(sys.stdin)
-    child = subprocess.Popen(
-        [sys.executable, "-c", "import time; time.sleep(0.25)"],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
+    package = request["analysis_package"]
+    assert isinstance(package, dict)
+    canary = str(package["canary"])
+
     if args.mode == "timeout":
-        time.sleep(10)
+        _child(seconds=30)
+        time.sleep(30)
         return 0
-    child.wait()
+    if args.mode == "short_lived_argv_leak":
+        for _ in range(10):
+            _child(seconds=0, argv_value=canary).wait()
+    elif args.mode == "argv_leak":
+        _child(seconds=0.5, argv_value=canary).wait()
+    elif args.mode == "env_leak":
+        _child(seconds=0.5, environment_value=canary).wait()
+    elif args.mode == "lingering_child":
+        _child(seconds=30)
+        time.sleep(0.1)
+    else:
+        _child(seconds=0.25).wait()
+
     if args.mode == "runtime_failure":
         return 7
     if args.mode == "no_result":
@@ -79,7 +110,17 @@ def main() -> int:
         candidates.pop()
     elif args.mode == "wrong_fingerprint":
         result["input_fingerprint"] = "sha256:" + "0" * 64
-    elif args.mode not in {"valid", "argv_leak", "env_leak"}:
+    elif args.mode == "extra_field":
+        result["unexpected"] = True
+    elif args.mode == "wrong_type":
+        result["candidates"] = "not-an-array"
+    elif args.mode not in {
+        "valid",
+        "argv_leak",
+        "env_leak",
+        "short_lived_argv_leak",
+        "lingering_child",
+    }:
         raise ValueError("unsupported synthetic mode")
 
     result_path.write_text(
