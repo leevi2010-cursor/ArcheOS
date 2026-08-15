@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import errno
 import importlib.util
 import json
 import re
@@ -262,10 +263,13 @@ class SemanticQualityWechatGateTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp); binary = root / "bin"; binary.mkdir(); sentinel = root / "codex-started"
             codex = binary / "codex"
-            codex.write_text(f"#!/bin/sh\ntouch {sentinel}\nexit 99\n", encoding="utf-8")
+            codex.write_text(f"#!/bin/sh\n: > '{sentinel}'\nexit 99\n", encoding="utf-8")
             codex.chmod(0o700)
             marker = root / "marker.json"
             environment = {"PATH": str(binary), "HOME": str(root / "home")}
+            subprocess.run([str(codex)], check=False, env=environment)
+            self.assertTrue(sentinel.exists())
+            sentinel.unlink()
             run = subprocess.run([sys.executable, str(HARNESS), "--synthetic", "--marker-path", str(marker)], cwd=ROOT, check=True, capture_output=True, text=True, env=environment)
             self.assertEqual(json.loads(run.stdout)["provider_calls"], 0)
             self.assertFalse(sentinel.exists())
@@ -280,7 +284,7 @@ class SemanticQualityWechatGateTest(unittest.TestCase):
 
     def test_esrch_means_absent_and_packet_wrapper_tamper_fails_marker(self):
         process = FakeProcess(["fake"])
-        with patch.object(gate.os, "killpg", side_effect=ProcessLookupError):
+        with patch.object(gate.os, "killpg", side_effect=OSError(errno.ESRCH, "gone")):
             self.assertIsNone(gate._cleanup_process_group(process))
         value = batch(); response = result_for(value); response["input_fingerprint"] = gate.provider_request(value)[1]
         original = gate.write_local_review_packet
