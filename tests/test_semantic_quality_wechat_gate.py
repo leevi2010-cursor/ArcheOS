@@ -2,12 +2,16 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import re
 import subprocess
 import sys
 import tempfile
 import unittest
+from contextlib import ExitStack
 from pathlib import Path
+from unittest.mock import patch
 
+from archeos import atomic_information, filesystem, representation_information
 from archeos.representation_information import (
     RepresentationAnalysisBatch,
     RepresentationAnalysisUnit,
@@ -70,6 +74,29 @@ class FakeProcess:
 
 
 class SemanticQualityWechatGateTest(unittest.TestCase):
+    def test_full_path_runtime_write_guards_are_never_called(self):
+        def forbidden(*_args, **_kwargs):
+            raise AssertionError("forbidden production write path was called")
+
+        with tempfile.TemporaryDirectory() as temp, ExitStack() as stack:
+            root = Path(temp)
+            sources, representations, representation = build_synthetic_representation(root, quality_export())
+            batch_value = gate.build_real_preflight(representation.representation_id, representations, sources)
+            response = result_for(batch_value)
+            response["input_fingerprint"] = gate.provider_request(batch_value)[1]
+            stack.enter_context(patch.object(representation_information.RepresentationInformationService, "extract", forbidden))
+            stack.enter_context(patch.object(representation_information, "_output_records", forbidden))
+            stack.enter_context(patch.object(representation_information, "_manifest", forbidden))
+            stack.enter_context(patch.object(filesystem, "publish_directory_no_replace", forbidden))
+            stack.enter_context(patch.object(atomic_information, "ingest_processing_package", forbidden))
+            gate.run_authorized_representation(
+                representation.representation_id, representations, sources,
+                marker_path=root / "marker.json", review_root=root / "review",
+                runner=lambda *args, **kwargs: FakeProcess(*args, payload=json.dumps(response), **kwargs),
+            )
+            self.assertFalse((root / "03_information").exists())
+            self.assertFalse((root / "04_core").exists())
+
     def test_no_extract_or_production_write_symbols(self):
         source = HARNESS.read_text(encoding="utf-8")
         self.assertNotIn(".extract(", source)
@@ -222,10 +249,33 @@ class SemanticQualityWechatGateTest(unittest.TestCase):
         tracked = [ROOT / "docs/experiments/semantic-quality-wechat/v0.1.0" / item for item in ("manifest.json", "RESULTS.md", "RECOMMENDATION.md")]
         forbidden = ("synthetic-source", "synthetic-representation", "unit_", "raw result", "sender")
         self.assertTrue(all(token not in path.read_text(encoding="utf-8") for path in tracked for token in forbidden))
-        run = subprocess.run([sys.executable, str(HARNESS), "--synthetic"], cwd=ROOT, check=True, capture_output=True, text=True)
+        with tempfile.TemporaryDirectory() as temp:
+            marker = Path(temp) / "marker.json"
+            run = subprocess.run([sys.executable, str(HARNESS), "--synthetic", "--marker-path", str(marker)], cwd=ROOT, check=True, capture_output=True, text=True)
         status = json.loads(run.stdout)
         self.assertEqual(status["provider_calls"], 0)
         self.assertFalse(status["real_marker_written"])
+        self.assertFalse(marker.exists())
+
+    def test_tracked_issue76_diff_privacy_scan_rejects_real_identifier_canary(self):
+        diff = subprocess.run(["git", "diff", "origin/main...HEAD", "--", "docs/experiments/semantic-quality-wechat", "tests/test_semantic_quality_wechat_gate.py"], cwd=ROOT, check=True, capture_output=True, text=True).stdout
+        banned = (r"src_[0-9a-f]{32}", r"repr_[0-9a-f]{32}", r"/Users/", r"Candidate statement", r"Evidence excerpt")
+        self.assertTrue(all(re.search(pattern, diff, re.IGNORECASE) is None for pattern in banned))
+        self.assertIsNotNone(re.search(r"src_[0-9a-f]{32}", "src_" + "a" * 32))
+
+    def test_permission_error_and_packet_tamper_fail_closed_and_consume_marker(self):
+        value = batch(); response = result_for(value)
+        response["input_fingerprint"] = gate.provider_request(value)[1]
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp); marker = root / "marker.json"
+            with patch.object(gate.os, "killpg", side_effect=PermissionError), self.assertRaises(gate.GateError):
+                gate.run_real_call(value, marker_path=marker, runner=lambda *args, **kwargs: FakeProcess(*args, payload=json.dumps(response), **kwargs))
+            self.assertEqual(json.loads(marker.read_text())["status"], "failed")
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp); marker = root / "marker.json"
+            with patch.object(gate, "review_packet_readback", return_value=False), self.assertRaises(gate.GateError):
+                gate.run_real_call(value, marker_path=marker, review_root=root / "review", runner=lambda *args, **kwargs: FakeProcess(*args, payload=json.dumps(response), **kwargs))
+            self.assertEqual(json.loads(marker.read_text())["status"], "failed")
 
     def test_production_wechat_gate_remains_covered_by_existing_test(self):
         existing = (ROOT / "tests/test_wechat_conversation.py").read_text(encoding="utf-8")
