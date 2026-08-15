@@ -1,0 +1,298 @@
+from __future__ import annotations
+
+import inspect
+import json
+import tempfile
+import unittest
+from pathlib import Path
+
+from archeos.atomic_information import JsonlAtomicInformationStore
+from archeos.representation import (
+    AdapterArtifact,
+    AdapterBuildResult,
+    LocalRepresentationRepository,
+    RepresentationService,
+)
+from archeos.representation_information import (
+    CodexCliRepresentationAnalysisProvider,
+    RepresentationAnalysisBatch,
+    RepresentationAnalysisUnit,
+    RepresentationInformationService,
+)
+from archeos.semantic_handoff import ExternalAgentSemanticHandoffService
+from archeos.source import LocalManagedSourceRepository
+
+
+class JsonAdapter:
+    name = "synthetic"
+    version = "1.0"
+    kind = "markdown_blocks"
+    supported_media_types = ("application/synthetic",)
+
+    def build(self, _source, _materialized, staging_dir, _configuration):
+        artifact = staging_dir / "artifacts" / "synthetic.json"
+        artifact.write_text(
+            json.dumps(
+                {
+                    "blocks": [
+                        {
+                            "kind": "paragraph",
+                            "raw": "Synthetic business input.",
+                            "source_locator": {"line": 1},
+                        }
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+        return AdapterBuildResult(
+            self.kind,
+            (
+                AdapterArtifact(
+                    "structure", "artifacts/synthetic.json", "application/json"
+                ),
+            ),
+            1.0,
+        )
+
+
+class FakeProcess:
+    def __init__(self, command, *, mode: str, calls: list[list[str]]):
+        self.command = list(command)
+        self.mode = mode
+        self.calls = calls
+        self.pid = 99999999
+        self.returncode: int | None = None
+        calls.append(self.command)
+
+    def communicate(self, *, input: str | None = None, timeout: float | None = None):
+        del timeout
+        if self.mode == "nonzero":
+            self.returncode = 7
+            return "", "synthetic nonzero"
+        if self.mode == "timeout":
+            from subprocess import TimeoutExpired
+
+            raise TimeoutExpired(self.command, 0.01)
+        assert input is not None
+        request = json.loads(input.split("Request:\n", 1)[1])
+        if self.mode == "wrong_binding":
+            request["input_fingerprint"] = "sha256:" + "0" * 64
+        result_path = Path(
+            self.command[self.command.index("--output-last-message") + 1]
+        )
+        if self.mode != "no_result":
+            result_path.write_text(
+                json.dumps(
+                    {
+                        "protocol_version": request["protocol_version"],
+                        "input_fingerprint": request["input_fingerprint"],
+                        "candidates": [
+                            {
+                                "statement": "Synthetic statement.",
+                                "semantic_type": "observation",
+                                "concerns": ["Synthetic"],
+                                "evidence_unit_ids": [
+                                    request["anchor_units"][0]["unit_id"]
+                                ],
+                                "context": "Synthetic context.",
+                                "confidence": 0.9,
+                            }
+                        ],
+                        "residue": [],
+                    }
+                ),
+                encoding="utf-8",
+            )
+        self.returncode = 0
+        return "", ""
+
+
+class FakeRunner:
+    def __init__(self, mode: str = "valid"):
+        self.mode = mode
+        self.calls: list[list[str]] = []
+        self.schemas: list[dict[str, object]] = []
+
+    def __call__(self, command, **_kwargs):
+        command = list(command)
+        self.schemas.append(
+            json.loads(Path(command[command.index("--output-schema") + 1]).read_text())
+        )
+        return FakeProcess(command, mode=self.mode, calls=self.calls)
+
+
+class SemanticHandoffTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp.name)
+
+    def tearDown(self) -> None:
+        self.temp.cleanup()
+
+    def unit(self) -> RepresentationAnalysisUnit:
+        return RepresentationAnalysisUnit(
+            unit_id="unit_" + "a" * 64,
+            representation_id="repr_" + "b" * 64,
+            source_id="src_" + "c" * 32,
+            source_content_hash="sha256:" + "d" * 64,
+            representation_kind="markdown_blocks",
+            kind="block",
+            content="Synthetic provider input.",
+            structured_value=None,
+            locator={"line": 1},
+            context="Synthetic context.",
+            artifact_id="artifact_" + "e" * 64,
+            artifact_locator="artifacts/synthetic.json",
+            analysis_eligible=True,
+        )
+
+    def test_codex_cli_provider_preserves_strict_binding_and_schema_shape(self) -> None:
+        runner = FakeRunner()
+        provider = CodexCliRepresentationAnalysisProvider(
+            provider_version="0.147.0", runner=runner
+        )
+        result = provider.analyze(RepresentationAnalysisBatch((self.unit(),)))
+        self.assertEqual(result.candidates[0].evidence_unit_ids, (self.unit().unit_id,))
+        schema = runner.schemas[0]
+        self.assertEqual(
+            schema["properties"]["protocol_version"],
+            {"type": "string", "const": "external-agent-semantic-handoff/1.0"},
+        )
+        self.assertFalse(schema["additionalProperties"])
+        self.assertEqual(
+            provider.execution_records[0].strict_validation_status, "passed"
+        )
+
+    def test_failure_is_fail_closed_and_does_not_echo_input(self) -> None:
+        provider = CodexCliRepresentationAnalysisProvider(
+            provider_version="0.147.0", runner=FakeRunner("nonzero")
+        )
+        with self.assertRaisesRegex(Exception, "未产生可验证") as error:
+            provider.analyze(RepresentationAnalysisBatch((self.unit(),)))
+        self.assertNotIn(self.unit().content, str(error.exception))
+        self.assertEqual(
+            provider.execution_records[0].failure_category, "runtime_nonzero_exit"
+        )
+
+    def test_wrong_protocol_binding_is_fail_closed_before_package_creation(
+        self,
+    ) -> None:
+        provider = CodexCliRepresentationAnalysisProvider(
+            provider_version="0.147.0", runner=FakeRunner("wrong_binding")
+        )
+        with self.assertRaisesRegex(Exception, "未产生可验证"):
+            provider.analyze(RepresentationAnalysisBatch((self.unit(),)))
+        self.assertEqual(
+            provider.execution_records[0].failure_category, "result_binding_failure"
+        )
+
+    def build_service(self):
+        external = self.root / "synthetic.txt"
+        external.write_text("synthetic", encoding="utf-8")
+        sources = LocalManagedSourceRepository(
+            self.root / "managed",
+            id_factory=lambda: "src_" + "1" * 32,
+            clock=lambda: "2026-08-15T00:00:00.000Z",
+        )
+        source = sources.admit(
+            external, metadata={"media_type": "application/synthetic"}
+        ).source
+        representations = LocalRepresentationRepository(self.root / "representations")
+        representation = (
+            RepresentationService(sources, representations)
+            .build(source.source_id, JsonAdapter())
+            .representation
+        )
+        service = RepresentationInformationService(
+            sources,
+            representations,
+            self.root / "information",
+            clock=lambda: "2026-08-15T00:00:00.000Z",
+        )
+        return representation, service
+
+    def test_handoff_writes_auditable_package_and_idempotent_store_replay(self) -> None:
+        representation, service = self.build_service()
+        runner = FakeRunner()
+        provider = CodexCliRepresentationAnalysisProvider(
+            provider_version="0.147.0", runner=runner
+        )
+        handoff = ExternalAgentSemanticHandoffService(
+            service,
+            JsonlAtomicInformationStore(self.root / "atomic.jsonl"),
+            self.root / "audits",
+        )
+        first = handoff.execute(representation.representation_id, provider)
+        self.assertEqual(first.ingestion.created, 1)
+        self.assertFalse(first.replayed_existing_package)
+        audit = json.loads(first.audit_paths[0].read_text())
+        self.assertEqual(audit["execution_status"], "succeeded")
+        self.assertTrue(audit["package_published"])
+        self.assertTrue(audit["information_ingested"])
+        self.assertEqual(audit["durable_ingestion_status"], "completed")
+        self.assertEqual(audit["unaccounted_units"], 0)
+        self.assertEqual(audit["audit_readback_status"], "verified")
+        self.assertNotIn("Synthetic business input.", first.audit_paths[0].read_text())
+        replay_provider = CodexCliRepresentationAnalysisProvider(
+            provider_version="0.147.0", runner=FakeRunner()
+        )
+        second = handoff.execute(representation.representation_id, replay_provider)
+        self.assertTrue(second.replayed_existing_package)
+        self.assertEqual(second.ingestion.existing, 1)
+        self.assertEqual(replay_provider.execution_records, [])
+
+    def test_handoff_failure_writes_audit_without_package_or_information(self) -> None:
+        representation, service = self.build_service()
+        provider = CodexCliRepresentationAnalysisProvider(
+            provider_version="0.147.0", runner=FakeRunner("nonzero")
+        )
+        handoff = ExternalAgentSemanticHandoffService(
+            service,
+            JsonlAtomicInformationStore(self.root / "atomic.jsonl"),
+            self.root / "audits",
+        )
+        with self.assertRaisesRegex(Exception, "未新增 Durable"):
+            handoff.execute(representation.representation_id, provider)
+        self.assertFalse(
+            (self.root / "information" / representation.representation_id).exists()
+        )
+        self.assertFalse((self.root / "atomic.jsonl").exists())
+        audits = list((self.root / "audits").glob("*/processing-run-audit.json"))
+        self.assertEqual(len(audits), 1)
+        self.assertEqual(
+            json.loads(audits[0].read_text())["execution_status"], "failed"
+        )
+
+    def test_audit_is_read_back_before_durable_ingestion(self) -> None:
+        representation, service = self.build_service()
+        audit_root = self.root / "audits"
+        case = self
+
+        class InspectingStore(JsonlAtomicInformationStore):
+            def ingest_batch(self, revisions):
+                audits = list(audit_root.glob("*/processing-run-audit.json"))
+                case.assertEqual(len(audits), 1)
+                observed = json.loads(audits[0].read_text())
+                case.assertEqual(observed["audit_readback_status"], "verified")
+                case.assertEqual(observed["durable_ingestion_status"], "pending")
+                return super().ingest_batch(revisions)
+
+        provider = CodexCliRepresentationAnalysisProvider(
+            provider_version="0.147.0", runner=FakeRunner()
+        )
+        handoff = ExternalAgentSemanticHandoffService(
+            service, InspectingStore(self.root / "atomic.jsonl"), audit_root
+        )
+        handoff.execute(representation.representation_id, provider)
+
+    def test_handoff_does_not_import_world_model_or_offer_fallback(self) -> None:
+        import archeos.semantic_handoff as handoff_module
+
+        source = inspect.getsource(handoff_module)
+        self.assertNotIn("world_model", source)
+        self.assertNotIn("fallback", source.lower())
+
+
+if __name__ == "__main__":
+    unittest.main()
