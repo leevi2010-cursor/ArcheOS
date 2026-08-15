@@ -17,6 +17,7 @@ from archeos.representation import (
     AdapterBuildResult,
     LocalRepresentationRepository,
     RepresentationService,
+    WechatConversationRepresentationAdapter,
 )
 from archeos.representation_information import (
     CodexCliRepresentationAnalysisProvider,
@@ -101,12 +102,11 @@ class FakeProcess:
                                 "statement": "Synthetic statement.",
                                 "semantic_type": "observation",
                                 "concerns": ["Synthetic"],
-                                "evidence_unit_ids": [
-                                    request["anchor_units"][0]["unit_id"]
-                                ],
+                                "evidence_unit_ids": [unit["unit_id"]],
                                 "context": "Synthetic context.",
                                 "confidence": 0.9,
                             }
+                            for unit in request["anchor_units"]
                         ],
                         "residue": [],
                     }
@@ -262,6 +262,46 @@ class SemanticHandoffTest(unittest.TestCase):
         )
         return representation, service
 
+    def build_wechat_service(self):
+        root = self.root / "wechat"
+        source_path = root / "private.json"
+        source_path.parent.mkdir(parents=True)
+        source_path.write_text(
+            json.dumps(
+                {
+                    "chat": "Synthetic Chat",
+                    "username": "wxid_synthetic",
+                    "is_group": False,
+                    "count": 2,
+                    "offset": 0,
+                    "limit": 50,
+                    "start_time": None,
+                    "end_time": None,
+                    "type": None,
+                    "messages": [
+                        "[2026-08-15 09:00] Sender_A: Synthetic message one.",
+                        "[2026-08-15 09:01] Sender_B: Synthetic message two.",
+                    ],
+                    "failures": None,
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+        sources = LocalManagedSourceRepository(
+            root / "01_inbox", id_factory=lambda: "src_" + "e" * 32
+        )
+        source = sources.admit(
+            source_path, metadata={"media_type": "application/json"}
+        ).source
+        representations = LocalRepresentationRepository(root / "representations")
+        representation = RepresentationService(sources, representations).build(
+            source.source_id, WechatConversationRepresentationAdapter(), {}
+        ).representation
+        return representation, RepresentationInformationService(
+            sources, representations, root / "information"
+        )
+
     def test_handoff_writes_auditable_package_and_idempotent_store_replay(self) -> None:
         representation, service = self.build_service()
         runner = FakeRunner()
@@ -290,6 +330,40 @@ class SemanticHandoffTest(unittest.TestCase):
         second = handoff.execute(representation.representation_id, replay_provider)
         self.assertTrue(second.replayed_existing_package)
         self.assertEqual(second.ingestion.existing, 1)
+        self.assertEqual(replay_provider.execution_records, [])
+
+    def test_wechat_representation_uses_the_production_handoff_and_exact_replay(self) -> None:
+        representation, service = self.build_wechat_service()
+        store_path = self.root / "wechat" / "atomic.jsonl"
+        audit_root = self.root / "wechat" / "audits"
+        provider = CodexCliRepresentationAnalysisProvider(
+            provider_version="0.147.0", runner=FakeRunner()
+        )
+        handoff = ExternalAgentSemanticHandoffService(
+            service, JsonlAtomicInformationStore(store_path), audit_root
+        )
+
+        first = handoff.execute(representation.representation_id, provider)
+        self.assertEqual(first.ingestion.created, 2)
+        self.assertFalse(first.replayed_existing_package)
+        self.assertEqual(len(first.audit_paths), 1)
+        audit = json.loads(first.audit_paths[0].read_text(encoding="utf-8"))
+        self.assertEqual(audit["eligible_units"], 2)
+        self.assertEqual(audit["covered_units"], 2)
+        self.assertEqual(audit["unaccounted_units"], 0)
+        self.assertEqual(audit["durable_ingestion_status"], "completed")
+        self.assertEqual(audit["handoff_status"], "completed")
+        manifest = json.loads((first.package / "manifest.json").read_text())
+        self.assertEqual(manifest["representation"]["kind"], "wechat_conversation")
+        self.assertEqual(manifest["downstream"]["world_model_write"], "not_performed")
+        self.assertFalse((self.root / "wechat" / "04_core").exists())
+
+        replay_provider = CodexCliRepresentationAnalysisProvider(
+            provider_version="0.147.0", runner=FakeRunner()
+        )
+        replay = handoff.execute(representation.representation_id, replay_provider)
+        self.assertTrue(replay.replayed_existing_package)
+        self.assertEqual(replay.ingestion.existing, 2)
         self.assertEqual(replay_provider.execution_records, [])
 
     def test_handoff_failure_writes_audit_without_package_or_information(self) -> None:

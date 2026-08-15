@@ -829,10 +829,6 @@ class RepresentationInformationService:
         try:
             representation_id = require_representation_id(representation_id)
             representation = self.representation_repository.get(representation_id)
-            if representation.kind == "wechat_conversation":
-                raise RepresentationInformationError(
-                    "Conversation 目前只允许生成 Representation；真实语义吸收尚未开放。"
-                )
             verification = self.representation_repository.verify(representation_id)
             if not verification.verified:
                 raise RepresentationInformationError("Representation failed verification")

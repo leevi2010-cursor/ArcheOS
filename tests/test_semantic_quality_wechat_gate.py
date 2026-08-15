@@ -314,9 +314,12 @@ class SemanticQualityWechatGateTest(unittest.TestCase):
                 gate.run_real_call(value, marker_path=marker, review_root=root / "review", runner=lambda *args, **kwargs: FakeProcess(*args, payload=json.dumps(response), **kwargs))
             self.assertEqual(json.loads(marker.read_text())["status"], "failed")
 
-    def test_production_wechat_gate_remains_covered_by_existing_test(self):
+    def test_unified_wechat_information_lifecycle_remains_covered_by_existing_test(self):
         existing = (ROOT / "tests/test_wechat_conversation.py").read_text(encoding="utf-8")
-        self.assertIn("test_information_extract_fails_before_provider_or_durable_write", existing)
+        self.assertIn(
+            "test_information_extract_uses_the_unified_information_lifecycle",
+            existing,
+        )
 
 
 if __name__ == "__main__":
