@@ -583,10 +583,17 @@ def _run_external_agent_once(
             "timeout" if _terminate_process_group(process) else "process_cleanup_failure"
         )
     except (OSError, subprocess.SubprocessError):
-        _terminate_process_group(process)
-        return _ExternalAgentProcessOutcome("runtime_execution_failure")
+        return _ExternalAgentProcessOutcome(
+            "runtime_execution_failure"
+            if _terminate_process_group(process)
+            else "process_cleanup_failure"
+        )
     if process.returncode != 0:
-        return _ExternalAgentProcessOutcome("runtime_nonzero_exit")
+        return _ExternalAgentProcessOutcome(
+            "runtime_nonzero_exit"
+            if _process_group_absent(process.pid) or _terminate_process_group(process)
+            else "process_cleanup_failure"
+        )
     if not _process_group_absent(process.pid) and not _terminate_process_group(process):
         return _ExternalAgentProcessOutcome("process_cleanup_failure")
     return _ExternalAgentProcessOutcome(None)

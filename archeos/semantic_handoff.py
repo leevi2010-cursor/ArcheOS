@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import tempfile
@@ -54,10 +55,19 @@ class ExternalAgentSemanticHandoffService:
         provider: CodexCliRepresentationAnalysisProvider,
     ) -> SemanticHandoffResult:
         package = self.representation_service.output_root / representation_id
-        if package.exists():
+        if os.path.lexists(package):
             try:
+                self._verify_replay_input(representation_id, package)
                 validate_representation_information_package(package)
+                audit_paths = self._matching_audit_paths(_package_fingerprint(package))
+                if not audit_paths:
+                    raise SemanticHandoffError(
+                        "已存在的信息包缺少可读回的 Processing Run 审计。"
+                    )
+                self._validate_replay_audits(audit_paths)
                 ingestion = ingest_processing_package(package, self.store)
+                self._readback_store(ingestion)
+                self._finalize_audits(audit_paths)
             except (
                 OSError,
                 ValueError,
@@ -67,30 +77,36 @@ class ExternalAgentSemanticHandoffService:
                 raise SemanticHandoffError(
                     "已存在的信息包未能安全重放；未执行 External Agent。"
                 ) from exc
-            return SemanticHandoffResult(package, ingestion, (), True)
+            return SemanticHandoffResult(package, ingestion, audit_paths, True)
 
         try:
             package = self.representation_service.extract(representation_id, provider)
             validate_representation_information_package(package)
+            package_fingerprint = _package_fingerprint(package)
             audit_paths = self._persist_audits(
                 provider.execution_records,
                 package_published=True,
                 information_ingested=False,
                 durable_ingestion_status="pending",
-                failure_category=None,
+                package_fingerprint=package_fingerprint,
+                handoff_status="pending",
             )
             if not audit_paths:
                 raise SemanticHandoffError(
                     "External Agent 未生成可读回的 Processing Run 审计。"
                 )
             ingestion = ingest_processing_package(package, self.store)
+            self._readback_store(ingestion)
         except (OSError, ValueError, TypeError, RepresentationInformationError) as exc:
             audit_paths = self._persist_audits(
                 provider.execution_records,
                 package_published=package.is_dir(),
                 information_ingested=False,
                 durable_ingestion_status="not_completed",
-                failure_category="handoff_failure",
+                package_fingerprint=(
+                    _package_fingerprint(package) if package.is_dir() else None
+                ),
+                handoff_status="failed",
             )
             if not audit_paths and provider.execution_records:
                 raise SemanticHandoffError("External Agent 审计无法安全保存。") from exc
@@ -98,13 +114,7 @@ class ExternalAgentSemanticHandoffService:
                 "External Agent 语义交接失败；未新增 Durable Atomic Information。"
             ) from exc
         try:
-            audit_paths = self._persist_audits(
-                provider.execution_records,
-                package_published=True,
-                information_ingested=True,
-                durable_ingestion_status="completed",
-                failure_category=None,
-            )
+            self._finalize_audits(audit_paths)
         except SemanticHandoffError as exc:
             raise SemanticHandoffError(
                 "Durable Atomic Information 已写入，但 Processing Run 审计仍为待完成；需要人工恢复审计读回。"
@@ -118,7 +128,8 @@ class ExternalAgentSemanticHandoffService:
         package_published: bool,
         information_ingested: bool,
         durable_ingestion_status: str,
-        failure_category: str | None,
+        package_fingerprint: str | None,
+        handoff_status: str,
     ) -> tuple[Path, ...]:
         paths: list[Path] = []
         for record in records:
@@ -132,13 +143,8 @@ class ExternalAgentSemanticHandoffService:
                 "provider_version": record.provider_version,
                 "started_at": record.started_at,
                 "finished_at": record.finished_at,
-                "execution_status": (
-                    "succeeded"
-                    if record.execution_status == "succeeded"
-                    and failure_category is None
-                    else "failed"
-                ),
-                "failure_category": failure_category or record.failure_category,
+                "execution_status": (record.execution_status),
+                "failure_category": record.failure_category,
                 "strict_validation_status": record.strict_validation_status,
                 "result_fingerprint": record.result_fingerprint,
                 "eligible_units": record.eligible_units,
@@ -150,8 +156,10 @@ class ExternalAgentSemanticHandoffService:
                     else "not_applicable"
                 ),
                 "package_published": package_published,
+                "package_fingerprint": package_fingerprint,
                 "information_ingested": information_ingested,
                 "durable_ingestion_status": durable_ingestion_status,
+                "handoff_status": handoff_status,
                 "audit_readback_status": "pending",
             }
             path = (
@@ -167,6 +175,78 @@ class ExternalAgentSemanticHandoffService:
                 raise SemanticHandoffError("Processing Run 审计最终读回失败。")
             paths.append(path)
         return tuple(paths)
+
+    def _verify_replay_input(self, representation_id: str, package: Path) -> None:
+        representation = self.representation_service.representation_repository.get(
+            representation_id
+        )
+        verification = self.representation_service.representation_repository.verify(
+            representation_id
+        )
+        if not verification.verified:
+            raise SemanticHandoffError("已存在的信息包对应 Representation 校验失败。")
+        self.representation_service._verify_source(representation)
+        manifest, _ = validate_representation_information_package(package)
+        source = manifest.get("source")
+        package_representation = manifest.get("representation")
+        if (
+            not isinstance(source, dict)
+            or not isinstance(package_representation, dict)
+            or source.get("id") != representation.source_id
+            or package_representation.get("representation_id")
+            != representation.representation_id
+            or source.get("content_hash") != representation.source_content_hash
+        ):
+            raise SemanticHandoffError("已存在的信息包不再匹配当前受管输入。")
+
+    def _matching_audit_paths(self, package_fingerprint: str) -> tuple[Path, ...]:
+        if not self.audit_root.is_dir():
+            return ()
+        matches: list[Path] = []
+        for path in sorted(self.audit_root.glob("*/processing-run-audit.json")):
+            try:
+                audit = _private_json_read(path)
+            except (OSError, json.JSONDecodeError, SemanticHandoffError):
+                continue
+            if audit.get("package_fingerprint") == package_fingerprint:
+                matches.append(path)
+        return tuple(matches)
+
+    def _validate_replay_audits(self, paths: tuple[Path, ...]) -> None:
+        for path in paths:
+            audit = _private_json_read(path)
+            if (
+                audit.get("execution_status") != "succeeded"
+                or audit.get("strict_validation_status") != "passed"
+                or audit.get("package_published") is not True
+                or audit.get("audit_readback_status") != "verified"
+                or audit.get("durable_ingestion_status") not in {"pending", "completed"}
+            ):
+                raise SemanticHandoffError("已存在的信息包审计状态不能安全重放。")
+
+    def _readback_store(self, ingestion: IngestionResult) -> None:
+        for atomic_information_id in ingestion.atomic_information_ids:
+            observed = self.store.get_current(atomic_information_id)
+            if observed.atomic_information_id != atomic_information_id:
+                raise SemanticHandoffError("Durable Atomic Information 读回不一致。")
+
+    def _finalize_audits(self, paths: tuple[Path, ...]) -> None:
+        for path in paths:
+            try:
+                payload = _private_json_read(path)
+                payload["information_ingested"] = True
+                payload["durable_ingestion_status"] = "completed"
+                payload["handoff_status"] = "completed"
+                payload["audit_readback_status"] = "pending"
+                _private_json_write(path, payload)
+                if _private_json_read(path) != payload:
+                    raise SemanticHandoffError("Processing Run 审计最终读回失败。")
+                payload["audit_readback_status"] = "verified"
+                _private_json_write(path, payload)
+                if _private_json_read(path) != payload:
+                    raise SemanticHandoffError("Processing Run 审计最终读回失败。")
+            except (OSError, ValueError, TypeError, json.JSONDecodeError):
+                raise SemanticHandoffError("Processing Run 审计最终读回失败。")
 
 
 def _private_json_write(path: Path, payload: dict[str, object]) -> None:
@@ -199,3 +279,21 @@ def _private_json_read(path: Path) -> dict[str, object]:
     if not isinstance(value, dict):
         raise SemanticHandoffError("Processing Run 审计不是对象。")
     return value
+
+
+def _package_fingerprint(package: Path) -> str:
+    """Stable private linkage between a strict package and its Processing Runs."""
+    package = Path(package)
+    if package.is_symlink() or not package.is_dir():
+        raise SemanticHandoffError("Processing package 目录不安全。")
+    digest = hashlib.sha256()
+    for path in sorted(package.rglob("*")):
+        if path.is_symlink() or not path.is_file():
+            continue
+        relative = path.relative_to(package).as_posix().encode("utf-8")
+        digest.update(len(relative).to_bytes(4, "big"))
+        digest.update(relative)
+        content = path.read_bytes()
+        digest.update(len(content).to_bytes(8, "big"))
+        digest.update(content)
+    return "sha256:" + digest.hexdigest()
