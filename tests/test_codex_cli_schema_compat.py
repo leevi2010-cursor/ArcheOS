@@ -21,9 +21,12 @@ SPEC.loader.exec_module(compat)
 class FakeProcess:
     def __init__(self, command, **_kwargs):
         self.command = command
+        self.pid = 123
         self.returncode = 0
 
     def communicate(self, input=None, timeout=None):
+        if self.command[-1] == "--version":
+            return "codex-cli synthetic", ""
         result = Path(self.command[self.command.index("--output-last-message") + 1])
         schema = json.loads(Path(self.command[self.command.index("--output-schema") + 1]).read_text())
         if set(schema["properties"]) == {"answer"}:
@@ -53,6 +56,8 @@ class FakeProcess:
 
 class NonzeroSchemaProcess(FakeProcess):
     def communicate(self, input=None, timeout=None):
+        if self.command[-1] == "--version":
+            return "codex-cli synthetic", ""
         self.returncode = 2
         return "", "invalid_json_schema: type key required"
 
@@ -66,6 +71,37 @@ class InvalidContextProcess(FakeProcess):
             payload["candidates"][0]["evidence_unit_ids"] = ["unknown-unit"]
             result.write_text(json.dumps(payload), encoding="utf-8")
         return stdout, stderr
+
+
+class MissingBinaryProcess:
+    def __init__(self, *_args, **_kwargs):
+        raise FileNotFoundError("synthetic codex missing")
+
+
+class TimeoutVersionProcess(FakeProcess):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.first = True
+
+    def communicate(self, input=None, timeout=None):
+        if self.first:
+            self.first = False
+            raise subprocess.TimeoutExpired(self.command, timeout)
+        self.returncode = -9
+        return "", "synthetic timeout cleanup"
+
+
+class ProcessGroupController:
+    def __init__(self):
+        self.calls: list[int] = []
+        self.killed = False
+
+    def __call__(self, _pid, signal_number):
+        self.calls.append(signal_number)
+        if signal_number == 0 and self.killed:
+            raise ProcessLookupError
+        if signal_number == compat.signal.SIGKILL:
+            self.killed = True
 
 
 class CodexCliSchemaCompatibilityTest(unittest.TestCase):
@@ -94,11 +130,30 @@ class CodexCliSchemaCompatibilityTest(unittest.TestCase):
                 "type": "object",
                 "properties": {"answer": {"const": "SYNTHETIC_OK"}},
             }), encoding="utf-8")
-            with patch.object(compat, "SIMPLE_SCHEMA_PATH", broken), patch.object(
-                compat.subprocess, "run", side_effect=AssertionError("version/model path must not start")
+            with (
+                patch.object(compat, "SIMPLE_SCHEMA_PATH", broken),
+                self.assertRaises(compat.SchemaCompatibilityError),
             ):
-                with self.assertRaises(compat.SchemaCompatibilityError):
-                    compat.run_experiment(codex_bin="synthetic-codex", timeout=1, popen=FakeProcess)
+                compat.run_experiment(codex_bin="synthetic-codex", timeout=1, popen=MissingBinaryProcess)
+
+    def test_draft_schema_invalid_required_items_and_type_stop_before_model_call(self):
+        invalid_values = (
+            {"type": "object", "properties": {}, "required": "answer"},
+            {"type": "object", "properties": {"items": {"type": "array", "items": "not-a-schema"}}},
+            {"type": "object", "properties": {"value": {"type": "not-a-json-schema-type"}}},
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            for index, invalid in enumerate(invalid_values):
+                broken = Path(temporary) / f"broken-{index}.schema.json"
+                broken.write_text(json.dumps({
+                    "$schema": "https://json-schema.org/draft/2020-12/schema",
+                    **invalid,
+                }), encoding="utf-8")
+                with (
+                    patch.object(compat, "SIMPLE_SCHEMA_PATH", broken),
+                    self.assertRaises(compat.SchemaCompatibilityError),
+                ):
+                    compat.run_experiment(codex_bin="synthetic-codex", timeout=1, popen=MissingBinaryProcess)
 
     def test_tracked_schema_is_exactly_corrected_existing_contract(self):
         tracked = compat.load_schema(compat.SEMANTIC_SCHEMA_PATH)
@@ -116,8 +171,7 @@ class CodexCliSchemaCompatibilityTest(unittest.TestCase):
         self.assertTrue(all(unit.context_support_unit_ids == (support,) for unit in large.anchor_units))
 
     def test_fake_runs_recover_strict_baseline_and_context_evidence(self):
-        with patch.object(compat.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "codex-cli synthetic", "")):
-            report = compat.run_experiment(codex_bin="synthetic-codex", timeout=1, popen=FakeProcess)
+        report = compat.run_experiment(codex_bin="synthetic-codex", timeout=1, popen=FakeProcess)
         self.assertEqual(report["model_calls"], 3)
         self.assertEqual(report["strict_execution_baseline"], "recovered")
         last = report["runs"][-1]
@@ -126,11 +180,29 @@ class CodexCliSchemaCompatibilityTest(unittest.TestCase):
         self.assertEqual(last["context_evidence_validator_status"], "passed")
 
     def test_first_failure_stops_budget_without_retry(self):
-        with patch.object(compat.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "codex-cli synthetic", "")):
-            report = compat.run_experiment(codex_bin="synthetic-codex", timeout=1, popen=NonzeroSchemaProcess)
+        report = compat.run_experiment(codex_bin="synthetic-codex", timeout=1, popen=NonzeroSchemaProcess)
         self.assertEqual(report["model_calls"], 1)
         self.assertEqual(report["failure_category"], "structured_output_schema_failure")
         self.assertEqual(len(report["runs"]), 1)
+
+    def test_version_startup_failure_returns_actionable_zero_call_report(self):
+        report = compat.run_experiment(codex_bin="synthetic-codex", timeout=1, popen=MissingBinaryProcess)
+        self.assertEqual(report["model_calls"], 0)
+        self.assertEqual(report["failure_category"], "runtime_or_auth_failure")
+        self.assertEqual(report["version"]["status"], "failed")
+        self.assertIn("FileNotFoundError", report["version"]["startup_error"])
+
+    def test_version_timeout_terminates_and_verifies_process_group(self):
+        controller = ProcessGroupController()
+        with patch.object(compat.os, "killpg", controller):
+            result = compat.run_codex_version("synthetic-codex", timeout=1, runner=TimeoutVersionProcess)
+        self.assertEqual(result["status"], "failed")
+        self.assertTrue(result["timed_out"])
+        self.assertEqual(result["cleanup_status"], "killed")
+        self.assertEqual(
+            controller.calls,
+            [0, compat.signal.SIGTERM, 0, compat.signal.SIGKILL, 0],
+        )
 
     def test_context_evidence_error_fails_closed(self):
         spec = compat.runs()[1]

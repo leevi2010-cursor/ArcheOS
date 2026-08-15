@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Issue #80 public-synthetic Codex CLI schema-compatibility experiment.
 
 This is an experiment-only execution harness.  It validates that the existing
@@ -10,15 +9,17 @@ from __future__ import annotations
 
 import argparse
 import copy
+import errno
 import hashlib
 import json
 import os
 import re
+import signal
 import subprocess
 import sys
 import tempfile
 import time
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -28,14 +29,12 @@ REPO_ROOT = ROOT.parents[3]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from archeos.representation_information import (  # noqa: E402
+from archeos.representation_information import (
     RepresentationAnalysisBatch,
     RepresentationAnalysisResult,
     RepresentationAnalysisUnit,
-    RepresentationCandidateDraft,
     RepresentationInformationError,
     RepresentationInformationService,
-    RepresentationResidueDraft,
     _candidate_draft,
     _provider_unit,
     _residue_draft,
@@ -45,6 +44,7 @@ from archeos.representation_information import (  # noqa: E402
 PROTOCOL_VERSION = "semantic-quality-wechat/1.0"
 MAX_MODEL_CALLS = 3
 TIMEOUT_SECONDS = 120
+VERSION_TIMEOUT_SECONDS = 15
 SAFE_TAIL_LIMIT = 1600
 SIMPLE_SCHEMA_PATH = ROOT / "schemas/simple-type-const.schema.json"
 SEMANTIC_SCHEMA_PATH = ROOT / "schemas/semantic-quality-result.schema.json"
@@ -56,6 +56,10 @@ class SchemaCompatibilityError(RuntimeError):
 
 class ResultError(RuntimeError):
     """The provider response failed the preserved #31/#48 contract."""
+
+
+class ProcessCleanupError(RuntimeError):
+    """A timed-out Codex process group could not be proven absent."""
 
 
 def canonical_json(value: object) -> str:
@@ -127,6 +131,20 @@ def preflight_const_types(schema: object, path: str = "$") -> None:
             preflight_const_types(child, f"{path}.{key}")
 
 
+def draft202012_check(schema: object) -> None:
+    """Use the declared ``mcp`` dependency's JSON Schema validator, or stop."""
+    try:
+        from jsonschema import Draft202012Validator
+    except ImportError as exc:
+        raise SchemaCompatibilityError(
+            "Draft 2020-12 schema validation is unavailable; install declared core dependencies"
+        ) from exc
+    try:
+        Draft202012Validator.check_schema(schema)
+    except Exception as exc:
+        raise SchemaCompatibilityError("tracked schema is not valid Draft 2020-12 JSON Schema") from exc
+
+
 def semantic_schema() -> dict[str, object]:
     """Rebuild the #76 strict schema, changing only protocol serialization."""
     base = representation_analysis_schema()
@@ -153,6 +171,7 @@ def load_schema(path: Path) -> dict[str, object]:
         raise SchemaCompatibilityError("tracked schema is not a Draft 2020-12 JSON Schema object")
     if value.get("type") != "object" or not isinstance(value.get("properties"), dict):
         raise SchemaCompatibilityError("tracked schema root is not a strict object schema")
+    draft202012_check(value)
     preflight_const_types(value)
     return value
 
@@ -277,6 +296,125 @@ def _failure_category(stderr: str, *, exit_code: int | None, result_present: boo
     return None
 
 
+def _process_group_absent(pid: int) -> bool:
+    try:
+        os.killpg(pid, 0)
+    except ProcessLookupError:
+        return True
+    except OSError as exc:
+        if exc.errno == errno.ESRCH:
+            return True
+        raise ProcessCleanupError("process-group absence cannot be verified") from exc
+    return False
+
+
+def terminate_process_group(process: Any) -> str:
+    """Terminate, verify, kill, then verify a timed-out process group."""
+    if not isinstance(getattr(process, "pid", None), int):
+        raise ProcessCleanupError("timed-out process has no valid process-group id")
+    if _process_group_absent(process.pid):
+        return "already_absent"
+    for sig, status in ((signal.SIGTERM, "terminated"), (signal.SIGKILL, "killed")):
+        try:
+            os.killpg(process.pid, sig)
+        except ProcessLookupError:
+            return status
+        except OSError as exc:
+            if exc.errno != errno.ESRCH:
+                raise ProcessCleanupError("process-group signal failed") from exc
+        if _process_group_absent(process.pid):
+            return status
+    raise ProcessCleanupError("timed-out process group remains after SIGKILL")
+
+
+@dataclass(frozen=True)
+class ProcessOutcome:
+    stdout: str
+    stderr: str
+    exit_code: int | None
+    timed_out: bool
+    startup_error: str | None
+    cleanup_status: str
+    cleanup_error: str | None
+    drain_timed_out: bool
+
+
+def run_bounded_process(
+    command: list[str],
+    *,
+    input_text: str | None,
+    timeout: int,
+    runner: Callable[..., Any] = subprocess.Popen,
+) -> ProcessOutcome:
+    """Run once and return bounded diagnostics even when startup or timeout fails."""
+    try:
+        process = runner(
+            command,
+            stdin=subprocess.PIPE if input_text is not None else subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            start_new_session=True,
+            env=safe_environment(),
+        )
+    except OSError as exc:
+        return ProcessOutcome("", "", None, False, f"{type(exc).__name__}: {exc}", "not_started", None, False)
+    try:
+        stdout, stderr = process.communicate(input=input_text, timeout=timeout)
+        return ProcessOutcome(stdout, stderr, process.returncode, False, None, "not_required", None, False)
+    except subprocess.TimeoutExpired as exc:
+        cleanup_status = "failed"
+        cleanup_error: str | None = None
+        try:
+            cleanup_status = terminate_process_group(process)
+        except ProcessCleanupError as cleanup_exc:
+            cleanup_error = str(cleanup_exc)
+        try:
+            stdout, stderr = process.communicate(timeout=5)
+            drain_timed_out = False
+        except subprocess.TimeoutExpired:
+            stdout = str(exc.output or "")
+            stderr = str(exc.stderr or "")
+            drain_timed_out = True
+        return ProcessOutcome(
+            stdout,
+            stderr,
+            process.returncode,
+            True,
+            None,
+            cleanup_status,
+            cleanup_error,
+            drain_timed_out,
+        )
+
+
+def run_codex_version(
+    codex_bin: str, *, timeout: int = VERSION_TIMEOUT_SECONDS, runner: Callable[..., Any] = subprocess.Popen
+) -> dict[str, object]:
+    outcome = run_bounded_process([codex_bin, "--version"], input_text=None, timeout=timeout, runner=runner)
+    if outcome.startup_error is not None:
+        category = "runtime_or_auth_failure"
+    elif outcome.timed_out:
+        category = "other_reproducible_runtime_failure" if outcome.cleanup_error else "transient_or_unreproduced_failure"
+    elif outcome.exit_code != 0:
+        category = "runtime_or_auth_failure"
+    else:
+        category = None
+    return {
+        "status": "passed" if category is None else "failed",
+        "exit_code": outcome.exit_code,
+        "timed_out": outcome.timed_out,
+        "startup_error": redact(outcome.startup_error or "") or None,
+        "stdout_tail": redact(outcome.stdout),
+        "stderr_tail": redact(outcome.stderr),
+        "cleanup_status": outcome.cleanup_status,
+        "cleanup_error": redact(outcome.cleanup_error or "") or None,
+        "drain_timed_out": outcome.drain_timed_out,
+        "failure_category": category,
+        "codex_version": redact((outcome.stdout or outcome.stderr).strip()) or None,
+    }
+
+
 @dataclass(frozen=True)
 class RunSpec:
     run_id: str
@@ -316,28 +454,13 @@ def run_one(spec: RunSpec, *, codex_bin: str, timeout: int, popen: Callable[...,
             codex_bin, "exec", "--ephemeral", "--sandbox", "read-only", "--skip-git-repo-check",
             "--output-schema", str(schema_path), "--output-last-message", str(result_path), "--cd", str(directory), "-",
         ]
-        stdout = stderr = ""
-        exit_code: int | None = None
-        timed_out = False
-        startup_error = ""
-        try:
-            process = popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                            text=True, start_new_session=True, env=safe_environment())
-            try:
-                stdout, stderr = process.communicate(input=spec.prompt, timeout=timeout)
-            except subprocess.TimeoutExpired:
-                timed_out = True
-                process.kill()
-                stdout, stderr = process.communicate()
-            exit_code = process.returncode
-        except OSError as exc:
-            startup_error = f"{type(exc).__name__}: {exc}"
+        outcome = run_bounded_process(command, input_text=spec.prompt, timeout=timeout, runner=popen)
         result_present = result_path.is_file()
         raw = result_path.read_text(encoding="utf-8", errors="replace") if result_present else ""
         json_status = "not_applicable" if spec.batch is None else "not_present"
         validation = "not_run"
         validation_error = ""
-        if not timed_out and exit_code == 0:
+        if not outcome.timed_out and outcome.exit_code == 0:
             try:
                 if spec.batch is None:
                     if json.loads(raw) != {"answer": "SYNTHETIC_OK"}:
@@ -352,23 +475,31 @@ def run_one(spec: RunSpec, *, codex_bin: str, timeout: int, popen: Callable[...,
                     json_status = "invalid" if isinstance(exc, json.JSONDecodeError) else "valid"
                 validation = "failed"
                 validation_error = str(exc)
-        if timed_out:
-            category = "transient_or_unreproduced_failure"
-        elif startup_error:
+        if outcome.timed_out:
+            category = "other_reproducible_runtime_failure" if outcome.cleanup_error else "transient_or_unreproduced_failure"
+        elif outcome.startup_error:
             category = "runtime_or_auth_failure"
         else:
-            category = _failure_category(stderr, exit_code=exit_code, result_present=result_present, validation=validation)
+            category = _failure_category(
+                outcome.stderr,
+                exit_code=outcome.exit_code,
+                result_present=result_present,
+                validation=validation,
+            )
         anchor_total = len(spec.batch.anchor_units) if spec.batch else 0
         return {
             "run_id": spec.run_id,
             "label": spec.label,
             "called": True,
-            "provider_completed": exit_code == 0 and not timed_out,
-            "exit_code": exit_code,
-            "timed_out": timed_out,
-            "stdout_tail": redact(stdout),
-            "stderr_tail": redact(stderr),
-            "startup_error": redact(startup_error) or None,
+            "provider_completed": outcome.exit_code == 0 and not outcome.timed_out,
+            "exit_code": outcome.exit_code,
+            "timed_out": outcome.timed_out,
+            "stdout_tail": redact(outcome.stdout),
+            "stderr_tail": redact(outcome.stderr),
+            "startup_error": redact(outcome.startup_error or "") or None,
+            "cleanup_status": outcome.cleanup_status,
+            "cleanup_error": redact(outcome.cleanup_error or "") or None,
+            "drain_timed_out": outcome.drain_timed_out,
             "result_file_present": result_present,
             "json_status": json_status,
             "strict_schema_status": validation,
@@ -388,22 +519,23 @@ def run_experiment(*, codex_bin: str, timeout: int, popen: Callable[..., Any] = 
     if timeout <= 0:
         raise ValueError("timeout must be positive")
     preflight_result = preflight()
-    version = subprocess.run([codex_bin, "--version"], check=False, capture_output=True, text=True, timeout=15)
+    version = run_codex_version(codex_bin, runner=popen)
     report: dict[str, object] = {
         "issue": 80,
         "synthetic_only": True,
         "maximum_model_calls": MAX_MODEL_CALLS,
         "model_calls": 0,
-        "codex_version": redact((version.stdout or version.stderr).strip()) or None,
-        "version_exit_code": version.returncode,
+        "codex_version": version["codex_version"],
+        "version_exit_code": version["exit_code"],
+        "version": version,
         "preflight": preflight_result,
         "runs": [],
         "strict_execution_baseline": "not_recovered",
         "failure_category": "unresolved",
         "production_writes": 0,
     }
-    if version.returncode != 0:
-        report["failure_category"] = "runtime_or_auth_failure"
+    if version["failure_category"] is not None:
+        report["failure_category"] = version["failure_category"]
         return report
     for spec in runs():
         if int(report["model_calls"]) >= MAX_MODEL_CALLS:
