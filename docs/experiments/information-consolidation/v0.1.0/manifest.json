@@ -1,0 +1,67 @@
+{
+  "schema_version": "1.0",
+  "experiment": "information-consolidation-v0.1.0",
+  "issue": 32,
+  "authority": "origin/main and current Issue 32 Lead Decision at experiment start",
+  "execution_mode": "local_read_only_real_corpus",
+  "corpus": {
+    "durable_atomic_information": 136,
+    "conversation_source_families": 11,
+    "conversation_representations": 11,
+    "evidence_entries": 336,
+    "complete_evidence_entries": 336,
+    "structured_claims": 0,
+    "object_bindings": 0,
+    "duplicate_source_content_groups": 0,
+    "cross_source_shared_resource_groups": 1
+  },
+  "sufficiency": {
+    "result": "CORPUS_SUFFICIENT",
+    "equivalent_or_derived_provenance_pair": "pass",
+    "same_source_or_derived_evidence_chain": "pass",
+    "cross_conversation_independent_same_statement": "pass_at_claim_scope",
+    "clear_chronological_change": "pass",
+    "cannot_safely_fold_case": "pass"
+  },
+  "pair_review": {
+    "total": 28,
+    "derived": 2,
+    "complementary": 6,
+    "temporal_update": 8,
+    "conflict": 3,
+    "uncertain": 4,
+    "unrelated_negative_controls": 5,
+    "confirmed_whole_record_equivalent": 0,
+    "surface_equivalence_candidates_reviewed": 6
+  },
+  "retrieval": {
+    "positive_or_ambiguous_pairs": 23,
+    "negative_controls": 5,
+    "recommended_top_k": 8,
+    "combined_recall_numerator": 19,
+    "combined_recall_denominator": 23,
+    "combined_recall": 0.826,
+    "negative_controls_retrieved_at_top_k": 3,
+    "average_candidates": 7.89,
+    "embedding_evaluated": false
+  },
+  "context_impact": {
+    "raw_top_level_items": 30,
+    "grouped_top_level_items": 6,
+    "information_retained": "30/30",
+    "evidence_retained": "120/120",
+    "independent_sources_retained": "5/5",
+    "top_level_reduction": 0.8
+  },
+  "writes": {
+    "provider_calls": 0,
+    "source_admissions": 0,
+    "representation_admissions": 0,
+    "durable_information": 0,
+    "objects": 0,
+    "relationships": 0,
+    "lifecycle": 0,
+    "world_model": 0
+  },
+  "recommendation": "rewrite"
+}
