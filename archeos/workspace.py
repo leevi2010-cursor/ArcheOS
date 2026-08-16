@@ -138,7 +138,7 @@ def initialize_workspace(
 def doctor(config_path: Path | None = None) -> dict[str, object]:
     result: dict[str, object] = {"archeos_version": _version(), "python": os.sys.version.split()[0]}
     try:
-        config = require_workspace(config_path)
+        config = load_workspace_config(config_path)
     except ValueError as exc:
         path = (config_path or default_config_path()).expanduser()
         result.update({
@@ -154,18 +154,23 @@ def doctor(config_path: Path | None = None) -> dict[str, object]:
     result["workspace_config"] = "valid"
     result["workspace_root"] = str(root)
     result["durable_path_authority"] = "configured_workspace"
-    result["workspace_structure"] = all((root / item).is_dir() for item in WORKSPACE_DIRECTORIES)
+    result["workspace_structure"] = root.is_dir() and all(
+        (root / item).is_dir() for item in WORKSPACE_DIRECTORIES
+    )
     result["workspace_worktree_coupling"] = _workspace_worktree_coupling(root)
     try:
-        with tempfile.NamedTemporaryFile(dir=root, prefix=".archeos-doctor-", delete=True):
-            pass
-        result["workspace_read_write"] = True
+        if root.is_dir():
+            with tempfile.NamedTemporaryFile(dir=root, prefix=".archeos-doctor-", delete=True):
+                pass
+            result["workspace_read_write"] = True
+        else:
+            result["workspace_read_write"] = False
     except OSError:
         result["workspace_read_write"] = False
     ignore_path = root / ".gitignore"
-    result["privacy_boundary"] = (
-        "configured" if ignore_path.is_file() and "01_inbox/**" in ignore_path.read_text(encoding="utf-8") else "needs_attention"
-    )
+    result["privacy_boundary"] = "configured" if (
+        ignore_path.is_file() and "01_inbox/**" in ignore_path.read_text(encoding="utf-8")
+    ) else "needs_attention"
     result["context_read_path"] = "available" if (root / "04_core" / "archeos.sqlite3").is_file() else "empty_workspace"
     codex = shutil.which("codex")
     result["codex"] = "unavailable"

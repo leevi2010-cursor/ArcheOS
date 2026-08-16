@@ -27,7 +27,14 @@ from archeos.digestion.models import (
     WorldModelOperation,
 )
 from archeos.mcp_server import CanonicalReadService, create_server
+from archeos.representation import LocalRepresentationRepository, RepresentationService
 from archeos.representation.models import AdapterArtifact, AdapterBuildResult
+from archeos.representation_information import (
+    CodexCliRepresentationAnalysisProvider,
+    RepresentationInformationService,
+)
+from archeos.semantic_handoff import ExternalAgentSemanticHandoffService
+from archeos.source import LocalManagedSourceRepository
 from archeos.workspace import (
     MANAGED_CONFIG_COMMENT,
     MANAGED_TABLE,
@@ -38,6 +45,7 @@ from archeos.workspace import (
     remove_codex_integration,
 )
 from archeos.world_model import SQLiteWorldModelRepository
+from tests.test_semantic_handoff import FakeRunner, JsonAdapter
 
 
 @contextmanager
@@ -67,6 +75,59 @@ class _SyntheticRepresentationAdapter:
 
 
 class WorkspaceAndMcpTest(unittest.TestCase):
+    def test_semantic_handoff_durable_state_replays_across_code_cwds(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            workspace, config = root / "stable-workspace", root / "archeos.toml"
+            initialize_workspace(workspace, config_path=config)
+            code_a, code_b = root / "code-a", root / "code-b"
+            code_a.mkdir(); code_b.mkdir()
+            external = root / "synthetic.txt"
+            external.write_text("synthetic", encoding="utf-8")
+
+            def resolved_args() -> object:
+                args = build_parser().parse_args([
+                    "information", "--config", str(config), "extract", "repr_" + "a" * 64,
+                    "--external-agent-route", "codex-cli", "--provider-version", "synthetic",
+                ])
+                _resolve_durable_paths(args)
+                return args
+
+            with _chdir(code_a):
+                args = resolved_args()
+                sources = LocalManagedSourceRepository(args.managed_root, id_factory=lambda: "src_" + "a" * 32)
+                source = sources.admit(external, metadata={"media_type": "application/synthetic"}).source
+                representations = LocalRepresentationRepository(args.representation_root)
+                representation = RepresentationService(sources, representations).build(source.source_id, JsonAdapter()).representation
+                service = RepresentationInformationService(sources, representations, args.output_root)
+                first_runner = FakeRunner()
+                first = ExternalAgentSemanticHandoffService(
+                    service, JsonlAtomicInformationStore(args.store), args.audit_root,
+                ).execute(representation.representation_id, CodexCliRepresentationAnalysisProvider(
+                    provider_version="synthetic", runner=first_runner,
+                ))
+                self.assertEqual((first.ingestion.created, len(first_runner.calls)), (1, 1))
+
+            (code_b / "02_processing").mkdir(); (code_b / "03_information").mkdir()
+            with _chdir(code_b):
+                args = resolved_args()
+                sources = LocalManagedSourceRepository(args.managed_root)
+                representations = LocalRepresentationRepository(args.representation_root)
+                service = RepresentationInformationService(sources, representations, args.output_root)
+                replay_runner = FakeRunner()
+                replay = ExternalAgentSemanticHandoffService(
+                    service, JsonlAtomicInformationStore(args.store), args.audit_root,
+                ).execute(representation.representation_id, CodexCliRepresentationAnalysisProvider(
+                    provider_version="synthetic", runner=replay_runner,
+                ))
+                self.assertTrue(replay.replayed_existing_package)
+                self.assertEqual((replay.ingestion.created, replay.ingestion.existing, replay_runner.calls), (0, 1, []))
+
+            shutil.rmtree(code_a)
+            self.assertTrue(first.package.is_dir())
+            self.assertTrue(first.audit_paths[0].is_file())
+            self.assertEqual(len(JsonlAtomicInformationStore(args.store).list_atomic_information()), 1)
+
     def test_production_cli_defaults_use_configured_workspace_across_code_cwds(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
@@ -181,6 +242,18 @@ class WorkspaceAndMcpTest(unittest.TestCase):
             self.assertEqual(report["workspace_config"], "valid")
             self.assertEqual(report["durable_path_authority"], "configured_workspace")
             self.assertEqual(report["workspace_worktree_coupling"], "detected")
+
+    def test_doctor_keeps_valid_config_when_workspace_is_incomplete(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            workspace = root / "workspace"
+            config = root / "archeos.toml"
+            initialize_workspace(workspace, config_path=config)
+            (workspace / "04_core").rmdir()
+            report = workspace_module.doctor(config)
+            self.assertEqual(report["workspace_config"], "valid")
+            self.assertFalse(report["workspace_structure"])
+            self.assertFalse(report["healthy"])
 
     def test_init_is_safe_idempotent_and_config_show_and_doctor_work(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
