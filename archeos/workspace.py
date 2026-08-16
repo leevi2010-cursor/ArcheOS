@@ -2,16 +2,16 @@
 
 from __future__ import annotations
 
-import json
 import hashlib
 import importlib.util
+import json
 import os
 import shutil
 import subprocess
 import tempfile
 import tomllib
-from dataclasses import dataclass
 from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -32,6 +32,36 @@ class WorkspaceConfig:
 
     def to_dict(self) -> dict[str, str]:
         return {"workspace": str(self.workspace), "config_path": str(self.config_path)}
+
+
+def resolve_storage_path(
+    explicit_path: Path | None,
+    workspace: WorkspaceConfig | None,
+    relative_default: Path,
+) -> Path:
+    """Resolve one durable path without ever falling back to the code cwd."""
+    if explicit_path is not None:
+        return explicit_path
+    if workspace is None:
+        raise ValueError(
+            "no configured Workspace for durable storage; run `archeos init "
+            "<stable-workspace-path>` or pass every required storage path explicitly"
+        )
+    return workspace.workspace / relative_default
+
+
+def require_workspace(config_path: Path | None = None) -> WorkspaceConfig:
+    """Load a usable configured Workspace for production durable defaults."""
+    config = load_workspace_config(config_path)
+    if not config.workspace.is_dir():
+        raise ValueError(f"configured Workspace does not exist: {config.workspace}")
+    missing = [name for name in WORKSPACE_DIRECTORIES if not (config.workspace / name).is_dir()]
+    if missing:
+        raise ValueError(
+            "configured Workspace is incomplete; run `archeos init "
+            f"{config.workspace}` to create: {', '.join(missing)}"
+        )
+    return config
 
 
 @dataclass(frozen=True)
@@ -110,22 +140,37 @@ def doctor(config_path: Path | None = None) -> dict[str, object]:
     try:
         config = load_workspace_config(config_path)
     except ValueError as exc:
-        result.update({"healthy": False, "configuration": "unavailable", "error": str(exc)})
+        path = (config_path or default_config_path()).expanduser()
+        result.update({
+            "healthy": False,
+            "workspace_config": "invalid" if path.exists() else "unavailable",
+            "durable_path_authority": "configured_workspace",
+            "error": str(exc),
+        })
         return result
 
     root = config.workspace
     result["workspace"] = str(root)
-    result["workspace_structure"] = all((root / item).is_dir() for item in WORKSPACE_DIRECTORIES)
+    result["workspace_config"] = "valid"
+    result["workspace_root"] = str(root)
+    result["durable_path_authority"] = "configured_workspace"
+    result["workspace_structure"] = root.is_dir() and all(
+        (root / item).is_dir() for item in WORKSPACE_DIRECTORIES
+    )
+    result["workspace_worktree_coupling"] = _workspace_worktree_coupling(root)
     try:
-        with tempfile.NamedTemporaryFile(dir=root, prefix=".archeos-doctor-", delete=True):
-            pass
-        result["workspace_read_write"] = True
+        if root.is_dir():
+            with tempfile.NamedTemporaryFile(dir=root, prefix=".archeos-doctor-", delete=True):
+                pass
+            result["workspace_read_write"] = True
+        else:
+            result["workspace_read_write"] = False
     except OSError:
         result["workspace_read_write"] = False
     ignore_path = root / ".gitignore"
-    result["privacy_boundary"] = (
-        "configured" if ignore_path.is_file() and "01_inbox/**" in ignore_path.read_text(encoding="utf-8") else "needs_attention"
-    )
+    result["privacy_boundary"] = "configured" if (
+        ignore_path.is_file() and "01_inbox/**" in ignore_path.read_text(encoding="utf-8")
+    ) else "needs_attention"
     result["context_read_path"] = "available" if (root / "04_core" / "archeos.sqlite3").is_file() else "empty_workspace"
     codex = shutil.which("codex")
     result["codex"] = "unavailable"
@@ -141,6 +186,18 @@ def doctor(config_path: Path | None = None) -> dict[str, object]:
     result["optional_document_runtime"] = _optional_document_status()
     result["healthy"] = bool(result["workspace_structure"] and result["workspace_read_write"])
     return result
+
+
+def _workspace_worktree_coupling(root: Path) -> str:
+    try:
+        current = root.resolve()
+        for candidate in (current, *current.parents):
+            marker = candidate / ".git"
+            if marker.exists():
+                return "detected"
+        return "not_detected"
+    except OSError:
+        return "unknown"
 
 
 def _version() -> str:
@@ -321,7 +378,7 @@ def codex_integration_status(config: WorkspaceConfig, codex_config: Path | None)
     if bounds is None:
         return {"state": "not_installed", "config_path": str(path)}
     block = text[bounds[0] : bounds[1]]
-    expected_workspace = f'"{str(config.workspace)}"'
+    expected_workspace = f'"{config.workspace!s}"'
     if MANAGED_TABLE not in block or expected_workspace not in block:
         return {"state": "needs_attention", "config_path": str(path)}
     return {

@@ -499,6 +499,10 @@ class AtomicInformationIngestionTest(unittest.TestCase):
                         SOURCE_ID,
                         "--information-store",
                         str(store_path),
+                        "--managed-root",
+                        str(root / "managed"),
+                        "--output-root",
+                        str(root / "processing"),
                     ]
                 )
             with redirect_stdout(StringIO()):

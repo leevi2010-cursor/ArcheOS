@@ -23,6 +23,7 @@ from archeos.pyannote_speakers import PyannoteSpeakerProvider
 from archeos.representation_information import (
     FileRepresentationAnalysisProvider,
 )
+from archeos.workspace import WorkspaceConfig
 from archeos.world_model import SQLiteWorldModelRepository
 
 
@@ -36,17 +37,14 @@ class CliTest(unittest.TestCase):
     ) -> None:
         process_managed_audio.return_value = Path("/tmp/package")
         ingest_processing_package.return_value = IngestionResult(0, 0, 0, ())
-        with redirect_stdout(StringIO()):
+        with (
+            patch("archeos.cli.require_workspace", return_value=WorkspaceConfig(Path("/workspace"), Path("/config"))),
+            redirect_stdout(StringIO()),
+        ):
             result = main(
                 [
-                    "process",
-                    "sample.wav",
-                    "--transcript",
-                    "transcript.json",
-                    "--speaker-map",
-                    "speakers.json",
-                    "--analysis-file",
-                    "analysis.json",
+                    "process", "sample.wav", "--transcript", "transcript.json",
+                    "--speaker-map", "speakers.json", "--analysis-file", "analysis.json",
                 ]
             )
         self.assertEqual(result, 0)
@@ -62,7 +60,7 @@ class CliTest(unittest.TestCase):
         store = ingest_processing_package.call_args.args[1]
         self.assertEqual(
             store.path,
-            Path("03_information/atomic_information.jsonl"),
+            Path("/workspace/03_information/atomic_information.jsonl"),
         )
 
     @patch("archeos.cli.ingest_processing_package")
@@ -74,7 +72,10 @@ class CliTest(unittest.TestCase):
     ) -> None:
         process_managed_audio.return_value = Path("/tmp/package")
         ingest_processing_package.return_value = IngestionResult(0, 0, 0, ())
-        with redirect_stdout(StringIO()):
+        with (
+            patch("archeos.cli.require_workspace", return_value=WorkspaceConfig(Path("/workspace"), Path("/config"))),
+            redirect_stdout(StringIO()),
+        ):
             result = main(["process", "sample.wav", "--transcript", "transcript.json"])
         self.assertEqual(result, 0)
         speaker_provider = process_managed_audio.call_args.args[4]
@@ -585,6 +586,8 @@ class CliTest(unittest.TestCase):
                     [
                         "process", str(Path(temp) / "external.wav"),
                         "--managed-root", str(Path(temp) / "managed"),
+                        "--output-root", str(Path(temp) / "processing"),
+                        "--information-store", str(Path(temp) / "information.jsonl"),
                     ]
                 )
             self.assertEqual(result, 1)

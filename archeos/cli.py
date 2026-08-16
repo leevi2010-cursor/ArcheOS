@@ -52,6 +52,8 @@ from .workspace import (
     install_codex_integration,
     load_workspace_config,
     remove_codex_integration,
+    require_workspace,
+    resolve_storage_path,
 )
 from .world_model import ObjectResolver, SQLiteWorldModelRepository
 
@@ -63,6 +65,51 @@ DEFAULT_MANAGED_SOURCE_ROOT = Path("01_inbox")
 DEFAULT_REPRESENTATION_ROOT = Path("02_processing/representations")
 DEFAULT_REPRESENTATION_INFORMATION_ROOT = Path("02_processing/information")
 DEFAULT_SEMANTIC_HANDOFF_AUDIT_ROOT = Path("02_processing/semantic_handoff_runs")
+
+
+def _add_workspace_config_argument(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--config", type=Path, help="ArcheOS local Workspace configuration path.")
+
+
+def _resolve_durable_paths(args: argparse.Namespace) -> None:
+    defaults: dict[str, Path] = {}
+    if args.command == "process":
+        defaults = {
+            "managed_root": DEFAULT_MANAGED_SOURCE_ROOT,
+            "output_root": Path("02_processing"),
+            "information_store": DEFAULT_ATOMIC_INFORMATION_STORE,
+        }
+    elif args.command == "information":
+        defaults = {"store": DEFAULT_ATOMIC_INFORMATION_STORE}
+        if args.information_command == "extract":
+            defaults.update({
+                "managed_root": DEFAULT_MANAGED_SOURCE_ROOT,
+                "representation_root": DEFAULT_REPRESENTATION_ROOT,
+                "output_root": DEFAULT_REPRESENTATION_INFORMATION_ROOT,
+            })
+            if args.external_agent_route is not None:
+                defaults["audit_root"] = DEFAULT_SEMANTIC_HANDOFF_AUDIT_ROOT
+    elif args.command == "object":
+        defaults = {"database": DEFAULT_WORLD_MODEL_DATABASE}
+    elif args.command in {"digest", "context"}:
+        defaults = {
+            "database": DEFAULT_WORLD_MODEL_DATABASE,
+            "information_store": DEFAULT_ATOMIC_INFORMATION_STORE,
+            "proposal_store": DEFAULT_CHANGE_PROPOSAL_STORE,
+            "journal": DEFAULT_CHANGE_JOURNAL,
+        }
+    elif args.command == "source":
+        defaults = {"managed_root": DEFAULT_MANAGED_SOURCE_ROOT}
+    elif args.command in {"representation", "conversation"}:
+        defaults = {
+            "managed_root": DEFAULT_MANAGED_SOURCE_ROOT,
+            "representation_root": DEFAULT_REPRESENTATION_ROOT,
+        }
+    if not defaults:
+        return
+    workspace = require_workspace(args.config) if any(getattr(args, name) is None for name in defaults) else None
+    for name, relative_default in defaults.items():
+        setattr(args, name, resolve_storage_path(getattr(args, name), workspace, relative_default))
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -106,17 +153,18 @@ def build_parser() -> argparse.ArgumentParser:
     process = subparsers.add_parser(
         "process", help="Process one verified Managed Source audio input."
     )
+    _add_workspace_config_argument(process)
     process.add_argument("source_id", help="Verified Managed Source ID to process.")
     process.add_argument(
         "--managed-root",
         type=Path,
-        default=DEFAULT_MANAGED_SOURCE_ROOT,
+        default=None,
         help="Managed Source root (default: 01_inbox).",
     )
     process.add_argument(
         "--output-root",
         type=Path,
-        default=Path("02_processing"),
+        default=None,
         help="Parent directory for processing packages (default: 02_processing).",
     )
     process.add_argument(
@@ -143,7 +191,7 @@ def build_parser() -> argparse.ArgumentParser:
     process.add_argument(
         "--information-store",
         type=Path,
-        default=DEFAULT_ATOMIC_INFORMATION_STORE,
+        default=None,
         help=(
             "Durable Atomic Information JSONL path "
             "(default: 03_information/atomic_information.jsonl)."
@@ -153,10 +201,11 @@ def build_parser() -> argparse.ArgumentParser:
     information = subparsers.add_parser(
         "information", help="Ingest durable local Atomic Information."
     )
+    _add_workspace_config_argument(information)
     information.add_argument(
         "--store",
         type=Path,
-        default=DEFAULT_ATOMIC_INFORMATION_STORE,
+        default=None,
         help=(
             "Durable Atomic Information JSONL path "
             "(default: 03_information/atomic_information.jsonl)."
@@ -174,13 +223,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     extract.add_argument("representation_id")
     extract.add_argument(
-        "--managed-root", type=Path, default=DEFAULT_MANAGED_SOURCE_ROOT
+        "--managed-root", type=Path, default=None
     )
     extract.add_argument(
-        "--representation-root", type=Path, default=DEFAULT_REPRESENTATION_ROOT
+        "--representation-root", type=Path, default=None
     )
     extract.add_argument(
-        "--output-root", type=Path, default=DEFAULT_REPRESENTATION_INFORMATION_ROOT
+        "--output-root", type=Path, default=None
     )
     provider = extract.add_mutually_exclusive_group(required=True)
     provider.add_argument(
@@ -200,17 +249,18 @@ def build_parser() -> argparse.ArgumentParser:
     extract.add_argument("--codex-bin", default="codex", help="Explicit Codex CLI executable for the approved route.")
     extract.add_argument("--timeout-seconds", type=float, default=120.0)
     extract.add_argument(
-        "--audit-root", type=Path, default=DEFAULT_SEMANTIC_HANDOFF_AUDIT_ROOT
+        "--audit-root", type=Path, default=None
     )
     extract.add_argument("--batch-size", type=int, default=100)
 
     objects = subparsers.add_parser(
         "object", help="Create and inspect local World Model Objects."
     )
+    _add_workspace_config_argument(objects)
     objects.add_argument(
         "--database",
         type=Path,
-        default=DEFAULT_WORLD_MODEL_DATABASE,
+        default=None,
         help="SQLite World Model path (default: 04_core/archeos.sqlite3).",
     )
     object_commands = objects.add_subparsers(dest="object_command", required=True)
@@ -240,25 +290,26 @@ def build_parser() -> argparse.ArgumentParser:
     digest = subparsers.add_parser(
         "digest", help="Digest Atomic Information into the governed World Model."
     )
+    _add_workspace_config_argument(digest)
     digest.add_argument(
         "--database",
         type=Path,
-        default=DEFAULT_WORLD_MODEL_DATABASE,
+        default=None,
     )
     digest.add_argument(
         "--information-store",
         type=Path,
-        default=DEFAULT_ATOMIC_INFORMATION_STORE,
+        default=None,
     )
     digest.add_argument(
         "--proposal-store",
         type=Path,
-        default=DEFAULT_CHANGE_PROPOSAL_STORE,
+        default=None,
     )
     digest.add_argument(
         "--journal",
         type=Path,
-        default=DEFAULT_CHANGE_JOURNAL,
+        default=None,
     )
     digest_commands = digest.add_subparsers(dest="digest_command", required=True)
     digest_information = digest_commands.add_parser(
@@ -282,16 +333,17 @@ def build_parser() -> argparse.ArgumentParser:
     context = subparsers.add_parser(
         "context", help="Build a read-only bounded context for an Object."
     )
+    _add_workspace_config_argument(context)
     context.add_argument(
-        "--database", type=Path, default=DEFAULT_WORLD_MODEL_DATABASE
+        "--database", type=Path, default=None
     )
     context.add_argument(
-        "--information-store", type=Path, default=DEFAULT_ATOMIC_INFORMATION_STORE
+        "--information-store", type=Path, default=None
     )
     context.add_argument(
-        "--proposal-store", type=Path, default=DEFAULT_CHANGE_PROPOSAL_STORE
+        "--proposal-store", type=Path, default=None
     )
-    context.add_argument("--journal", type=Path, default=DEFAULT_CHANGE_JOURNAL)
+    context.add_argument("--journal", type=Path, default=None)
     context_commands = context.add_subparsers(dest="context_command", required=True)
     context_build = context_commands.add_parser(
         "build", help="Build a bounded Context Bundle."
@@ -307,10 +359,11 @@ def build_parser() -> argparse.ArgumentParser:
     source = subparsers.add_parser(
         "source", help="Admit, inspect, verify, and restore local Managed Sources."
     )
+    _add_workspace_config_argument(source)
     source.add_argument(
         "--managed-root",
         type=Path,
-        default=DEFAULT_MANAGED_SOURCE_ROOT,
+        default=None,
         help="Managed Source root (default: 01_inbox).",
     )
     source_commands = source.add_subparsers(dest="source_command", required=True)
@@ -375,16 +428,17 @@ def build_parser() -> argparse.ArgumentParser:
     representation = subparsers.add_parser(
         "representation", help="Inspect or build a Normalized Representation."
     )
+    _add_workspace_config_argument(representation)
     representation.add_argument(
         "--managed-root",
         type=Path,
-        default=DEFAULT_MANAGED_SOURCE_ROOT,
+        default=None,
         help="Managed Source root (default: 01_inbox).",
     )
     representation.add_argument(
         "--representation-root",
         type=Path,
-        default=DEFAULT_REPRESENTATION_ROOT,
+        default=None,
         help="Representation root (default: 02_processing/representations).",
     )
     representation_commands = representation.add_subparsers(
@@ -434,6 +488,7 @@ def build_parser() -> argparse.ArgumentParser:
     conversation = subparsers.add_parser(
         "conversation", help="Build provider-specific Conversation Representations."
     )
+    _add_workspace_config_argument(conversation)
     conversation_providers = conversation.add_subparsers(
         dest="conversation_provider", required=True
     )
@@ -448,10 +503,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     wechat_represent.add_argument("source_id")
     wechat_represent.add_argument(
-        "--managed-root", type=Path, default=DEFAULT_MANAGED_SOURCE_ROOT
+        "--managed-root", type=Path, default=None
     )
     wechat_represent.add_argument(
-        "--representation-root", type=Path, default=DEFAULT_REPRESENTATION_ROOT
+        "--representation-root", type=Path, default=None
     )
     return parser
 
@@ -852,6 +907,11 @@ def main(argv: list[str] | None = None) -> int:
         return _workspace_command(args)
     if args.command == "mcp":
         return _mcp_command(args)
+    try:
+        _resolve_durable_paths(args)
+    except ValueError as exc:
+        print(f"error: {exc}")
+        return 1
     if args.command == "process":
         return _process_command(args)
     if args.command == "object":
