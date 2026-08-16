@@ -267,27 +267,27 @@ Issue #21 只固化 Managed Source 的权威边界，不实现 runtime。后续�
 
 已按统一 contract 实现 Markdown、text PDF、XLSX、PPTX 与 image structural preflight；OCR / 复杂视觉语义继续后置。
 
-#### #31 — M2-C2d Representation → Atomic Information contract（当前）
+#### #31 — M2-C2d Representation → Atomic Information contract（已完成）
 
 把具有可分析业务内容的 Normalized Representation 接入唯一 Atomic Information 生命周期，建立 stable Analysis Units、Candidate / Residue coverage、Evidence、strict package 与 durable ingestion contract。
 
-#31 **不再承担正式 semantic execution provider 的选择**；其 production semantic provider 已拆到 #50。#31 可以在不选择 live Provider 的前提下完成 contract / plumbing，并保持 fail-closed。
+#31 不承担正式 semantic execution provider 的选择；其严格的 Analysis Units、Candidate / Residue coverage、Evidence、package 与 durable ingestion contract 已成为后续 Conversation ingestion 的唯一权威。
 
-#### #50 — M2-C2e Semantic Analysis Provider 验证（当前，可与 #48 并行）
+#### #50 — M2-C2e Semantic Analysis Provider 验证（已完成）
 
-独立验证正式 semantic execution path：比较 pinned/latest Codex、External Agent handoff 以及必要的其他成熟 Provider，回答哪条路线能够稳定、可审计、隐私可控地产生严格 structured result。
+已完成正式 semantic execution path 的验证；后续由 #61 production External Agent Semantic Handoff 在不降低严格 contract 的前提下承接执行。
 
-#50 不修改 Atomic Information / World Model 语义；其结论是后续真实多格式和微信 semantic digestion 的执行门禁。
+#50 不修改 Atomic Information / World Model 语义。
 
-#### #48 — M3-B1a 微信 Conversation Representation v1（#31 后，可与 #50 并行）
+#### #48 — M3-B1a 微信 Conversation Representation v1（已完成）
 
 以现有真实微信 Source 验证 Conversation Representation、stable message locator、message-level Evidence、bounded context-only units、metadata preservation、analysis eligibility 与 deterministic batching。
 
-#48 只把微信稳定地转换成可交给 #31 `RepresentationAnalysisProvider` contract 的 Analysis Units，**不负责选择 production semantic provider，也不在本 Issue 宣称真实微信已经完成长期 Atomic Information 消化**。
+#48 只把微信稳定地转换成可交给 #31 `RepresentationAnalysisProvider` contract 的 Analysis Units；production semantic provider 与真实长期 Information 消化由后续 #61 / #62 分别验证。
 
-#### 微信真实 Semantic Digestion（#48 + #50 后，后续最小 Issue）
+#### #61 / #62 — 微信真实 Semantic Digestion（已完成 Evidence）
 
-当 #48 的 Conversation Representation 通过 Architecture Review，且 #50 给出正式 provider route 后，再创建最小 Issue 完成：
+#61 已建立 production External Agent Semantic Handoff；#62 已在真实微信 Conversation 上完成严格 Semantic Digestion，产生 12 条可追溯 Durable Atomic Information，exact replay PASS，且 World Model writes = 0：
 
 ```text
 Conversation Analysis Units
@@ -296,19 +296,19 @@ Conversation Analysis Units
 → Durable Atomic Information
 ```
 
-真实 50 条微信的语义质量、遗漏/错误信息、Evidence 与 unresolved referent 在此阶段验收，而不是提前塞回 #48。
+该 Evidence 证明 Conversation 已可通过同一 Information lifecycle 进入 Durable Atomic Information；它不替代后续 Information Consolidation 的真实案例覆盖，也不把模型输出升级为 World Model truth。
 
 #### #32 — M2-C3a Information Consolidation 真实实验
 
-在统一 Atomic Information 能稳定承接真实多格式 / Conversation 数据后，以真实、受控样本验证跨 Source 的 equivalent、derived、complementary、temporal_update、conflict、uncertain 等整理边界，不直接扩大为正式 runtime。
+在统一 Atomic Information 已能稳定承接真实 Conversation 数据后，以真实、受控样本验证跨 Source 的 equivalent、derived、complementary、temporal_update、conflict、uncertain 等整理边界，不直接扩大为正式 runtime。当前等待 #88 的最小真实案例覆盖 PASS 后启动。
 
 #### #33 — M2-C3b Information Consolidation 运行时
 
-在 #32 的实验结论通过后，实现受治理的信息整理运行时。
+由 #32 的 Recommendation 决定：需要 production runtime 时才将 #33 重写为可执行实现并启动；若 #32 结论为 `not needed`，则不实现 #33。
 
 #### #34 — M2-C4 Object Emergence
 
-在 Information Consolidation 有充分证据后，研究从 Information 到长期 Object 的受治理形成边界。
+#34 需要 #32 形成的 Information 整理与 identity Evidence。若 #33 实施，则等待其结果；若 #33 为 `not needed`，则由 ChatGPT Product / Technical Lead 基于 #32 Recommendation 重写或确认 #34 前置条件后才可进入。
 
 #### 并行任务：#23 Handoff Marker（已完成，非主线 Gate）
 
@@ -416,19 +416,18 @@ ArcheOS 不开发自己的 Agent。M3 的目标是让 Codex 与未来其他 Exte
 
 Conversation 是输入 / Representation 形态，不是新的业务 Core。
 
-当前顺序：
+已获 Evidence：
 
 ```text
 #48 微信 Conversation Representation v1
-↓
-#50 gate 后的微信真实 Semantic Digestion
-↓
-#47 继续完成 Codex / ChatGPT 跨 Provider 对照研究
-↓
-#43 Codex Conversation production（按 #47 结论收敛）
-↓
-ChatGPT Export Provider（未来独立 Issue，按 #47 结论决定）
+→ stable message locator、bounded context 与统一 #31 Analysis Units
+
+#62 微信真实 Semantic Digestion v1
+→ Durable Atomic Information、Evidence、exact replay
+→ World Model writes = 0
 ```
+
+Codex / ChatGPT Conversation 接入是后置候选；启动前必须按当时的 #31 / #48 / #61 / #62 contract 重新 preflight 并重写相应 Issue，不以历史研究或旧设计直接启动 production ingestion。
 
 统一目标：
 
@@ -575,28 +574,16 @@ Goal
 当前主线：
 
 ```text
-                     #31
-       Representation → Information contract
-                     ↓
-           ┌─────────┴─────────┐
-           ↓                   ↓
-          #48                 #50
- WeChat Conversation      Semantic Provider
-  Representation            validation
-           │                   │
-           └─────────┬─────────┘
-                     ↓
-         微信真实 Semantic Digestion
-              （后续最小 Issue）
+                    #88
+  Information Consolidation 最小真实语料集
                      ↓
                     #32
      Information Consolidation 真实实验
                      ↓
-                    #33
-       Information Consolidation runtime
+           #33 implement | rewrite | not needed
                      ↓
                     #34
-              Object Emergence
+  #33 implement 时等其结果；否则 Lead 重写/确认前置条件
                      ↓
                     #17
        真实旧数据压力测试 / clean-cut
@@ -607,8 +594,8 @@ Goal
 并行 / 后置：
 
 ```text
-#47 Conversation 跨 Provider 研究       微信 v1 后继续，不阻塞 #48
-#43 Codex Conversation production       等 #47 收敛
+#47 Conversation contract research       后置；启动前按 #31/#48/#61/#62 重新对齐
+#43 Codex Conversation production        后置；启动前重新 preflight 并重写
 #44 Workspace portability               后置
 Human View / Frontend                    已规划，不启动
 #42 Protocol 驱动的决策增强实验          Product Stage 2；当前 blocked
