@@ -3,20 +3,31 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import os
+import shutil
 import sys
 import tempfile
 import unittest
-from contextlib import redirect_stdout
+from contextlib import contextmanager, redirect_stdout
 from io import StringIO
 from pathlib import Path
 from unittest import mock
 
-from archeos.cli import main
-from archeos.atomic_information import AtomicInformationRevision, EvidenceRecord, JsonlAtomicInformationStore
-from archeos.digestion import JsonlChangeProposalStore
-from archeos.digestion.models import ChangeProposal, HumanReviewContent, WorldModelOperation
-from archeos.mcp_server import CanonicalReadService, create_server
 import archeos.workspace as workspace_module
+from archeos.atomic_information import (
+    AtomicInformationRevision,
+    EvidenceRecord,
+    JsonlAtomicInformationStore,
+)
+from archeos.cli import _resolve_durable_paths, build_parser, main
+from archeos.digestion import JsonlChangeProposalStore
+from archeos.digestion.models import (
+    ChangeProposal,
+    HumanReviewContent,
+    WorldModelOperation,
+)
+from archeos.mcp_server import CanonicalReadService, create_server
+from archeos.representation.models import AdapterArtifact, AdapterBuildResult
 from archeos.workspace import (
     MANAGED_CONFIG_COMMENT,
     MANAGED_TABLE,
@@ -29,7 +40,148 @@ from archeos.workspace import (
 from archeos.world_model import SQLiteWorldModelRepository
 
 
+@contextmanager
+def _chdir(path: Path):
+    previous = Path.cwd()
+    os.chdir(path)
+    try:
+        yield
+    finally:
+        os.chdir(previous)
+
+
+class _SyntheticRepresentationAdapter:
+    name = "synthetic-workspace"
+    version = "1.0"
+    kind = "synthetic_workspace"
+    supported_media_types = ("text/markdown",)
+
+    def build(self, source, materialized_path, staging_dir, configuration):
+        artifact_path = staging_dir / "artifacts" / "synthetic.json"
+        artifact_path.write_text('{"synthetic":true}\n', encoding="utf-8")
+        return AdapterBuildResult(
+            self.kind,
+            (AdapterArtifact("structure", "artifacts/synthetic.json", "application/json"),),
+            1.0,
+        )
+
+
 class WorkspaceAndMcpTest(unittest.TestCase):
+    def test_production_cli_defaults_use_configured_workspace_across_code_cwds(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            workspace = root / "stable-workspace"
+            config = root / "archeos.toml"
+            initialize_workspace(workspace, config_path=config)
+            code_a = root / "code-a"
+            code_b = root / "code-b"
+            code_a.mkdir()
+            code_b.mkdir()
+            external = root / "fixture.md"
+            external.write_text("# Synthetic workspace fixture\n", encoding="utf-8")
+
+            with _chdir(code_a):
+                output = StringIO()
+                with redirect_stdout(output):
+                    self.assertEqual(main([
+                        "source", "--config", str(config), "admit", str(external), "--media-type", "text/markdown",
+                    ]), 0)
+                source_id = json.loads(output.getvalue())["source"]["source_id"]
+                output = StringIO()
+                with (
+                    mock.patch("archeos.cli.production_adapter", return_value=_SyntheticRepresentationAdapter()),
+                    redirect_stdout(output),
+                ):
+                    self.assertEqual(main([
+                        "representation", "--config", str(config), "build", source_id,
+                        "--adapter", "synthetic-workspace",
+                    ]), 0)
+                representation_id = json.loads(output.getvalue())["representation"]["representation_id"]
+
+            (code_b / "01_inbox").mkdir()
+            (code_b / "03_information").mkdir()
+            with _chdir(code_b):
+                output = StringIO()
+                with redirect_stdout(output):
+                    self.assertEqual(main(["source", "--config", str(config), "list"]), 0)
+                self.assertEqual([item["source_id"] for item in json.loads(output.getvalue())], [source_id])
+                output = StringIO()
+                with redirect_stdout(output):
+                    self.assertEqual(main([
+                        "representation", "--config", str(config), "show", representation_id,
+                    ]), 0)
+                self.assertEqual(json.loads(output.getvalue())["representation_id"], representation_id)
+
+            with SQLiteWorldModelRepository(workspace / "04_core" / "archeos.sqlite3") as repository:
+                record = repository.create_object("Synthetic workspace object")
+            with _chdir(code_b):
+                output = StringIO()
+                with redirect_stdout(output):
+                    self.assertEqual(main([
+                        "context", "--config", str(config), "build", "--scope", "object", record.object_id,
+                    ]), 0)
+                self.assertEqual(json.loads(output.getvalue())["root"]["object_id"], record.object_id)
+
+            shutil.rmtree(code_a)
+            self.assertTrue((workspace / "01_inbox" / "sources" / source_id / "manifest.json").is_file())
+            self.assertTrue((workspace / "02_processing" / "representations").is_dir())
+            self.assertTrue((workspace / "04_core" / "archeos.sqlite3").is_file())
+
+    def test_omitted_paths_fail_closed_and_explicit_paths_bypass_workspace_config(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            code = root / "code"
+            code.mkdir()
+            with _chdir(code):
+                output = StringIO()
+                with redirect_stdout(output):
+                    self.assertEqual(main(["source", "list"]), 1)
+                self.assertIn("error:", output.getvalue())
+                self.assertFalse((code / "01_inbox").exists())
+
+                explicit = root / "explicit-sources"
+                output = StringIO()
+                with redirect_stdout(output):
+                    self.assertEqual(main(["source", "--managed-root", str(explicit), "list"]), 0)
+                self.assertEqual(json.loads(output.getvalue()), [])
+                self.assertFalse((code / "01_inbox").exists())
+
+    def test_shared_resolver_covers_package_audit_and_governance_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            workspace = root / "workspace"
+            config = root / "archeos.toml"
+            initialize_workspace(workspace, config_path=config)
+            parser = build_parser()
+            args = parser.parse_args([
+                "information", "--config", str(config), "extract", "repr_" + "a" * 64,
+                "--external-agent-route", "codex-cli",
+            ])
+            _resolve_durable_paths(args)
+            self.assertEqual(args.managed_root, workspace.resolve() / "01_inbox")
+            self.assertEqual(args.representation_root, workspace.resolve() / "02_processing" / "representations")
+            self.assertEqual(args.output_root, workspace.resolve() / "02_processing" / "information")
+            self.assertEqual(args.store, workspace.resolve() / "03_information" / "atomic_information.jsonl")
+            self.assertEqual(args.audit_root, workspace.resolve() / "02_processing" / "semantic_handoff_runs")
+
+            args = parser.parse_args(["digest", "--config", str(config), "pending"])
+            _resolve_durable_paths(args)
+            self.assertEqual(args.proposal_store, workspace.resolve() / "03_information" / "change_proposals.jsonl")
+            self.assertEqual(args.journal, workspace.resolve() / "03_information" / "change_journal.jsonl")
+            self.assertEqual(args.database, workspace.resolve() / "04_core" / "archeos.sqlite3")
+
+    def test_doctor_reports_workspace_as_durable_authority_and_git_warning(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            workspace = root / "workspace"
+            config = root / "archeos.toml"
+            initialize_workspace(workspace, config_path=config)
+            (workspace / ".git").mkdir()
+            report = workspace_module.doctor(config)
+            self.assertEqual(report["workspace_config"], "valid")
+            self.assertEqual(report["durable_path_authority"], "configured_workspace")
+            self.assertEqual(report["workspace_worktree_coupling"], "detected")
+
     def test_init_is_safe_idempotent_and_config_show_and_doctor_work(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
