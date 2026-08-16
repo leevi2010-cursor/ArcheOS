@@ -23,6 +23,7 @@ from archeos.representation_information import (
     CodexCliRepresentationAnalysisProvider,
     RepresentationAnalysisBatch,
     RepresentationAnalysisUnit,
+    RepresentationInformationError,
     RepresentationInformationService,
 )
 from archeos.semantic_handoff import ExternalAgentSemanticHandoffService
@@ -92,27 +93,50 @@ class FakeProcess:
             self.command[self.command.index("--output-last-message") + 1]
         )
         if self.mode != "no_result":
-            result_path.write_text(
-                json.dumps(
+            result = {
+                "protocol_version": request["protocol_version"],
+                "input_fingerprint": request["input_fingerprint"],
+                "candidates": [
                     {
-                        "protocol_version": request["protocol_version"],
-                        "input_fingerprint": request["input_fingerprint"],
-                        "candidates": [
-                            {
-                                "statement": "Synthetic statement.",
-                                "semantic_type": "observation",
-                                "concerns": ["Synthetic"],
-                                "evidence_unit_ids": [unit["unit_id"]],
-                                "context": "Synthetic context.",
-                                "confidence": 0.9,
-                            }
-                            for unit in request["anchor_units"]
-                        ],
-                        "residue": [],
+                        "statement": "Synthetic statement.",
+                        "semantic_type": "observation",
+                        "concerns": ["Synthetic"],
+                        "evidence_unit_ids": [unit["unit_id"]],
+                        "context": "Synthetic context.",
+                        "confidence": 0.9,
                     }
-                ),
-                encoding="utf-8",
-            )
+                    for unit in request["anchor_units"]
+                ],
+                "residue": [],
+            }
+            if self.mode == "invalid_json":
+                result_path.write_text("{synthetic", encoding="utf-8")
+            else:
+                if self.mode == "top_level_missing":
+                    result.pop("residue")
+                elif self.mode == "top_level_extra":
+                    result["unexpected"] = True
+                elif self.mode == "candidate_shape":
+                    result["candidates"][0].pop("statement")
+                elif self.mode == "candidate_semantic":
+                    result["candidates"][0]["semantic_type"] = "unsupported"
+                elif self.mode == "candidate_confidence":
+                    result["candidates"][0]["confidence"] = 2
+                elif self.mode == "residue_shape":
+                    result["residue"] = [{"evidence_unit_ids": []}]
+                elif self.mode == "candidate_unknown_reference":
+                    result["candidates"][0]["evidence_unit_ids"] = ["unit_" + "f" * 64]
+                elif self.mode == "residue_unknown_reference":
+                    result["residue"] = [
+                        {
+                            "evidence_unit_ids": ["unit_" + "f" * 64],
+                            "reason_not_absorbed": "Synthetic residue.",
+                            "future_value_or_uncertainty": "Synthetic uncertainty.",
+                        }
+                    ]
+                elif self.mode == "anchor_uncovered":
+                    result["candidates"] = []
+                result_path.write_text(json.dumps(result), encoding="utf-8")
         self.returncode = 0
         return "", ""
 
@@ -184,6 +208,65 @@ class SemanticHandoffTest(unittest.TestCase):
         self.assertEqual(
             provider.execution_records[0].strict_validation_status, "passed"
         )
+        self.assertIsNone(provider.execution_records[0].contract_failure_detail)
+
+    def test_contract_failure_details_are_allowlisted(self) -> None:
+        cases = {
+            "top_level_missing": "top_level_schema",
+            "top_level_extra": "top_level_schema",
+            "candidate_shape": "candidate_schema",
+            "candidate_semantic": "candidate_schema",
+            "candidate_confidence": "candidate_schema",
+            "residue_shape": "residue_schema",
+            "candidate_unknown_reference": "evidence_reference",
+            "residue_unknown_reference": "evidence_reference",
+            "anchor_uncovered": "anchor_coverage",
+        }
+        for mode, detail in cases.items():
+            with self.subTest(mode=mode):
+                provider = CodexCliRepresentationAnalysisProvider(
+                    provider_version="0.147.0", runner=FakeRunner(mode)
+                )
+                with self.assertRaisesRegex(Exception, "未产生可验证"):
+                    provider.analyze(RepresentationAnalysisBatch((self.unit(),)))
+                record = provider.execution_records[0]
+                self.assertEqual(record.failure_category, "result_contract_failure")
+                self.assertEqual(record.contract_failure_detail, detail)
+
+    def test_unmapped_contract_validation_error_is_recorded_as_unknown(self) -> None:
+        provider = CodexCliRepresentationAnalysisProvider(
+            provider_version="0.147.0", runner=FakeRunner()
+        )
+        with (
+            patch.object(
+                RepresentationInformationService,
+                "_validate_batch_result",
+                side_effect=RepresentationInformationError("synthetic internal detail"),
+            ),
+            self.assertRaisesRegex(Exception, "未产生可验证"),
+        ):
+            provider.analyze(RepresentationAnalysisBatch((self.unit(),)))
+        record = provider.execution_records[0]
+        self.assertEqual(record.failure_category, "result_contract_failure")
+        self.assertEqual(record.contract_failure_detail, "unknown")
+
+    def test_non_contract_failures_do_not_receive_contract_detail(self) -> None:
+        for mode, category in (
+            ("invalid_json", "invalid_json"),
+            ("wrong_binding", "result_binding_failure"),
+            ("timeout", "timeout"),
+            ("nonzero", "runtime_nonzero_exit"),
+            ("no_result", "no_result"),
+        ):
+            with self.subTest(mode=mode):
+                provider = CodexCliRepresentationAnalysisProvider(
+                    provider_version="0.147.0", runner=FakeRunner(mode)
+                )
+                with self.assertRaisesRegex(Exception, "未产生可验证"):
+                    provider.analyze(RepresentationAnalysisBatch((self.unit(),)))
+                record = provider.execution_records[0]
+                self.assertEqual(record.failure_category, category)
+                self.assertIsNone(record.contract_failure_detail)
 
     def test_failure_is_fail_closed_and_does_not_echo_input(self) -> None:
         provider = CodexCliRepresentationAnalysisProvider(
@@ -318,6 +401,7 @@ class SemanticHandoffTest(unittest.TestCase):
         self.assertFalse(first.replayed_existing_package)
         audit = json.loads(first.audit_paths[0].read_text())
         self.assertEqual(audit["execution_status"], "succeeded")
+        self.assertIsNone(audit["contract_failure_detail"])
         self.assertTrue(audit["package_published"])
         self.assertTrue(audit["information_ingested"])
         self.assertEqual(audit["durable_ingestion_status"], "completed")
@@ -349,6 +433,7 @@ class SemanticHandoffTest(unittest.TestCase):
         audit_path = next(audit_root.glob("*/processing-run-audit.json"))
         legacy = json.loads(audit_path.read_text(encoding="utf-8"))
         for field in (
+            "contract_failure_detail",
             "diagnostic_schema_version",
             "elapsed_ms",
             "deadline_ms",
@@ -438,6 +523,29 @@ class SemanticHandoffTest(unittest.TestCase):
         self.assertNotIn("diagnostic_cleanup_status", audit)
         self.assertNotIn("stdout", set(audit) - {"stdout_bytes"})
         self.assertNotIn("stderr", set(audit) - {"stderr_bytes"})
+
+    def test_contract_failure_audit_is_read_back_without_internal_error_text(self) -> None:
+        representation, service = self.build_service()
+        handoff = ExternalAgentSemanticHandoffService(
+            service,
+            JsonlAtomicInformationStore(self.root / "atomic.jsonl"),
+            self.root / "audits",
+        )
+        with self.assertRaisesRegex(Exception, "未确认新增 Durable"):
+            handoff.execute(
+                representation.representation_id,
+                CodexCliRepresentationAnalysisProvider(
+                    provider_version="0.147.0", runner=FakeRunner("candidate_shape")
+                ),
+            )
+        audit_path = next((self.root / "audits").glob("*/processing-run-audit.json"))
+        audit_text = audit_path.read_text(encoding="utf-8")
+        audit = json.loads(audit_text)
+        self.assertEqual(audit["failure_category"], "result_contract_failure")
+        self.assertEqual(audit["contract_failure_detail"], "candidate_schema")
+        self.assertFalse(audit["package_published"])
+        self.assertFalse(audit["information_ingested"])
+        self.assertNotIn("candidate does not match", audit_text)
 
     def test_replay_rechecks_managed_source_before_store_write(self) -> None:
         representation, service = self.build_service()
