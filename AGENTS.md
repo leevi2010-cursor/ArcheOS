@@ -20,13 +20,13 @@ Agents must keep these layers separate. Processing a recording or document is no
 5. 代码、配置、协议关键字以及第三方原始名称保持其正式拼写，不为满足语言规则强行翻译标识符。
 6. 面向普通业务用户的文字仍同时遵循 `docs/product/INFORMATION_GOVERNANCE.md` 的业务语言规则。
 
-本规则约束 Architect、Executor 及其他后续 Agent 的 GitHub 写入；历史内容不要求为了统一语言而单独重写。
+本规则约束 Product / Technical Lead、Executor / Developer 及其他后续 Agent 的 GitHub 写入；历史内容不要求为了统一语言而单独重写。
 
 ## Roles
 
-- **Product owner (user):** provides business context and local sample data, makes product decisions, approves material changes to product direction / Product Stage / Stage Gate, and accepts or rejects delivered results.
-- **Architect (ChatGPT):** maintains product direction, `PRODUCT_ROADMAP.md`, development-roadmap alignment, architecture, canonical concepts, durable product rules, implementation-ready Issues, test cases, and architecture reviews. Architect may re-plan technical work inside an approved Product Stage, but must not silently change material product direction on engineering preference alone.
-- **Executor (Codex):** implements one approved GitHub Issue at a time. Codex may make local engineering choices inside the approved boundary and may surface evidence-backed Roadmap Feedback, but must not invent product models, durable concepts, product behavior, Product Stages, or roadmap changes.
+- **Product Owner（用户）:** 负责最终业务目标与产品取舍；批准 material Product Stage / Stage Gate / 产品边界变化；授权真实数据、外部调用与重大风险；接受或否决重要产品结果。
+- **Product / Technical Lead + Reviewer（ChatGPT 主线程）:** 负责产品定位、Product Roadmap、Development Roadmap、优先级与 backlog replenishment、技术路线、系统架构、canonical concepts、durable governance、implementation-ready Issue / Implementation Plan / Acceptance Criteria、实验 Gate 与风险接受标准。Lead 负责 Code Review、Architecture / Concept / Product-alignment Review，判断实现是否符合批准方案，提出修改要求，并决定 PR 是否可合并；在可用工具和权限允许时执行合并，或明确给出 Merge PASS。Lead 可在已批准 Product Stage 内重排技术工作，但不得因工程偏好静默改变 material 产品方向。
+- **Executor / Developer（Codex）:** 每次只实现一个已批准 GitHub Issue：建立 branch / worktree、实现、测试、提交 Draft PR，并根据 ChatGPT Lead Review 在同一 PR 修复。Codex 提供实施事实、测试结果、Roadmap Feedback 与 blocker，但不作 Code / Architecture / Concept Review 的最终判定、不作 Merge 决策、不重规划产品或技术路线，也不得自行修改 approved architecture / concept / Evidence contract 或扩大真实数据与 Provider 授权。
 
 ## Product-led planning authority
 
@@ -55,7 +55,7 @@ The repository is the durable authority. Chat prompts, one conversation thread, 
 
 ### Planning authority rules
 
-Before creating, substantially rewriting, prioritizing, or replenishing product / architecture / capability Issues, Architect must:
+Before creating, substantially rewriting, prioritizing, or replenishing product / architecture / capability Issues, the ChatGPT Product / Technical Lead must:
 
 1. Read the current `docs/product/PRODUCT_SPEC.md`.
 2. Read the current `docs/product/PRODUCT_ROADMAP.md` and identify the current Product Stage / Stage Gate.
@@ -145,10 +145,10 @@ keep | review | revise
 
 Authority boundary:
 
-1. Executor / experiment Agent / Reviewer may identify evidence and propose Roadmap Feedback.
+1. Codex Executor / Developer and experiment Agent may identify evidence and propose Roadmap Feedback.
 2. Executor must not silently implement the proposed roadmap change unless a new or updated authorized Issue explicitly allows it.
-3. Architect decides whether the evidence is an implementation detail, a Development Roadmap re-plan, or a material Product Roadmap question.
-4. Architect may re-sequence technical work inside an already approved Product Stage when the Product Stage and Stage Gate do not materially change.
+3. The ChatGPT Product / Technical Lead decides whether the evidence is an implementation detail, a Development Roadmap re-plan, or a material Product Roadmap question.
+4. The ChatGPT Product / Technical Lead may re-sequence technical work inside an already approved Product Stage when the Product Stage and Stage Gate do not materially change.
 5. Product Owner makes the final decision on material changes to product definition, target user, Product Stage, Stage Gate, product boundary, first commercial-product direction, or other major commercialization assumptions.
 6. An upstream document is updated only after the relevant decision is made; conversation memory or PR comments do not become competing authority.
 7. Repository `Roadmap Feedback` is a planning/review label and is distinct from canonical product/runtime `Feedback` in the ArcheOS information / decision lifecycle.
@@ -181,11 +181,11 @@ Before changing code or system documentation, the executor must:
 5. Read `docs/product/INFORMATION_GOVERNANCE.md` whenever the work touches Atomic Information ingestion, Object updates, approval/escalation, Object creation/deletion, relationship safety, or human-facing prompts/messages.
 6. Read durable documents referenced by the Issue, including Product / Development Roadmaps when the Issue points to them.
 7. Inspect the current repository and perform a preflight.
-8. If the Issue contains an Architect-approved Implementation Plan, do not replace it. Verify that it is executable.
-9. If a concrete repository conflict makes the plan unexecutable, stop and report it.
+8. If the Issue contains a ChatGPT Lead-approved Implementation Plan, do not replace it. Verify that it is executable.
+9. If a concrete repository conflict makes the plan unexecutable, stop the affected scope and report `LEAD_DECISION_REQUIRED`.
 10. Otherwise implement the smallest complete solution within the Issue boundary.
 11. Run required automated tests and smoke tests.
-12. Open or update one PR with `Closes #<issue-number>`.
+12. Open or update one Draft PR with `Closes #<issue-number>`, then request ChatGPT Lead Code + Architecture + Concept Review.
 13. Report changed areas, validation results, unresolved risks, and material Roadmap Feedback if real evidence changed an upstream assumption.
 
 Ordinary engineering choices inside approved scope do not need product-owner approval. Architecture, lifecycle, canonical concepts, durable product rules, explicit non-goals, Product Stage or material product direction cannot be changed silently.
@@ -212,9 +212,9 @@ Agents must:
 
 ### Issue Concept Convergence Check
 
-Architect 与 Executor 都必须受“概念收敛”约束。任何涉及产品语义、长期状态、数据 contract、治理或新领域名词的 Issue，在进入 Ready 或开始实现前，必须先完成一次 **Concept Convergence Check**。
+ChatGPT Product / Technical Lead 与 Codex Executor / Developer 都必须受“概念收敛”约束。任何涉及产品语义、长期状态、数据 contract、治理或新领域名词的 Issue，在进入 Ready 或开始实现前，必须先完成一次 **Concept Convergence Check**。
 
-Architect 在创建或实质修改 Issue 前必须：
+ChatGPT Product / Technical Lead 在创建或实质修改 Issue 前必须：
 
 1. 先阅读当前 `docs/architecture/CONCEPTS.md`，不能凭会话记忆或旧系统命名直接设计；
 2. 列出会影响数据模型、生命周期、长期状态、API contract 或用户理解的主要名词；
@@ -251,9 +251,9 @@ New canonical concepts: none
 
 如果确需新增 canonical concept，Issue 必须引用**已经合并**的 `CONCEPTS.md` / domain concept change 和 ADR / Decision；不能让“本 Issue 计划新增概念”与实现同时发生。
 
-Executor 开始实现时必须重新核对 Issue 正文已经使用 canonical terms。如果实现过程中发现必须新增未获批准的类型、Role、Relationship、状态机、长期记录、Store 或 API noun，必须停止相关实现并报告 `ARCHITECT_DECISION_REQUIRED`，不得自行把实现便利升级成产品概念。
+Executor 开始实现时必须重新核对 Issue 正文已经使用 canonical terms。如果实现过程中发现必须新增未获批准的类型、Role、Relationship、状态机、长期记录、Store 或 API noun，必须停止相关实现并报告 `LEAD_DECISION_REQUIRED`，不得自行把实现便利升级成产品概念。
 
-PR Architecture Review 同样检查 **concept diff**：不仅看代码是否工作，也检查 PR 是否偷偷引入了 Issue 未声明的新概念或让已收敛的旧词重新变成平行模型。对于尚未开发的新能力，发现本应在设计阶段收敛的概念漂移应直接退回 Issue/Concept 设计，不用兼容层补救。
+ChatGPT Lead 的 PR Architecture / Concept Review 同样检查 **concept diff**：不仅看代码是否工作，也检查 PR 是否偷偷引入了 Issue 未声明的新概念或让已收敛的旧词重新变成平行模型。对于尚未开发的新能力，发现本应在设计阶段收敛的概念漂移应直接退回 Issue/Concept 设计，不用兼容层补救。
 
 ## Product-rule governance
 
@@ -271,6 +271,7 @@ Do not duplicate those rules across Issues, adapters, prompts, or implementation
 - A PR must demonstrate how it satisfies the Issue acceptance criteria and pre-defined tests.
 - Do not create issue-specific duplicate spec/plan documents unless the Issue explicitly requires one.
 - Product / architecture / capability PRs should preserve the Issue's Roadmap Alignment and report whether the expected product evidence was actually obtained.
+- Codex submits a Draft PR and only fixes it after ChatGPT Lead review; ChatGPT Lead owns the final Code / Architecture / Concept review judgment and Merge decision. Codex must not self-review as final authority or merge its own PR.
 
 ### Review concerns
 
@@ -282,7 +283,7 @@ Do not collapse all review into one question. Review should distinguish:
 
 Product Alignment does not require a second review platform. It can be a section of the existing Issue / PR / Architecture Review.
 
-For material product / architecture / capability PRs, the reviewer should report at minimum:
+For material product / architecture / capability PRs, the ChatGPT Lead reviewer should report at minimum:
 
 ```text
 Product alignment: PASS | PARTIAL | FAIL

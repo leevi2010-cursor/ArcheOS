@@ -12,7 +12,7 @@
 - `docs/architecture/CONCEPTS.md`：定义 Core 概念；
 - `docs/product/INFORMATION_GOVERNANCE.md`：定义信息吸收、自动更新与人工判断的产品规则；
 - 本 `ROADMAP.md`：在已批准 Product Stage 内，定义为了关闭 Evidence Gap 所需的技术演化与验证顺序；
-- GitHub Issue：定义当前一次开发必须交付什么；复杂 Issue 可以内嵌 Architect 批准的 Implementation Plan 与 Test Cases；
+- GitHub Issue：定义当前一次开发必须交付什么；复杂 Issue 可以内嵌 ChatGPT Product / Technical Lead 批准的 Implementation Plan 与 Test Cases；
 - Durable Spec / ADR：仅在稳定契约或架构决策需要跨多个 Issue 复用时建立。
 
 因此，本文件回答的是“为了证明当前产品阶段成立，系统接下来缺什么能力”，而不是“一个完整软件理论上还应该有哪些功能”。技术完整度不能反过来成为产品路线权威。
@@ -362,7 +362,7 @@ Canonical State
   → Presentation
 ```
 
-**当前不创建 Frontend 实现 Issue，不启动开发。** 只有当真实使用反复证明“人类理解 / 审核成为主要瓶颈”，或 Product Roadmap 进入需要 Human View 的阶段后，再由 Architect 根据当时的 canonical read contracts 创建最小 Human View Issue。
+**当前不创建 Frontend 实现 Issue，不启动开发。** 只有当真实使用反复证明“人类理解 / 审核成为主要瓶颈”，或 Product Roadmap 进入需要 Human View 的阶段后，再由 ChatGPT Product / Technical Lead 根据当时的 canonical read contracts 创建最小 Human View Issue。
 
 ### M2-D — Migration Readiness & Clean-cut Plan
 
@@ -387,7 +387,7 @@ RETIRE
 - Raw Source / Evidence / provenance 不可因 structured reset 被误删；
 - IMPORT/REBUILD 必须映射到现有 canonical concepts；
 - 迁移映射只用于**已经存在的旧代码、旧数据和旧语义**；不得用 mapping 为尚未开发的新设计保留平行概念；
-- 缺失的真实业务语义交由 Architect 决策，不在 migration script 中偷偷造 schema；
+- 缺失的真实业务语义交由 ChatGPT Product / Technical Lead 决策，不在 migration script 中偷偷造 schema；
 - 前端资产优先判断为 `REBUILD / reference`，只复用可证明有价值的交互，不继承旧数据模型；
 - #17 完成旧数据与前端资产盘点后，可正式 Archive 旧 `sunward-operating-system` 仓库；
 - 先形成版本化 inventory / mapping / cutover plan，再创建少量单向 Import Issues。

@@ -324,7 +324,7 @@ Founder / Sales / Project / Research / Operations 等都只是候选，不在本
 
 `docs/development/ROADMAP.md` 应围绕这个问题安排当前技术主线。
 
-当 Ready backlog 需要补充时，Architect / CTO 必须先检查当前 Product Stage 的 Evidence Gap，再创建或重排 Development Roadmap / Issues；不得仅依据技术完整度补功能。
+当 Ready backlog 需要补充时，ChatGPT Product / Technical Lead 必须先检查当前 Product Stage 的 Evidence Gap，再创建或重排 Development Roadmap / Issues；不得仅依据技术完整度补功能。
 
 ---
 
@@ -355,9 +355,9 @@ keep | review | revise
 
 权限边界：
 
-- Executor、实验 Agent、Reviewer 可以提出 Evidence-backed Roadmap Feedback；
-- Architect 负责判断它是否只是实现问题、Development Roadmap 调整，还是已经影响 Product Roadmap；
-- 在已批准 Product Stage 内的普通技术重排可以由 Architect 维护；
+- Codex Executor / Developer、实验 Agent 可以提出 Evidence-backed Roadmap Feedback；
+- ChatGPT Product / Technical Lead 负责判断它是否只是实现问题、Development Roadmap 调整，还是已经影响 Product Roadmap；
+- 在已批准 Product Stage 内的普通技术重排可以由 ChatGPT Product / Technical Lead 维护；
 - 改变产品定义、目标用户、Stage Gate、产品边界、重大商业化方向或进入 / 退出 Product Stage，必须由 Product Owner 做最终产品判断；
 - 未批准的反馈不得被 Executor 悄悄实现为新的产品方向。
 
