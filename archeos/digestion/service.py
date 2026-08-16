@@ -4,7 +4,7 @@ import hashlib
 import json
 from collections.abc import Callable
 from dataclasses import asdict, replace
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 from ..atomic_information import (
     AtomicInformationRevision,
@@ -44,7 +44,7 @@ MAX_RELATED_INFORMATION = 20
 
 
 def _utc_now() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    return datetime.now(UTC).isoformat()
 
 
 def _normalize_name(value: str) -> str:
@@ -197,6 +197,8 @@ class AtomicInformationDigestionService:
 
     def decide(self, proposal_id: str, decision: str) -> DigestionResult:
         normalized = self.human_judgment.normalize_decision(decision)
+        if normalized not in {"approve", "reject", "defer"}:
+            raise ValueError("decision is not supported for this Change Proposal")
         requested_status = {
             "approve": "approved",
             "reject": "rejected",

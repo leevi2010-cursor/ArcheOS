@@ -141,12 +141,14 @@ def proposal_to_dict(proposal: ChangeProposal) -> dict[str, object]:
         ),
         "before_state_fingerprint": proposal.before_state_fingerprint,
         "interpretation_fingerprint": proposal.interpretation_fingerprint,
+        "external_identity_key": proposal.external_identity_key,
         "human_review": {
             "finding": proposal.human_review.finding,
             "importance": proposal.human_review.importance,
             "recommendation": proposal.human_review.recommendation,
             "evidence": proposal.human_review.evidence,
             "consequences": proposal.human_review.consequences,
+            "allowed_actions": list(proposal.human_review.allowed_actions),
         },
         "status": proposal.status,
         "created_at": proposal.created_at,
@@ -172,20 +174,25 @@ def proposal_from_dict(value: object, field: str = "proposal") -> ChangeProposal
         "created_at",
         "decided_at",
     }
-    optional = {"claim_summary", "proposed_claim"}
+    optional = {"claim_summary", "proposed_claim", "external_identity_key"}
     if not set(value).issubset(expected | optional) or not expected.issubset(value):
         raise ValueError(f"{field} does not match the Change Proposal schema")
     raw_operations = value["proposed_operations"]
     if not isinstance(raw_operations, list) or not raw_operations:
         raise ValueError(f"{field}.proposed_operations must not be empty")
     human_review = value["human_review"]
-    if not isinstance(human_review, dict) or set(human_review) != {
+    human_review_required = {
         "finding",
         "importance",
         "recommendation",
         "evidence",
         "consequences",
-    }:
+    }
+    if (
+        not isinstance(human_review, dict)
+        or not human_review_required.issubset(human_review)
+        or not set(human_review).issubset(human_review_required | {"allowed_actions"})
+    ):
         raise ValueError(f"{field}.human_review does not match its schema")
     proposal = ChangeProposal(
         proposal_id=_text(value["proposal_id"], f"{field}.proposal_id"),
@@ -230,6 +237,14 @@ def proposal_from_dict(value: object, field: str = "proposal") -> ChangeProposal
                 human_review["consequences"],
                 f"{field}.human_review.consequences",
             ),
+            allowed_actions=(
+                ("approve", "reject", "defer")
+                if "allowed_actions" not in human_review
+                else _strings(
+                    human_review["allowed_actions"],
+                    f"{field}.human_review.allowed_actions",
+                )
+            ),
         ),
         status=_text(value["status"], f"{field}.status"),
         created_at=_text(value["created_at"], f"{field}.created_at"),
@@ -241,6 +256,9 @@ def proposal_from_dict(value: object, field: str = "proposal") -> ChangeProposal
             None
             if value.get("proposed_claim") is None
             else claim_from_dict(value["proposed_claim"], f"{field}.proposed_claim")
+        ),
+        external_identity_key=_optional_text(
+            value.get("external_identity_key"), f"{field}.external_identity_key"
         ),
     )
     validate_proposal(proposal, field)
@@ -267,6 +285,7 @@ def validate_proposal(proposal: ChangeProposal, field: str = "proposal") -> None
     for index, operation in enumerate(proposal.proposed_operations, start=1):
         validate_operation(operation, f"{field}.proposed_operations[{index}]")
     _optional_text(proposal.claim_summary, f"{field}.claim_summary")
+    _optional_text(proposal.external_identity_key, f"{field}.external_identity_key")
     if proposal.proposed_claim is not None:
         validate_claim_attribution(proposal.proposed_claim, f"{field}.proposed_claim")
 

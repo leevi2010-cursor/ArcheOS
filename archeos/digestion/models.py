@@ -65,6 +65,7 @@ class HumanReviewContent:
     recommendation: str
     evidence: str
     consequences: str
+    allowed_actions: tuple[str, ...] = ("approve", "reject", "defer")
 
 
 @dataclass(frozen=True)
@@ -84,6 +85,7 @@ class ChangeProposal:
     decided_at: str | None
     claim_summary: str | None = None
     proposed_claim: ClaimAttribution | None = None
+    external_identity_key: str | None = None
 
 
 @dataclass(frozen=True)

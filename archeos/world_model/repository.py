@@ -6,6 +6,7 @@ from typing import Protocol
 
 from .models import (
     ApplyReceiptRecord,
+    ExternalIdentityMappingRecord,
     LifecycleRecord,
     NameAssignment,
     ObjectRecord,
@@ -39,6 +40,18 @@ class WorldModelRepository(Protocol):
     def list_apply_receipts(self) -> tuple[ApplyReceiptRecord, ...]: ...
 
     def put_apply_receipt(self, apply_id: str, payload: str) -> ApplyReceiptRecord: ...
+
+    def get_external_identity_mapping(
+        self, identity_key: str
+    ) -> ExternalIdentityMappingRecord | None: ...
+
+    def list_external_identity_mappings(
+        self,
+    ) -> tuple[ExternalIdentityMappingRecord, ...]: ...
+
+    def put_external_identity_mapping(
+        self, identity_key: str, object_id: str
+    ) -> ExternalIdentityMappingRecord: ...
 
     def rename_object(self, object_id: str, name: str) -> NameAssignment: ...
 
