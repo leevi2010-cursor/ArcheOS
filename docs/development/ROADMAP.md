@@ -583,7 +583,7 @@ Goal
            #33 implement | rewrite | not needed
                      ↓
                     #34
-  #33 implement 时等其结果；否则 Lead 重写/确认前置条件
+  implement/rewrite → 完成并合并 #33；not needed → Lead 重写/确认 #34 前置条件
                      ↓
                     #17
        真实旧数据压力测试 / clean-cut
