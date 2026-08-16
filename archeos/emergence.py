@@ -321,8 +321,10 @@ class IdentityGateService:
                 None,
                 (object_id,),
                 proposal.interpretation_fingerprint,
-                None,
-                self._before_state_fingerprint(None, (object_id,)),
+                proposal.external_identity_key,
+                self._before_state_fingerprint(
+                    None, (object_id,), proposal.external_identity_key
+                ),
             )
         else:
             if not isinstance(name, str) or not name.strip():
@@ -335,8 +337,10 @@ class IdentityGateService:
                 name.strip(),
                 (),
                 proposal.interpretation_fingerprint,
-                None,
-                self._before_state_fingerprint(name.strip(), ()),
+                proposal.external_identity_key,
+                self._before_state_fingerprint(
+                    name.strip(), (), proposal.external_identity_key
+                ),
             )
         result = self.apply(assessment, mode="human_approved", proposal_id=proposal_id)
         if proposal.status != "approved":
@@ -593,9 +597,12 @@ class IdentityGateService:
                 for item in information.source_evidence
             ),
             before_state_fingerprint=self._before_state_fingerprint(
-                None, assessment.resolved_object_ids
+                None,
+                assessment.resolved_object_ids,
+                assessment.external_identity_key,
             ),
             interpretation_fingerprint=assessment.identity_fingerprint,
+            external_identity_key=assessment.external_identity_key,
             human_review=HumanReviewContent(
                 finding="系统无法安全确认这条信息对应的长期对象身份。",
                 importance="错误绑定或重复创建会影响后续长期认知。",

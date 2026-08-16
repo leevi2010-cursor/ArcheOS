@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import tempfile
 import unittest
 from dataclasses import replace
@@ -16,6 +17,7 @@ from archeos.digestion import (
     JsonlChangeJournal,
     JsonlChangeProposalStore,
 )
+from archeos.digestion.serialization import proposal_to_dict
 from archeos.emergence import IdentityEvidence, IdentityGateService
 from archeos.world_model import SQLiteWorldModelRepository
 
@@ -440,6 +442,159 @@ class IdentityGateTests(unittest.TestCase):
         self.assertEqual(
             self.repository.list_relationships(object_id=object_record.object_id), ()
         )
+
+    def test_human_create_persists_external_identity_across_name_change(self) -> None:
+        raw_external_id = "synthetic-human-create-external-id"
+        first_information = self.ingest("human-external-create-first")
+        pending = self.service.process(
+            first_information.atomic_information_id,
+            self.evidence(
+                first_information,
+                "Synthetic Human Name A",
+                "stable_external_id",
+                stable_external_id=raw_external_id,
+                requires_structure=True,
+            ),
+        )
+        proposal = self.proposals.get(pending.proposal_id)
+
+        created = self.service.decide(
+            pending.proposal_id,
+            "create_minimal",
+            name="Synthetic Human Name A",
+        )
+        second_information = self.ingest("human-external-create-second")
+        bound = self.service.process(
+            second_information.atomic_information_id,
+            self.evidence(
+                second_information,
+                "Synthetic Human Name B",
+                "stable_external_id",
+                stable_external_id=raw_external_id,
+            ),
+        )
+
+        mapping = self.repository.list_external_identity_mappings()
+        self.assertIsNotNone(proposal.external_identity_key)
+        self.assertNotEqual(proposal.external_identity_key, raw_external_id)
+        self.assertEqual(mapping[0].identity_key, proposal.external_identity_key)
+        self.assertEqual(mapping[0].object_id, created.object_id)
+        self.assertEqual(bound.outcome, "bind_existing")
+        self.assertEqual(bound.object_id, created.object_id)
+        self.assertEqual(len(self.repository.list_objects()), 1)
+        self.assertNotIn(
+            raw_external_id,
+            (self.root / "proposals.jsonl").read_text(encoding="utf-8"),
+        )
+        self.assertNotIn(
+            raw_external_id.encode(), (self.root / "world.sqlite3").read_bytes()
+        )
+
+    def test_human_bind_external_identity_survives_repository_restart(self) -> None:
+        target = self.repository.create_object("Synthetic Existing Identity")
+        first_information = self.ingest("human-external-bind-first")
+        pending = self.service.process(
+            first_information.atomic_information_id,
+            self.evidence(
+                first_information,
+                "Synthetic Candidate Label",
+                "stable_external_id",
+                stable_external_id="synthetic-human-bind-external-id",
+                possible_existing_object_ids=(target.object_id,),
+            ),
+        )
+        decided = self.service.decide(
+            pending.proposal_id, "bind_existing", object_id=target.object_id
+        )
+
+        self.repository.close()
+        self.repository = SQLiteWorldModelRepository(self.root / "world.sqlite3")
+        self.service = self._service()
+        second_information = self.ingest("human-external-bind-second")
+        rebound = self.service.process(
+            second_information.atomic_information_id,
+            self.evidence(
+                second_information,
+                "Synthetic Renamed Candidate",
+                "stable_external_id",
+                stable_external_id="synthetic-human-bind-external-id",
+            ),
+        )
+
+        self.assertEqual(decided.object_id, target.object_id)
+        self.assertEqual(rebound.outcome, "bind_existing")
+        self.assertEqual(rebound.object_id, target.object_id)
+        self.assertEqual(len(self.repository.list_objects()), 1)
+        self.assertEqual(len(self.repository.list_external_identity_mappings()), 1)
+
+    def test_human_external_identity_collision_fails_closed(self) -> None:
+        mapped_target = self.repository.create_object("Mapped Identity")
+        reviewed_target = self.repository.create_object("Reviewed Identity")
+        information = self.ingest("human-external-collision")
+        pending = self.service.process(
+            information.atomic_information_id,
+            self.evidence(
+                information,
+                "Synthetic Review Label",
+                "stable_external_id",
+                stable_external_id="synthetic-human-collision-external-id",
+                possible_existing_object_ids=(reviewed_target.object_id,),
+            ),
+        )
+        proposal = self.proposals.get(pending.proposal_id)
+        self.repository.put_external_identity_mapping(
+            proposal.external_identity_key, mapped_target.object_id
+        )
+
+        with self.assertRaisesRegex(ValueError, "conflicts"):
+            self.service.decide(
+                pending.proposal_id,
+                "bind_existing",
+                object_id=reviewed_target.object_id,
+            )
+
+        mapping = self.repository.get_external_identity_mapping(
+            proposal.external_identity_key
+        )
+        self.assertEqual(mapping.object_id, mapped_target.object_id)
+        self.assertEqual(
+            self.atomic_store.get_current(
+                information.atomic_information_id
+            ).related_object_ids,
+            (),
+        )
+        self.assertEqual(self.proposals.get(pending.proposal_id).status, "pending")
+
+    def test_legacy_proposal_without_external_identity_key_can_replay(self) -> None:
+        information = self.ingest("legacy-human-proposal")
+        pending = self.service.process(
+            information.atomic_information_id,
+            self.evidence(information, "Legacy Review", requires_structure=True),
+        )
+        payload = proposal_to_dict(self.proposals.get(pending.proposal_id))
+        payload.pop("external_identity_key")
+        legacy_path = self.root / "legacy-proposals.jsonl"
+        legacy_path.write_text(json.dumps(payload) + "\n", encoding="utf-8")
+        legacy_store = JsonlChangeProposalStore(legacy_path)
+        legacy_service = IdentityGateService(
+            self.atomic_store,
+            self.repository,
+            legacy_store,
+            self.journal,
+            BusinessLanguageHumanJudgmentPort(),
+            clock=lambda: "2026-08-17T00:00:00+00:00",
+        )
+
+        self.assertIsNone(legacy_store.get(pending.proposal_id).external_identity_key)
+        first = legacy_service.decide(
+            pending.proposal_id, "create_minimal", name="Legacy Reviewed Identity"
+        )
+        replay = legacy_service.decide(
+            pending.proposal_id, "create_minimal", name="Legacy Reviewed Identity"
+        )
+
+        self.assertEqual(replay.object_id, first.object_id)
+        self.assertEqual(self.repository.list_external_identity_mappings(), ())
 
     def test_stale_assessment_fails_closed_before_create(self) -> None:
         information = self.ingest("stale")

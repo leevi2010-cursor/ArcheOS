@@ -141,6 +141,7 @@ def proposal_to_dict(proposal: ChangeProposal) -> dict[str, object]:
         ),
         "before_state_fingerprint": proposal.before_state_fingerprint,
         "interpretation_fingerprint": proposal.interpretation_fingerprint,
+        "external_identity_key": proposal.external_identity_key,
         "human_review": {
             "finding": proposal.human_review.finding,
             "importance": proposal.human_review.importance,
@@ -173,7 +174,7 @@ def proposal_from_dict(value: object, field: str = "proposal") -> ChangeProposal
         "created_at",
         "decided_at",
     }
-    optional = {"claim_summary", "proposed_claim"}
+    optional = {"claim_summary", "proposed_claim", "external_identity_key"}
     if not set(value).issubset(expected | optional) or not expected.issubset(value):
         raise ValueError(f"{field} does not match the Change Proposal schema")
     raw_operations = value["proposed_operations"]
@@ -256,6 +257,9 @@ def proposal_from_dict(value: object, field: str = "proposal") -> ChangeProposal
             if value.get("proposed_claim") is None
             else claim_from_dict(value["proposed_claim"], f"{field}.proposed_claim")
         ),
+        external_identity_key=_optional_text(
+            value.get("external_identity_key"), f"{field}.external_identity_key"
+        ),
     )
     validate_proposal(proposal, field)
     return proposal
@@ -281,6 +285,7 @@ def validate_proposal(proposal: ChangeProposal, field: str = "proposal") -> None
     for index, operation in enumerate(proposal.proposed_operations, start=1):
         validate_operation(operation, f"{field}.proposed_operations[{index}]")
     _optional_text(proposal.claim_summary, f"{field}.claim_summary")
+    _optional_text(proposal.external_identity_key, f"{field}.external_identity_key")
     if proposal.proposed_claim is not None:
         validate_claim_attribution(proposal.proposed_claim, f"{field}.proposed_claim")
 
