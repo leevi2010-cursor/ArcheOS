@@ -25,8 +25,9 @@ Architecture Review 对本次严格结果合同失败作出后续决定。
 - discovery 没有自动创建 Source。只有上述 9 个选中 window 转为现有严格 WeChat
   export contract，并分别完成 immutable Managed Source admission。
 - 9/9 Managed Source verify、9/9 Conversation Representation verify 通过。
-- 转换只排除了 2 条现有 contract 无法表示、且不承载本轮长期业务语义的系统提示；
-  没有改写、复制或伪造业务陈述。
+- 9 个选中 window 的 source sequence span 合计 95 个位置；最小转换排除 1 条
+  当前 contract 无法表示的 non-canonical 记录，最终 94 条消息进入 9 个
+  exports / Representations。没有改写、复制或伪造业务陈述。
 - canonical WeChat Conversation Representation 足以承载所选材料的重要 sender、
   time、order、content 与 unavailable metadata；未发现需要第二套 contract 的语义
   blocker。
@@ -102,6 +103,15 @@ Provider calls。
   auto-reply。
 - GitHub 不包含真实正文、sender/identity、群名、业务主题名、Source/Information ID、
   locator、路径、hash、prompt、raw result、stdout/stderr 或 credential。
+
+## Repository Validation
+
+- WeChat / Semantic Handoff / failure diagnostics focused tests：52 项通过。
+- 完整测试（含 document extra）：443 项通过。
+- `compileall`、diff check 与公开内容隐私扫描：通过。
+- 全仓 Ruff 静态检查已实际运行：当前 head 报告 107 项既有问题。与
+  `origin/main...HEAD` 对比，本 PR 修改的 Python 文件数为 0，因此本 PR 新增 Ruff
+  问题为 0；未跨 Issue 修改主线既有静态规则问题。
 
 ## Product Alignment / Roadmap Feedback
 
