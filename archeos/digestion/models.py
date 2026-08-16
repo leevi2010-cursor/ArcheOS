@@ -65,6 +65,7 @@ class HumanReviewContent:
     recommendation: str
     evidence: str
     consequences: str
+    allowed_actions: tuple[str, ...] = ("approve", "reject", "defer")
 
 
 @dataclass(frozen=True)

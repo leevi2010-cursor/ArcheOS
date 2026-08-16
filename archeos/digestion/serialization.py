@@ -147,6 +147,7 @@ def proposal_to_dict(proposal: ChangeProposal) -> dict[str, object]:
             "recommendation": proposal.human_review.recommendation,
             "evidence": proposal.human_review.evidence,
             "consequences": proposal.human_review.consequences,
+            "allowed_actions": list(proposal.human_review.allowed_actions),
         },
         "status": proposal.status,
         "created_at": proposal.created_at,
@@ -179,13 +180,18 @@ def proposal_from_dict(value: object, field: str = "proposal") -> ChangeProposal
     if not isinstance(raw_operations, list) or not raw_operations:
         raise ValueError(f"{field}.proposed_operations must not be empty")
     human_review = value["human_review"]
-    if not isinstance(human_review, dict) or set(human_review) != {
+    human_review_required = {
         "finding",
         "importance",
         "recommendation",
         "evidence",
         "consequences",
-    }:
+    }
+    if (
+        not isinstance(human_review, dict)
+        or not human_review_required.issubset(human_review)
+        or not set(human_review).issubset(human_review_required | {"allowed_actions"})
+    ):
         raise ValueError(f"{field}.human_review does not match its schema")
     proposal = ChangeProposal(
         proposal_id=_text(value["proposal_id"], f"{field}.proposal_id"),
@@ -229,6 +235,14 @@ def proposal_from_dict(value: object, field: str = "proposal") -> ChangeProposal
             consequences=_text(
                 human_review["consequences"],
                 f"{field}.human_review.consequences",
+            ),
+            allowed_actions=(
+                ("approve", "reject", "defer")
+                if "allowed_actions" not in human_review
+                else _strings(
+                    human_review["allowed_actions"],
+                    f"{field}.human_review.allowed_actions",
+                )
             ),
         ),
         status=_text(value["status"], f"{field}.status"),
