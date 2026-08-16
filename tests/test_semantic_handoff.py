@@ -25,6 +25,8 @@ from archeos.representation_information import (
     RepresentationAnalysisUnit,
     RepresentationInformationError,
     RepresentationInformationService,
+    _analysis_batches,
+    _units_from_representation,
 )
 from archeos.semantic_handoff import ExternalAgentSemanticHandoffService
 from archeos.source import LocalManagedSourceRepository
@@ -655,6 +657,99 @@ class SemanticHandoffTest(unittest.TestCase):
             (self.root / "information" / representation.representation_id).exists()
         )
         self.assertFalse((self.root / "atomic.jsonl").exists())
+
+    def test_smaller_default_partition_is_deterministic_and_replays_published_batches(
+        self,
+    ) -> None:
+        representation, service = self.build_service(blocks=81)
+        units = _units_from_representation(
+            representation, service.representation_repository
+        )
+        first_partition = _analysis_batches(units, service.batch_size)
+        second_partition = _analysis_batches(units, service.batch_size)
+        self.assertEqual(service.batch_size, 40)
+        self.assertEqual(
+            [len(batch.anchor_units) for batch in first_partition], [40, 40, 1]
+        )
+        self.assertEqual(
+            [
+                tuple(unit.unit_id for unit in batch.anchor_units)
+                for batch in first_partition
+            ],
+            [
+                tuple(unit.unit_id for unit in batch.anchor_units)
+                for batch in second_partition
+            ],
+        )
+        self.assertEqual(
+            tuple(
+                unit.unit_id
+                for batch in first_partition
+                for unit in batch.anchor_units
+            ),
+            tuple(unit.unit_id for unit in units if unit.analysis_eligible),
+        )
+
+        audit_root = self.root / "audits"
+        provider = CodexCliRepresentationAnalysisProvider(
+            provider_version="0.147.0", runner=FakeRunner()
+        )
+        handoff = ExternalAgentSemanticHandoffService(
+            service,
+            JsonlAtomicInformationStore(self.root / "atomic.jsonl"),
+            audit_root,
+        )
+        first = handoff.execute(representation.representation_id, provider)
+        manifest = json.loads((first.package / "manifest.json").read_text())
+        self.assertEqual(
+            [len(batch["unit_ids"]) for batch in manifest["batches"]], [40, 40, 1]
+        )
+        self.assertEqual(len(provider.execution_records), 3)
+
+        service.batch_size = 100
+        replay_provider = CodexCliRepresentationAnalysisProvider(
+            provider_version="0.147.0", runner=FakeRunner()
+        )
+        replay = handoff.execute(representation.representation_id, replay_provider)
+        self.assertTrue(replay.replayed_existing_package)
+        self.assertEqual(replay_provider.execution_records, [])
+        self.assertEqual(replay.ingestion.existing, 81)
+
+    def test_anchor_coverage_failure_in_later_smaller_batch_is_fail_closed(
+        self,
+    ) -> None:
+        representation, service = self.build_service(blocks=81)
+        audit_root = self.root / "audits"
+        provider = CodexCliRepresentationAnalysisProvider(
+            provider_version="0.147.0",
+            runner=SequenceRunner("valid", "anchor_uncovered"),
+        )
+        handoff = ExternalAgentSemanticHandoffService(
+            service,
+            JsonlAtomicInformationStore(self.root / "atomic.jsonl"),
+            audit_root,
+        )
+
+        with self.assertRaisesRegex(Exception, "未确认新增 Durable"):
+            handoff.execute(representation.representation_id, provider)
+
+        audits = sorted(audit_root.glob("*/processing-run-audit.json"))
+        audit_payloads = [json.loads(path.read_text()) for path in audits]
+        self.assertEqual(len(audits), 2)
+        failed = next(
+            payload
+            for payload in audit_payloads
+            if payload["execution_status"] == "failed"
+        )
+        self.assertEqual(failed["failure_category"], "result_contract_failure")
+        self.assertEqual(failed["contract_failure_detail"], "anchor_coverage")
+        self.assertEqual(failed["eligible_units"], 40)
+        self.assertEqual(failed["covered_units"], 0)
+        self.assertFalse(
+            (self.root / "information" / representation.representation_id).exists()
+        )
+        self.assertFalse((self.root / "atomic.jsonl").exists())
+        self.assertFalse((self.root / "04_core").exists())
 
     def test_audit_is_read_back_before_durable_ingestion(self) -> None:
         representation, service = self.build_service()

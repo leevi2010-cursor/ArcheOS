@@ -31,6 +31,7 @@ from .representation import (
 )
 from .representation.registry import production_adapter
 from .representation_information import (
+    DEFAULT_EXTERNAL_AGENT_BATCH_SIZE,
     CodexCliRepresentationAnalysisProvider,
     FileRepresentationAnalysisProvider,
     RepresentationInformationError,
@@ -251,7 +252,9 @@ def build_parser() -> argparse.ArgumentParser:
     extract.add_argument(
         "--audit-root", type=Path, default=None
     )
-    extract.add_argument("--batch-size", type=int, default=100)
+    extract.add_argument(
+        "--batch-size", type=int, default=DEFAULT_EXTERNAL_AGENT_BATCH_SIZE
+    )
 
     objects = subparsers.add_parser(
         "object", help="Create and inspect local World Model Objects."
