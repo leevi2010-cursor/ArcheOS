@@ -11,7 +11,7 @@
 - `docs/architecture/CONCEPTS.md`：定义概念是什么；
 - `docs/product/INFORMATION_GOVERNANCE.md`：定义系统遇到新信息时应该怎么处理；
 - `docs/architecture/ARCHITECTURE.md`：定义这些能力由哪些系统边界承载；
-- `AGENTS.md`：约束 Architect / Executor 如何遵守上述权威文档；
+- `AGENTS.md`：约束 ChatGPT Product / Technical Lead 与 Codex Executor / Developer 如何遵守上述权威文档；
 - GitHub Issue：定义一次具体开发要实现哪些规则。
 
 本文件不维护当前 Issue 顺序或 runtime 实现状态；这些分别以 `docs/development/ROADMAP.md`、GitHub Issue 和代码为准。
@@ -203,7 +203,7 @@ related_to
 - 关系方向必须明确；
 - 不同时持久化一条关系及其纯查询意义上的反向副本；
 - 能用更具体已批准关系表达时，不应为了省事全部写成 `related_to`；
-- 现有词汇不足时保留 Atomic Information / Claim / Hypothesis，并交由 Architect 判断是否需要扩展；在 `CONCEPTS.md` 修改通过前，不允许 Agent 临时发明新的 relation 值。
+- 现有词汇不足时保留 Atomic Information / Claim / Hypothesis，并交由 ChatGPT Product / Technical Lead 判断是否需要扩展；在 `CONCEPTS.md` 修改通过前，不允许 Agent 临时发明新的 relation 值。
 
 Object 通过 Identity Gate 自动创建，不等于任何 Relationship 自动成立。Relationship 仍按本节独立判断。
 
