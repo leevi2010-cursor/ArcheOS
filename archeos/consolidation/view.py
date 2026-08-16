@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 from collections.abc import Iterable
 from dataclasses import dataclass
+from itertools import combinations
 
 from ..atomic_information import AtomicInformationRevision, EvidenceRecord
 from ..atomic_information.models import validate_atomic_information_revision
@@ -24,7 +25,8 @@ class ConsolidatedInformationGroup:
     relation_states: tuple[str, ...]
     temporal_order_complete: bool | None
     evidence_count: int
-    independent_source_count: int
+    distinct_source_count: int
+    independent_source_count: int | None
     representation_count: int
 
 
@@ -34,7 +36,8 @@ class ConsolidatedInformationViewMetadata:
     included_information: int
     group_count: int
     relation_states: tuple[str, ...]
-    independent_source_count: int
+    distinct_source_count: int
+    independent_source_count: int | None
     representation_count: int
     evidence_count: int
     pending_or_uncertain_count: int
@@ -57,8 +60,78 @@ def _evidence(
     )
 
 
-def _source_count(revisions: Iterable[AtomicInformationRevision]) -> int:
-    return len({evidence.source_id for evidence in _evidence(revisions)})
+def _source_ids(revisions: Iterable[AtomicInformationRevision]) -> frozenset[str]:
+    return frozenset(evidence.source_id for evidence in _evidence(revisions))
+
+
+def _distinct_source_count(revisions: Iterable[AtomicInformationRevision]) -> int:
+    return len(_source_ids(revisions))
+
+
+def _independent_source_count(
+    revisions: tuple[AtomicInformationRevision, ...],
+    judgments: Iterable[InformationRelationJudgment],
+) -> int | None:
+    source_ids = _source_ids(revisions)
+    if len(source_ids) <= 1:
+        return len(source_ids)
+
+    revisions_by_id = {
+        revision.atomic_information_id: revision for revision in revisions
+    }
+    pair_labels: dict[frozenset[str], set[str]] = {}
+    for judgment in judgments:
+        left = revisions_by_id[judgment.left_projection.atomic_information_id]
+        right = revisions_by_id[judgment.right_projection.atomic_information_id]
+        left_source_ids = _source_ids((left,))
+        right_source_ids = _source_ids((right,))
+        if len(left_source_ids) != 1 or len(right_source_ids) != 1:
+            return None
+        left_source_id = next(iter(left_source_ids))
+        right_source_id = next(iter(right_source_ids))
+        if left_source_id == right_source_id:
+            continue
+        pair_labels.setdefault(frozenset((left_source_id, right_source_id)), set()).add(
+            judgment.evidence_independence
+        )
+
+    if any(len(labels) != 1 for labels in pair_labels.values()):
+        return None
+
+    parent = {source_id: source_id for source_id in source_ids}
+
+    def find(source_id: str) -> str:
+        while parent[source_id] != source_id:
+            parent[source_id] = parent[parent[source_id]]
+            source_id = parent[source_id]
+        return source_id
+
+    def union(left_source_id: str, right_source_id: str) -> None:
+        left_root = find(left_source_id)
+        right_root = find(right_source_id)
+        if left_root != right_root:
+            parent[right_root] = left_root
+
+    for pair, labels in pair_labels.items():
+        if next(iter(labels)) == "same_source_family":
+            left_source_id, right_source_id = sorted(pair)
+            union(left_source_id, right_source_id)
+
+    for pair, labels in pair_labels.items():
+        label = next(iter(labels))
+        left_source_id, right_source_id = sorted(pair)
+        if label == "unknown":
+            return None
+        if label == "independent" and find(left_source_id) == find(right_source_id):
+            return None
+
+    for left_source_id, right_source_id in combinations(sorted(source_ids), 2):
+        if find(left_source_id) == find(right_source_id):
+            continue
+        labels = pair_labels.get(frozenset((left_source_id, right_source_id)))
+        if labels != {"independent"}:
+            return None
+    return len({find(source_id) for source_id in source_ids})
 
 
 def _representation_count(revisions: Iterable[AtomicInformationRevision]) -> int:
@@ -133,7 +206,10 @@ class ConsolidatedInformationViewBuilder:
             included_information=len(raw_information),
             group_count=len(groups),
             relation_states=_relation_states(supplied_judgments),
-            independent_source_count=_source_count(raw_information),
+            distinct_source_count=_distinct_source_count(raw_information),
+            independent_source_count=_independent_source_count(
+                raw_information, supplied_judgments
+            ),
             representation_count=_representation_count(raw_information),
             evidence_count=len(evidence),
             pending_or_uncertain_count=sum(
@@ -259,7 +335,10 @@ class ConsolidatedInformationViewBuilder:
                     relation_states=states,
                     temporal_order_complete=temporal_complete,
                     evidence_count=len(_evidence(information)),
-                    independent_source_count=_source_count(information),
+                    distinct_source_count=_distinct_source_count(information),
+                    independent_source_count=_independent_source_count(
+                        information, component_judgments
+                    ),
                     representation_count=_representation_count(information),
                 )
             )

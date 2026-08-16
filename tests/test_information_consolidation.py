@@ -97,6 +97,7 @@ def _judgment(
     right_span: tuple[int, int] | None = None,
     left_time: str | None = None,
     right_time: str | None = None,
+    evidence_independence: str = "unknown",
 ) -> InformationRelationJudgment:
     left_projection = InformationComparisonProjection.from_revision(
         left,
@@ -115,7 +116,7 @@ def _judgment(
         left_revision=left,
         right_revision=right,
         provenance_basis=("synthetic review",),
-        evidence_independence="unknown",
+        evidence_independence=evidence_independence,
         uncertainty=("requires review" if relation == "uncertain" else None),
         left_time=left_time,
         right_time=right_time,
@@ -410,6 +411,8 @@ class GroupedViewContractTest(unittest.TestCase):
         self.assertEqual(view.groups, ())
         self.assertEqual(view.metadata.total_information, 3)
         self.assertEqual(view.metadata.included_information, 3)
+        self.assertEqual(view.metadata.distinct_source_count, 3)
+        self.assertIsNone(view.metadata.independent_source_count)
 
     def test_equivalent_and_derived_never_delete_information_or_evidence(self) -> None:
         for relation in ("equivalent", "derived"):
@@ -420,8 +423,103 @@ class GroupedViewContractTest(unittest.TestCase):
                 )
                 self.assertEqual(len(view.raw_information), 2)
                 self.assertEqual(view.metadata.evidence_count, 4)
-                self.assertEqual(view.metadata.independent_source_count, 2)
+                self.assertEqual(view.metadata.distinct_source_count, 2)
+                self.assertIsNone(view.metadata.independent_source_count)
                 self.assertEqual(view.groups[0].evidence_count, 4)
+
+    def test_same_source_family_is_not_counted_as_independent(self) -> None:
+        view = self.builder.build(
+            (self.first, self.second),
+            (
+                _judgment(
+                    self.first,
+                    self.second,
+                    "complementary",
+                    evidence_independence="same_source_family",
+                ),
+            ),
+        )
+        self.assertEqual(view.metadata.distinct_source_count, 2)
+        self.assertEqual(view.metadata.independent_source_count, 1)
+        self.assertEqual(view.groups[0].distinct_source_count, 2)
+        self.assertEqual(view.groups[0].independent_source_count, 1)
+
+    def test_independent_sources_are_counted_when_judged(self) -> None:
+        view = self.builder.build(
+            (self.first, self.second),
+            (
+                _judgment(
+                    self.first,
+                    self.second,
+                    "complementary",
+                    evidence_independence="independent",
+                ),
+            ),
+        )
+        self.assertEqual(view.metadata.distinct_source_count, 2)
+        self.assertEqual(view.metadata.independent_source_count, 2)
+
+    def test_unknown_independence_does_not_produce_a_count(self) -> None:
+        view = self.builder.build(
+            (self.first, self.second),
+            (_judgment(self.first, self.second, "complementary"),),
+        )
+        self.assertEqual(view.metadata.distinct_source_count, 2)
+        self.assertIsNone(view.metadata.independent_source_count)
+
+    def test_derived_relation_does_not_imply_source_lineage(self) -> None:
+        view = self.builder.build(
+            (self.first, self.second),
+            (_judgment(self.first, self.second, "derived"),),
+        )
+        self.assertEqual(view.metadata.distinct_source_count, 2)
+        self.assertIsNone(view.metadata.independent_source_count)
+
+    def test_incomplete_group_judgments_make_global_independence_unknown(self) -> None:
+        fourth = _revision(
+            "fourth",
+            "Synthetic fourth detail.",
+            source="src_" + "d" * 32,
+            representation="repr_fourth",
+        )
+        judgments = (
+            _judgment(
+                self.first,
+                self.second,
+                "complementary",
+                evidence_independence="independent",
+            ),
+            _judgment(self.third, fourth, "uncertain"),
+        )
+        view = self.builder.build(
+            (self.first, self.second, self.third, fourth), judgments
+        )
+        self.assertEqual(view.metadata.distinct_source_count, 4)
+        self.assertIsNone(view.metadata.independent_source_count)
+        self.assertEqual(
+            {group.independent_source_count for group in view.groups}, {2, None}
+        )
+
+    def test_mixed_source_family_group_requires_complete_independence_coverage(
+        self,
+    ) -> None:
+        judgments = (
+            _judgment(
+                self.first,
+                self.second,
+                "complementary",
+                evidence_independence="same_source_family",
+            ),
+            _judgment(
+                self.second,
+                self.third,
+                "complementary",
+                evidence_independence="independent",
+            ),
+        )
+        view = self.builder.build((self.first, self.second, self.third), judgments)
+        self.assertEqual(view.groups[0].distinct_source_count, 3)
+        self.assertIsNone(view.groups[0].independent_source_count)
 
     def test_complementary_conflict_and_uncertain_remain_explicit_and_parallel(
         self,
@@ -504,7 +602,8 @@ class GroupedViewContractTest(unittest.TestCase):
         self.assertEqual(view.metadata.included_information, 3)
         self.assertEqual(view.metadata.group_count, 1)
         self.assertEqual(view.metadata.evidence_count, 5)
-        self.assertEqual(view.metadata.independent_source_count, 3)
+        self.assertEqual(view.metadata.distinct_source_count, 3)
+        self.assertIsNone(view.metadata.independent_source_count)
         self.assertEqual(view.metadata.representation_count, 3)
         self.assertEqual(view.metadata.retrieval_completeness, "caller_bounded")
         self.assertFalse(hasattr(view.groups[0], "summary"))
