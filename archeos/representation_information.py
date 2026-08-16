@@ -426,6 +426,7 @@ class ExternalAgentExecutionRecord:
     finished_at: str
     execution_status: str
     failure_category: str | None
+    contract_failure_detail: str | None
     strict_validation_status: str
     result_fingerprint: str | None
     eligible_units: int
@@ -447,6 +448,26 @@ class ExternalAgentExecutionRecord:
 DIAGNOSTIC_SCHEMA_VERSION = "external-agent-diagnostics/1.0"
 _MAX_DIAGNOSTIC_STREAM_BYTES = 64 * 1024
 _DIAGNOSTIC_TTL_SECONDS = 24 * 60 * 60
+CONTRACT_FAILURE_DETAILS = frozenset(
+    {
+        "top_level_schema",
+        "candidate_schema",
+        "residue_schema",
+        "evidence_reference",
+        "anchor_coverage",
+        "unknown",
+    }
+)
+
+
+class _ExternalAgentContractFailure(RepresentationInformationError):
+    """A strict-result failure with an approved, non-sensitive detail."""
+
+    def __init__(self, detail: str) -> None:
+        if detail not in CONTRACT_FAILURE_DETAILS:
+            raise ValueError("unsupported External Agent contract failure detail")
+        super().__init__("result_contract_failure")
+        self.detail = detail
 
 
 class CodexCliRepresentationAnalysisProvider:
@@ -524,6 +545,7 @@ class CodexCliRepresentationAnalysisProvider:
                     finished_at=_utc_timestamp(),
                     execution_status="failed",
                     failure_category="runtime_execution_failure",
+                    contract_failure_detail=None,
                     strict_validation_status="failed",
                     result_fingerprint=None,
                     eligible_units=len(batch.anchor_units),
@@ -605,11 +627,21 @@ class CodexCliRepresentationAnalysisProvider:
                     category = "runtime_execution_failure"
                 if "outcome" not in locals():
                     outcome = _ExternalAgentProcessOutcome.runtime_error()
+                contract_failure_detail = (
+                    exc.detail
+                    if isinstance(exc, _ExternalAgentContractFailure)
+                    else None
+                )
+                if category == "result_contract_failure":
+                    contract_failure_detail = contract_failure_detail or "unknown"
+                else:
+                    contract_failure_detail = None
                 record = ExternalAgentExecutionRecord(
                     **record_base,
                     finished_at=_utc_timestamp(),
                     execution_status="failed",
                     failure_category=category,
+                    contract_failure_detail=contract_failure_detail,
                     strict_validation_status="failed",
                     result_fingerprint=None,
                     eligible_units=len(batch.anchor_units),
@@ -643,6 +675,7 @@ class CodexCliRepresentationAnalysisProvider:
                 finished_at=_utc_timestamp(),
                 execution_status="succeeded",
                 failure_category=None,
+                contract_failure_detail=None,
                 strict_validation_status="passed",
                 result_fingerprint="sha256:"
                 + hashlib.sha256(raw.encode("utf-8")).hexdigest(),
@@ -1208,7 +1241,7 @@ def _parse_external_agent_result(
     if not isinstance(payload, dict) or set(payload) != {
         "protocol_version", "input_fingerprint", "candidates", "residue"
     }:
-        raise RepresentationInformationError("result_contract_failure")
+        raise _ExternalAgentContractFailure("top_level_schema")
     if (
         payload["protocol_version"] != EXTERNAL_AGENT_PROTOCOL_VERSION
         or payload["input_fingerprint"] != expected_fingerprint
@@ -1218,16 +1251,22 @@ def _parse_external_agent_result(
         candidates = tuple(
             _candidate_draft(item) for item in _items(payload["candidates"], "candidates")
         )
+    except RepresentationInformationError as exc:
+        raise _ExternalAgentContractFailure("candidate_schema") from exc
+    try:
         residue = tuple(
             _residue_draft(item) for item in _items(payload["residue"], "residue")
         )
-        RepresentationInformationService._validate_batch_result(
-            batch, RepresentationAnalysisResult(candidates, residue)
-        )
     except RepresentationInformationError as exc:
-        if str(exc) == "result_binding_failure":
-            raise
-        raise RepresentationInformationError("result_contract_failure") from exc
+        raise _ExternalAgentContractFailure("residue_schema") from exc
+    try:
+        RepresentationInformationService._validate_batch_result(
+            batch, RepresentationAnalysisResult(candidates, residue), external_contract=True
+        )
+    except _ExternalAgentContractFailure:
+        raise
+    except RepresentationInformationError as exc:
+        raise _ExternalAgentContractFailure("unknown") from exc
     return RepresentationAnalysisResult(candidates, residue)
 
 
@@ -1421,8 +1460,16 @@ class RepresentationInformationService:
 
     @staticmethod
     def _validate_batch_result(
-        batch: RepresentationAnalysisBatch, result: RepresentationAnalysisResult
+        batch: RepresentationAnalysisBatch,
+        result: RepresentationAnalysisResult,
+        *,
+        external_contract: bool = False,
     ) -> None:
+        def fail(detail: str, message: str) -> None:
+            if external_contract:
+                raise _ExternalAgentContractFailure(detail)
+            raise RepresentationInformationError(message)
+
         anchor_ids = {unit.unit_id for unit in batch.anchor_units}
         supplied = {
             unit.unit_id: unit
@@ -1434,29 +1481,29 @@ class RepresentationInformationService:
         covered: set[str] = set()
         for item in result.candidates:
             if not isinstance(item, RepresentationCandidateDraft):
-                raise RepresentationInformationError("Representation analysis result item is invalid")
+                fail("candidate_schema", "Representation analysis result item is invalid")
             references = item.evidence_unit_ids
             if len(set(references)) != len(references) or any(
                 reference not in candidate_evidence_ids for reference in references
             ):
-                raise RepresentationInformationError("Representation analysis references an invalid unit")
+                fail("evidence_reference", "Representation analysis references an invalid unit")
             if not anchor_ids.intersection(references):
-                raise RepresentationInformationError("Representation analysis result must account for an anchor unit")
+                fail("evidence_reference", "Representation analysis result must account for an anchor unit")
             covered.update(anchor_ids.intersection(references))
         for item in result.residue:
             if not isinstance(item, RepresentationResidueDraft):
-                raise RepresentationInformationError("Representation analysis result item is invalid")
+                fail("residue_schema", "Representation analysis result item is invalid")
             references = item.evidence_unit_ids
             if len(set(references)) != len(references) or any(
                 reference not in anchor_ids for reference in references
             ):
-                raise RepresentationInformationError("Representation Residue references an invalid unit")
+                fail("evidence_reference", "Representation Residue references an invalid unit")
             if not references:
-                raise RepresentationInformationError("Representation analysis result must account for an anchor unit")
+                fail("evidence_reference", "Representation analysis result must account for an anchor unit")
             covered.update(references)
         missing = anchor_ids - covered
         if missing:
-            raise RepresentationInformationError("eligible Representation units were not covered")
+            fail("anchor_coverage", "eligible Representation units were not covered")
 
     def _timestamp(self) -> str:
         if self.clock is not None:

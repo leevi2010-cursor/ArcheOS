@@ -13,6 +13,7 @@ from pathlib import Path
 from .atomic_information import IngestionResult, ingest_processing_package
 from .atomic_information.store import AtomicInformationStore
 from .representation_information import (
+    CONTRACT_FAILURE_DETAILS,
     EXTERNAL_AGENT_PROTOCOL_VERSION,
     EXTERNAL_AGENT_ROUTE,
     CodexCliRepresentationAnalysisProvider,
@@ -171,6 +172,14 @@ class ExternalAgentSemanticHandoffService:
     ) -> tuple[Path, ...]:
         paths: list[Path] = []
         for record in records:
+            if (
+                record.failure_category == "result_contract_failure"
+                and record.contract_failure_detail not in CONTRACT_FAILURE_DETAILS
+            ) or (
+                record.failure_category != "result_contract_failure"
+                and record.contract_failure_detail is not None
+            ):
+                raise SemanticHandoffError("Processing Run 合同失败诊断字段无效。")
             payload = {
                 "schema_version": "processing-run-audit/1.0",
                 "artifact_kind": "processing_run_audit",
@@ -184,6 +193,7 @@ class ExternalAgentSemanticHandoffService:
                 "finished_at": record.finished_at,
                 "execution_status": (record.execution_status),
                 "failure_category": record.failure_category,
+                "contract_failure_detail": record.contract_failure_detail,
                 "strict_validation_status": record.strict_validation_status,
                 "result_fingerprint": record.result_fingerprint,
                 "eligible_units": record.eligible_units,
@@ -322,6 +332,7 @@ class ExternalAgentSemanticHandoffService:
                 or record.provider_version != provider.provider_version
                 or record.execution_status != "succeeded"
                 or record.failure_category is not None
+                or record.contract_failure_detail is not None
                 or record.strict_validation_status != "passed"
                 or not _sha256_fingerprint(record.result_fingerprint)
                 or record.eligible_units != len(anchor_unit_ids)
@@ -390,12 +401,18 @@ class ExternalAgentSemanticHandoffService:
             "stderr_bytes",
             "process_cleanup_status",
         }
+        optional_fields = {"contract_failure_detail"}
         legacy_required_fields = required_fields - diagnostic_fields
         observed_batches: set[tuple[str, ...]] = set()
         expected_by_anchor = dict(expected_batches)
         for path in paths:
             audit = _private_json_read(path)
-            if set(audit) not in {frozenset(required_fields), frozenset(legacy_required_fields)}:
+            if set(audit) not in {
+                frozenset(required_fields),
+                frozenset(legacy_required_fields),
+                frozenset(required_fields | optional_fields),
+                frozenset(legacy_required_fields | optional_fields),
+            }:
                 raise SemanticHandoffError("已存在的信息包审计不完整。")
             has_diagnostics = diagnostic_fields.issubset(audit)
             anchor_unit_ids = audit.get("anchor_unit_ids")
@@ -445,6 +462,7 @@ class ExternalAgentSemanticHandoffService:
                 or not _timestamp(audit.get("finished_at"))
                 or audit.get("execution_status") != "succeeded"
                 or audit.get("failure_category") is not None
+                or audit.get("contract_failure_detail") is not None
                 or audit.get("strict_validation_status") != "passed"
                 or not _sha256_fingerprint(audit.get("result_fingerprint"))
                 or audit.get("eligible_units") != len(batch)
