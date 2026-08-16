@@ -304,7 +304,7 @@ Conversation Analysis Units
 
 #### #33 — M2-C3b Information Consolidation 运行时
 
-由 #32 的 Recommendation 决定：需要 production runtime 时才将 #33 重写为可执行实现并启动；若 #32 结论为 `not needed`，则不实现 #33。
+由 #32 的 Recommendation 决定：implement → 完成并合并 #33 后进入 #34；rewrite → Lead 按 #32 Recommendation 重写 #33，完成并合并后进入 #34；not needed → 跳过 #33，由 Lead 基于 #32 Recommendation 重写/确认 #34 前置条件。
 
 #### #34 — M2-C4 Object Emergence
 
@@ -594,6 +594,7 @@ Goal
 并行 / 后置：
 
 ```text
+#89 移动硬盘只读 inventory               Deferred / Planned；当前不执行，不阻塞也不并行抢占 #88/#32
 #47 Conversation contract research       后置；启动前按 #31/#48/#61/#62 重新对齐
 #43 Codex Conversation production        后置；启动前重新 preflight 并重写
 #44 Workspace portability               后置
