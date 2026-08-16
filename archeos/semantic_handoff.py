@@ -20,7 +20,7 @@ from .representation_information import (
     ExternalAgentExecutionRecord,
     RepresentationInformationError,
     RepresentationInformationService,
-    _analysis_batches,
+    _analysis_batches_for_anchor_unit_ids,
     _external_agent_request,
     _units_from_representation,
     validate_representation_information_package,
@@ -294,12 +294,27 @@ class ExternalAgentSemanticHandoffService:
         representation = self.representation_service.representation_repository.get(
             representation_id
         )
-        batches = _analysis_batches(
-            _units_from_representation(
-                representation, self.representation_service.representation_repository
-            ),
-            self.representation_service.batch_size,
-        )
+        batch_unit_ids: list[tuple[str, ...]] = []
+        for package_batch in manifest_batches:
+            if not isinstance(package_batch, dict):
+                raise SemanticHandoffError("已存在的信息包批次清单不可读。")
+            unit_ids = package_batch.get("unit_ids")
+            if (
+                not isinstance(unit_ids, list)
+                or not unit_ids
+                or any(not isinstance(item, str) for item in unit_ids)
+            ):
+                raise SemanticHandoffError("已存在的信息包批次清单不可读。")
+            batch_unit_ids.append(tuple(unit_ids))
+        try:
+            batches = _analysis_batches_for_anchor_unit_ids(
+                _units_from_representation(
+                    representation, self.representation_service.representation_repository
+                ),
+                batch_unit_ids,
+            )
+        except RepresentationInformationError as exc:
+            raise SemanticHandoffError("当前 canonical Analysis Unit 批次不再匹配信息包。") from exc
         if len(batches) != len(manifest_batches):
             raise SemanticHandoffError("当前 canonical Analysis Unit 批次不再匹配信息包。")
         contracts: list[tuple[tuple[str, ...], str]] = []

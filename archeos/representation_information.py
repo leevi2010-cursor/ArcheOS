@@ -36,6 +36,7 @@ _LOGGER = logging.getLogger(__name__)
 PACKAGE_SCHEMA_VERSION = "2.0"
 PACKAGE_KIND = "representation_information"
 DEFAULT_CODEX_ANALYSIS_TIMEOUT_SECONDS = 120.0
+DEFAULT_EXTERNAL_AGENT_BATCH_SIZE = 40
 EXTERNAL_AGENT_PROTOCOL_VERSION = "external-agent-semantic-handoff/1.0"
 EXTERNAL_AGENT_ROUTE = "codex-cli"
 
@@ -1351,7 +1352,7 @@ class RepresentationInformationService:
         representation_repository: RepresentationRepository,
         output_root: Path,
         *,
-        batch_size: int = 100,
+        batch_size: int = DEFAULT_EXTERNAL_AGENT_BATCH_SIZE,
         clock: callable | None = None,
     ) -> None:
         if isinstance(batch_size, bool) or not isinstance(batch_size, int) or batch_size < 1:
@@ -1626,24 +1627,60 @@ def _analysis_batches(
         raise ValueError("batch_size must be a positive integer")
     eligible = tuple(unit for unit in units if unit.analysis_eligible)
     by_id = {unit.unit_id: unit for unit in units}
+    return tuple(
+        _analysis_batch(eligible[index : index + batch_size], by_id)
+        for index in range(0, len(eligible), batch_size)
+    )
+
+
+def _analysis_batches_for_anchor_unit_ids(
+    units: Sequence[RepresentationAnalysisUnit],
+    anchor_unit_id_batches: Sequence[Sequence[str]],
+) -> tuple[RepresentationAnalysisBatch, ...]:
+    """Rebuild a published execution partition without changing its boundaries."""
+
+    eligible = tuple(unit for unit in units if unit.analysis_eligible)
+    by_id = {unit.unit_id: unit for unit in units}
+    flattened: list[str] = []
     batches: list[RepresentationAnalysisBatch] = []
-    for index in range(0, len(eligible), batch_size):
-        anchors = eligible[index : index + batch_size]
-        anchor_ids = {unit.unit_id for unit in anchors}
-        support_ids: list[str] = []
-        for anchor in anchors:
-            for unit_id in anchor.context_support_unit_ids:
-                if unit_id not in by_id:
-                    raise RepresentationInformationError("Representation context support unit is unavailable")
-                if unit_id not in anchor_ids and unit_id not in support_ids:
-                    support_ids.append(unit_id)
-        batches.append(
-            RepresentationAnalysisBatch(
-                anchor_units=anchors,
-                context_support_units=tuple(by_id[unit_id] for unit_id in support_ids),
-            )
+    for anchor_unit_ids in anchor_unit_id_batches:
+        if not anchor_unit_ids or len(set(anchor_unit_ids)) != len(anchor_unit_ids):
+            raise RepresentationInformationError("Representation information batch is invalid")
+        anchors: list[RepresentationAnalysisUnit] = []
+        for unit_id in anchor_unit_ids:
+            unit = by_id.get(unit_id)
+            if unit is None or not unit.analysis_eligible:
+                raise RepresentationInformationError(
+                    "Representation information batch is not replayable"
+                )
+            anchors.append(unit)
+            flattened.append(unit_id)
+        batches.append(_analysis_batch(tuple(anchors), by_id))
+    if tuple(flattened) != tuple(unit.unit_id for unit in eligible):
+        raise RepresentationInformationError(
+            "Representation information batches do not replay unit order"
         )
     return tuple(batches)
+
+
+def _analysis_batch(
+    anchors: Sequence[RepresentationAnalysisUnit],
+    by_id: Mapping[str, RepresentationAnalysisUnit],
+) -> RepresentationAnalysisBatch:
+    anchor_ids = {unit.unit_id for unit in anchors}
+    support_ids: list[str] = []
+    for anchor in anchors:
+        for unit_id in anchor.context_support_unit_ids:
+            if unit_id not in by_id:
+                raise RepresentationInformationError(
+                    "Representation context support unit is unavailable"
+                )
+            if unit_id not in anchor_ids and unit_id not in support_ids:
+                support_ids.append(unit_id)
+    return RepresentationAnalysisBatch(
+        anchor_units=tuple(anchors),
+        context_support_units=tuple(by_id[unit_id] for unit_id in support_ids),
+    )
 
 
 def _map_artifact(kind: str, payload: object):
