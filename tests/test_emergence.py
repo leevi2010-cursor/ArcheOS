@@ -74,6 +74,18 @@ class FailOnceJournal:
         return self.inner.list_changes()
 
 
+class FailOnceReceiptRepository(SQLiteWorldModelRepository):
+    def __init__(self, database: Path) -> None:
+        super().__init__(database)
+        self.failures_remaining = 1
+
+    def put_apply_receipt(self, apply_id: str, payload: str):
+        if self.failures_remaining:
+            self.failures_remaining -= 1
+            raise OSError("synthetic receipt failure")
+        return super().put_apply_receipt(apply_id, payload)
+
+
 class IdentityGateTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary_directory = tempfile.TemporaryDirectory()
@@ -187,6 +199,112 @@ class IdentityGateTests(unittest.TestCase):
             self.repository.list_relationships(object_id=created.object_id), ()
         )
         self.assertEqual(len(self.journal.list_changes()), 1)
+        self.assertEqual(len(self.repository.list_external_identity_mappings()), 1)
+
+    def test_stable_external_identity_binds_across_information_with_name_change(
+        self,
+    ) -> None:
+        first_information = self.ingest("external-stability-first")
+        first = self.service.process(
+            first_information.atomic_information_id,
+            self.evidence(
+                first_information,
+                "Synthetic Name A",
+                "stable_external_id",
+                stable_external_id="synthetic-external-stability",
+            ),
+        )
+        second_information = self.ingest("external-stability-second")
+        second = self.service.process(
+            second_information.atomic_information_id,
+            self.evidence(
+                second_information,
+                "Synthetic Name B",
+                "stable_external_id",
+                stable_external_id="synthetic-external-stability",
+            ),
+        )
+
+        self.assertEqual(first.outcome, "create_minimal")
+        self.assertEqual(second.outcome, "bind_existing")
+        self.assertEqual(second.object_id, first.object_id)
+        self.assertEqual(len(self.repository.list_objects()), 1)
+        self.assertEqual(len(self.repository.list_external_identity_mappings()), 1)
+        self.assertEqual(
+            self.atomic_store.get_current(
+                second_information.atomic_information_id
+            ).related_object_ids,
+            (first.object_id,),
+        )
+
+    def test_stable_external_identity_mapping_survives_repository_restart(self) -> None:
+        first_information = self.ingest("external-restart-first")
+        first = self.service.process(
+            first_information.atomic_information_id,
+            self.evidence(
+                first_information,
+                "Synthetic Restart Name A",
+                "stable_external_id",
+                stable_external_id="synthetic-external-restart",
+            ),
+        )
+
+        self.repository.close()
+        self.repository = SQLiteWorldModelRepository(self.root / "world.sqlite3")
+        self.service = self._service()
+        second_information = self.ingest("external-restart-second")
+        second = self.service.process(
+            second_information.atomic_information_id,
+            self.evidence(
+                second_information,
+                "Synthetic Restart Name B",
+                "stable_external_id",
+                stable_external_id="synthetic-external-restart",
+            ),
+        )
+
+        self.assertEqual(second.outcome, "bind_existing")
+        self.assertEqual(second.object_id, first.object_id)
+        self.assertEqual(len(self.repository.list_objects()), 1)
+        self.assertEqual(len(self.repository.list_external_identity_mappings()), 1)
+
+    def test_stable_external_identity_collision_fails_closed(self) -> None:
+        first_information = self.ingest("external-collision-first")
+        first = self.service.process(
+            first_information.atomic_information_id,
+            self.evidence(
+                first_information,
+                "Synthetic Collision Name A",
+                "stable_external_id",
+                stable_external_id="synthetic-external-collision",
+            ),
+        )
+        conflicting = self.repository.create_object("Synthetic Collision Name B")
+        second_information = self.ingest("external-collision-second")
+
+        with self.assertRaisesRegex(ValueError, "conflicts"):
+            self.service.process(
+                second_information.atomic_information_id,
+                self.evidence(
+                    second_information,
+                    "Synthetic Collision Name B",
+                    "stable_external_id",
+                    stable_external_id="synthetic-external-collision",
+                    approved_existing_object_id=conflicting.object_id,
+                ),
+            )
+
+        self.assertEqual(len(self.repository.list_objects()), 2)
+        self.assertEqual(
+            self.repository.list_external_identity_mappings()[0].object_id,
+            first.object_id,
+        )
+        self.assertEqual(
+            self.atomic_store.get_current(
+                second_information.atomic_information_id
+            ).related_object_ids,
+            (),
+        )
 
     def test_repeated_current_revisions_can_create_but_duplicate_support_cannot_weight(
         self,
@@ -360,6 +478,7 @@ class IdentityGateTests(unittest.TestCase):
         with self.assertRaisesRegex(OSError, "journal failure"):
             failing_service.process(information.atomic_information_id, evidence)
         self.assertEqual(len(self.repository.list_objects()), 1)
+        self.assertEqual(len(self.repository.list_external_identity_mappings()), 1)
         self.assertEqual(self.journal.list_changes(), ())
 
         self.repository.close()
@@ -369,8 +488,47 @@ class IdentityGateTests(unittest.TestCase):
         current = self.atomic_store.get_current(information.atomic_information_id)
         self.assertEqual(recovered.outcome, "create_minimal")
         self.assertEqual(len(self.repository.list_objects()), 1)
+        self.assertEqual(len(self.repository.list_external_identity_mappings()), 1)
         self.assertEqual(len(self.journal.list_changes()), 1)
         self.assertEqual(current.related_object_ids, (recovered.object_id,))
+
+    def test_receipt_failure_rolls_back_object_and_external_identity_mapping(
+        self,
+    ) -> None:
+        self.repository.close()
+        self.repository = FailOnceReceiptRepository(self.root / "world.sqlite3")
+        self.service = self._service()
+        information = self.ingest("receipt-rollback")
+        evidence = self.evidence(
+            information,
+            "Synthetic Receipt Rollback",
+            "stable_external_id",
+            stable_external_id="synthetic-external-receipt-rollback",
+        )
+
+        with self.assertRaisesRegex(OSError, "receipt failure"):
+            self.service.process(information.atomic_information_id, evidence)
+        self.assertEqual(self.repository.list_objects(), ())
+        self.assertEqual(self.repository.list_external_identity_mappings(), ())
+        self.assertEqual(self.repository.list_apply_receipts(), ())
+        self.assertEqual(self.journal.list_changes(), ())
+
+        self.repository.close()
+        self.repository = SQLiteWorldModelRepository(self.root / "world.sqlite3")
+        self.service = self._service()
+        recovered = self.service.process(information.atomic_information_id, evidence)
+
+        self.assertEqual(recovered.outcome, "create_minimal")
+        self.assertEqual(len(self.repository.list_objects()), 1)
+        self.assertEqual(len(self.repository.list_external_identity_mappings()), 1)
+        self.assertEqual(len(self.repository.list_apply_receipts()), 1)
+        self.assertEqual(len(self.journal.list_changes()), 1)
+        self.assertEqual(
+            self.atomic_store.get_current(
+                information.atomic_information_id
+            ).related_object_ids,
+            (recovered.object_id,),
+        )
 
     def test_duplicate_race_fails_closed(self) -> None:
         information = self.ingest("race")

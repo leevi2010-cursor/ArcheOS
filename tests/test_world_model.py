@@ -287,6 +287,27 @@ class WorldModelRepositoryTest(unittest.TestCase):
             "Persistent Synthetic Object",
         )
 
+    def test_external_identity_mapping_is_durable_and_rejects_remap(self) -> None:
+        first = self.repository.create_object("Synthetic External Identity A")
+        second = self.repository.create_object("Synthetic External Identity B")
+        key = "external_identity_synthetic_hash"
+
+        recorded = self.repository.put_external_identity_mapping(key, first.object_id)
+        repeated = self.repository.put_external_identity_mapping(key, first.object_id)
+        self.repository.close()
+        self.repository = SQLiteWorldModelRepository(self.database)
+        self.resolver = ObjectResolver(self.repository)
+
+        self.assertEqual(recorded.object_id, first.object_id)
+        self.assertEqual(repeated, recorded)
+        self.assertEqual(
+            self.repository.get_external_identity_mapping(key).object_id,
+            first.object_id,
+        )
+        self.assertEqual(len(self.repository.list_external_identity_mappings()), 1)
+        with self.assertRaisesRegex(ValueError, "another Object"):
+            self.repository.put_external_identity_mapping(key, second.object_id)
+
     def test_no_parallel_role_specific_base_models_exist(self) -> None:
         forbidden = ("PersonObject", "ProjectObject", "BusinessLineObject")
 

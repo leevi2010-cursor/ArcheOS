@@ -5,13 +5,14 @@ import uuid
 from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
 from dataclasses import replace
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Self
 
 from .models import (
     ALLOWED_ROLES,
     ApplyReceiptRecord,
+    ExternalIdentityMappingRecord,
     LifecycleRecord,
     NameAssignment,
     ObjectRecord,
@@ -21,7 +22,7 @@ from .models import (
 
 
 def _utc_now() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    return datetime.now(UTC).isoformat()
 
 
 def _identifier(prefix: str) -> str:
@@ -56,7 +57,9 @@ class SQLiteWorldModelRepository:
         self.read_only = read_only
         if read_only:
             if not self.database.is_file():
-                raise ValueError(f"World Model database does not exist: {self.database}")
+                raise ValueError(
+                    f"World Model database does not exist: {self.database}"
+                )
             database_uri = self.database.resolve().as_uri() + "?mode=ro&immutable=1"
             self._connection = sqlite3.connect(database_uri, uri=True)
         else:
@@ -193,6 +196,14 @@ class SQLiteWorldModelRepository:
                 payload TEXT NOT NULL CHECK (length(trim(payload)) > 0),
                 created_at TEXT NOT NULL
             );
+
+            CREATE TABLE IF NOT EXISTS external_identity_mappings (
+                identity_key TEXT PRIMARY KEY CHECK (length(trim(identity_key)) > 0),
+                object_id TEXT NOT NULL REFERENCES objects(object_id) ON DELETE RESTRICT,
+                created_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS external_identity_mappings_object_id
+                ON external_identity_mappings(object_id);
             """
         )
 
@@ -293,6 +304,53 @@ class SQLiteWorldModelRepository:
                 (clean_apply_id, clean_payload, now),
             )
         return ApplyReceiptRecord(clean_apply_id, clean_payload, now)
+
+    def get_external_identity_mapping(
+        self, identity_key: str
+    ) -> ExternalIdentityMappingRecord | None:
+        clean_key = _non_empty(identity_key, "identity_key")
+        row = self._connection.execute(
+            "SELECT * FROM external_identity_mappings WHERE identity_key = ?",
+            (clean_key,),
+        ).fetchone()
+        if row is None:
+            return None
+        return ExternalIdentityMappingRecord(
+            row["identity_key"], row["object_id"], row["created_at"]
+        )
+
+    def list_external_identity_mappings(
+        self,
+    ) -> tuple[ExternalIdentityMappingRecord, ...]:
+        rows = self._connection.execute(
+            "SELECT * FROM external_identity_mappings ORDER BY rowid"
+        ).fetchall()
+        return tuple(
+            ExternalIdentityMappingRecord(
+                row["identity_key"], row["object_id"], row["created_at"]
+            )
+            for row in rows
+        )
+
+    def put_external_identity_mapping(
+        self, identity_key: str, object_id: str
+    ) -> ExternalIdentityMappingRecord:
+        clean_key = _non_empty(identity_key, "identity_key")
+        self.get_object(object_id)
+        existing = self.get_external_identity_mapping(clean_key)
+        if existing is not None:
+            if existing.object_id != object_id:
+                raise ValueError(
+                    "external identity key is already mapped to another Object"
+                )
+            return existing
+        now = _utc_now()
+        with self._write_scope():
+            self._connection.execute(
+                "INSERT INTO external_identity_mappings VALUES (?, ?, ?)",
+                (clean_key, object_id, now),
+            )
+        return ExternalIdentityMappingRecord(clean_key, object_id, now)
 
     def rename_object(self, object_id: str, name: str) -> NameAssignment:
         clean_name = _non_empty(name, "name")

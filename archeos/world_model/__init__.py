@@ -2,6 +2,7 @@ from .models import (
     ALLOWED_RELATIONSHIPS,
     ALLOWED_ROLES,
     ApplyReceiptRecord,
+    ExternalIdentityMappingRecord,
     LifecycleRecord,
     NameAssignment,
     ObjectReadModel,
@@ -14,9 +15,10 @@ from .resolver import ObjectResolver
 from .sqlite_repository import SQLiteWorldModelRepository
 
 __all__ = [
-    "ALLOWED_ROLES",
     "ALLOWED_RELATIONSHIPS",
+    "ALLOWED_ROLES",
     "ApplyReceiptRecord",
+    "ExternalIdentityMappingRecord",
     "LifecycleRecord",
     "NameAssignment",
     "ObjectReadModel",

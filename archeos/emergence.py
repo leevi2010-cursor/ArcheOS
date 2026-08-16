@@ -73,6 +73,7 @@ class IdentityAssessment:
     name: str | None
     resolved_object_ids: tuple[str, ...]
     identity_fingerprint: str
+    external_identity_key: str | None
     before_state_fingerprint: str
 
 
@@ -111,7 +112,8 @@ class IdentityGateService:
         information = self.atomic_information_store.get_current(atomic_information_id)
         self._validate_evidence(information, evidence)
         fingerprint = self._identity_fingerprint(evidence)
-        candidates = self._existing_candidates(evidence)
+        external_identity_key = self._external_identity_key(evidence)
+        candidates = self._existing_candidates(evidence, external_identity_key)
         outcome, resolved = self._choose_outcome(information, evidence, candidates)
         return IdentityAssessment(
             outcome=outcome,
@@ -121,8 +123,9 @@ class IdentityGateService:
             name=evidence.name,
             resolved_object_ids=resolved,
             identity_fingerprint=fingerprint,
+            external_identity_key=external_identity_key,
             before_state_fingerprint=self._before_state_fingerprint(
-                evidence.name, resolved
+                evidence.name, resolved, external_identity_key
             ),
         )
 
@@ -172,7 +175,9 @@ class IdentityGateService:
             raise ValueError("Atomic Information revision is stale; assess again.")
         if (
             self._before_state_fingerprint(
-                assessment.name, assessment.resolved_object_ids
+                assessment.name,
+                assessment.resolved_object_ids,
+                assessment.external_identity_key,
             )
             != assessment.before_state_fingerprint
         ):
@@ -200,6 +205,7 @@ class IdentityGateService:
 
         now = self.clock()
         with self.world_model_repository.transaction():
+            mapped_object_id = self._mapped_object_id(assessment.external_identity_key)
             if assessment.outcome == "bind_existing":
                 if len(assessment.resolved_object_ids) != 1:
                     raise ValueError(
@@ -207,10 +213,18 @@ class IdentityGateService:
                     )
                 object_id = assessment.resolved_object_ids[0]
                 self._require_active_object(object_id)
+                if mapped_object_id is not None and mapped_object_id != object_id:
+                    raise ValueError(
+                        "external identity key conflicts with the resolved Object"
+                    )
             else:
                 if assessment.name is None:
                     raise ValueError(
                         "minimal Object creation requires an evidence-backed Name"
+                    )
+                if mapped_object_id is not None:
+                    raise ValueError(
+                        "external identity key is already mapped; assess again."
                     )
                 if self._name_owners(assessment.name):
                     raise ValueError(
@@ -219,6 +233,10 @@ class IdentityGateService:
                 object_id = self.world_model_repository.create_object(
                     assessment.name, roles=()
                 ).object_id
+            if assessment.external_identity_key is not None:
+                self.world_model_repository.put_external_identity_mapping(
+                    assessment.external_identity_key, object_id
+                )
             record = ChangeJournalRecord(
                 change_id=change_id,
                 atomic_information_id=assessment.atomic_information_id,
@@ -303,6 +321,7 @@ class IdentityGateService:
                 None,
                 (object_id,),
                 proposal.interpretation_fingerprint,
+                None,
                 self._before_state_fingerprint(None, (object_id,)),
             )
         else:
@@ -316,6 +335,7 @@ class IdentityGateService:
                 name.strip(),
                 (),
                 proposal.interpretation_fingerprint,
+                None,
                 self._before_state_fingerprint(name.strip(), ()),
             )
         result = self.apply(assessment, mode="human_approved", proposal_id=proposal_id)
@@ -455,13 +475,37 @@ class IdentityGateService:
         ):
             self._require_active_object(object_id)
 
-    def _existing_candidates(self, evidence: IdentityEvidence) -> tuple[str, ...]:
+    def _existing_candidates(
+        self, evidence: IdentityEvidence, external_identity_key: str | None
+    ) -> tuple[str, ...]:
         candidates: set[str] = set(evidence.possible_existing_object_ids)
         if evidence.approved_existing_object_id is not None:
             candidates.add(evidence.approved_existing_object_id)
         if evidence.name is not None:
             candidates.update(self._name_owners(evidence.name))
+        mapped_object_id = self._mapped_object_id(external_identity_key)
+        if mapped_object_id is not None:
+            self._require_active_object(mapped_object_id)
+            if candidates and candidates != {mapped_object_id}:
+                raise ValueError(
+                    "external identity key conflicts with another Object candidate"
+                )
+            return (mapped_object_id,)
         return tuple(sorted(candidates))
+
+    @staticmethod
+    def _external_identity_key(evidence: IdentityEvidence) -> str | None:
+        if evidence.stable_external_id is None:
+            return None
+        return _digest_id("external_identity", evidence.stable_external_id)
+
+    def _mapped_object_id(self, external_identity_key: str | None) -> str | None:
+        if external_identity_key is None:
+            return None
+        mapping = self.world_model_repository.get_external_identity_mapping(
+            external_identity_key
+        )
+        return None if mapping is None else mapping.object_id
 
     def _name_owners(self, name: str) -> set[str]:
         normalized = _normalize(name)
@@ -501,10 +545,16 @@ class IdentityGateService:
         return "identity_gate_" + hashlib.sha256(encoded.encode()).hexdigest()[:32]
 
     def _before_state_fingerprint(
-        self, name: str | None, object_ids: tuple[str, ...]
+        self,
+        name: str | None,
+        object_ids: tuple[str, ...],
+        external_identity_key: str | None = None,
     ) -> str:
         payload = {
             "name_owners": sorted(self._name_owners(name)) if name is not None else [],
+            "external_identity_object_id": self._mapped_object_id(
+                external_identity_key
+            ),
             "objects": [
                 (
                     object_id,

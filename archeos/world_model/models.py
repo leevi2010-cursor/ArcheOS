@@ -28,6 +28,15 @@ class ApplyReceiptRecord:
 
 
 @dataclass(frozen=True)
+class ExternalIdentityMappingRecord:
+    """Repository-level technical mapping from a hashed external identity key."""
+
+    identity_key: str
+    object_id: str
+    created_at: str
+
+
+@dataclass(frozen=True)
 class ObjectRecord:
     object_id: str
     status: str
