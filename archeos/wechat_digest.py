@@ -53,9 +53,12 @@ from .source.local_repository import SourceNotFoundError
 from .world_model import ObjectResolver, SQLiteWorldModelRepository
 
 CHECKPOINT_SCHEMA_VERSION = "wechat-digest-checkpoint/1.0"
-RUN_PLAN_SCHEMA_VERSION = "wechat-digest-run-plan/2.0"
+RUN_PLAN_SCHEMA_VERSION = "wechat-digest-run-plan/3.0"
+PREVIOUS_RUN_PLAN_SCHEMA_VERSION = "wechat-digest-run-plan/2.0"
 LEGACY_RUN_PLAN_SCHEMA_VERSION = "wechat-digest-run-plan/1.0"
 RUN_STATUS_SCHEMA_VERSION = "wechat-digest-run-status/1.0"
+RUN_PLAN_RECEIPT_SCHEMA_VERSION = "wechat-digest-run-plan-receipt/2.0"
+LEGACY_RUN_PLAN_RECEIPT_SCHEMA_VERSION = "wechat-digest-run-plan-receipt/1.0"
 CAPTURE_SCHEMA_VERSION = "wechat-cli-capture/1.0"
 SUPPORTED_WECHAT_CLI_VERSION = "0.5.0"
 DEFAULT_CAPTURE_WINDOW_DAYS = 30
@@ -170,6 +173,7 @@ class WechatCaptureProvider(Protocol):
         after_cursor: WechatCursor,
         *,
         upper_bound: WechatCursor | None = None,
+        all_history_upper_bound: WechatCursor | None = None,
         observe_only: bool = False,
     ) -> WechatCapture: ...
 
@@ -322,12 +326,20 @@ class WechatCliCaptureProvider:
         after_cursor: WechatCursor,
         *,
         upper_bound: WechatCursor | None = None,
+        all_history_upper_bound: WechatCursor | None = None,
         observe_only: bool = False,
     ) -> WechatCapture:
+        if upper_bound is not None and all_history_upper_bound is not None:
+            raise WechatDigestError("微信捕获边界冲突；未推进 checkpoint。")
         request = {
             "config_path": None if self.config_path is None else str(self.config_path),
             "after_cursor": after_cursor.to_dict(),
             "upper_bound": None if upper_bound is None else upper_bound.to_dict(),
+            "all_history_upper_bound": (
+                None
+                if all_history_upper_bound is None
+                else all_history_upper_bound.to_dict()
+            ),
             "observe_only": observe_only,
             "window_days": self.window_days,
             "window_message_limit": self.window_message_limit,
@@ -353,6 +365,13 @@ class WechatCliCaptureProvider:
             raise WechatDigestError("微信只读捕获结果不完整；未推进 checkpoint。") from exc
         if upper_bound is not None and capture.upper_bound != upper_bound:
             raise WechatDigestError("微信重放范围发生变化；未推进 checkpoint。")
+        if (
+            all_history_upper_bound is not None
+            and capture.upper_bound > all_history_upper_bound
+        ):
+            raise WechatDigestError("微信全历史边界发生漂移；未推进 checkpoint。")
+        if observe_only and capture.messages:
+            raise WechatDigestError("微信只读边界观察返回了消息内容；未推进 checkpoint。")
         return capture
 
     def _parse_capture(
@@ -568,7 +587,12 @@ class WechatDigestRunStore:
         clock: Callable[[], str] = _utc_now,
         before_checkpoint_publish: Callable[[], None] | None = None,
         before_upgrade_status_write: Callable[[], None] | None = None,
+        after_upgrade_pending_receipt_write: Callable[[], None] | None = None,
+        before_upgrade_commit_receipt_write: Callable[[], None] | None = None,
         after_upgrade_receipt_write: Callable[[], None] | None = None,
+        before_create_status_write: Callable[[], None] | None = None,
+        before_create_receipt_write: Callable[[], None] | None = None,
+        before_create_active_write: Callable[[], None] | None = None,
     ) -> None:
         self.root = Path(root)
         self.runs_root = self.root / "runs"
@@ -578,7 +602,16 @@ class WechatDigestRunStore:
         self.clock = clock
         self.before_checkpoint_publish = before_checkpoint_publish
         self.before_upgrade_status_write = before_upgrade_status_write
+        self.after_upgrade_pending_receipt_write = (
+            after_upgrade_pending_receipt_write
+        )
+        self.before_upgrade_commit_receipt_write = (
+            before_upgrade_commit_receipt_write
+        )
         self.after_upgrade_receipt_write = after_upgrade_receipt_write
+        self.before_create_status_write = before_create_status_write
+        self.before_create_receipt_write = before_create_receipt_write
+        self.before_create_active_write = before_create_active_write
 
     @contextmanager
     def lock(self) -> Iterator[None]:
@@ -621,16 +654,65 @@ class WechatDigestRunStore:
 
     def plan(self, run_id: str) -> dict[str, object]:
         value = self._read_json(self.runs_root / run_id / "plan.json")
-        if not isinstance(value, dict) or value.get("schema_version") not in {RUN_PLAN_SCHEMA_VERSION, LEGACY_RUN_PLAN_SCHEMA_VERSION}:
+        if not isinstance(value, dict) or value.get("schema_version") not in {
+            RUN_PLAN_SCHEMA_VERSION,
+            PREVIOUS_RUN_PLAN_SCHEMA_VERSION,
+            LEGACY_RUN_PLAN_SCHEMA_VERSION,
+        }:
             raise WechatDigestError("微信运行计划损坏。")
         return value
 
     def plan_receipt(self, run_id: str) -> dict[str, object]:
         value = self._read_json(self.runs_root / run_id / "run-plan-receipt.json")
-        if (
-            not isinstance(value, dict)
-            or set(value) != {"schema_version", "run_id", "plan_fingerprint"}
-            or value.get("schema_version") != "wechat-digest-run-plan-receipt/1.0"
+        if not isinstance(value, dict) or value.get("run_id") != run_id:
+            raise WechatDigestError("微信运行计划 receipt 损坏。")
+        if value.get("schema_version") == LEGACY_RUN_PLAN_RECEIPT_SCHEMA_VERSION:
+            if set(value) != {"schema_version", "run_id", "plan_fingerprint"}:
+                raise WechatDigestError("微信运行计划 receipt 损坏。")
+        elif value.get("schema_version") == RUN_PLAN_RECEIPT_SCHEMA_VERSION:
+            phase = value.get("phase")
+            expected = (
+                {"schema_version", "run_id", "phase", "plan_fingerprint"}
+                if phase == "committed"
+                else {
+                    "schema_version",
+                    "run_id",
+                    "phase",
+                    "previous_plan_fingerprint",
+                    "all_history_upper_bound",
+                    "target_plan_fingerprint",
+                }
+            )
+            if phase not in {"pending", "committed"} or set(value) != expected:
+                raise WechatDigestError("微信运行计划 receipt 损坏。")
+            if phase == "pending":
+                try:
+                    WechatCursor.from_dict(
+                        value["all_history_upper_bound"],
+                        "receipt.all_history_upper_bound",
+                    )
+                except (TypeError, ValueError) as exc:
+                    raise WechatDigestError(
+                        "微信运行计划 receipt 损坏。"
+                    ) from exc
+        else:
+            raise WechatDigestError("微信运行计划 receipt 损坏。")
+        fingerprints = (
+            (value.get("plan_fingerprint"),)
+            if value.get("schema_version")
+            == LEGACY_RUN_PLAN_RECEIPT_SCHEMA_VERSION
+            or value.get("phase") == "committed"
+            else (
+                value.get("previous_plan_fingerprint"),
+                value.get("target_plan_fingerprint"),
+            )
+        )
+        if any(
+            (
+                not isinstance(fingerprint, str)
+                or re.fullmatch(r"sha256:[0-9a-f]{64}", fingerprint) is None
+            )
+            for fingerprint in fingerprints
         ):
             raise WechatDigestError("微信运行计划 receipt 损坏。")
         return value
@@ -647,18 +729,42 @@ class WechatDigestRunStore:
     def create(self, plan: dict[str, object], status: dict[str, object]) -> None:
         run_id = str(plan["run_id"])
         run_dir = self.runs_root / run_id
-        if run_dir.exists():
+        run_dir.mkdir(parents=True, exist_ok=True)
+        plan_path = run_dir / "plan.json"
+        status_path = run_dir / "status.json"
+        receipt_path = run_dir / "run-plan-receipt.json"
+        if receipt_path.exists() and not status_path.exists():
+            raise WechatDigestError("微信运行创建记录顺序损坏。")
+        if plan_path.exists():
             if self.plan(run_id) != plan:
                 raise WechatDigestError("微信运行 identity collision。")
         else:
-            run_dir.mkdir(parents=True)
-            _atomic_write_json(run_dir / "plan.json", plan)
-            _atomic_write_json(run_dir / "status.json", status)
-            _atomic_write_json(run_dir / "run-plan-receipt.json", {
-                "schema_version": "wechat-digest-run-plan-receipt/1.0",
-                "run_id": run_id,
-                "plan_fingerprint": _plan_fingerprint(plan),
-            })
+            if status_path.exists() or receipt_path.exists():
+                raise WechatDigestError("微信运行创建记录损坏。")
+            _atomic_write_json(plan_path, plan)
+        if self.before_create_status_write is not None:
+            self.before_create_status_write()
+        if status_path.exists():
+            if self.status(run_id) != status:
+                raise WechatDigestError("微信运行创建状态不一致。")
+        else:
+            _atomic_write_json(status_path, status)
+        if self.before_create_receipt_write is not None:
+            self.before_create_receipt_write()
+        committed_receipt = _committed_plan_receipt(run_id, plan)
+        if receipt_path.exists():
+            if self.plan_receipt(run_id) != committed_receipt:
+                raise WechatDigestError("微信运行创建 receipt 不一致。")
+        else:
+            _atomic_write_json(receipt_path, committed_receipt)
+        if (
+            self.plan(run_id) != plan
+            or self.status(run_id) != status
+            or self.plan_receipt(run_id) != committed_receipt
+        ):
+            raise WechatDigestError("微信运行创建读回不一致。")
+        if self.before_create_active_write is not None:
+            self.before_create_active_write()
         _atomic_write_json(self.active_path, {"active_run_id": run_id})
 
     def update_status(self, run_id: str, status: dict[str, object]) -> None:
@@ -680,12 +786,57 @@ class WechatDigestRunStore:
             _atomic_write_json(status_path, status)
         _atomic_write_json(
             self.runs_root / run_id / "run-plan-receipt.json",
-            {
-                "schema_version": "wechat-digest-run-plan-receipt/1.0",
-                "run_id": run_id,
-                "plan_fingerprint": _plan_fingerprint(plan),
-            },
+            _committed_plan_receipt(run_id, plan),
         )
+        if self.after_upgrade_receipt_write is not None:
+            self.after_upgrade_receipt_write()
+
+    def complete_all_history_upper_upgrade(
+        self,
+        run_id: str,
+        plan: dict[str, object],
+        status: dict[str, object],
+        pending_receipt: dict[str, object],
+    ) -> None:
+        """Converge a verified v2→v3 scope upgrade; receipt commits last."""
+        plan_path = self.runs_root / run_id / "plan.json"
+        status_path = self.runs_root / run_id / "status.json"
+        receipt_path = self.runs_root / run_id / "run-plan-receipt.json"
+        current_receipt = self.plan_receipt(run_id)
+        committed_receipt = _committed_plan_receipt(run_id, plan)
+        if current_receipt == committed_receipt:
+            return
+        if current_receipt != pending_receipt:
+            previous_fingerprint = pending_receipt.get(
+                "previous_plan_fingerprint"
+            )
+            if (
+                _committed_receipt_fingerprint(current_receipt)
+                != previous_fingerprint
+                or _plan_fingerprint(self.plan(run_id))
+                != previous_fingerprint
+                or self.status(run_id).get("plan_fingerprint")
+                != previous_fingerprint
+            ):
+                raise WechatDigestError(
+                    "微信全历史边界升级初始 receipt 不一致。"
+                )
+            _atomic_write_json(receipt_path, pending_receipt)
+            if self.plan_receipt(run_id) != pending_receipt:
+                raise WechatDigestError(
+                    "微信全历史边界 pending receipt 读回不一致。"
+                )
+        if self.after_upgrade_pending_receipt_write is not None:
+            self.after_upgrade_pending_receipt_write()
+        if self.plan(run_id) != plan:
+            _atomic_write_json(plan_path, plan)
+        if self.before_upgrade_status_write is not None:
+            self.before_upgrade_status_write()
+        if self.status(run_id) != status:
+            _atomic_write_json(status_path, status)
+        if self.before_upgrade_commit_receipt_write is not None:
+            self.before_upgrade_commit_receipt_write()
+        _atomic_write_json(receipt_path, committed_receipt)
         if self.after_upgrade_receipt_write is not None:
             self.after_upgrade_receipt_write()
 
@@ -902,9 +1053,15 @@ def _conversation_source_payload(
 def _build_plan(
     capture: WechatCapture, *, clock: Callable[[], str],
     semantic_batch_size: int = DEFAULT_EXTERNAL_AGENT_BATCH_SIZE,
+    all_history_upper_bound: WechatCursor | None = None,
     run_id: str | None = None,
     created_at: str | None = None,
 ) -> tuple[dict[str, object], dict[str, object]]:
+    if (
+        all_history_upper_bound is not None
+        and capture.upper_bound > all_history_upper_bound
+    ):
+        raise WechatDigestError("微信窗口超出冻结的全历史边界。")
     fingerprint = _capture_fingerprint(capture)
     created_at = created_at or clock()
     run_id = run_id or _stable_id(
@@ -967,6 +1124,11 @@ def _build_plan(
         "provider_version": capture.provider_version,
         "after_cursor": capture.after_cursor.to_dict(),
         "upper_bound": capture.upper_bound.to_dict(),
+        "all_history_upper_bound": (
+            None
+            if all_history_upper_bound is None
+            else all_history_upper_bound.to_dict()
+        ),
         "capture_fingerprint": fingerprint,
         "semantic_batch_size": semantic_batch_size,
         "message_keys": [message.message_key for message in capture.messages],
@@ -1021,8 +1183,49 @@ def _build_plan(
 
 
 def _plan_fingerprint(plan: Mapping[str, object]) -> str:
-    keys = ("schema_version", "run_id", "after_cursor", "upper_bound", "capture_fingerprint", "semantic_batch_size", "conversations")
+    keys = [
+        "schema_version",
+        "run_id",
+        "after_cursor",
+        "upper_bound",
+        "capture_fingerprint",
+        "semantic_batch_size",
+        "conversations",
+    ]
+    if plan.get("schema_version") == RUN_PLAN_SCHEMA_VERSION:
+        keys.insert(4, "all_history_upper_bound")
     return _sha256_bytes(_canonical_json({key: plan.get(key) for key in keys}).encode("utf-8"))
+
+
+def _committed_plan_receipt(
+    run_id: str, plan: Mapping[str, object]
+) -> dict[str, object]:
+    return {
+        "schema_version": RUN_PLAN_RECEIPT_SCHEMA_VERSION,
+        "run_id": run_id,
+        "phase": "committed",
+        "plan_fingerprint": _plan_fingerprint(plan),
+    }
+
+
+def _committed_receipt_fingerprint(receipt: Mapping[str, object]) -> str:
+    if receipt.get("schema_version") == LEGACY_RUN_PLAN_RECEIPT_SCHEMA_VERSION or (
+        receipt.get("schema_version") == RUN_PLAN_RECEIPT_SCHEMA_VERSION
+        and receipt.get("phase") == "committed"
+    ):
+        value = receipt.get("plan_fingerprint")
+    else:
+        raise WechatDigestError("微信运行计划 receipt 尚未提交。")
+    if not isinstance(value, str):
+        raise WechatDigestError("微信运行计划 receipt 损坏。")
+    return value
+
+
+def _previous_plan_projection(plan: Mapping[str, object]) -> dict[str, object]:
+    projected = dict(plan)
+    projected["schema_version"] = PREVIOUS_RUN_PLAN_SCHEMA_VERSION
+    projected.pop("all_history_upper_bound", None)
+    return projected
 
 
 def _plan_sequence(value: object, field: str) -> list[dict[str, object]]:
@@ -1092,6 +1295,15 @@ class WechatDigestService:
             )
         with self.run_store.lock():
             try:
+                active_run_id = self.run_store.active_run_id()
+                history_scope = all_history
+                if active_run_id is not None:
+                    history_scope = (
+                        self._plan_all_history_upper(
+                            self.run_store.plan(active_run_id)
+                        )
+                        is not None
+                    )
                 results: list[WechatDigestResult] = []
                 while True:
                     result = self._run_locked(
@@ -1100,6 +1312,8 @@ class WechatDigestService:
                         all_history=all_history,
                     )
                     results.append(result)
+                    if history_scope and self.run_store.active_run_id() is None:
+                        return self._aggregate_results(results)
                     if from_now or result.new_messages == 0:
                         return self._aggregate_results(results)
                     since = None
@@ -1175,6 +1389,7 @@ class WechatDigestService:
             expected_legacy = dict(plan)
             expected_legacy["schema_version"] = LEGACY_RUN_PLAN_SCHEMA_VERSION
             expected_legacy.pop("semantic_batch_size")
+            expected_legacy.pop("all_history_upper_bound")
             status = self.run_store.status(run_id)
             # A receipt-less interruption may leave either independently
             # validated schema shape on disk.  No other shape is recoverable.
@@ -1210,6 +1425,207 @@ class WechatDigestService:
                 active_run_id, capture, disk_plan, disk_status
             )
             return active_run_id
+
+    def upgrade_active_v2_all_history(self) -> str:
+        """Explicitly freeze one global upper for an active v2 history run."""
+        with self.run_store.lock():
+            run_id = self.run_store.active_run_id()
+            if run_id is None:
+                raise WechatDigestError(
+                    "不存在可冻结全历史边界的 active v2 微信运行。"
+                )
+            persisted_plan = self.run_store.plan(run_id)
+            if persisted_plan.get("run_id") != run_id:
+                raise WechatDigestError("active v2 微信运行计划损坏。")
+            capture = self.capture_provider.capture(
+                WechatCursor.from_dict(
+                    persisted_plan["after_cursor"], "plan.after_cursor"
+                ),
+                upper_bound=WechatCursor.from_dict(
+                    persisted_plan["upper_bound"], "plan.upper_bound"
+                ),
+            )
+            self._verify_capture_against_plan(capture, persisted_plan)
+            created_at = persisted_plan.get("created_at")
+            if not isinstance(created_at, str):
+                raise WechatDigestError("active v2 微信运行损坏。")
+            status = self.run_store.status(run_id)
+            receipt = self.run_store.plan_receipt(run_id)
+            receipt_phase = receipt.get("phase")
+            if receipt.get("schema_version") == LEGACY_RUN_PLAN_RECEIPT_SCHEMA_VERSION:
+                receipt_phase = "committed"
+
+            if receipt_phase == "committed":
+                committed_fingerprint = _committed_receipt_fingerprint(receipt)
+                if persisted_plan.get("schema_version") == RUN_PLAN_SCHEMA_VERSION:
+                    if committed_fingerprint != _plan_fingerprint(persisted_plan):
+                        raise WechatDigestError(
+                            "微信全历史边界升级 receipt 不一致。"
+                        )
+                    self._verify_plan_and_status(
+                        run_id, capture, persisted_plan, status
+                    )
+                    if self._plan_all_history_upper(persisted_plan) is None:
+                        raise WechatDigestError(
+                            "active v3 微信运行不是全历史恢复范围。"
+                        )
+                    return run_id
+                if (
+                    persisted_plan.get("schema_version")
+                    != PREVIOUS_RUN_PLAN_SCHEMA_VERSION
+                ):
+                    raise WechatDigestError(
+                        "active 微信运行不是可升级的 v2 全历史范围。"
+                    )
+                self._verify_plan_and_status(
+                    run_id, capture, persisted_plan, status
+                )
+                observed = self.capture_provider.capture(
+                    ZERO_CURSOR, observe_only=True
+                )
+                all_history_upper = observed.upper_bound
+                if all_history_upper < capture.upper_bound:
+                    raise WechatDigestError(
+                        "微信全历史边界早于 active 窗口；未执行升级。"
+                    )
+                plan, _ = _build_plan(
+                    capture,
+                    clock=lambda: created_at,
+                    run_id=run_id,
+                    created_at=created_at,
+                    semantic_batch_size=self._plan_batch_size(persisted_plan),
+                    all_history_upper_bound=all_history_upper,
+                )
+                if _previous_plan_projection(plan) != persisted_plan:
+                    raise WechatDigestError(
+                        "active v2 与 fixed capture 不一致。"
+                    )
+                pending_receipt = {
+                    "schema_version": RUN_PLAN_RECEIPT_SCHEMA_VERSION,
+                    "run_id": run_id,
+                    "phase": "pending",
+                    "previous_plan_fingerprint": committed_fingerprint,
+                    "all_history_upper_bound": all_history_upper.to_dict(),
+                    "target_plan_fingerprint": _plan_fingerprint(plan),
+                }
+            elif receipt_phase == "pending":
+                try:
+                    all_history_upper = WechatCursor.from_dict(
+                        receipt.get("all_history_upper_bound"),
+                        "receipt.all_history_upper_bound",
+                    )
+                except (TypeError, ValueError) as exc:
+                    raise WechatDigestError(
+                        "微信全历史边界 pending receipt 损坏。"
+                    ) from exc
+                if all_history_upper < capture.upper_bound:
+                    raise WechatDigestError(
+                        "微信全历史边界早于 active 窗口。"
+                    )
+                plan, _ = _build_plan(
+                    capture,
+                    clock=lambda: created_at,
+                    run_id=run_id,
+                    created_at=created_at,
+                    semantic_batch_size=self._plan_batch_size(persisted_plan),
+                    all_history_upper_bound=all_history_upper,
+                )
+                previous_plan = _previous_plan_projection(plan)
+                previous_fingerprint = _plan_fingerprint(previous_plan)
+                target_fingerprint = _plan_fingerprint(plan)
+                if (
+                    receipt.get("previous_plan_fingerprint")
+                    != previous_fingerprint
+                    or receipt.get("target_plan_fingerprint")
+                    != target_fingerprint
+                ):
+                    raise WechatDigestError(
+                        "微信全历史边界 pending receipt 不一致。"
+                    )
+                if persisted_plan == previous_plan:
+                    if status.get("plan_fingerprint") != previous_fingerprint:
+                        raise WechatDigestError(
+                            "微信全历史边界升级状态不一致。"
+                        )
+                    self._verify_plan_and_status(
+                        run_id,
+                        capture,
+                        previous_plan,
+                        status,
+                        require_receipt=False,
+                    )
+                elif persisted_plan == plan:
+                    if status.get("plan_fingerprint") == previous_fingerprint:
+                        self._verify_plan_and_status(
+                            run_id,
+                            capture,
+                            previous_plan,
+                            status,
+                            require_receipt=False,
+                        )
+                    elif status.get("plan_fingerprint") == target_fingerprint:
+                        self._verify_plan_and_status(
+                            run_id,
+                            capture,
+                            plan,
+                            status,
+                            require_receipt=False,
+                        )
+                    else:
+                        raise WechatDigestError(
+                            "微信全历史边界升级状态不一致。"
+                        )
+                else:
+                    raise WechatDigestError(
+                        "微信全历史边界升级 plan 不一致。"
+                    )
+                pending_receipt = dict(receipt)
+            else:
+                raise WechatDigestError(
+                    "微信全历史边界升级 receipt 损坏。"
+                )
+
+            if persisted_plan.get("schema_version") == RUN_PLAN_SCHEMA_VERSION:
+                if persisted_plan != plan:
+                    raise WechatDigestError(
+                        "微信全历史边界升级 plan 不一致。"
+                    )
+                if status.get("plan_fingerprint") == _plan_fingerprint(plan):
+                    self._verify_plan_and_status(
+                        run_id,
+                        capture,
+                        plan,
+                        status,
+                        require_receipt=False,
+                    )
+
+            upgraded_status = dict(status)
+            upgraded_status["plan_fingerprint"] = _plan_fingerprint(plan)
+            self.run_store.complete_all_history_upper_upgrade(
+                run_id, plan, upgraded_status, pending_receipt
+            )
+            if self.run_store.active_run_id() != run_id:
+                raise WechatDigestError(
+                    "微信全历史边界升级 active run 读回不一致。"
+                )
+            disk_plan = self.run_store.plan(run_id)
+            disk_status = self.run_store.status(run_id)
+            disk_receipt = self.run_store.plan_receipt(run_id)
+            if (
+                disk_plan != plan
+                or disk_status != upgraded_status
+                or disk_receipt.get("run_id") != run_id
+                or _committed_receipt_fingerprint(disk_receipt)
+                != _plan_fingerprint(disk_plan)
+            ):
+                raise WechatDigestError(
+                    "微信全历史边界升级 durable readback 不一致。"
+                )
+            self._verify_capture_against_plan(capture, disk_plan)
+            self._verify_plan_and_status(
+                run_id, capture, disk_plan, disk_status
+            )
+            return run_id
 
     def _prepare_next_semantic_locked(
         self,
@@ -1298,6 +1714,30 @@ class WechatDigestService:
             raise WechatDigestError("微信运行计划 semantic batch size 损坏。")
         return value
 
+    @staticmethod
+    def _plan_all_history_upper(
+        plan: Mapping[str, object],
+    ) -> WechatCursor | None:
+        if plan.get("schema_version") != RUN_PLAN_SCHEMA_VERSION:
+            return None
+        if "all_history_upper_bound" not in plan:
+            raise WechatDigestError("微信运行计划缺少全历史边界。")
+        value = plan["all_history_upper_bound"]
+        if value is None:
+            return None
+        try:
+            upper = WechatCursor.from_dict(
+                value, "plan.all_history_upper_bound"
+            )
+            window_upper = WechatCursor.from_dict(
+                plan.get("upper_bound"), "plan.upper_bound"
+            )
+        except (TypeError, ValueError) as exc:
+            raise WechatDigestError("微信运行计划全历史边界损坏。") from exc
+        if window_upper > upper:
+            raise WechatDigestError("微信窗口超出冻结的全历史边界。")
+        return upper
+
     def _verify_plan_and_status(
         self,
         active_run_id: str,
@@ -1315,6 +1755,7 @@ class WechatDigestService:
         plan_is_legacy = plan.get("schema_version") == LEGACY_RUN_PLAN_SCHEMA_VERSION
         if plan.get("schema_version") not in {
             RUN_PLAN_SCHEMA_VERSION,
+            PREVIOUS_RUN_PLAN_SCHEMA_VERSION,
             LEGACY_RUN_PLAN_SCHEMA_VERSION,
         }:
             raise WechatDigestError("微信运行计划损坏。")
@@ -1323,7 +1764,10 @@ class WechatDigestService:
         fingerprint = _plan_fingerprint(plan)
         if require_receipt:
             receipt = self.run_store.plan_receipt(active_run_id)
-            if receipt.get("run_id") != active_run_id or receipt.get("plan_fingerprint") != fingerprint:
+            if (
+                receipt.get("run_id") != active_run_id
+                or _committed_receipt_fingerprint(receipt) != fingerprint
+            ):
                 raise WechatDigestError("微信运行计划 receipt 不一致。")
         if status.get("run_id") != active_run_id:
             raise WechatDigestError("微信运行计划 receipt 不一致。")
@@ -1348,12 +1792,21 @@ class WechatDigestService:
             expected_status_keys.add("plan_fingerprint")
         if set(status) != expected_status_keys:
             raise WechatDigestError("微信运行状态形态损坏。")
-        expected, _ = _build_plan(capture, clock=lambda: created_at, run_id=run_id,
-            created_at=created_at, semantic_batch_size=self._plan_batch_size(plan))
+        expected, _ = _build_plan(
+            capture,
+            clock=lambda: created_at,
+            run_id=run_id,
+            created_at=created_at,
+            semantic_batch_size=self._plan_batch_size(plan),
+            all_history_upper_bound=self._plan_all_history_upper(plan),
+        )
         comparable = dict(plan)
         if comparable.get("schema_version") == LEGACY_RUN_PLAN_SCHEMA_VERSION:
             expected.pop("semantic_batch_size")
+            expected.pop("all_history_upper_bound")
             expected["schema_version"] = LEGACY_RUN_PLAN_SCHEMA_VERSION
+        elif comparable.get("schema_version") == PREVIOUS_RUN_PLAN_SCHEMA_VERSION:
+            expected = _previous_plan_projection(expected)
         if comparable != expected:
             raise WechatDigestError("微信 durable plan 与 fixed capture 不一致。")
         items = status.get("items")
@@ -1408,6 +1861,10 @@ class WechatDigestService:
             if any((since is not None, from_now, all_history)):
                 raise WechatDigestError("存在未完成运行；请先原样恢复，不要更改首次起点。")
             plan = self.run_store.plan(active_run_id)
+            if plan.get("schema_version") == PREVIOUS_RUN_PLAN_SCHEMA_VERSION:
+                raise WechatDigestError(
+                    "active v2 微信运行必须显式冻结全历史边界。"
+                )
             after = WechatCursor.from_dict(plan["after_cursor"], "plan.after_cursor")
             upper = WechatCursor.from_dict(plan["upper_bound"], "plan.upper_bound")
             capture = self.capture_provider.capture(after, upper_bound=upper)
@@ -1416,7 +1873,38 @@ class WechatDigestService:
             if self.semantic_batch_size != self._plan_batch_size(plan):
                 raise WechatDigestError("semantic batch size 与 durable run 不一致。")
             self._verify_plan_and_status(active_run_id, capture, plan, status)
+            all_history_upper = self._plan_all_history_upper(plan)
+            if (
+                status.get("state") == "completed"
+                and all_history_upper is not None
+                and upper < all_history_upper
+            ):
+                if not status.get("checkpoint_published") or checkpoint != upper:
+                    raise WechatDigestError(
+                        "微信全历史窗口 checkpoint 与完成状态不一致。"
+                    )
+                next_capture = self.capture_provider.capture(
+                    upper, all_history_upper_bound=all_history_upper
+                )
+                if next_capture.upper_bound <= upper:
+                    raise WechatDigestError(
+                        "冻结的微信全历史边界无法继续读回。"
+                    )
+                created_at = plan.get("created_at")
+                if not isinstance(created_at, str):
+                    raise WechatDigestError("微信运行计划损坏。")
+                plan, status = _build_plan(
+                    next_capture,
+                    clock=lambda: created_at,
+                    created_at=created_at,
+                    semantic_batch_size=self.semantic_batch_size,
+                    all_history_upper_bound=all_history_upper,
+                )
+                self.run_store.create(plan, status)
+                active_run_id = str(plan["run_id"])
+                capture = next_capture
         else:
+            all_history_upper: WechatCursor | None = None
             if checkpoint is None:
                 if not any((since is not None, from_now, all_history)):
                     raise WechatDigestError(
@@ -1432,8 +1920,24 @@ class WechatDigestService:
                         observed.upper_bound,
                         (),
                     )
+                elif all_history:
+                    observed = self.capture_provider.capture(
+                        ZERO_CURSOR, observe_only=True
+                    )
+                    all_history_upper = observed.upper_bound
+                    capture = self.capture_provider.capture(
+                        ZERO_CURSOR,
+                        all_history_upper_bound=all_history_upper,
+                    )
+                    if (
+                        all_history_upper > ZERO_CURSOR
+                        and capture.upper_bound <= ZERO_CURSOR
+                    ):
+                        raise WechatDigestError(
+                            "冻结的微信全历史边界无法读回。"
+                        )
                 else:
-                    after = ZERO_CURSOR if all_history else parse_since(str(since))
+                    after = parse_since(str(since))
                     capture = self.capture_provider.capture(after)
             else:
                 if any((since is not None, from_now, all_history)):
@@ -1441,8 +1945,12 @@ class WechatDigestService:
                         "checkpoint 已存在；日常运行不要再指定首次起点。"
                     )
                 capture = self.capture_provider.capture(checkpoint)
-            plan, status = _build_plan(capture, clock=self.clock,
-                semantic_batch_size=self.semantic_batch_size)
+            plan, status = _build_plan(
+                capture,
+                clock=self.clock,
+                semantic_batch_size=self.semantic_batch_size,
+                all_history_upper_bound=all_history_upper,
+            )
             self.run_store.create(plan, status)
             active_run_id = str(plan["run_id"])
 
@@ -1553,7 +2061,9 @@ class WechatDigestService:
         converged["state"] = "completed"
         converged["updated_at"] = self.clock()
         self.run_store.update_status(run_id, converged)
-        self.run_store.clear_active()
+        all_history_upper = self._plan_all_history_upper(plan)
+        if all_history_upper is None or upper == all_history_upper:
+            self.run_store.clear_active()
         return self._result(run_id, converged, replayed=replayed)
 
     @staticmethod
