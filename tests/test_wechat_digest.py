@@ -649,6 +649,183 @@ class WechatDigestTests(unittest.TestCase):
         with self.assertRaisesRegex(WechatDigestError, "重放内容发生变化"):
             self.service(capture).run()
 
+    def test_prepare_requires_active_run_without_capture(self) -> None:
+        capture = SyntheticCaptureProvider([message(1)])
+        with self.assertRaisesRegex(WechatDigestError, "不存在可恢复"):
+            self.service(capture).prepare_next_semantic()
+        self.assertEqual(capture.calls, [])
+
+    def test_prepare_is_idempotent_and_keeps_checkpoint_unpublished(self) -> None:
+        capture = SyntheticCaptureProvider([message(1)])
+        self.semantic.failures_remaining = 1
+        service = self.service(capture)
+        with self.assertRaises(WechatDigestError):
+            service.run(all_history=True)
+        first = service.prepare_next_semantic()
+        second = service.prepare_next_semantic()
+        self.assertEqual(first, second)
+        self.assertEqual(self.semantic.provider.calls, 0)
+        status = service.run_store.status(first.run_id)
+        self.assertFalse(status["checkpoint_published"])
+        self.assertEqual(service.run_store.active_run_id(), first.run_id)
+
+    def test_prepare_replays_existing_package_without_provider(self) -> None:
+        self.create_object()
+        capture = SyntheticCaptureProvider([message(1, conversation="a"), message(2, conversation="b")])
+        service = self.service(capture, service_type=FailAfterGovernanceOnceService)
+        with self.assertRaises(WechatDigestError):
+            service.run(all_history=True)
+        provider_calls = self.semantic.provider.calls
+        prepared = service.prepare_next_semantic()
+        self.assertEqual(self.semantic.provider.calls, provider_calls)
+        self.assertFalse(service.run_store.status(prepared.run_id)["checkpoint_published"])
+
+    def test_prepare_converges_unsupported_attachment_without_provider(self) -> None:
+        attachment_path = self.workspace / "synthetic.bin"
+        attachment_path.write_bytes(b"synthetic")
+        capture = SyntheticCaptureProvider([message(1, attachments=(attachment(attachment_path, "attachment_1", media_type="application/x-synthetic"),)), message(2, conversation="a"), message(3, conversation="b")])
+        self.create_object()
+        service = self.service(capture, service_type=FailAfterGovernanceOnceService)
+        with self.assertRaises(WechatDigestError):
+            service.run(all_history=True)
+        provider_calls = self.semantic.provider.calls
+        prepared = service.prepare_next_semantic()
+        self.assertEqual(self.semantic.provider.calls, provider_calls)
+        self.assertEqual(service.run_store.status(prepared.run_id)["items"]["attachment:attachment_1"]["state"], "unsupported")
+
+    def test_prepare_stops_at_multi_batch_item(self) -> None:
+        capture = SyntheticCaptureProvider([message(number) for number in range(1, 42)])
+        self.semantic.failures_remaining = 1
+        service = self.service(capture)
+        with self.assertRaises(WechatDigestError):
+            service.run(all_history=True)
+        with self.assertRaisesRegex(WechatDigestError, "多个 batch"):
+            service.prepare_next_semantic(batch_size=40)
+        run_id = service.run_store.active_run_id()
+        assert run_id is not None
+        self.assertEqual(next(iter(service.run_store.status(run_id)["items"].values()))["state"], "represented")
+        self.assertEqual(self.semantic.provider.calls, 0)
+
+    def test_prepare_fingerprint_change_fails_before_provider(self) -> None:
+        capture = SyntheticCaptureProvider([message(1)])
+        self.semantic.failures_remaining = 1
+        service = self.service(capture)
+        with self.assertRaises(WechatDigestError):
+            service.run(all_history=True)
+        capture.messages[0] = replace(capture.messages[0], visible_content="changed")
+        with self.assertRaisesRegex(WechatDigestError, "重放内容发生变化"):
+            service.prepare_next_semantic()
+        self.assertEqual(self.semantic.provider.calls, 0)
+
+    def test_prepare_rejects_tampered_plan_and_status_before_provider(self) -> None:
+        capture = SyntheticCaptureProvider([message(1)])
+        self.semantic.failures_remaining = 1
+        service = self.service(capture)
+        with self.assertRaises(WechatDigestError):
+            service.run(all_history=True)
+        run_id = service.run_store.active_run_id()
+        assert run_id is not None
+        plan_path = service.run_store.runs_root / run_id / "plan.json"
+        plan = json.loads(plan_path.read_text())
+        plan["conversations"][0]["content_hash"] = "sha256:" + "0" * 64
+        plan_path.write_text(json.dumps(plan), encoding="utf-8")
+        with self.assertRaisesRegex(WechatDigestError, "receipt"):
+            service.prepare_next_semantic()
+        self.assertEqual(self.semantic.provider.calls, 0)
+
+    def test_semantic_batch_size_is_durable_and_legacy_is_40(self) -> None:
+        capture = SyntheticCaptureProvider([message(number) for number in range(1, 42)])
+        self.semantic.failures_remaining = 1
+        service = self.service(capture)
+        with self.assertRaises(WechatDigestError):
+            service.run(all_history=True)
+        run_id = service.run_store.active_run_id()
+        assert run_id is not None
+        plan_path = service.run_store.runs_root / run_id / "plan.json"
+        plan = json.loads(plan_path.read_text())
+        self.assertEqual(plan["semantic_batch_size"], 40)
+        with self.assertRaisesRegex(WechatDigestError, "batch size"):
+            service.prepare_next_semantic(batch_size=100)
+        plan.pop("semantic_batch_size")
+        plan["schema_version"] = "wechat-digest-run-plan/1.0"
+        plan_path.write_text(json.dumps(plan), encoding="utf-8")
+        with self.assertRaisesRegex(WechatDigestError, "显式升级"):
+            service.prepare_next_semantic(batch_size=40)
+
+    def _make_active_legacy_run(
+        self, capture: SyntheticCaptureProvider, *, run_store: WechatDigestRunStore | None = None
+    ) -> tuple[WechatDigestService, str]:
+        self.semantic.failures_remaining = 1
+        service = self.service(capture, run_store=run_store)
+        with self.assertRaises(WechatDigestError):
+            service.run(all_history=True)
+        run_id = service.run_store.active_run_id()
+        assert run_id is not None
+        run_dir = service.run_store.runs_root / run_id
+        plan_path = run_dir / "plan.json"
+        status_path = run_dir / "status.json"
+        plan = json.loads(plan_path.read_text(encoding="utf-8"))
+        plan["schema_version"] = "wechat-digest-run-plan/1.0"
+        plan.pop("semantic_batch_size")
+        plan_path.write_text(json.dumps(plan), encoding="utf-8")
+        status = json.loads(status_path.read_text(encoding="utf-8"))
+        status.pop("plan_fingerprint")
+        status_path.write_text(json.dumps(status), encoding="utf-8")
+        (run_dir / "run-plan-receipt.json").unlink()
+        return service, run_id
+
+    def test_upgrade_rejects_tampered_legacy_binding_before_any_write(self) -> None:
+        capture = SyntheticCaptureProvider([message(1)])
+        service, run_id = self._make_active_legacy_run(capture)
+        run_dir = service.run_store.runs_root / run_id
+        status_path = run_dir / "status.json"
+        status = json.loads(status_path.read_text(encoding="utf-8"))
+        item = next(iter(status["items"].values()))
+        item["source_id"] = "src_" + "0" * 32
+        status_path.write_text(json.dumps(status), encoding="utf-8")
+        before = {
+            path.name: path.read_bytes()
+            for path in run_dir.iterdir()
+            if path.is_file()
+        }
+        with self.assertRaisesRegex(WechatDigestError, "binding"):
+            service.upgrade_active_v1()
+        after = {
+            path.name: path.read_bytes()
+            for path in run_dir.iterdir()
+            if path.is_file()
+        }
+        self.assertEqual(after, before)
+        self.assertEqual(self.semantic.provider.calls, 0)
+
+    def test_upgrade_recovers_after_plan_write_before_status_and_commits_receipt_last(self) -> None:
+        capture = SyntheticCaptureProvider([message(1)])
+        fail_once = [True]
+
+        def interrupt_before_status() -> None:
+            if fail_once.pop():
+                raise RuntimeError("synthetic status write interruption")
+
+        run_store = WechatDigestRunStore(
+            self.workspace / "02_processing" / "wechat_digest",
+            before_upgrade_status_write=interrupt_before_status,
+        )
+        service, run_id = self._make_active_legacy_run(capture, run_store=run_store)
+        with self.assertRaisesRegex(RuntimeError, "status write interruption"):
+            service.upgrade_active_v1()
+        run_dir = run_store.runs_root / run_id
+        self.assertEqual(
+            json.loads((run_dir / "plan.json").read_text())["schema_version"],
+            "wechat-digest-run-plan/2.0",
+        )
+        self.assertFalse((run_dir / "run-plan-receipt.json").exists())
+        run_store.before_upgrade_status_write = None
+        self.assertEqual(service.upgrade_active_v1(), run_id)
+        self.assertTrue((run_dir / "run-plan-receipt.json").exists())
+        self.assertEqual(self.semantic.provider.calls, 0)
+        with self.assertRaisesRegex(WechatDigestError, "已经完成升级"):
+            service.upgrade_active_v1()
+
     def test_concurrent_digest_fails_without_reading_capture(self) -> None:
         capture = SyntheticCaptureProvider([])
         service = self.service(capture)

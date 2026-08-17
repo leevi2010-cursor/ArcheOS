@@ -555,6 +555,12 @@ def build_parser() -> argparse.ArgumentParser:
     wechat_digest.add_argument(
         "--batch-size", type=int, default=DEFAULT_EXTERNAL_AGENT_BATCH_SIZE
     )
+    wechat_digest.add_argument(
+        "--prepare-next-semantic",
+        action="store_true",
+        help="仅准备下一 semantic batch；不新增 Semantic Handoff 调用。",
+    )
+    wechat_digest.add_argument("--upgrade-active-v1", action="store_true", help="零 Provider 升级当前 active v1 run 到 v2。")
     return parser
 
 
@@ -986,12 +992,34 @@ def _wechat_product_command(args: argparse.Namespace) -> int:
                 batch_size=args.batch_size,
             )
 
-        result = WechatDigestService(
+        service = WechatDigestService(
             workspace=workspace,
             capture_provider=capture,
             semantic_handoff_factory=semantic_handoff,
             interpretation_provider=CodexAtomicInformationInterpretationProvider(),
-        ).run(
+            semantic_batch_size=args.batch_size,
+        )
+        if args.prepare_next_semantic:
+            prepared = service.prepare_next_semantic(batch_size=args.batch_size)
+            print(
+                json.dumps(
+                    {
+                        "run_id": prepared.run_id,
+                        "representation_id": prepared.representation_id,
+                        "anchor_unit_ids": list(prepared.anchor_unit_ids),
+                        "semantic_provider_calls": prepared.semantic_provider_calls,
+                        "governance_provider_calls": prepared.governance_provider_calls if prepared.governance_provider_calls is not None else "unavailable",
+                        "checkpoint_published": False,
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                )
+            )
+            return 0
+        if args.upgrade_active_v1:
+            print(json.dumps({"run_id": service.upgrade_active_v1(), "semantic_provider_calls": 0}, ensure_ascii=False))
+            return 0
+        result = service.run(
             since=args.since,
             from_now=args.from_now,
             all_history=args.all_history,
