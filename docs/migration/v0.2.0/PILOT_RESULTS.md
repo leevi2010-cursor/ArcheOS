@@ -117,6 +117,8 @@ durable cap 由每次 apply 前后重新读取的 apply receipts、Change Journa
 - pending identity 决定为 `deferred`，重复 defer 为 no-op；
 - 最终仍无 Relationship、Lifecycle、merge、delete、split。
 
+本次 `business_line` Role 走 Human Judgment 是该真实案例的 Product Owner 决定，不表示所有 Role 更新都必须人工批准。Role、Relationship、Lifecycle 继续按 `INFORMATION_GOVERNANCE.md` 独立治理：满足目标唯一、Evidence 足够、无冲突 / 歧义、使用已批准语义等安全自动更新条件时可以自动执行；歧义、冲突、高影响结构，以及 identity correction、merge、delete、split 等进入 Human Judgment。
+
 ## 7. Cap accounting deviation 与 recovery
 
 第一次本地 Identity evaluation harness 只使用单进程 counter。两次末端只读校验接口错误后重跑，累计产生了无效的 5 次 create / 9 次 bind，超过批准的 3 / 5 cap。

@@ -8,8 +8,9 @@
 2. 按 source family 建立少量、有验收条件的 Import Issues；
 3. 不长期 dual-read / dual-write；
 4. 旧 schema、ID、状态与关系不能直接成为 ArcheOS Core truth；
-5. identity、Role、Relationship、Lifecycle 的 consequential change 保持 Human Judgment；
-6. cutover 前后都保留 Raw Source、Evidence、Processing Run 与可逆 readback。
+5. Role、Relationship、Lifecycle 按 `INFORMATION_GOVERNANCE.md` 分别治理；满足安全自动更新条件时可以自动执行；
+6. 歧义、冲突、高影响结构、identity correction、merge、delete、split 等进入 Human Judgment；
+7. cutover 前后都保留 Raw Source、Evidence、Processing Run 与可逆 readback。
 
 ## 建议阶段
 
@@ -37,8 +38,9 @@
 
 - 从 read-only assessment / apply plan 开始；
 - cap 从 durable receipts / journal / bindings / Objects 计算；
-- automatic apply 只在批准 envelope 内；
-- Role、Relationship、Lifecycle 与 identity correction 由 Human Judgment 决定。
+- automatic apply 只在批准 envelope 内，并同时满足目标唯一、Evidence 足够、无冲突 / 歧义、使用已批准结构语义等安全条件；
+- Role、Relationship、Lifecycle 独立判断，不因 Object 已创建而自动成立，也不因属于结构更新而一律要求人工审批；
+- 歧义、冲突、高影响结构、Relationship 端点或语义不确定，以及 identity correction、merge、delete、split 等进入 Human Judgment。
 
 ### 4. Context 对照
 
