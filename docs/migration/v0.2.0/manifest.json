@@ -1,0 +1,92 @@
+{
+  "schema_version": "1.0",
+  "artifact_version": "v0.2.0",
+  "issue": 17,
+  "generated_at": "2026-08-17",
+  "product_stage": "Stage 1",
+  "result": {
+    "technical_chain": "pass",
+    "product_alignment": "partial",
+    "expected_evidence_obtained": "partial",
+    "stage_gate_recommendation": "review",
+    "unresolved_p0": 0,
+    "unresolved_p1": 0
+  },
+  "corpus": {
+    "sources": 20,
+    "source_families": 3,
+    "privacy_approved_semantic_sources": 17,
+    "local_only_sources": 3,
+    "representation_complete": 17,
+    "representation_partial": 3,
+    "representation_failed": 0,
+    "representation_warnings": 7
+  },
+  "semantic": {
+    "analysis_units_total": 750,
+    "eligible_units": 633,
+    "excluded_units": 117,
+    "unaccounted_units": 0,
+    "distinct_batches": 25,
+    "strict_pass_batches": 25,
+    "provider_calls_including_transport_recovery": 26,
+    "atomic_information_created": 275,
+    "atomic_information_existing": 0,
+    "residue_items": 24
+  },
+  "consolidation": {
+    "reviewed_pairs": 100,
+    "equivalent": 0,
+    "derived": 0,
+    "complementary": 0,
+    "temporal_update": 0,
+    "conflict": 0,
+    "uncertain": 100,
+    "durable_relation_writes": 0,
+    "durable_information_rewrites": 0,
+    "false_merge": "not_measurable_yet",
+    "false_split": "not_measurable_yet"
+  },
+  "identity": {
+    "auto_create_minimal": 1,
+    "auto_bind_existing": 1,
+    "accumulate": 1,
+    "human_review": 1,
+    "no_object": 1,
+    "false_create": 0,
+    "false_bind": 0,
+    "duplicate_objects": 0,
+    "human_approved_role": "business_line",
+    "pending_identity_decision": "deferred"
+  },
+  "context": {
+    "roots": 1,
+    "information_total": 2,
+    "information_included": 2,
+    "pending_judgments": 1,
+    "truncated": 0,
+    "product_owner_review": "accepted"
+  },
+  "execution_deviation": {
+    "category": "private_harness_durable_cap_accounting",
+    "invalid_create_attempts_isolated": 5,
+    "invalid_bind_attempts_isolated": 9,
+    "active_baseline_recovered": true,
+    "isolated_evidence_preserved": true,
+    "final_reexecution": "passed"
+  },
+  "privacy": {
+    "contains_real_business_content": false,
+    "contains_real_names_or_paths": false,
+    "contains_source_or_object_ids": false,
+    "local_artifacts_gitignored": true
+  },
+  "artifacts": [
+    "README.md",
+    "INVENTORY.md",
+    "MAPPING.md",
+    "PILOT_RESULTS.md",
+    "CUTOVER_PLAN.md",
+    "manifest.json"
+  ]
+}
