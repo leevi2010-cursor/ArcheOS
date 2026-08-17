@@ -32,8 +32,13 @@ from archeos.representation_information import (
     _analysis_batches,
     _external_agent_request,
     _units_from_representation,
+    validate_representation_information_package,
 )
-from archeos.semantic_handoff import ExternalAgentSemanticHandoffService
+from archeos.semantic_handoff import (
+    ExternalAgentSemanticHandoffService,
+    _package_fingerprint,
+    validate_completed_published_audits,
+)
 from archeos.source import LocalManagedSourceRepository
 
 
@@ -241,6 +246,33 @@ class SemanticHandoffTest(unittest.TestCase):
                     )[1],
                     fingerprint,
                 )
+
+    def test_current_v1_producer_passes_the_shared_audit_validator(self) -> None:
+        representation, service = self.build_service()
+        provider = CodexCliRepresentationAnalysisProvider(
+            provider_version="0.147.0", runner=FakeRunner()
+        )
+        audit_root = self.root / "audits"
+        result = ExternalAgentSemanticHandoffService(
+            service,
+            JsonlAtomicInformationStore(self.root / "atomic.jsonl"),
+            audit_root,
+        ).execute(representation.representation_id, provider)
+        manifest, _ = validate_representation_information_package(
+            result.package
+        )
+        self.assertEqual(manifest["provider"], {"name": provider.name})
+        self.assertEqual(
+            validate_completed_published_audits(
+                representation_service=service,
+                representation_id=representation.representation_id,
+                manifest=manifest,
+                audit_root=audit_root,
+                package_fingerprint=_package_fingerprint(result.package),
+                provider=provider,
+            ),
+            result.audit_paths,
+        )
 
     def test_contract_failure_details_are_allowlisted(self) -> None:
         cases = {

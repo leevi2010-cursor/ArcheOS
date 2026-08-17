@@ -229,6 +229,7 @@ class SyntheticSemanticHandoff:
         self.provider = SyntheticAnalysisProvider()
         self.failures_remaining = 0
         self.protocol_version = EXTERNAL_AGENT_PROTOCOL_V1
+        self.profiled_v1 = False
 
     def execute(self, representation_id: str):
         output_root = self.workspace / "02_processing" / "information"
@@ -248,16 +249,20 @@ class SyntheticSemanticHandoff:
             ),
             output_root,
         ).extract(representation_id, self.provider)
-        manifest_path = package / "manifest.json"
-        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-        manifest["provider"] = {
-            "name": self.provider.name,
-            "provider_version": self.provider.provider_version,
-            "model": self.provider.model,
-            "reasoning_effort": self.provider.reasoning_effort,
-            "fallback_policy": self.provider.fallback_policy,
-        }
-        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+        if (
+            self.protocol_version != EXTERNAL_AGENT_PROTOCOL_V1
+            or self.profiled_v1
+        ):
+            manifest_path = package / "manifest.json"
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            manifest["provider"] = {
+                "name": "external-agent-codex-cli",
+                "provider_version": "0.147.0",
+                "model": "gpt-5.6-terra",
+                "reasoning_effort": "medium",
+                "fallback_policy": "none",
+            }
+            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
         ingestion = ingest_processing_package(package, store)
         self._write_success_audits(package, representation_id)
         return SimpleNamespace(ingestion=ingestion)
@@ -303,9 +308,6 @@ class SyntheticSemanticHandoff:
                 "anchor_unit_ids": anchor_unit_ids,
                 "provider_route": "codex-cli",
                 "provider_version": self.provider.provider_version,
-                "model": self.provider.model,
-                "reasoning_effort": self.provider.reasoning_effort,
-                "fallback_policy": self.provider.fallback_policy,
                 "started_at": "2026-08-18T00:00:00.000Z",
                 "finished_at": "2026-08-18T00:00:01.000Z",
                 "execution_status": "succeeded",
@@ -340,6 +342,17 @@ class SyntheticSemanticHandoff:
                 "handoff_status": "completed",
                 "audit_readback_status": "verified",
             }
+            if (
+                self.protocol_version != EXTERNAL_AGENT_PROTOCOL_V1
+                or self.profiled_v1
+            ):
+                audit.update(
+                    {
+                        "model": "gpt-5.6-terra",
+                        "reasoning_effort": "medium",
+                        "fallback_policy": "none",
+                    }
+                )
             if self.protocol_version == EXTERNAL_AGENT_PROTOCOL_V3_1:
                 audit.update(
                     {
@@ -1070,6 +1083,7 @@ class WechatDigestTests(unittest.TestCase):
         messages: list[CapturedMessage],
         suffix: str,
         protocol_version: str = EXTERNAL_AGENT_PROTOCOL_V1,
+        profiled_v1: bool = False,
     ) -> tuple[WechatDigestService, SyntheticSemanticHandoff, str]:
         workspace = Path(self.temporary.name) / f"workspace_{suffix}"
         for directory in (
@@ -1082,6 +1096,7 @@ class WechatDigestTests(unittest.TestCase):
         semantic = SyntheticSemanticHandoff(workspace)
         semantic.provider.mode = mode
         semantic.protocol_version = protocol_version
+        semantic.profiled_v1 = profiled_v1
         with SQLiteWorldModelRepository(
             workspace / "04_core" / "archeos.sqlite3"
         ) as repository:
@@ -1185,24 +1200,61 @@ class WechatDigestTests(unittest.TestCase):
 
     def test_active_v2_upgrade_accepts_historical_audit_contracts(self) -> None:
         protocols = (
-            EXTERNAL_AGENT_PROTOCOL_V1,
-            EXTERNAL_AGENT_PROTOCOL_V2,
-            EXTERNAL_AGENT_PROTOCOL_V3,
-            EXTERNAL_AGENT_PROTOCOL_V3_1,
+            (EXTERNAL_AGENT_PROTOCOL_V1, False),
+            (EXTERNAL_AGENT_PROTOCOL_V1, True),
+            (EXTERNAL_AGENT_PROTOCOL_V2, False),
+            (EXTERNAL_AGENT_PROTOCOL_V3, False),
+            (EXTERNAL_AGENT_PROTOCOL_V3_1, False),
         )
-        for index, protocol_version in enumerate(protocols):
+        for index, (protocol_version, profiled_v1) in enumerate(protocols):
             with self.subTest(protocol=protocol_version):
                 service, semantic, run_id = self._make_active_v2_processed_run(
                     mode="all_residue",
                     messages=[message(1)],
                     suffix=f"protocol_{index}",
                     protocol_version=protocol_version,
+                    profiled_v1=profiled_v1,
                 )
                 calls = semantic.provider.calls
                 self.assertEqual(
                     service.upgrade_active_v2_all_history(), run_id
                 )
                 self.assertEqual(semantic.provider.calls, calls)
+
+    def test_active_v2_upgrade_accepts_pre_diagnostics_v1_audit(self) -> None:
+        service, semantic, run_id = self._make_active_v2_processed_run(
+            mode="all_candidate",
+            messages=[message(1)],
+            suffix="pre_diagnostics_v1",
+        )
+        audit_path = next(
+            (
+                service.workspace
+                / "02_processing"
+                / "semantic_handoff_runs"
+            ).glob("*/processing-run-audit.json")
+        )
+        audit = json.loads(audit_path.read_text(encoding="utf-8"))
+        for field in (
+            "diagnostic_schema_version",
+            "elapsed_ms",
+            "deadline_ms",
+            "exit_code",
+            "termination_signal",
+            "timeout_phase",
+            "provider_error_category",
+            "result_file_present",
+            "result_size_bytes",
+            "stdout_bytes",
+            "stderr_bytes",
+            "process_cleanup_status",
+            "contract_failure_detail",
+        ):
+            audit.pop(field)
+        audit_path.write_text(json.dumps(audit), encoding="utf-8")
+        calls = semantic.provider.calls
+        self.assertEqual(service.upgrade_active_v2_all_history(), run_id)
+        self.assertEqual(semantic.provider.calls, calls)
 
     def test_active_v2_upgrade_rejects_semantic_receipt_tamper(self) -> None:
         cases = (
@@ -1214,6 +1266,7 @@ class WechatDigestTests(unittest.TestCase):
             "store",
             "missing_field",
             "missing_contract_field",
+            "impossible_legacy_shape",
             "extra_field",
             "protocol",
             "fingerprint",
@@ -1230,6 +1283,12 @@ class WechatDigestTests(unittest.TestCase):
                     mode="all_candidate",
                     messages=[message(1), message(2)],
                     suffix=case,
+                    protocol_version=(
+                        EXTERNAL_AGENT_PROTOCOL_V3_1
+                        if case
+                        in {"missing_contract_field", "provider_profile"}
+                        else EXTERNAL_AGENT_PROTOCOL_V1
+                    ),
                 )
                 status_path = service.run_store.runs_root / run_id / "status.json"
                 status = json.loads(status_path.read_text(encoding="utf-8"))
@@ -1271,6 +1330,7 @@ class WechatDigestTests(unittest.TestCase):
                 elif case in {
                     "missing_field",
                     "missing_contract_field",
+                    "impossible_legacy_shape",
                     "extra_field",
                     "protocol",
                     "fingerprint",
@@ -1295,6 +1355,22 @@ class WechatDigestTests(unittest.TestCase):
                         audit.pop("input_fingerprint")
                     elif case == "missing_contract_field":
                         audit.pop("contract_failure_detail")
+                    elif case == "impossible_legacy_shape":
+                        for field in (
+                            "diagnostic_schema_version",
+                            "elapsed_ms",
+                            "deadline_ms",
+                            "exit_code",
+                            "termination_signal",
+                            "timeout_phase",
+                            "provider_error_category",
+                            "result_file_present",
+                            "result_size_bytes",
+                            "stdout_bytes",
+                            "stderr_bytes",
+                            "process_cleanup_status",
+                        ):
+                            audit.pop(field)
                     elif case == "extra_field":
                         audit["unexpected_field"] = "synthetic"
                     elif case == "protocol":

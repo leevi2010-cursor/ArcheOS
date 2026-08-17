@@ -185,6 +185,8 @@ class WechatCaptureProvider(Protocol):
 
 
 class SemanticHandoffPort(Protocol):
+    provider: CodexCliRepresentationAnalysisProvider
+
     def execute(self, representation_id: str): ...
 
 
@@ -1919,6 +1921,7 @@ class WechatDigestService:
                     / "semantic_handoff_runs"
                 ),
                 package_fingerprint=_package_fingerprint(package),
+                provider=self._semantic_port().provider,
             )
             observed = item.get("atomic_information_ids")
             if (
@@ -2520,13 +2523,16 @@ class WechatDigestService:
         return tuple(texts)
 
     def _semantic(self, representation_id: str) -> tuple[str, ...]:
-        if self._semantic_handoff is None:
-            self._semantic_handoff = self.semantic_handoff_factory()
-        result = self._semantic_handoff.execute(representation_id)
+        result = self._semantic_port().execute(representation_id)
         atomic_ids = tuple(result.ingestion.atomic_information_ids)
         for atomic_id in atomic_ids:
             self.information_store.get_current(atomic_id)
         return atomic_ids
+
+    def _semantic_port(self) -> SemanticHandoffPort:
+        if self._semantic_handoff is None:
+            self._semantic_handoff = self.semantic_handoff_factory()
+        return self._semantic_handoff
 
     def _has_semantic_units(self, representation_id: str) -> bool:
         representation = self.representation_repository.get(representation_id)
