@@ -214,13 +214,13 @@ class SemanticHandoffTest(unittest.TestCase):
         command = runner.calls[0]
         self.assertIn("--ignore-user-config", command)
         self.assertIn("--strict-config", command)
-        self.assertEqual(command[command.index("--model") + 1], "gpt-5.6")
+        self.assertEqual(command[command.index("--model") + 1], "gpt-5.6-terra")
         self.assertEqual(
             command[command.index("--config") + 1],
             'model_reasoning_effort="medium"',
         )
         record = provider.execution_records[0]
-        self.assertEqual(record.model, "gpt-5.6")
+        self.assertEqual(record.model, "gpt-5.6-terra")
         self.assertEqual(record.reasoning_effort, "medium")
         self.assertEqual(record.fallback_policy, "none")
 
@@ -228,13 +228,13 @@ class SemanticHandoffTest(unittest.TestCase):
         runner = FakeRunner()
         provider = CodexCliRepresentationAnalysisProvider(
             provider_version="0.147.0",
-            model="gpt-5.6",
+            model="gpt-5.6-sol",
             reasoning_effort="high",
             runner=runner,
         )
         provider.analyze(RepresentationAnalysisBatch((self.unit(),)))
         command = runner.calls[0]
-        self.assertEqual(command[command.index("--model") + 1], "gpt-5.6")
+        self.assertEqual(command[command.index("--model") + 1], "gpt-5.6-sol")
         self.assertEqual(
             command[command.index("--config") + 1],
             'model_reasoning_effort="high"',
@@ -451,7 +451,7 @@ class SemanticHandoffTest(unittest.TestCase):
         self.assertEqual(audit["durable_ingestion_status"], "completed")
         self.assertEqual(audit["unaccounted_units"], 0)
         self.assertEqual(audit["audit_readback_status"], "verified")
-        self.assertEqual(audit["model"], "gpt-5.6")
+        self.assertEqual(audit["model"], "gpt-5.6-terra")
         self.assertEqual(audit["reasoning_effort"], "medium")
         self.assertEqual(audit["fallback_policy"], "none")
         self.assertNotIn("chain_of_thought", audit)
@@ -462,7 +462,7 @@ class SemanticHandoffTest(unittest.TestCase):
             {
                 "name": "external-agent-codex-cli",
                 "provider_version": "0.147.0",
-                "model": "gpt-5.6",
+                "model": "gpt-5.6-terra",
                 "reasoning_effort": "medium",
                 "fallback_policy": "none",
             },
@@ -587,7 +587,7 @@ class SemanticHandoffTest(unittest.TestCase):
         audit = json.loads(audit_text)
         self.assertNotIn("synthetic nonzero", audit_text)
         self.assertEqual(len(provider.runner.calls), 1)
-        self.assertEqual(audit["model"], "gpt-5.6")
+        self.assertEqual(audit["model"], "gpt-5.6-terra")
         self.assertEqual(audit["reasoning_effort"], "medium")
         self.assertEqual(audit["fallback_policy"], "none")
         self.assertEqual(audit["diagnostic_schema_version"], "external-agent-diagnostics/1.0")
