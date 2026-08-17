@@ -289,7 +289,6 @@ def external_agent_representation_analysis_schema(
         if protocol_version == EXTERNAL_AGENT_PROTOCOL_VERSION:
             assert batch is not None
             accounting_schema["maxItems"] = len(batch.anchor_units)
-            accounting_schema["uniqueItems"] = True
         protocol_properties["anchor_accounting"] = accounting_schema
     schema["required"] = ["protocol_version", "input_fingerprint", *required]
     schema["properties"] = {**protocol_properties, **properties}
