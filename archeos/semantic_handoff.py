@@ -16,6 +16,7 @@ from .representation_information import (
     CONTRACT_FAILURE_DETAILS,
     EXTERNAL_AGENT_PROTOCOL_VERSION,
     EXTERNAL_AGENT_ROUTE,
+    SUPPORTED_EXTERNAL_AGENT_PROTOCOL_VERSIONS,
     CodexCliRepresentationAnalysisProvider,
     ExternalAgentExecutionRecord,
     RepresentationInformationError,
@@ -68,15 +69,20 @@ class ExternalAgentSemanticHandoffService:
             try:
                 manifest = self._verify_replay_input(representation_id, package)
                 package_fingerprint = _package_fingerprint(package)
-                expected_batches = self._expected_batch_contracts(
-                    representation_id, manifest, provider
-                )
                 audit_paths = self._matching_audit_paths(package_fingerprint)
+                protocol_version = self._replay_protocol_version(audit_paths)
+                expected_batches = self._expected_batch_contracts(
+                    representation_id,
+                    manifest,
+                    provider,
+                    protocol_version=protocol_version,
+                )
                 self._validate_replay_audits(
                     audit_paths,
                     expected_batches,
                     provider,
                     package_fingerprint,
+                    protocol_version=protocol_version,
                 )
                 self._mark_durable_attempt(audit_paths)
                 ingestion = ingest_processing_package(package, self.store)
@@ -103,7 +109,10 @@ class ExternalAgentSemanticHandoffService:
             package_fingerprint = _package_fingerprint(package)
             records = provider.execution_records[record_offset:]
             expected_batches = self._expected_batch_contracts(
-                representation_id, manifest, provider
+                representation_id,
+                manifest,
+                provider,
+                protocol_version=EXTERNAL_AGENT_PROTOCOL_VERSION,
             )
             self._validate_execution_records(records, expected_batches, provider)
             audit_paths = self._persist_audits(
@@ -280,11 +289,30 @@ class ExternalAgentSemanticHandoffService:
                 matches.append(path)
         return tuple(matches)
 
+    @staticmethod
+    def _replay_protocol_version(paths: tuple[Path, ...]) -> str:
+        versions = {
+            _private_json_read(path).get("protocol_version") for path in paths
+        }
+        if len(versions) != 1:
+            raise SemanticHandoffError(
+                "已存在的信息包审计缺少唯一 External Agent protocol。"
+            )
+        protocol_version = versions.pop()
+        if protocol_version not in SUPPORTED_EXTERNAL_AGENT_PROTOCOL_VERSIONS:
+            raise SemanticHandoffError(
+                "已存在的信息包使用不受支持的 External Agent protocol。"
+            )
+        assert isinstance(protocol_version, str)
+        return protocol_version
+
     def _expected_batch_contracts(
         self,
         representation_id: str,
         manifest: dict[str, object],
         provider: CodexCliRepresentationAnalysisProvider,
+        *,
+        protocol_version: str,
     ) -> tuple[tuple[tuple[str, ...], str], ...]:
         package_provider = manifest.get("provider")
         if (
@@ -328,7 +356,9 @@ class ExternalAgentSemanticHandoffService:
             anchor_unit_ids = tuple(unit.unit_id for unit in batch.anchor_units)
             if package_batch.get("unit_ids") != list(anchor_unit_ids):
                 raise SemanticHandoffError("当前 canonical Analysis Unit 批次不再匹配信息包。")
-            _, fingerprint = _external_agent_request(batch)
+            _, fingerprint = _external_agent_request(
+                batch, protocol_version=protocol_version
+            )
             contracts.append((anchor_unit_ids, fingerprint))
         return tuple(contracts)
 
@@ -368,6 +398,8 @@ class ExternalAgentSemanticHandoffService:
         expected_batches: tuple[tuple[tuple[str, ...], str], ...],
         provider: CodexCliRepresentationAnalysisProvider,
         package_fingerprint: str,
+        *,
+        protocol_version: str,
     ) -> None:
         if len(paths) != len(expected_batches):
             raise SemanticHandoffError("已存在的信息包缺少完整的 Processing Run 审计集合。")
@@ -479,7 +511,7 @@ class ExternalAgentSemanticHandoffService:
                 audit.get("schema_version") != "processing-run-audit/1.0"
                 or audit.get("artifact_kind") != "processing_run_audit"
                 or not _processing_run_id(audit.get("processing_run_id"))
-                or audit.get("protocol_version") != EXTERNAL_AGENT_PROTOCOL_VERSION
+                or audit.get("protocol_version") != protocol_version
                 or audit.get("input_fingerprint") != expected_fingerprint
                 or audit.get("provider_route") != EXTERNAL_AGENT_ROUTE
                 or audit.get("provider_version") != provider.provider_version

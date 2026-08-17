@@ -37,7 +37,11 @@ PACKAGE_SCHEMA_VERSION = "2.0"
 PACKAGE_KIND = "representation_information"
 DEFAULT_CODEX_ANALYSIS_TIMEOUT_SECONDS = 120.0
 DEFAULT_EXTERNAL_AGENT_BATCH_SIZE = 40
-EXTERNAL_AGENT_PROTOCOL_VERSION = "external-agent-semantic-handoff/1.0"
+EXTERNAL_AGENT_PROTOCOL_V1 = "external-agent-semantic-handoff/1.0"
+EXTERNAL_AGENT_PROTOCOL_VERSION = "external-agent-semantic-handoff/2.0"
+SUPPORTED_EXTERNAL_AGENT_PROTOCOL_VERSIONS = frozenset(
+    {EXTERNAL_AGENT_PROTOCOL_V1, EXTERNAL_AGENT_PROTOCOL_VERSION}
+)
 EXTERNAL_AGENT_ROUTE = "codex-cli"
 DEFAULT_SEMANTIC_MODEL = "gpt-5.6-terra"
 DEFAULT_SEMANTIC_REASONING_EFFORT = "medium"
@@ -103,6 +107,12 @@ class RepresentationResidueDraft:
 class RepresentationAnalysisResult:
     candidates: tuple[RepresentationCandidateDraft, ...]
     residue: tuple[RepresentationResidueDraft, ...]
+
+
+@dataclass(frozen=True)
+class _AnchorAccounting:
+    anchor_unit_id: str
+    accounted_as: str
 
 
 class RepresentationAnalysisProvider(Protocol):
@@ -213,24 +223,46 @@ def representation_analysis_schema() -> dict[str, object]:
     }
 
 
-def external_agent_representation_analysis_schema() -> dict[str, object]:
+def external_agent_representation_analysis_schema(
+    protocol_version: str = EXTERNAL_AGENT_PROTOCOL_VERSION,
+) -> dict[str, object]:
     """The #31 result contract with the #80 Codex serialization binding."""
+    if protocol_version not in SUPPORTED_EXTERNAL_AGENT_PROTOCOL_VERSIONS:
+        raise ValueError("unsupported External Agent protocol version")
     schema = representation_analysis_schema()
     required = schema["required"]
     properties = schema["properties"]
     assert isinstance(required, list) and isinstance(properties, dict)
-    schema["required"] = ["protocol_version", "input_fingerprint", *required]
-    schema["properties"] = {
+    protocol_properties: dict[str, object] = {
         "protocol_version": {
             "type": "string",
-            "const": EXTERNAL_AGENT_PROTOCOL_VERSION,
+            "const": protocol_version,
         },
         "input_fingerprint": {
             "type": "string",
             "pattern": "^sha256:[0-9a-f]{64}$",
         },
-        **properties,
     }
+    if protocol_version == EXTERNAL_AGENT_PROTOCOL_VERSION:
+        required = ["anchor_accounting", *required]
+        protocol_properties["anchor_accounting"] = {
+            "type": "array",
+            "minItems": 1,
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["anchor_unit_id", "accounted_as"],
+                "properties": {
+                    "anchor_unit_id": {"type": "string", "minLength": 1},
+                    "accounted_as": {
+                        "type": "string",
+                        "enum": ["candidate", "residue"],
+                    },
+                },
+            },
+        }
+    schema["required"] = ["protocol_version", "input_fingerprint", *required]
+    schema["properties"] = {**protocol_properties, **properties}
     return schema
 
 
@@ -463,6 +495,7 @@ CONTRACT_FAILURE_DETAILS = frozenset(
         "residue_schema",
         "evidence_reference",
         "anchor_coverage",
+        "anchor_accounting",
         "unknown",
     }
 )
@@ -1233,15 +1266,24 @@ def _utc_timestamp() -> str:
 
 def _external_agent_request(
     batch: RepresentationAnalysisBatch,
+    protocol_version: str = EXTERNAL_AGENT_PROTOCOL_VERSION,
 ) -> tuple[dict[str, object], str]:
+    if protocol_version not in SUPPORTED_EXTERNAL_AGENT_PROTOCOL_VERSIONS:
+        raise ValueError("unsupported External Agent protocol version")
+    rules = [
+        "Return only the strict structured result.",
+        "Account for every anchor with Candidate or Residue.",
+        "Candidate must cite an anchor; context is Evidence only when explicitly cited and evidence-capable.",
+        "Use Residue for unresolved or insufficient evidence; never invent identity, facts, or World Model state.",
+    ]
+    if protocol_version == EXTERNAL_AGENT_PROTOCOL_VERSION:
+        rules.insert(
+            2,
+            "Emit exactly one anchor_accounting item for every supplied anchor; accounted_as must match whether that anchor is cited by Candidate or Residue.",
+        )
     payload: dict[str, object] = {
-        "protocol_version": EXTERNAL_AGENT_PROTOCOL_VERSION,
-        "rules": [
-            "Return only the strict structured result.",
-            "Account for every anchor with Candidate or Residue.",
-            "Candidate must cite an anchor; context is Evidence only when explicitly cited and evidence-capable.",
-            "Use Residue for unresolved or insufficient evidence; never invent identity, facts, or World Model state.",
-        ],
+        "protocol_version": protocol_version,
+        "rules": rules,
         "anchor_units": [_provider_unit(unit, role="anchor") for unit in batch.anchor_units],
         "context_support_units": [
             _provider_unit(unit, role="context_support")
@@ -1267,17 +1309,26 @@ def _parse_external_agent_result(
     raw: str,
     batch: RepresentationAnalysisBatch,
     expected_fingerprint: str,
+    expected_protocol_version: str = EXTERNAL_AGENT_PROTOCOL_VERSION,
 ) -> RepresentationAnalysisResult:
     try:
         payload = json.loads(raw)
     except json.JSONDecodeError as exc:
         raise RepresentationInformationError("invalid_json") from exc
-    if not isinstance(payload, dict) or set(payload) != {
-        "protocol_version", "input_fingerprint", "candidates", "residue"
-    }:
+    if expected_protocol_version not in SUPPORTED_EXTERNAL_AGENT_PROTOCOL_VERSIONS:
+        raise ValueError("unsupported External Agent protocol version")
+    expected_fields = {
+        "protocol_version",
+        "input_fingerprint",
+        "candidates",
+        "residue",
+    }
+    if expected_protocol_version == EXTERNAL_AGENT_PROTOCOL_VERSION:
+        expected_fields.add("anchor_accounting")
+    if not isinstance(payload, dict) or set(payload) != expected_fields:
         raise _ExternalAgentContractFailure("top_level_schema")
     if (
-        payload["protocol_version"] != EXTERNAL_AGENT_PROTOCOL_VERSION
+        payload["protocol_version"] != expected_protocol_version
         or payload["input_fingerprint"] != expected_fingerprint
     ):
         raise RepresentationInformationError("result_binding_failure")
@@ -1293,9 +1344,21 @@ def _parse_external_agent_result(
         )
     except RepresentationInformationError as exc:
         raise _ExternalAgentContractFailure("residue_schema") from exc
+    accounting: tuple[_AnchorAccounting, ...] | None = None
+    if expected_protocol_version == EXTERNAL_AGENT_PROTOCOL_VERSION:
+        try:
+            accounting = tuple(
+                _anchor_accounting(item)
+                for item in _items(payload["anchor_accounting"], "anchor_accounting")
+            )
+        except RepresentationInformationError as exc:
+            raise _ExternalAgentContractFailure("anchor_accounting") from exc
     try:
         RepresentationInformationService._validate_batch_result(
-            batch, RepresentationAnalysisResult(candidates, residue), external_contract=True
+            batch,
+            RepresentationAnalysisResult(candidates, residue),
+            external_contract=True,
+            anchor_accounting=accounting,
         )
     except _ExternalAgentContractFailure:
         raise
@@ -1375,6 +1438,27 @@ def _residue_draft(value: object) -> RepresentationResidueDraft:
         future_value_or_uncertainty=_text(
             value["future_value_or_uncertainty"], "Residue future_value_or_uncertainty"
         ),
+    )
+
+
+def _anchor_accounting(value: object) -> _AnchorAccounting:
+    if not isinstance(value, dict) or set(value) != {
+        "anchor_unit_id",
+        "accounted_as",
+    }:
+        raise RepresentationInformationError(
+            "anchor accounting item does not match the execution contract"
+        )
+    accounted_as = _text(value["accounted_as"], "anchor accounting outcome")
+    if accounted_as not in {"candidate", "residue"}:
+        raise RepresentationInformationError(
+            "anchor accounting outcome is not supported"
+        )
+    return _AnchorAccounting(
+        anchor_unit_id=_text(
+            value["anchor_unit_id"], "anchor accounting unit_id"
+        ),
+        accounted_as=accounted_as,
     )
 
 
@@ -1498,6 +1582,7 @@ class RepresentationInformationService:
         result: RepresentationAnalysisResult,
         *,
         external_contract: bool = False,
+        anchor_accounting: tuple[_AnchorAccounting, ...] | None = None,
     ) -> None:
         def fail(detail: str, message: str) -> None:
             if external_contract:
@@ -1513,6 +1598,8 @@ class RepresentationInformationService:
             unit_id for unit_id, unit in supplied.items() if unit.analysis_eligible
         }
         covered: set[str] = set()
+        candidate_anchor_refs: set[str] = set()
+        residue_anchor_refs: set[str] = set()
         for item in result.candidates:
             if not isinstance(item, RepresentationCandidateDraft):
                 fail("candidate_schema", "Representation analysis result item is invalid")
@@ -1523,7 +1610,9 @@ class RepresentationInformationService:
                 fail("evidence_reference", "Representation analysis references an invalid unit")
             if not anchor_ids.intersection(references):
                 fail("evidence_reference", "Representation analysis result must account for an anchor unit")
-            covered.update(anchor_ids.intersection(references))
+            candidate_refs = anchor_ids.intersection(references)
+            candidate_anchor_refs.update(candidate_refs)
+            covered.update(candidate_refs)
         for item in result.residue:
             if not isinstance(item, RepresentationResidueDraft):
                 fail("residue_schema", "Representation analysis result item is invalid")
@@ -1534,10 +1623,34 @@ class RepresentationInformationService:
                 fail("evidence_reference", "Representation Residue references an invalid unit")
             if not references:
                 fail("evidence_reference", "Representation analysis result must account for an anchor unit")
+            residue_anchor_refs.update(references)
             covered.update(references)
         missing = anchor_ids - covered
         if missing:
             fail("anchor_coverage", "eligible Representation units were not covered")
+        if anchor_accounting is not None:
+            accounted_ids = [item.anchor_unit_id for item in anchor_accounting]
+            if (
+                len(accounted_ids) != len(anchor_ids)
+                or len(set(accounted_ids)) != len(accounted_ids)
+                or set(accounted_ids) != anchor_ids
+            ):
+                fail(
+                    "anchor_coverage",
+                    "anchor accounting does not enumerate every supplied anchor exactly once",
+                )
+            for item in anchor_accounting:
+                candidate_ref = item.anchor_unit_id in candidate_anchor_refs
+                residue_ref = item.anchor_unit_id in residue_anchor_refs
+                if item.accounted_as == "candidate":
+                    matches = candidate_ref and not residue_ref
+                else:
+                    matches = residue_ref and not candidate_ref
+                if not matches:
+                    fail(
+                        "anchor_accounting",
+                        "anchor accounting does not match Candidate or Residue Evidence",
+                    )
 
     def _timestamp(self) -> str:
         if self.clock is not None:
