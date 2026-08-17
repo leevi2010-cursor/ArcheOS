@@ -545,6 +545,11 @@ def build_parser() -> argparse.ArgumentParser:
     wechat_digest.add_argument(
         "--batch-size", type=int, default=DEFAULT_EXTERNAL_AGENT_BATCH_SIZE
     )
+    wechat_digest.add_argument(
+        "--prepare-next-semantic",
+        action="store_true",
+        help="仅恢复当前运行至下一个 semantic batch，不调用 Provider。",
+    )
     return parser
 
 
@@ -972,12 +977,29 @@ def _wechat_product_command(args: argparse.Namespace) -> int:
                 batch_size=args.batch_size,
             )
 
-        result = WechatDigestService(
+        service = WechatDigestService(
             workspace=workspace,
             capture_provider=capture,
             semantic_handoff_factory=semantic_handoff,
             interpretation_provider=CodexAtomicInformationInterpretationProvider(),
-        ).run(
+        )
+        if args.prepare_next_semantic:
+            prepared = service.prepare_next_semantic(batch_size=args.batch_size)
+            print(
+                json.dumps(
+                    {
+                        "run_id": prepared.run_id,
+                        "representation_id": prepared.representation_id,
+                        "anchor_unit_ids": list(prepared.anchor_unit_ids),
+                        "provider_calls": 0,
+                        "checkpoint_published": False,
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                )
+            )
+            return 0
+        result = service.run(
             since=args.since,
             from_now=args.from_now,
             all_history=args.all_history,

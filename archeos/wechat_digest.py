@@ -77,6 +77,15 @@ class WechatDigestError(RuntimeError):
     """The bounded run did not safely converge; checkpoint remains unchanged."""
 
 
+@dataclass(frozen=True)
+class WechatSemanticPreparation:
+    """A local-only handoff point for the next deterministic semantic batch."""
+
+    run_id: str
+    representation_id: str
+    anchor_unit_ids: tuple[str, ...]
+
+
 @dataclass(frozen=True, order=True)
 class WechatCursor:
     timestamp: int
@@ -1032,6 +1041,107 @@ class WechatDigestService:
                     "微信信息消化未安全完成；checkpoint 未推进。"
                 ) from exc
 
+    def prepare_next_semantic(
+        self, *, batch_size: int = DEFAULT_EXTERNAL_AGENT_BATCH_SIZE
+    ) -> WechatSemanticPreparation:
+        """Recover an active run only up to its next single semantic batch."""
+        if isinstance(batch_size, bool) or not isinstance(batch_size, int) or batch_size < 1:
+            raise WechatDigestError("semantic batch size 必须是正整数。")
+        with self.run_store.lock():
+            run_id = self.run_store.active_run_id()
+            if run_id is None:
+                raise WechatDigestError("不存在可恢复的微信运行；未创建新 capture。")
+            plan = self.run_store.plan(run_id)
+            capture = self.capture_provider.capture(
+                WechatCursor.from_dict(plan["after_cursor"], "plan.after_cursor"),
+                upper_bound=WechatCursor.from_dict(
+                    plan["upper_bound"], "plan.upper_bound"
+                ),
+            )
+            self._verify_capture_against_plan(capture, plan)
+            return self._prepare_next_semantic_locked(
+                run_id,
+                capture,
+                plan,
+                self.run_store.status(run_id),
+                batch_size=batch_size,
+            )
+
+    def _prepare_next_semantic_locked(
+        self,
+        run_id: str,
+        capture: WechatCapture,
+        plan: dict[str, object],
+        status: dict[str, object],
+        *,
+        batch_size: int,
+    ) -> WechatSemanticPreparation:
+        items = status.get("items")
+        if not isinstance(items, dict):
+            raise WechatDigestError("微信运行状态 items 损坏。")
+        attachments = _plan_sequence(plan.get("attachments"), "attachments")
+        attachment_source_ids = {
+            str(item["attachment_key"]): (
+                None if item.get("source_id") is None else str(item["source_id"])
+            )
+            for item in attachments
+        }
+        captured_attachments = {
+            attachment.attachment_key: attachment
+            for message in capture.messages
+            for attachment in message.attachments
+        }
+        for item_plan in attachments:
+            item_id = f"attachment:{item_plan['attachment_key']}"
+            if self._terminal_item_valid(self._item(items, item_id)):
+                continue
+            if item_plan["status"] != "available":
+                self._update_item(run_id, status, item_id, state="unsupported")
+                continue
+            captured = captured_attachments.get(str(item_plan["attachment_key"]))
+            if captured is None or captured.path is None:
+                raise WechatDigestError("微信附件重放无法精确定位。")
+            ready = self._process_attachment(
+                run_id, status, item_id, item_plan, captured, prepare_only=True
+            )
+            if ready is not None:
+                return self._prepared_batch(run_id, ready, batch_size)
+        for item_plan in _plan_sequence(plan.get("conversations"), "conversations"):
+            item_id = f"conversation:{item_plan['conversation_key']}"
+            if self._terminal_item_valid(self._item(items, item_id)):
+                continue
+            payload = _conversation_source_payload(
+                capture, str(item_plan["conversation_key"]), attachment_source_ids
+            )
+            if (
+                _sha256_bytes(payload) != item_plan["content_hash"]
+                or len(payload) != item_plan["size_bytes"]
+            ):
+                raise WechatDigestError("微信 Conversation Source 重放不一致。")
+            ready = self._process_conversation(
+                run_id, status, item_id, item_plan, payload, prepare_only=True
+            )
+            if ready is not None:
+                return self._prepared_batch(run_id, ready, batch_size)
+        raise WechatDigestError("当前运行没有可准备的 semantic item。")
+
+    def _prepared_batch(
+        self, run_id: str, representation_id: str, batch_size: int
+    ) -> WechatSemanticPreparation:
+        representation = self.representation_repository.get(representation_id)
+        eligible = tuple(
+            unit.unit_id
+            for unit in _units_from_representation(
+                representation, self.representation_repository
+            )
+            if unit.analysis_eligible
+        )
+        if not eligible:
+            raise WechatDigestError("semantic item 缺少 eligible units。")
+        if len(eligible) > batch_size:
+            raise WechatDigestError("下一个 semantic item 需要多个 batch；未跳过该 item。")
+        return WechatSemanticPreparation(run_id, representation_id, eligible)
+
     def _run_locked(
         self, *, since: str | None, from_now: bool, all_history: bool
     ) -> WechatDigestResult:
@@ -1338,7 +1448,8 @@ class WechatDigestService:
         item_id: str,
         plan: Mapping[str, object],
         attachment: CapturedAttachment,
-    ) -> None:
+        *, prepare_only: bool = False,
+    ) -> str | None:
         source_id = str(plan["source_id"])
         assert attachment.content_hash is not None and attachment.size_bytes is not None
         self._ensure_source_file(
@@ -1370,10 +1481,10 @@ class WechatDigestService:
                 privacy_route="local_only",
                 privacy_categories=["unresolved_high_sensitivity"],
             )
-            return
+            return None
         if adapter_name is None:
             self._update_item(run_id, status, item_id, state="unsupported")
-            return
+            return None
         representation = self.representation_service.build(
             source_id, production_adapter(adapter_name), {}
         ).representation
@@ -1402,7 +1513,7 @@ class WechatDigestService:
                 privacy_route=privacy.route,
                 privacy_categories=list(privacy.categories),
             )
-            return
+            return None
         if not self._has_semantic_units(representation.representation_id):
             self._update_item(
                 run_id,
@@ -1412,7 +1523,11 @@ class WechatDigestService:
                 privacy_route="approved",
                 privacy_categories=[],
             )
-            return
+            return None
+        if prepare_only and not self._existing_semantic_package(
+            representation.representation_id
+        ):
+            return representation.representation_id
         atomic_ids = self._semantic(representation.representation_id)
         pending, object_ids = self._govern(atomic_ids)
         self._update_item(
@@ -1426,6 +1541,7 @@ class WechatDigestService:
             pending_human=pending,
             context_object_ids=list(object_ids),
         )
+        return None
 
     def _process_conversation(
         self,
@@ -1434,7 +1550,9 @@ class WechatDigestService:
         item_id: str,
         plan: Mapping[str, object],
         payload: bytes,
-    ) -> None:
+        *,
+        prepare_only: bool = False,
+    ) -> str | None:
         source_id = str(plan["source_id"])
         self._ensure_source_bytes(
             source_id=source_id,
@@ -1473,7 +1591,7 @@ class WechatDigestService:
                 privacy_route=privacy.route,
                 privacy_categories=list(privacy.categories),
             )
-            return
+            return None
         if not self._has_semantic_units(representation.representation_id):
             self._update_item(
                 run_id,
@@ -1483,7 +1601,11 @@ class WechatDigestService:
                 privacy_route="approved",
                 privacy_categories=[],
             )
-            return
+            return None
+        if prepare_only and not self._existing_semantic_package(
+            representation.representation_id
+        ):
+            return representation.representation_id
         atomic_ids = self._semantic(representation.representation_id)
         pending, object_ids = self._govern(atomic_ids)
         self._update_item(
@@ -1497,6 +1619,12 @@ class WechatDigestService:
             pending_human=pending,
             context_object_ids=list(object_ids),
         )
+        return None
+
+    def _existing_semantic_package(self, representation_id: str) -> bool:
+        return (
+            self.workspace / "02_processing" / "information" / representation_id
+        ).exists()
 
     def _representation_texts(self, representation_id: str) -> tuple[str, ...]:
         representation = self.representation_repository.get(representation_id)

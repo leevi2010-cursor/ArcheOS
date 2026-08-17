@@ -649,6 +649,74 @@ class WechatDigestTests(unittest.TestCase):
         with self.assertRaisesRegex(WechatDigestError, "重放内容发生变化"):
             self.service(capture).run()
 
+    def test_prepare_requires_active_run_without_capture(self) -> None:
+        capture = SyntheticCaptureProvider([message(1)])
+        with self.assertRaisesRegex(WechatDigestError, "不存在可恢复"):
+            self.service(capture).prepare_next_semantic()
+        self.assertEqual(capture.calls, [])
+
+    def test_prepare_is_idempotent_and_keeps_checkpoint_unpublished(self) -> None:
+        capture = SyntheticCaptureProvider([message(1)])
+        self.semantic.failures_remaining = 1
+        service = self.service(capture)
+        with self.assertRaises(WechatDigestError):
+            service.run(all_history=True)
+        first = service.prepare_next_semantic()
+        second = service.prepare_next_semantic()
+        self.assertEqual(first, second)
+        self.assertEqual(self.semantic.provider.calls, 0)
+        status = service.run_store.status(first.run_id)
+        self.assertFalse(status["checkpoint_published"])
+        self.assertEqual(service.run_store.active_run_id(), first.run_id)
+
+    def test_prepare_replays_existing_package_without_provider(self) -> None:
+        self.create_object()
+        capture = SyntheticCaptureProvider([message(1, conversation="a"), message(2, conversation="b")])
+        service = self.service(capture, service_type=FailAfterGovernanceOnceService)
+        with self.assertRaises(WechatDigestError):
+            service.run(all_history=True)
+        provider_calls = self.semantic.provider.calls
+        prepared = service.prepare_next_semantic()
+        self.assertEqual(self.semantic.provider.calls, provider_calls)
+        self.assertFalse(service.run_store.status(prepared.run_id)["checkpoint_published"])
+
+    def test_prepare_converges_unsupported_attachment_without_provider(self) -> None:
+        attachment_path = self.workspace / "synthetic.bin"
+        attachment_path.write_bytes(b"synthetic")
+        capture = SyntheticCaptureProvider([message(1, attachments=(attachment(attachment_path, "attachment_1", media_type="application/x-synthetic"),)), message(2, conversation="a"), message(3, conversation="b")])
+        self.create_object()
+        service = self.service(capture, service_type=FailAfterGovernanceOnceService)
+        with self.assertRaises(WechatDigestError):
+            service.run(all_history=True)
+        provider_calls = self.semantic.provider.calls
+        prepared = service.prepare_next_semantic()
+        self.assertEqual(self.semantic.provider.calls, provider_calls)
+        self.assertEqual(service.run_store.status(prepared.run_id)["items"]["attachment:attachment_1"]["state"], "unsupported")
+
+    def test_prepare_stops_at_multi_batch_item(self) -> None:
+        capture = SyntheticCaptureProvider([message(number) for number in range(1, 42)])
+        self.semantic.failures_remaining = 1
+        service = self.service(capture)
+        with self.assertRaises(WechatDigestError):
+            service.run(all_history=True)
+        with self.assertRaisesRegex(WechatDigestError, "多个 batch"):
+            service.prepare_next_semantic(batch_size=40)
+        run_id = service.run_store.active_run_id()
+        assert run_id is not None
+        self.assertEqual(next(iter(service.run_store.status(run_id)["items"].values()))["state"], "represented")
+        self.assertEqual(self.semantic.provider.calls, 0)
+
+    def test_prepare_fingerprint_change_fails_before_provider(self) -> None:
+        capture = SyntheticCaptureProvider([message(1)])
+        self.semantic.failures_remaining = 1
+        service = self.service(capture)
+        with self.assertRaises(WechatDigestError):
+            service.run(all_history=True)
+        capture.messages[0] = replace(capture.messages[0], visible_content="changed")
+        with self.assertRaisesRegex(WechatDigestError, "重放内容发生变化"):
+            service.prepare_next_semantic()
+        self.assertEqual(self.semantic.provider.calls, 0)
+
     def test_concurrent_digest_fails_without_reading_capture(self) -> None:
         capture = SyntheticCaptureProvider([])
         service = self.service(capture)

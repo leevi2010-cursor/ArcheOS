@@ -23,7 +23,7 @@ from archeos.pyannote_speakers import PyannoteSpeakerProvider
 from archeos.representation_information import (
     FileRepresentationAnalysisProvider,
 )
-from archeos.wechat_digest import WechatDigestResult
+from archeos.wechat_digest import WechatDigestResult, WechatSemanticPreparation
 from archeos.workspace import WorkspaceConfig
 from archeos.world_model import SQLiteWorldModelRepository
 
@@ -63,6 +63,21 @@ class CliTest(unittest.TestCase):
         digest_service.return_value.run.assert_called_once_with(
             since=None, from_now=True, all_history=False
         )
+        capture_provider.assert_called_once()
+
+    @patch("archeos.cli.WechatDigestService")
+    @patch("archeos.cli.WechatCliCaptureProvider")
+    @patch("archeos.cli.require_workspace")
+    def test_wechat_digest_prepares_without_running_digest(self, require_workspace: Mock, capture_provider: Mock, digest_service: Mock) -> None:
+        require_workspace.return_value = WorkspaceConfig(Path("/workspace"), Path("/config"))
+        digest_service.return_value.prepare_next_semantic.return_value = WechatSemanticPreparation("run_" + "a" * 32, "repr_" + "b" * 32, ("unit_" + "c" * 64,))
+        output = StringIO()
+        with redirect_stdout(output):
+            result = main(["wechat", "digest", "--prepare-next-semantic"])
+        self.assertEqual(result, 0)
+        self.assertIn('"provider_calls": 0', output.getvalue())
+        digest_service.return_value.prepare_next_semantic.assert_called_once_with(batch_size=40)
+        digest_service.return_value.run.assert_not_called()
         capture_provider.assert_called_once()
 
     @patch("archeos.cli.ingest_processing_package")
