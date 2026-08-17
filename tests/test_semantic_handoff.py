@@ -22,6 +22,8 @@ from archeos.representation import (
 )
 from archeos.representation_information import (
     EXTERNAL_AGENT_PROTOCOL_V1,
+    EXTERNAL_AGENT_PROTOCOL_V2,
+    EXTERNAL_AGENT_PROTOCOL_VERSION,
     CodexCliRepresentationAnalysisProvider,
     RepresentationAnalysisBatch,
     RepresentationAnalysisUnit,
@@ -99,6 +101,7 @@ class FakeProcess:
             self.command[self.command.index("--output-last-message") + 1]
         )
         if self.mode != "no_result":
+            is_v3 = request["protocol_version"] == EXTERNAL_AGENT_PROTOCOL_VERSION
             result = {
                 "protocol_version": request["protocol_version"],
                 "input_fingerprint": request["input_fingerprint"],
@@ -114,7 +117,14 @@ class FakeProcess:
                         "statement": "Synthetic statement.",
                         "semantic_type": "observation",
                         "concerns": ["Synthetic"],
-                        "evidence_unit_ids": [unit["unit_id"]],
+                        **(
+                            {
+                                "anchor_unit_ids": [unit["unit_id"]],
+                                "supporting_evidence_unit_ids": [],
+                            }
+                            if is_v3
+                            else {"evidence_unit_ids": [unit["unit_id"]]}
+                        ),
                         "context": "Synthetic context.",
                         "confidence": 0.9,
                     }
@@ -136,13 +146,22 @@ class FakeProcess:
                 elif self.mode == "candidate_confidence":
                     result["candidates"][0]["confidence"] = 2
                 elif self.mode == "residue_shape":
-                    result["residue"] = [{"evidence_unit_ids": []}]
+                    result["residue"] = [
+                        {"anchor_unit_ids": []}
+                        if is_v3
+                        else {"evidence_unit_ids": []}
+                    ]
                 elif self.mode == "candidate_unknown_reference":
-                    result["candidates"][0]["evidence_unit_ids"] = ["unit_" + "f" * 64]
+                    field = "anchor_unit_ids" if is_v3 else "evidence_unit_ids"
+                    result["candidates"][0][field] = ["unit_" + "f" * 64]
                 elif self.mode == "residue_unknown_reference":
                     result["residue"] = [
                         {
-                            "evidence_unit_ids": ["unit_" + "f" * 64],
+                            (
+                                "anchor_unit_ids"
+                                if is_v3
+                                else "evidence_unit_ids"
+                            ): ["unit_" + "f" * 64],
                             "reason_not_absorbed": "Synthetic residue.",
                             "future_value_or_uncertainty": "Synthetic uncertainty.",
                         }
@@ -153,7 +172,11 @@ class FakeProcess:
                     result["candidates"] = []
                     result["residue"] = [
                         {
-                            "evidence_unit_ids": [unit["unit_id"]],
+                            (
+                                "anchor_unit_ids"
+                                if is_v3
+                                else "evidence_unit_ids"
+                            ): [unit["unit_id"]],
                             "reason_not_absorbed": "Synthetic unresolved input.",
                             "future_value_or_uncertainty": "Synthetic future value.",
                         }
@@ -161,6 +184,41 @@ class FakeProcess:
                     ]
                     for item in result["anchor_accounting"]:
                         item["accounted_as"] = "residue"
+                elif self.mode == "candidate_no_anchor":
+                    result["candidates"][0]["anchor_unit_ids"] = []
+                elif self.mode == "candidate_duplicate_anchor":
+                    anchor_id = result["candidates"][0]["anchor_unit_ids"][0]
+                    result["candidates"][0]["anchor_unit_ids"] = [
+                        anchor_id,
+                        anchor_id,
+                    ]
+                elif self.mode == "candidate_context_as_anchor":
+                    result["candidates"][0]["anchor_unit_ids"] = [
+                        request["context_support_units"][0]["unit_id"]
+                    ]
+                elif self.mode == "candidate_anchor_as_support":
+                    result["candidates"][0]["supporting_evidence_unit_ids"] = [
+                        request["anchor_units"][0]["unit_id"]
+                    ]
+                elif self.mode in {
+                    "candidate_non_evidence_context",
+                    "candidate_evidence_context",
+                }:
+                    result["candidates"][0]["supporting_evidence_unit_ids"] = [
+                        request["context_support_units"][0]["unit_id"]
+                    ]
+                elif self.mode == "residue_context_reference":
+                    result["candidates"] = []
+                    result["residue"] = [
+                        {
+                            "anchor_unit_ids": [
+                                request["context_support_units"][0]["unit_id"]
+                            ],
+                            "reason_not_absorbed": "Synthetic unresolved input.",
+                            "future_value_or_uncertainty": "Synthetic future value.",
+                        }
+                    ]
+                    result["anchor_accounting"][0]["accounted_as"] = "residue"
                 elif self.mode == "accounting_missing_anchor":
                     result["anchor_accounting"] = []
                 elif self.mode == "accounting_unknown_anchor":
@@ -239,10 +297,18 @@ class SemanticHandoffTest(unittest.TestCase):
         schema = runner.schemas[0]
         self.assertEqual(
             schema["properties"]["protocol_version"],
-            {"type": "string", "const": "external-agent-semantic-handoff/2.0"},
+            {"type": "string", "const": EXTERNAL_AGENT_PROTOCOL_VERSION},
         )
         self.assertIn("anchor_accounting", schema["required"])
         self.assertFalse(schema["additionalProperties"])
+        candidate_properties = schema["properties"]["candidates"]["items"][
+            "properties"
+        ]
+        self.assertNotIn("evidence_unit_ids", candidate_properties)
+        self.assertEqual(
+            candidate_properties["anchor_unit_ids"]["items"]["enum"],
+            [self.unit().unit_id],
+        )
         self.assertEqual(
             provider.execution_records[0].strict_validation_status, "passed"
         )
@@ -277,6 +343,117 @@ class SemanticHandoffTest(unittest.TestCase):
         self.assertEqual(
             schema["properties"]["protocol_version"],
             {"type": "string", "const": EXTERNAL_AGENT_PROTOCOL_V1},
+        )
+
+    def test_v2_request_fingerprint_and_schema_remain_exactly_readable(self) -> None:
+        request, fingerprint = _external_agent_request(
+            RepresentationAnalysisBatch((self.unit(),)),
+            protocol_version=EXTERNAL_AGENT_PROTOCOL_V2,
+        )
+        self.assertEqual(
+            fingerprint,
+            "sha256:67ac01137cd702dc561a544920c883bece975eca54c643f0fdcb6287a2b588a1",
+        )
+        self.assertIn("anchor_accounting", request["rules"][2])
+        schema = external_agent_representation_analysis_schema(
+            EXTERNAL_AGENT_PROTOCOL_V2
+        )
+        candidate_properties = schema["properties"]["candidates"]["items"][
+            "properties"
+        ]
+        self.assertIn("evidence_unit_ids", candidate_properties)
+        self.assertNotIn("anchor_unit_ids", candidate_properties)
+        self.assertIn("anchor_accounting", schema["properties"])
+
+    def test_v3_schema_binds_anchor_and_evidence_context_enums(self) -> None:
+        evidence_context = replace(
+            self.unit(), unit_id="unit_" + "e" * 64
+        )
+        non_evidence_context = replace(
+            self.unit(),
+            unit_id="unit_" + "f" * 64,
+            analysis_eligible=False,
+            exclusion_reason="synthetic context only",
+        )
+        schema = external_agent_representation_analysis_schema(
+            batch=RepresentationAnalysisBatch(
+                (self.unit(),), (evidence_context, non_evidence_context)
+            )
+        )
+        candidate = schema["properties"]["candidates"]["items"]["properties"]
+        self.assertEqual(
+            candidate["anchor_unit_ids"]["items"]["enum"],
+            [self.unit().unit_id],
+        )
+        self.assertEqual(
+            candidate["supporting_evidence_unit_ids"]["items"]["enum"],
+            [evidence_context.unit_id],
+        )
+        residue = schema["properties"]["residue"]["items"]["properties"]
+        self.assertEqual(
+            residue["anchor_unit_ids"]["items"]["enum"],
+            [self.unit().unit_id],
+        )
+
+    def test_v3_rejects_invalid_anchor_and_context_accounting(self) -> None:
+        evidence_context = replace(
+            self.unit(), unit_id="unit_" + "e" * 64
+        )
+        non_evidence_context = replace(
+            self.unit(),
+            unit_id="unit_" + "f" * 64,
+            analysis_eligible=False,
+            exclusion_reason="synthetic context only",
+        )
+        cases = {
+            "candidate_no_anchor": "candidate_schema",
+            "candidate_duplicate_anchor": "candidate_schema",
+            "candidate_context_as_anchor": "evidence_reference",
+            "candidate_anchor_as_support": "evidence_reference",
+            "residue_context_reference": "evidence_reference",
+        }
+        for mode, detail in cases.items():
+            with self.subTest(mode=mode):
+                provider = CodexCliRepresentationAnalysisProvider(
+                    provider_version="0.147.0", runner=FakeRunner(mode)
+                )
+                with self.assertRaisesRegex(Exception, "未产生可验证"):
+                    provider.analyze(
+                        RepresentationAnalysisBatch(
+                            (self.unit(),), (evidence_context,)
+                        )
+                    )
+                self.assertEqual(
+                    provider.execution_records[0].contract_failure_detail,
+                    detail,
+                )
+        provider = CodexCliRepresentationAnalysisProvider(
+            provider_version="0.147.0",
+            runner=FakeRunner("candidate_non_evidence_context"),
+        )
+        with self.assertRaisesRegex(Exception, "未产生可验证"):
+            provider.analyze(
+                RepresentationAnalysisBatch(
+                    (self.unit(),), (non_evidence_context,)
+                )
+            )
+        self.assertEqual(
+            provider.execution_records[0].contract_failure_detail,
+            "evidence_reference",
+        )
+
+    def test_v3_maps_valid_supporting_context_into_canonical_evidence(self) -> None:
+        evidence_context = replace(self.unit(), unit_id="unit_" + "e" * 64)
+        provider = CodexCliRepresentationAnalysisProvider(
+            provider_version="0.147.0",
+            runner=FakeRunner("candidate_evidence_context"),
+        )
+        result = provider.analyze(
+            RepresentationAnalysisBatch((self.unit(),), (evidence_context,))
+        )
+        self.assertEqual(
+            result.candidates[0].evidence_unit_ids,
+            (self.unit().unit_id, evidence_context.unit_id),
         )
 
     def test_provider_may_account_every_anchor_as_residue(self) -> None:
@@ -597,6 +774,44 @@ class SemanticHandoffTest(unittest.TestCase):
         historical = json.loads(audit_path.read_text(encoding="utf-8"))
         historical["protocol_version"] = EXTERNAL_AGENT_PROTOCOL_V1
         historical["input_fingerprint"] = v1_fingerprint
+        audit_path.write_text(json.dumps(historical), encoding="utf-8")
+
+        replay_runner = FakeRunner()
+        replay = handoff.execute(
+            representation.representation_id,
+            CodexCliRepresentationAnalysisProvider(
+                provider_version="0.147.0", runner=replay_runner
+            ),
+        )
+        self.assertTrue(replay.replayed_existing_package)
+        self.assertEqual(replay.ingestion.existing, 1)
+        self.assertEqual(replay_runner.calls, [])
+
+    def test_v2_package_and_audit_replay_without_a_provider_call(self) -> None:
+        representation, service = self.build_service()
+        audit_root = self.root / "audits"
+        handoff = ExternalAgentSemanticHandoffService(
+            service,
+            JsonlAtomicInformationStore(self.root / "atomic.jsonl"),
+            audit_root,
+        )
+        first = handoff.execute(
+            representation.representation_id,
+            CodexCliRepresentationAnalysisProvider(
+                provider_version="0.147.0", runner=FakeRunner()
+            ),
+        )
+        units = _units_from_representation(
+            representation, service.representation_repository
+        )
+        batch = _analysis_batches(units, service.batch_size)[0]
+        _, v2_fingerprint = _external_agent_request(
+            batch, protocol_version=EXTERNAL_AGENT_PROTOCOL_V2
+        )
+        audit_path = first.audit_paths[0]
+        historical = json.loads(audit_path.read_text(encoding="utf-8"))
+        historical["protocol_version"] = EXTERNAL_AGENT_PROTOCOL_V2
+        historical["input_fingerprint"] = v2_fingerprint
         audit_path.write_text(json.dumps(historical), encoding="utf-8")
 
         replay_runner = FakeRunner()

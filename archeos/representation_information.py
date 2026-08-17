@@ -38,9 +38,14 @@ PACKAGE_KIND = "representation_information"
 DEFAULT_CODEX_ANALYSIS_TIMEOUT_SECONDS = 120.0
 DEFAULT_EXTERNAL_AGENT_BATCH_SIZE = 40
 EXTERNAL_AGENT_PROTOCOL_V1 = "external-agent-semantic-handoff/1.0"
-EXTERNAL_AGENT_PROTOCOL_VERSION = "external-agent-semantic-handoff/2.0"
+EXTERNAL_AGENT_PROTOCOL_V2 = "external-agent-semantic-handoff/2.0"
+EXTERNAL_AGENT_PROTOCOL_VERSION = "external-agent-semantic-handoff/3.0"
 SUPPORTED_EXTERNAL_AGENT_PROTOCOL_VERSIONS = frozenset(
-    {EXTERNAL_AGENT_PROTOCOL_V1, EXTERNAL_AGENT_PROTOCOL_VERSION}
+    {
+        EXTERNAL_AGENT_PROTOCOL_V1,
+        EXTERNAL_AGENT_PROTOCOL_V2,
+        EXTERNAL_AGENT_PROTOCOL_VERSION,
+    }
 )
 EXTERNAL_AGENT_ROUTE = "codex-cli"
 DEFAULT_SEMANTIC_MODEL = "gpt-5.6-terra"
@@ -225,11 +230,18 @@ def representation_analysis_schema() -> dict[str, object]:
 
 def external_agent_representation_analysis_schema(
     protocol_version: str = EXTERNAL_AGENT_PROTOCOL_VERSION,
+    *,
+    batch: RepresentationAnalysisBatch | None = None,
 ) -> dict[str, object]:
     """The #31 result contract with the #80 Codex serialization binding."""
     if protocol_version not in SUPPORTED_EXTERNAL_AGENT_PROTOCOL_VERSIONS:
         raise ValueError("unsupported External Agent protocol version")
-    schema = representation_analysis_schema()
+    if protocol_version == EXTERNAL_AGENT_PROTOCOL_VERSION:
+        if batch is None:
+            raise ValueError("v3 External Agent schema requires its bound batch")
+        schema = _external_agent_v3_analysis_schema(batch)
+    else:
+        schema = representation_analysis_schema()
     required = schema["required"]
     properties = schema["properties"]
     assert isinstance(required, list) and isinstance(properties, dict)
@@ -243,9 +255,22 @@ def external_agent_representation_analysis_schema(
             "pattern": "^sha256:[0-9a-f]{64}$",
         },
     }
-    if protocol_version == EXTERNAL_AGENT_PROTOCOL_VERSION:
+    if protocol_version in {
+        EXTERNAL_AGENT_PROTOCOL_V2,
+        EXTERNAL_AGENT_PROTOCOL_VERSION,
+    }:
         required = ["anchor_accounting", *required]
-        protocol_properties["anchor_accounting"] = {
+        anchor_unit_id: dict[str, object] = {
+            "type": "string",
+            "minLength": 1,
+        }
+        if protocol_version == EXTERNAL_AGENT_PROTOCOL_VERSION:
+            assert batch is not None
+            anchor_unit_id = {
+                "type": "string",
+                "enum": [unit.unit_id for unit in batch.anchor_units],
+            }
+        accounting_schema: dict[str, object] = {
             "type": "array",
             "minItems": 1,
             "items": {
@@ -253,7 +278,7 @@ def external_agent_representation_analysis_schema(
                 "additionalProperties": False,
                 "required": ["anchor_unit_id", "accounted_as"],
                 "properties": {
-                    "anchor_unit_id": {"type": "string", "minLength": 1},
+                    "anchor_unit_id": anchor_unit_id,
                     "accounted_as": {
                         "type": "string",
                         "enum": ["candidate", "residue"],
@@ -261,9 +286,101 @@ def external_agent_representation_analysis_schema(
                 },
             },
         }
+        if protocol_version == EXTERNAL_AGENT_PROTOCOL_VERSION:
+            assert batch is not None
+            accounting_schema["maxItems"] = len(batch.anchor_units)
+            accounting_schema["uniqueItems"] = True
+        protocol_properties["anchor_accounting"] = accounting_schema
     schema["required"] = ["protocol_version", "input_fingerprint", *required]
     schema["properties"] = {**protocol_properties, **properties}
     return schema
+
+
+def _external_agent_v3_analysis_schema(
+    batch: RepresentationAnalysisBatch,
+) -> dict[str, object]:
+    anchor_ids = [unit.unit_id for unit in batch.anchor_units]
+    context_ids = [
+        unit.unit_id for unit in batch.context_support_units if unit.analysis_eligible
+    ]
+    anchor_refs = {
+        "type": "array",
+        "items": {"type": "string", "enum": anchor_ids},
+        "minItems": 1,
+        "uniqueItems": True,
+    }
+    context_refs: dict[str, object] = {
+        "type": "array",
+        "items": {"type": "string", "enum": context_ids},
+        "uniqueItems": True,
+    }
+    return {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "additionalProperties": False,
+        "required": ["candidates", "residue"],
+        "properties": {
+            "candidates": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "required": [
+                        "statement",
+                        "semantic_type",
+                        "concerns",
+                        "anchor_unit_ids",
+                        "supporting_evidence_unit_ids",
+                        "context",
+                        "confidence",
+                    ],
+                    "properties": {
+                        "statement": {"type": "string", "minLength": 1},
+                        "semantic_type": {
+                            "type": "string",
+                            "enum": sorted(SEMANTIC_TYPES),
+                        },
+                        "concerns": {
+                            "type": "array",
+                            "items": {"type": "string", "minLength": 1},
+                            "minItems": 1,
+                        },
+                        "anchor_unit_ids": anchor_refs,
+                        "supporting_evidence_unit_ids": context_refs,
+                        "context": {"type": "string", "minLength": 1},
+                        "confidence": {
+                            "type": "number",
+                            "minimum": 0,
+                            "maximum": 1,
+                        },
+                    },
+                },
+            },
+            "residue": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "required": [
+                        "anchor_unit_ids",
+                        "reason_not_absorbed",
+                        "future_value_or_uncertainty",
+                    ],
+                    "properties": {
+                        "anchor_unit_ids": anchor_refs,
+                        "reason_not_absorbed": {
+                            "type": "string",
+                            "minLength": 1,
+                        },
+                        "future_value_or_uncertainty": {
+                            "type": "string",
+                            "minLength": 1,
+                        },
+                    },
+                },
+            },
+        },
+    }
 
 
 def _provider_unit(unit: RepresentationAnalysisUnit, *, role: str) -> dict[str, object]:
@@ -625,7 +742,7 @@ class CodexCliRepresentationAnalysisProvider:
             raise RepresentationInformationError(
                 "External Agent 诊断目录不安全；未启动 Provider。"
             )
-        schema = external_agent_representation_analysis_schema()
+        schema = external_agent_representation_analysis_schema(batch=batch)
         _require_codex_schema_compatibility(schema)
         result_file_present = False
         result_size_bytes = 0
@@ -1276,10 +1393,18 @@ def _external_agent_request(
         "Candidate must cite an anchor; context is Evidence only when explicitly cited and evidence-capable.",
         "Use Residue for unresolved or insufficient evidence; never invent identity, facts, or World Model state.",
     ]
-    if protocol_version == EXTERNAL_AGENT_PROTOCOL_VERSION:
+    if protocol_version in {
+        EXTERNAL_AGENT_PROTOCOL_V2,
+        EXTERNAL_AGENT_PROTOCOL_VERSION,
+    }:
         rules.insert(
             2,
             "Emit exactly one anchor_accounting item for every supplied anchor; accounted_as must match whether that anchor is cited by Candidate or Residue.",
+        )
+    if protocol_version == EXTERNAL_AGENT_PROTOCOL_VERSION:
+        rules.insert(
+            3,
+            "For each Candidate, separate anchor_unit_ids from evidence-capable supporting_evidence_unit_ids; Residue may reference anchors only.",
         )
     payload: dict[str, object] = {
         "protocol_version": protocol_version,
@@ -1323,7 +1448,10 @@ def _parse_external_agent_result(
         "candidates",
         "residue",
     }
-    if expected_protocol_version == EXTERNAL_AGENT_PROTOCOL_VERSION:
+    if expected_protocol_version in {
+        EXTERNAL_AGENT_PROTOCOL_V2,
+        EXTERNAL_AGENT_PROTOCOL_VERSION,
+    }:
         expected_fields.add("anchor_accounting")
     if not isinstance(payload, dict) or set(payload) != expected_fields:
         raise _ExternalAgentContractFailure("top_level_schema")
@@ -1332,20 +1460,29 @@ def _parse_external_agent_result(
         or payload["input_fingerprint"] != expected_fingerprint
     ):
         raise RepresentationInformationError("result_binding_failure")
-    try:
-        candidates = tuple(
-            _candidate_draft(item) for item in _items(payload["candidates"], "candidates")
-        )
-    except RepresentationInformationError as exc:
-        raise _ExternalAgentContractFailure("candidate_schema") from exc
-    try:
-        residue = tuple(
-            _residue_draft(item) for item in _items(payload["residue"], "residue")
-        )
-    except RepresentationInformationError as exc:
-        raise _ExternalAgentContractFailure("residue_schema") from exc
-    accounting: tuple[_AnchorAccounting, ...] | None = None
     if expected_protocol_version == EXTERNAL_AGENT_PROTOCOL_VERSION:
+        candidates = _v3_candidate_drafts(payload["candidates"], batch)
+        residue = _v3_residue_drafts(payload["residue"], batch)
+    else:
+        try:
+            candidates = tuple(
+                _candidate_draft(item)
+                for item in _items(payload["candidates"], "candidates")
+            )
+        except RepresentationInformationError as exc:
+            raise _ExternalAgentContractFailure("candidate_schema") from exc
+        try:
+            residue = tuple(
+                _residue_draft(item)
+                for item in _items(payload["residue"], "residue")
+            )
+        except RepresentationInformationError as exc:
+            raise _ExternalAgentContractFailure("residue_schema") from exc
+    accounting: tuple[_AnchorAccounting, ...] | None = None
+    if expected_protocol_version in {
+        EXTERNAL_AGENT_PROTOCOL_V2,
+        EXTERNAL_AGENT_PROTOCOL_VERSION,
+    }:
         try:
             accounting = tuple(
                 _anchor_accounting(item)
@@ -1365,6 +1502,114 @@ def _parse_external_agent_result(
     except RepresentationInformationError as exc:
         raise _ExternalAgentContractFailure("unknown") from exc
     return RepresentationAnalysisResult(candidates, residue)
+
+
+def _v3_candidate_drafts(
+    value: object,
+    batch: RepresentationAnalysisBatch,
+) -> tuple[RepresentationCandidateDraft, ...]:
+    anchor_ids = {unit.unit_id for unit in batch.anchor_units}
+    context_ids = {
+        unit.unit_id for unit in batch.context_support_units if unit.analysis_eligible
+    }
+    drafts: list[RepresentationCandidateDraft] = []
+    try:
+        items = _items(value, "candidates")
+        for item in items:
+            if not isinstance(item, dict) or set(item) != {
+                "statement",
+                "semantic_type",
+                "concerns",
+                "anchor_unit_ids",
+                "supporting_evidence_unit_ids",
+                "context",
+                "confidence",
+            }:
+                raise RepresentationInformationError(
+                    "candidate does not match the v3 execution contract"
+                )
+            anchors = _unique_strings(
+                item["anchor_unit_ids"], "candidate anchor_unit_ids", required=True
+            )
+            supporting = _unique_strings(
+                item["supporting_evidence_unit_ids"],
+                "candidate supporting_evidence_unit_ids",
+                required=False,
+            )
+            if any(unit_id not in anchor_ids for unit_id in anchors) or any(
+                unit_id not in context_ids for unit_id in supporting
+            ):
+                raise _ExternalAgentContractFailure("evidence_reference")
+            confidence = item["confidence"]
+            if (
+                isinstance(confidence, bool)
+                or not isinstance(confidence, (int, float))
+                or not 0 <= confidence <= 1
+            ):
+                raise RepresentationInformationError(
+                    "candidate confidence must be between 0 and 1"
+                )
+            semantic_type = _text(item["semantic_type"], "candidate semantic_type")
+            if semantic_type not in SEMANTIC_TYPES:
+                raise RepresentationInformationError(
+                    "candidate semantic_type is not supported"
+                )
+            drafts.append(
+                RepresentationCandidateDraft(
+                    statement=_text(item["statement"], "candidate statement"),
+                    semantic_type=semantic_type,
+                    concerns=_strings(item["concerns"], "candidate concerns"),
+                    evidence_unit_ids=(*anchors, *supporting),
+                    context=_text(item["context"], "candidate context"),
+                    confidence=float(confidence),
+                )
+            )
+    except _ExternalAgentContractFailure:
+        raise
+    except RepresentationInformationError as exc:
+        raise _ExternalAgentContractFailure("candidate_schema") from exc
+    return tuple(drafts)
+
+
+def _v3_residue_drafts(
+    value: object,
+    batch: RepresentationAnalysisBatch,
+) -> tuple[RepresentationResidueDraft, ...]:
+    anchor_ids = {unit.unit_id for unit in batch.anchor_units}
+    drafts: list[RepresentationResidueDraft] = []
+    try:
+        items = _items(value, "residue")
+        for item in items:
+            if not isinstance(item, dict) or set(item) != {
+                "anchor_unit_ids",
+                "reason_not_absorbed",
+                "future_value_or_uncertainty",
+            }:
+                raise RepresentationInformationError(
+                    "Residue does not match the v3 execution contract"
+                )
+            anchors = _unique_strings(
+                item["anchor_unit_ids"], "Residue anchor_unit_ids", required=True
+            )
+            if any(unit_id not in anchor_ids for unit_id in anchors):
+                raise _ExternalAgentContractFailure("evidence_reference")
+            drafts.append(
+                RepresentationResidueDraft(
+                    evidence_unit_ids=anchors,
+                    reason_not_absorbed=_text(
+                        item["reason_not_absorbed"], "Residue reason_not_absorbed"
+                    ),
+                    future_value_or_uncertainty=_text(
+                        item["future_value_or_uncertainty"],
+                        "Residue future_value_or_uncertainty",
+                    ),
+                )
+            )
+    except _ExternalAgentContractFailure:
+        raise
+    except RepresentationInformationError as exc:
+        raise _ExternalAgentContractFailure("residue_schema") from exc
+    return tuple(drafts)
 
 
 def _require_codex_schema_compatibility(schema: Mapping[str, object]) -> None:
@@ -1404,6 +1649,21 @@ def _strings(value: object, field: str) -> tuple[str, ...]:
     if not isinstance(value, list) or not value:
         raise RepresentationInformationError(f"{field} must be a non-empty array")
     return tuple(_text(item, field) for item in value)
+
+
+def _unique_strings(
+    value: object,
+    field: str,
+    *,
+    required: bool,
+) -> tuple[str, ...]:
+    if not isinstance(value, list) or required and not value:
+        requirement = "a non-empty array" if required else "an array"
+        raise RepresentationInformationError(f"{field} must be {requirement}")
+    result = tuple(_text(item, field) for item in value)
+    if len(set(result)) != len(result):
+        raise RepresentationInformationError(f"{field} must contain unique values")
+    return result
 
 
 def _candidate_draft(value: object) -> RepresentationCandidateDraft:
