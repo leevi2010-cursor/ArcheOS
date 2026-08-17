@@ -982,6 +982,7 @@ def _wechat_product_command(args: argparse.Namespace) -> int:
             capture_provider=capture,
             semantic_handoff_factory=semantic_handoff,
             interpretation_provider=CodexAtomicInformationInterpretationProvider(),
+            semantic_batch_size=args.batch_size,
         )
         if args.prepare_next_semantic:
             prepared = service.prepare_next_semantic(batch_size=args.batch_size)

@@ -717,6 +717,40 @@ class WechatDigestTests(unittest.TestCase):
             service.prepare_next_semantic()
         self.assertEqual(self.semantic.provider.calls, 0)
 
+    def test_prepare_rejects_tampered_plan_and_status_before_provider(self) -> None:
+        capture = SyntheticCaptureProvider([message(1)])
+        self.semantic.failures_remaining = 1
+        service = self.service(capture)
+        with self.assertRaises(WechatDigestError):
+            service.run(all_history=True)
+        run_id = service.run_store.active_run_id()
+        assert run_id is not None
+        plan_path = service.run_store.runs_root / run_id / "plan.json"
+        plan = json.loads(plan_path.read_text())
+        plan["conversations"][0]["content_hash"] = "sha256:" + "0" * 64
+        plan_path.write_text(json.dumps(plan), encoding="utf-8")
+        with self.assertRaisesRegex(WechatDigestError, "durable plan"):
+            service.prepare_next_semantic()
+        self.assertEqual(self.semantic.provider.calls, 0)
+
+    def test_semantic_batch_size_is_durable_and_legacy_is_40(self) -> None:
+        capture = SyntheticCaptureProvider([message(number) for number in range(1, 42)])
+        self.semantic.failures_remaining = 1
+        service = self.service(capture)
+        with self.assertRaises(WechatDigestError):
+            service.run(all_history=True)
+        run_id = service.run_store.active_run_id()
+        assert run_id is not None
+        plan_path = service.run_store.runs_root / run_id / "plan.json"
+        plan = json.loads(plan_path.read_text())
+        self.assertEqual(plan["semantic_batch_size"], 40)
+        with self.assertRaisesRegex(WechatDigestError, "batch size"):
+            service.prepare_next_semantic(batch_size=100)
+        plan.pop("semantic_batch_size")
+        plan_path.write_text(json.dumps(plan), encoding="utf-8")
+        with self.assertRaisesRegex(WechatDigestError, "多个 batch"):
+            service.prepare_next_semantic(batch_size=40)
+
     def test_concurrent_digest_fails_without_reading_capture(self) -> None:
         capture = SyntheticCaptureProvider([])
         service = self.service(capture)

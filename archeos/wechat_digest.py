@@ -844,11 +844,14 @@ def _conversation_source_payload(
 
 
 def _build_plan(
-    capture: WechatCapture, *, clock: Callable[[], str]
+    capture: WechatCapture, *, clock: Callable[[], str],
+    semantic_batch_size: int = DEFAULT_EXTERNAL_AGENT_BATCH_SIZE,
+    run_id: str | None = None,
+    created_at: str | None = None,
 ) -> tuple[dict[str, object], dict[str, object]]:
     fingerprint = _capture_fingerprint(capture)
-    created_at = clock()
-    run_id = _stable_id(
+    created_at = created_at or clock()
+    run_id = run_id or _stable_id(
         "run",
         fingerprint,
         _canonical_json(capture.after_cursor.to_dict()),
@@ -909,6 +912,7 @@ def _build_plan(
         "after_cursor": capture.after_cursor.to_dict(),
         "upper_bound": capture.upper_bound.to_dict(),
         "capture_fingerprint": fingerprint,
+        "semantic_batch_size": semantic_batch_size,
         "message_keys": [message.message_key for message in capture.messages],
         "conversations": conversation_plans,
         "attachments": attachment_plans,
@@ -974,6 +978,7 @@ class WechatDigestService:
         interpretation_provider: AtomicInformationInterpretationProvider,
         privacy_gate: DeterministicPrivacyGate | None = None,
         run_store: WechatDigestRunStore | None = None,
+        semantic_batch_size: int = DEFAULT_EXTERNAL_AGENT_BATCH_SIZE,
         clock: Callable[[], str] = _utc_now,
     ) -> None:
         self.workspace = Path(workspace)
@@ -1006,6 +1011,9 @@ class WechatDigestService:
             self.workspace / "02_processing" / "wechat_digest", clock=clock
         )
         self._semantic_handoff: SemanticHandoffPort | None = None
+        if isinstance(semantic_batch_size, bool) or not isinstance(semantic_batch_size, int) or semantic_batch_size < 1:
+            raise ValueError("semantic batch size must be positive")
+        self.semantic_batch_size = semantic_batch_size
 
     def run(
         self,
@@ -1052,6 +1060,9 @@ class WechatDigestService:
             if run_id is None:
                 raise WechatDigestError("不存在可恢复的微信运行；未创建新 capture。")
             plan = self.run_store.plan(run_id)
+            effective_batch_size = self._plan_batch_size(plan)
+            if batch_size != effective_batch_size:
+                raise WechatDigestError("semantic batch size 与 durable run 不一致。")
             capture = self.capture_provider.capture(
                 WechatCursor.from_dict(plan["after_cursor"], "plan.after_cursor"),
                 upper_bound=WechatCursor.from_dict(
@@ -1059,12 +1070,13 @@ class WechatDigestService:
                 ),
             )
             self._verify_capture_against_plan(capture, plan)
+            self._verify_plan_and_status(capture, plan, self.run_store.status(run_id))
             return self._prepare_next_semantic_locked(
                 run_id,
                 capture,
                 plan,
                 self.run_store.status(run_id),
-                batch_size=batch_size,
+                batch_size=effective_batch_size,
             )
 
     def _prepare_next_semantic_locked(
@@ -1142,6 +1154,41 @@ class WechatDigestService:
             raise WechatDigestError("下一个 semantic item 需要多个 batch；未跳过该 item。")
         return WechatSemanticPreparation(run_id, representation_id, eligible)
 
+    @staticmethod
+    def _plan_batch_size(plan: Mapping[str, object]) -> int:
+        value = plan.get("semantic_batch_size", DEFAULT_EXTERNAL_AGENT_BATCH_SIZE)
+        if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+            raise WechatDigestError("微信运行计划 semantic batch size 损坏。")
+        return value
+
+    def _verify_plan_and_status(
+        self, capture: WechatCapture, plan: dict[str, object], status: dict[str, object]
+    ) -> None:
+        run_id = plan.get("run_id")
+        created_at = plan.get("created_at")
+        if not isinstance(run_id, str) or not isinstance(created_at, str):
+            raise WechatDigestError("微信运行计划损坏。")
+        expected, _ = _build_plan(capture, clock=lambda: created_at, run_id=run_id,
+            created_at=created_at, semantic_batch_size=self._plan_batch_size(plan))
+        comparable = dict(plan)
+        if "semantic_batch_size" not in comparable:
+            expected.pop("semantic_batch_size")
+        if comparable != expected:
+            raise WechatDigestError("微信 durable plan 与 fixed capture 不一致。")
+        items = status.get("items")
+        if not isinstance(items, dict):
+            raise WechatDigestError("微信运行状态 items 损坏。")
+        expected_items = {
+            **{f"conversation:{item['conversation_key']}": ("conversation", item["source_id"]) for item in _plan_sequence(plan.get("conversations"), "conversations")},
+            **{f"attachment:{item['attachment_key']}": ("attachment", item["source_id"]) for item in _plan_sequence(plan.get("attachments"), "attachments")},
+        }
+        if set(items) != set(expected_items):
+            raise WechatDigestError("微信运行状态与 durable plan 不收敛。")
+        for item_id, (kind, source_id) in expected_items.items():
+            item = self._item(items, item_id)
+            if item.get("kind") != kind or item.get("source_id") != source_id:
+                raise WechatDigestError("微信运行状态 binding 损坏。")
+
     def _run_locked(
         self, *, since: str | None, from_now: bool, all_history: bool
     ) -> WechatDigestResult:
@@ -1157,6 +1204,9 @@ class WechatDigestService:
             capture = self.capture_provider.capture(after, upper_bound=upper)
             self._verify_capture_against_plan(capture, plan)
             status = self.run_store.status(active_run_id)
+            if self.semantic_batch_size != self._plan_batch_size(plan):
+                raise WechatDigestError("semantic batch size 与 durable run 不一致。")
+            self._verify_plan_and_status(capture, plan, status)
         else:
             if checkpoint is None:
                 if not any((since is not None, from_now, all_history)):
@@ -1182,7 +1232,8 @@ class WechatDigestService:
                         "checkpoint 已存在；日常运行不要再指定首次起点。"
                     )
                 capture = self.capture_provider.capture(checkpoint)
-            plan, status = _build_plan(capture, clock=self.clock)
+            plan, status = _build_plan(capture, clock=self.clock,
+                semantic_batch_size=self.semantic_batch_size)
             self.run_store.create(plan, status)
             active_run_id = str(plan["run_id"])
 
