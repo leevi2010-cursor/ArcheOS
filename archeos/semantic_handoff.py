@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import json
 import os
@@ -9,7 +10,8 @@ import re
 import secrets
 import stat
 import tempfile
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
@@ -1147,6 +1149,18 @@ class _SemanticRecoveryRun:
         return loaded
 
 
+def _analysis_results_fingerprint(
+    outputs: tuple[RepresentationAnalysisResult, ...]
+) -> str:
+    return _fingerprint([asdict(output) for output in outputs])
+
+
+@dataclass(frozen=True)
+class _FinalizedRecoveryResults:
+    outputs: tuple[RepresentationAnalysisResult, ...]
+    verify_before_publish: Callable[[], None]
+
+
 class _RecoveryAwareProvider:
     """Feeds exact recovered batches into the unchanged complete package builder."""
 
@@ -1173,6 +1187,83 @@ class _RecoveryAwareProvider:
         self.records: list[ExternalAgentExecutionRecord] = []
         self.new_calls = 0
         self._ordinal = 0
+
+    @contextmanager
+    def finalize_results(
+        self, early_outputs: tuple[RepresentationAnalysisResult, ...]
+    ):
+        """Hold one exclusive run lock across final disk reload and package publish."""
+
+        _require_private_directory(self.recovery.run_dir)
+        descriptor = os.open(self.recovery.run_dir, os.O_RDONLY)
+        try:
+            observed = self.recovery.run_dir.lstat()
+            opened = os.fstat(descriptor)
+            if (
+                observed.st_dev != opened.st_dev
+                or observed.st_ino != opened.st_ino
+                or stat.S_IMODE(opened.st_mode) != 0o700
+                or opened.st_uid != os.getuid()
+            ):
+                raise SemanticHandoffError(
+                    "Semantic recovery finalization lock binding 损坏。"
+                )
+            fcntl.flock(descriptor, fcntl.LOCK_EX)
+            outputs, records = self._final_disk_outputs(early_outputs)
+
+            def verify_before_publish() -> None:
+                verified_outputs, verified_records = self._final_disk_outputs(
+                    outputs
+                )
+                if (
+                    verified_outputs != outputs
+                    or verified_records != records
+                    or _analysis_results_fingerprint(verified_outputs)
+                    != _analysis_results_fingerprint(outputs)
+                ):
+                    raise SemanticHandoffError(
+                        "Semantic recovery package publish 前发生漂移。"
+                    )
+
+            finalization = _FinalizedRecoveryResults(
+                outputs=outputs,
+                verify_before_publish=verify_before_publish,
+            )
+            yield finalization
+        finally:
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
+            finally:
+                os.close(descriptor)
+
+    def _final_disk_outputs(
+        self, expected_outputs: tuple[RepresentationAnalysisResult, ...]
+    ) -> tuple[
+        tuple[RepresentationAnalysisResult, ...],
+        tuple[ExternalAgentExecutionRecord, ...],
+    ]:
+        if self._ordinal != len(self.recovery.batches):
+            raise SemanticHandoffError(
+                "Semantic recovery 未完成全部 canonical batches。"
+            )
+        loaded, unknown = self.recovery.inspect()
+        if unknown or any(item is None for item in loaded):
+            raise SemanticHandoffError(
+                "Semantic recovery 最终全批次复核不完整。"
+            )
+        outputs = tuple(item[0] for item in loaded if item is not None)
+        records = tuple(item[1] for item in loaded if item is not None)
+        if (
+            outputs != expected_outputs
+            or _analysis_results_fingerprint(outputs)
+            != _analysis_results_fingerprint(expected_outputs)
+            or records != tuple(self.records)
+        ):
+            raise SemanticHandoffError(
+                "Semantic recovery 最终磁盘结果与内存输出漂移。"
+            )
+        self.records = list(records)
+        return outputs, records
 
     def analyze(
         self, batch: RepresentationAnalysisBatch

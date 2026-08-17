@@ -1980,6 +1980,90 @@ class SemanticHandoffTest(unittest.TestCase):
         self.assertEqual(len(resume_runner.calls), 2)
         self.assertEqual(result.ingestion.created, 83)
 
+    def test_final_all_batch_revalidation_rejects_earlier_batch_mutation(
+        self,
+    ) -> None:
+        representation, service = self.build_service(blocks=83)
+        audit_root = self.root / "audits"
+        store_path = self.root / "atomic.jsonl"
+
+        class MutatingThirdRunner(FakeRunner):
+            def __call__(inner_self, command, **kwargs):
+                if len(inner_self.calls) == 2:
+                    first = next(
+                        audit_root.glob(
+                            "semantic_run_*/results/batch_0001/result.json"
+                        )
+                    )
+                    os.chmod(first, 0o644)
+                return super().__call__(command, **kwargs)
+
+        runner = MutatingThirdRunner()
+        with self.assertRaises(SemanticHandoffError):
+            ExternalAgentSemanticHandoffService(
+                service, JsonlAtomicInformationStore(store_path), audit_root
+            ).execute(
+                representation.representation_id,
+                CodexCliRepresentationAnalysisProvider(
+                    provider_version="0.147.0", runner=runner
+                ),
+                privacy_binding=self.privacy_binding(),
+                new_call_authority=3,
+            )
+        self.assertEqual(len(runner.calls), 3)
+        self.assertFalse(store_path.exists())
+        self.assertFalse(
+            (self.root / "information" / representation.representation_id).exists()
+        )
+
+    def test_pre_publish_revalidation_rejects_post_finalize_mutation(self) -> None:
+        import archeos.representation_information as information_module
+
+        representation, service = self.build_service(blocks=83)
+        audit_root = self.root / "audits"
+        store_path = self.root / "atomic.jsonl"
+        original_output_records = information_module._output_records
+        mutated = False
+
+        def mutate_after_final_disk_reload(*args, **kwargs):
+            nonlocal mutated
+            output = original_output_records(*args, **kwargs)
+            if not mutated:
+                first = next(
+                    audit_root.glob(
+                        "semantic_run_*/results/batch_0001/result.json"
+                    )
+                )
+                os.chmod(first, 0o644)
+                mutated = True
+            return output
+
+        runner = FakeRunner()
+        with (
+            patch.object(
+                information_module,
+                "_output_records",
+                mutate_after_final_disk_reload,
+            ),
+            self.assertRaises(SemanticHandoffError),
+        ):
+            ExternalAgentSemanticHandoffService(
+                service, JsonlAtomicInformationStore(store_path), audit_root
+            ).execute(
+                representation.representation_id,
+                CodexCliRepresentationAnalysisProvider(
+                    provider_version="0.147.0", runner=runner
+                ),
+                privacy_binding=self.privacy_binding(),
+                new_call_authority=3,
+            )
+        self.assertTrue(mutated)
+        self.assertEqual(len(runner.calls), 3)
+        self.assertFalse(store_path.exists())
+        self.assertFalse(
+            (self.root / "information" / representation.representation_id).exists()
+        )
+
     def test_recovery_2_receipt_attacks_and_legacy_1_fail_closed(self) -> None:
         import archeos.semantic_handoff as handoff_module
 
@@ -2083,6 +2167,253 @@ class SemanticHandoffTest(unittest.TestCase):
                 self.assertFalse(
                     (root / "information" / representation.representation_id).exists()
                 )
+
+    @unittest.skipUnless(
+        sys.platform in {"darwin", "linux"} and hasattr(os, "fork"),
+        "real fork/SIGKILL durability matrix requires macOS or Linux",
+    )
+    def test_real_fork_sigkill_durable_recovery_matrix(self) -> None:
+        import archeos.semantic_handoff as handoff_module
+
+        convergable = {
+            "final_rename",
+            "phase_visible",
+            "phase_parent_fsync",
+            "final_readback",
+        }
+        hard_blocked = {
+            "run_staging",
+            "attempt_staging",
+            "result_staging",
+        }
+        boundaries = (
+            "run_staging",
+            "run_root_fsync",
+            "attempt_staging",
+            "attempt_visible",
+            "result_staging",
+            "final_rename",
+            "phase_visible",
+            "phase_parent_fsync",
+            "final_readback",
+        )
+        for boundary in boundaries:
+            with self.subTest(boundary=boundary):
+                root = self.root / boundary
+                representation, service = self.build_service(blocks=1, root=root)
+                audit_root = root / "audits"
+                store_path = root / "atomic.jsonl"
+                handoff = ExternalAgentSemanticHandoffService(
+                    service,
+                    JsonlAtomicInformationStore(store_path),
+                    audit_root,
+                )
+                pid = os.fork()
+                if pid == 0:
+                    original_directory_publish = (
+                        handoff_module.publish_directory_no_replace
+                    )
+                    original_file_publish = handoff_module.publish_file_no_replace
+                    original_fsync = handoff_module._fsync_directory
+                    original_load = handoff_module._SemanticRecoveryRun._load_result
+
+                    def kill_now() -> None:
+                        os.kill(os.getpid(), 9)
+
+                    def directory_publish(
+                        staging,
+                        final,
+                        current_boundary=boundary,
+                        delegate=original_directory_publish,
+                    ):
+                        if (
+                            current_boundary == "run_staging"
+                            and final.name.startswith("semantic_run_")
+                        ) or (
+                            current_boundary == "result_staging"
+                            and final.name == "batch_0001"
+                        ):
+                            kill_now()
+                        output = delegate(staging, final)
+                        if (
+                            current_boundary == "final_rename"
+                            and final.name == "batch_0001"
+                        ):
+                            kill_now()
+                        return output
+
+                    def file_publish(
+                        staging,
+                        final,
+                        current_boundary=boundary,
+                        delegate=original_file_publish,
+                    ):
+                        if (
+                            current_boundary == "attempt_staging"
+                            and final.name == "batch_0001.json"
+                            and final.parent.name == "attempts"
+                        ):
+                            kill_now()
+                        output = delegate(staging, final)
+                        if (
+                            current_boundary == "phase_visible"
+                            and final.name == "phase-committed.json"
+                        ):
+                            kill_now()
+                        return output
+
+                    def fsync_directory(
+                        path,
+                        current_boundary=boundary,
+                        current_audit_root=audit_root,
+                        delegate=original_fsync,
+                    ):
+                        if (
+                            current_boundary == "run_root_fsync"
+                            and path == current_audit_root
+                            and any(current_audit_root.glob("semantic_run_*"))
+                        ) or (
+                            current_boundary == "phase_parent_fsync"
+                            and path.name == "batch_0001"
+                            and (path / "phase-committed.json").exists()
+                        ):
+                            kill_now()
+                        return delegate(path)
+
+                    def load_result(
+                        run,
+                        ordinal,
+                        contract,
+                        attempt,
+                        current_boundary=boundary,
+                        delegate=original_load,
+                    ):
+                        loaded = delegate(run, ordinal, contract, attempt)
+                        if (
+                            current_boundary == "final_readback"
+                            and ordinal == 1
+                            and (
+                                run._result_path(ordinal)
+                                / "phase-committed.json"
+                            ).exists()
+                        ):
+                            kill_now()
+                        return loaded
+
+                    class ChildRunner(FakeRunner):
+                        def __call__(
+                            inner_self,
+                            command,
+                            current_boundary=boundary,
+                            **kwargs,
+                        ):
+                            if current_boundary == "attempt_visible":
+                                kill_now()
+                            return super().__call__(command, **kwargs)
+
+                    patchers = (
+                        patch.object(
+                            handoff_module,
+                            "publish_directory_no_replace",
+                            directory_publish,
+                        ),
+                        patch.object(
+                            handoff_module,
+                            "publish_file_no_replace",
+                            file_publish,
+                        ),
+                        patch.object(
+                            handoff_module,
+                            "_fsync_directory",
+                            fsync_directory,
+                        ),
+                        patch.object(
+                            handoff_module._SemanticRecoveryRun,
+                            "_load_result",
+                            load_result,
+                        ),
+                    )
+                    for patcher in patchers:
+                        patcher.start()
+                    try:
+                        handoff.execute(
+                            representation.representation_id,
+                            CodexCliRepresentationAnalysisProvider(
+                                provider_version="0.147.0",
+                                runner=ChildRunner(),
+                            ),
+                            privacy_binding=self.privacy_binding(),
+                            new_call_authority=1,
+                        )
+                    finally:
+                        os._exit(91)
+                waited_pid, status = os.waitpid(pid, 0)
+                self.assertEqual(waited_pid, pid)
+                self.assertTrue(os.WIFSIGNALED(status), status)
+                self.assertEqual(os.WTERMSIG(status), 9)
+                next_runner = FakeRunner()
+                next_provider = CodexCliRepresentationAnalysisProvider(
+                    provider_version="0.147.0", runner=next_runner
+                )
+                if boundary in convergable:
+                    preflight = handoff.recovery_preflight(
+                        representation.representation_id,
+                        next_provider,
+                        self.privacy_binding(),
+                    )
+                    self.assertEqual(preflight.replayable_batches, 1)
+                    self.assertEqual(preflight.required_new_calls, 0)
+                    result = handoff.execute(
+                        representation.representation_id,
+                        next_provider,
+                        privacy_binding=self.privacy_binding(),
+                        new_call_authority=0,
+                    )
+                    self.assertEqual(result.ingestion.created, 1)
+                    self.assertEqual(next_runner.calls, [])
+                    self.assertTrue(result.package.is_dir())
+                elif boundary == "run_root_fsync":
+                    preflight = handoff.recovery_preflight(
+                        representation.representation_id,
+                        next_provider,
+                        self.privacy_binding(),
+                    )
+                    self.assertEqual(preflight.replayable_batches, 0)
+                    self.assertEqual(preflight.required_new_calls, 1)
+                    self.assertEqual(next_runner.calls, [])
+                elif boundary == "attempt_visible":
+                    preflight = handoff.recovery_preflight(
+                        representation.representation_id,
+                        next_provider,
+                        self.privacy_binding(),
+                    )
+                    self.assertEqual(preflight.conservatively_counted_attempts, 1)
+                    with self.assertRaisesRegex(Exception, "LEAD_DECISION_REQUIRED"):
+                        handoff.execute(
+                            representation.representation_id,
+                            next_provider,
+                            privacy_binding=self.privacy_binding(),
+                            new_call_authority=1,
+                        )
+                    self.assertEqual(next_runner.calls, [])
+                else:
+                    self.assertIn(boundary, hard_blocked)
+                    with self.assertRaises(SemanticHandoffError):
+                        handoff.recovery_preflight(
+                            representation.representation_id,
+                            next_provider,
+                            self.privacy_binding(),
+                        )
+                    self.assertEqual(next_runner.calls, [])
+                if boundary not in convergable:
+                    self.assertFalse(store_path.exists())
+                    self.assertFalse(
+                        (
+                            root
+                            / "information"
+                            / representation.representation_id
+                        ).exists()
+                    )
 
     def test_recovery_resumes_40_40_3_after_first_result_receipt(self) -> None:
         import archeos.semantic_handoff as handoff_module

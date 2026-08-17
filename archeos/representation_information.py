@@ -17,6 +17,7 @@ import time
 import uuid
 from collections import Counter
 from collections.abc import Callable, Mapping, Sequence
+from contextlib import nullcontext
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -1947,44 +1948,82 @@ class RepresentationInformationService:
                 representation,
                 self.representation_repository,
             )
-            candidates, residue, batches = self._analyze(units, provider)
+            outputs, batches = self._analysis_outputs(units, provider)
             self._verify_source(representation)
         except (OSError, RuntimeError, ValueError, TypeError, json.JSONDecodeError) as exc:
             if isinstance(exc, RepresentationInformationError):
                 raise
             raise RepresentationInformationError(str(exc)) from exc
 
-        manifest = _manifest(
-            representation,
-            units,
-            candidates,
-            residue,
-            batches,
-            provider,
-            self._timestamp(),
+        finalize = getattr(provider, "finalize_results", None)
+        finalization_context = (
+            finalize(tuple(outputs))
+            if callable(finalize)
+            else nullcontext(tuple(outputs))
         )
-        self.output_root.mkdir(parents=True, exist_ok=True)
-        with tempfile.TemporaryDirectory(prefix=f".{representation_id}-", dir=self.output_root) as temp:
-            staging = Path(temp)
-            (staging / "manifest.json").write_text(
-                json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+        with finalization_context as finalization:
+            finalized_outputs = getattr(finalization, "outputs", finalization)
+            if (
+                not isinstance(finalized_outputs, tuple)
+                or len(finalized_outputs) != len(batches)
+                or any(
+                    not isinstance(item, RepresentationAnalysisResult)
+                    for item in finalized_outputs
+                )
+            ):
+                raise RepresentationInformationError(
+                    "Representation finalization returned invalid results"
+                )
+            candidates, residue = _output_records(
+                units, list(finalized_outputs), self._timestamp()
             )
-            (staging / "atomic_information_candidates.jsonl").write_text(
-                _jsonl(candidates), encoding="utf-8"
+            manifest = _manifest(
+                representation,
+                units,
+                candidates,
+                residue,
+                batches,
+                provider,
+                self._timestamp(),
             )
-            (staging / "residue.jsonl").write_text(_jsonl(residue), encoding="utf-8")
-            (staging / "processing_summary.md").write_text(
-                _summary(manifest), encoding="utf-8"
-            )
-            validate_representation_information_package(staging)
-            self._verify_source(representation)
-            verification = self.representation_repository.verify(representation_id)
-            if not verification.verified:
-                raise RepresentationInformationError("Representation changed during extraction")
-            try:
-                publish_directory_no_replace(staging, final)
-            except (FileExistsError, OSError) as exc:
-                raise RepresentationInformationError("Representation information package could not publish safely") from exc
+            self.output_root.mkdir(parents=True, exist_ok=True)
+            with tempfile.TemporaryDirectory(
+                prefix=f".{representation_id}-", dir=self.output_root
+            ) as temp:
+                staging = Path(temp)
+                (staging / "manifest.json").write_text(
+                    json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
+                    encoding="utf-8",
+                )
+                (staging / "atomic_information_candidates.jsonl").write_text(
+                    _jsonl(candidates), encoding="utf-8"
+                )
+                (staging / "residue.jsonl").write_text(
+                    _jsonl(residue), encoding="utf-8"
+                )
+                (staging / "processing_summary.md").write_text(
+                    _summary(manifest), encoding="utf-8"
+                )
+                validate_representation_information_package(staging)
+                self._verify_source(representation)
+                verification = self.representation_repository.verify(
+                    representation_id
+                )
+                if not verification.verified:
+                    raise RepresentationInformationError(
+                        "Representation changed during extraction"
+                    )
+                verify_before_publish = getattr(
+                    finalization, "verify_before_publish", None
+                )
+                if callable(verify_before_publish):
+                    verify_before_publish()
+                try:
+                    publish_directory_no_replace(staging, final)
+                except (FileExistsError, OSError) as exc:
+                    raise RepresentationInformationError(
+                        "Representation information package could not publish safely"
+                    ) from exc
         return final
 
     def _verify_source(self, representation: NormalizedRepresentation) -> None:
@@ -2004,7 +2043,18 @@ class RepresentationInformationService:
         self,
         units: tuple[RepresentationAnalysisUnit, ...],
         provider: RepresentationAnalysisProvider,
-    ) -> tuple[list[dict[str, object]], list[dict[str, object]], list[dict[str, object]]]:
+    ) -> tuple[
+        list[dict[str, object]], list[dict[str, object]], list[dict[str, object]]
+    ]:
+        outputs, batches = self._analysis_outputs(units, provider)
+        candidates, residue = _output_records(units, outputs, self._timestamp())
+        return candidates, residue, batches
+
+    def _analysis_outputs(
+        self,
+        units: tuple[RepresentationAnalysisUnit, ...],
+        provider: RepresentationAnalysisProvider,
+    ) -> tuple[list[RepresentationAnalysisResult], list[dict[str, object]]]:
         if not isinstance(getattr(provider, "name", None), str) or not provider.name.strip():
             raise RepresentationInformationError("Representation analysis provider must have a name")
         outputs: list[RepresentationAnalysisResult] = []
@@ -2021,8 +2071,7 @@ class RepresentationInformationService:
             batches.append(
                 {"batch_id": f"batch_{len(batches) + 1:04d}", "unit_ids": [unit.unit_id for unit in batch.anchor_units]}
             )
-        candidates, residue = _output_records(units, outputs, self._timestamp())
-        return candidates, residue, batches
+        return outputs, batches
 
     @staticmethod
     def _validate_batch_result(
