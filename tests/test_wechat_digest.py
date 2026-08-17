@@ -752,6 +752,80 @@ class WechatDigestTests(unittest.TestCase):
         with self.assertRaisesRegex(WechatDigestError, "显式升级"):
             service.prepare_next_semantic(batch_size=40)
 
+    def _make_active_legacy_run(
+        self, capture: SyntheticCaptureProvider, *, run_store: WechatDigestRunStore | None = None
+    ) -> tuple[WechatDigestService, str]:
+        self.semantic.failures_remaining = 1
+        service = self.service(capture, run_store=run_store)
+        with self.assertRaises(WechatDigestError):
+            service.run(all_history=True)
+        run_id = service.run_store.active_run_id()
+        assert run_id is not None
+        run_dir = service.run_store.runs_root / run_id
+        plan_path = run_dir / "plan.json"
+        status_path = run_dir / "status.json"
+        plan = json.loads(plan_path.read_text(encoding="utf-8"))
+        plan["schema_version"] = "wechat-digest-run-plan/1.0"
+        plan.pop("semantic_batch_size")
+        plan_path.write_text(json.dumps(plan), encoding="utf-8")
+        status = json.loads(status_path.read_text(encoding="utf-8"))
+        status.pop("plan_fingerprint")
+        status_path.write_text(json.dumps(status), encoding="utf-8")
+        (run_dir / "run-plan-receipt.json").unlink()
+        return service, run_id
+
+    def test_upgrade_rejects_tampered_legacy_binding_before_any_write(self) -> None:
+        capture = SyntheticCaptureProvider([message(1)])
+        service, run_id = self._make_active_legacy_run(capture)
+        run_dir = service.run_store.runs_root / run_id
+        status_path = run_dir / "status.json"
+        status = json.loads(status_path.read_text(encoding="utf-8"))
+        item = next(iter(status["items"].values()))
+        item["source_id"] = "src_" + "0" * 32
+        status_path.write_text(json.dumps(status), encoding="utf-8")
+        before = {
+            path.name: path.read_bytes()
+            for path in run_dir.iterdir()
+            if path.is_file()
+        }
+        with self.assertRaisesRegex(WechatDigestError, "binding"):
+            service.upgrade_active_v1()
+        after = {
+            path.name: path.read_bytes()
+            for path in run_dir.iterdir()
+            if path.is_file()
+        }
+        self.assertEqual(after, before)
+        self.assertEqual(self.semantic.provider.calls, 0)
+
+    def test_upgrade_recovers_after_plan_write_before_status_and_commits_receipt_last(self) -> None:
+        capture = SyntheticCaptureProvider([message(1)])
+        fail_once = [True]
+
+        def interrupt_before_status() -> None:
+            if fail_once.pop():
+                raise RuntimeError("synthetic status write interruption")
+
+        run_store = WechatDigestRunStore(
+            self.workspace / "02_processing" / "wechat_digest",
+            before_upgrade_status_write=interrupt_before_status,
+        )
+        service, run_id = self._make_active_legacy_run(capture, run_store=run_store)
+        with self.assertRaisesRegex(RuntimeError, "status write interruption"):
+            service.upgrade_active_v1()
+        run_dir = run_store.runs_root / run_id
+        self.assertEqual(
+            json.loads((run_dir / "plan.json").read_text())["schema_version"],
+            "wechat-digest-run-plan/2.0",
+        )
+        self.assertFalse((run_dir / "run-plan-receipt.json").exists())
+        run_store.before_upgrade_status_write = None
+        self.assertEqual(service.upgrade_active_v1(), run_id)
+        self.assertTrue((run_dir / "run-plan-receipt.json").exists())
+        self.assertEqual(self.semantic.provider.calls, 0)
+        with self.assertRaisesRegex(WechatDigestError, "已经完成升级"):
+            service.upgrade_active_v1()
+
     def test_concurrent_digest_fails_without_reading_capture(self) -> None:
         capture = SyntheticCaptureProvider([])
         service = self.service(capture)

@@ -565,6 +565,7 @@ class WechatDigestRunStore:
         *,
         clock: Callable[[], str] = _utc_now,
         before_checkpoint_publish: Callable[[], None] | None = None,
+        before_upgrade_status_write: Callable[[], None] | None = None,
     ) -> None:
         self.root = Path(root)
         self.runs_root = self.root / "runs"
@@ -573,6 +574,7 @@ class WechatDigestRunStore:
         self.lock_path = self.root / ".digest.lock"
         self.clock = clock
         self.before_checkpoint_publish = before_checkpoint_publish
+        self.before_upgrade_status_write = before_upgrade_status_write
 
     @contextmanager
     def lock(self) -> Iterator[None]:
@@ -625,6 +627,9 @@ class WechatDigestRunStore:
             raise WechatDigestError("微信运行计划 receipt 损坏。")
         return value
 
+    def has_plan_receipt(self, run_id: str) -> bool:
+        return (self.runs_root / run_id / "run-plan-receipt.json").exists()
+
     def status(self, run_id: str) -> dict[str, object]:
         value = self._read_json(self.runs_root / run_id / "status.json")
         if not isinstance(value, dict) or value.get("schema_version") != RUN_STATUS_SCHEMA_VERSION:
@@ -651,13 +656,28 @@ class WechatDigestRunStore:
     def update_status(self, run_id: str, status: dict[str, object]) -> None:
         _atomic_write_json(self.runs_root / run_id / "status.json", status)
 
-    def upgrade_plan(self, run_id: str, plan: dict[str, object], status: dict[str, object]) -> None:
-        if self.plan(run_id).get("schema_version") != LEGACY_RUN_PLAN_SCHEMA_VERSION:
-            raise WechatDigestError("仅允许升级 active v1 微信运行。")
-        fingerprint = _plan_fingerprint(plan)
-        _atomic_write_json(self.runs_root / run_id / "plan.json", plan)
-        _atomic_write_json(self.runs_root / run_id / "status.json", status)
-        _atomic_write_json(self.runs_root / run_id / "run-plan-receipt.json", {"schema_version": "wechat-digest-run-plan-receipt/1.0", "run_id": run_id, "plan_fingerprint": fingerprint})
+    def complete_upgrade(
+        self, run_id: str, plan: dict[str, object], status: dict[str, object]
+    ) -> None:
+        """Converge an already-validated v1→v2 upgrade; receipt commits last."""
+        if self.has_plan_receipt(run_id):
+            raise WechatDigestError("active 微信运行已经完成升级。")
+        plan_path = self.runs_root / run_id / "plan.json"
+        status_path = self.runs_root / run_id / "status.json"
+        if self.plan(run_id) != plan:
+            _atomic_write_json(plan_path, plan)
+        if self.before_upgrade_status_write is not None:
+            self.before_upgrade_status_write()
+        if self.status(run_id) != status:
+            _atomic_write_json(status_path, status)
+        _atomic_write_json(
+            self.runs_root / run_id / "run-plan-receipt.json",
+            {
+                "schema_version": "wechat-digest-run-plan-receipt/1.0",
+                "run_id": run_id,
+                "plan_fingerprint": _plan_fingerprint(plan),
+            },
+        )
 
     def publish_checkpoint(self, run_id: str, cursor: WechatCursor) -> None:
         if self.before_checkpoint_publish is not None:
@@ -1114,31 +1134,50 @@ class WechatDigestService:
             run_id = self.run_store.active_run_id()
             if run_id is None:
                 raise WechatDigestError("不存在可升级的 active v1 微信运行。")
-            legacy = self.run_store.plan(run_id)
-            if legacy.get("schema_version") != LEGACY_RUN_PLAN_SCHEMA_VERSION:
-                raise WechatDigestError("active 微信运行不是可升级的 v1。")
+            if self.run_store.has_plan_receipt(run_id):
+                raise WechatDigestError("active 微信运行已经完成升级。")
+            persisted_plan = self.run_store.plan(run_id)
+            if persisted_plan.get("run_id") != run_id:
+                raise WechatDigestError("active 微信运行计划损坏。")
             capture = self.capture_provider.capture(
-                WechatCursor.from_dict(legacy["after_cursor"], "plan.after_cursor"),
-                upper_bound=WechatCursor.from_dict(legacy["upper_bound"], "plan.upper_bound"),
+                WechatCursor.from_dict(
+                    persisted_plan["after_cursor"], "plan.after_cursor"
+                ),
+                upper_bound=WechatCursor.from_dict(
+                    persisted_plan["upper_bound"], "plan.upper_bound"
+                ),
             )
-            self._verify_capture_against_plan(capture, legacy)
-            created_at = legacy.get("created_at")
-            if not isinstance(created_at, str) or legacy.get("run_id") != run_id:
+            self._verify_capture_against_plan(capture, persisted_plan)
+            created_at = persisted_plan.get("created_at")
+            if not isinstance(created_at, str):
                 raise WechatDigestError("active v1 微信运行损坏。")
-            plan, _ = _build_plan(capture, clock=lambda: created_at, run_id=run_id,
-                created_at=created_at, semantic_batch_size=DEFAULT_EXTERNAL_AGENT_BATCH_SIZE)
+            plan, _ = _build_plan(
+                capture,
+                clock=lambda: created_at,
+                run_id=run_id,
+                created_at=created_at,
+                semantic_batch_size=DEFAULT_EXTERNAL_AGENT_BATCH_SIZE,
+            )
             expected_legacy = dict(plan)
             expected_legacy["schema_version"] = LEGACY_RUN_PLAN_SCHEMA_VERSION
             expected_legacy.pop("semantic_batch_size")
-            if legacy != expected_legacy:
-                raise WechatDigestError("active v1 与 fixed capture 不一致。")
             status = self.run_store.status(run_id)
-            items = status.get("items")
-            if status.get("run_id") != run_id or not isinstance(items, dict):
-                raise WechatDigestError("active v1 status 损坏。")
+            # A receipt-less interruption may leave either independently
+            # validated schema shape on disk.  No other shape is recoverable.
+            if persisted_plan == expected_legacy:
+                self._verify_plan_and_status(
+                    run_id, capture, persisted_plan, status, require_receipt=False
+                )
+            elif persisted_plan == plan:
+                self._verify_plan_and_status(
+                    run_id, capture, persisted_plan, status, require_receipt=False,
+                    allow_legacy_status=True,
+                )
+            else:
+                raise WechatDigestError("active v1 与 fixed capture 不一致。")
             status = dict(status)
             status["plan_fingerprint"] = _plan_fingerprint(plan)
-            self.run_store.upgrade_plan(run_id, plan, status)
+            self.run_store.complete_upgrade(run_id, plan, status)
             self._verify_plan_and_status(run_id, capture, plan, self.run_store.status(run_id))
             return run_id
 
@@ -1230,18 +1269,55 @@ class WechatDigestService:
         return value
 
     def _verify_plan_and_status(
-        self, active_run_id: str, capture: WechatCapture, plan: dict[str, object], status: dict[str, object]
+        self,
+        active_run_id: str,
+        capture: WechatCapture,
+        plan: dict[str, object],
+        status: dict[str, object],
+        *,
+        require_receipt: bool = True,
+        allow_legacy_status: bool = False,
     ) -> None:
         run_id = plan.get("run_id")
         created_at = plan.get("created_at")
         if not isinstance(run_id, str) or run_id != active_run_id or not isinstance(created_at, str):
             raise WechatDigestError("微信运行计划损坏。")
-        if plan.get("schema_version") != RUN_PLAN_SCHEMA_VERSION:
+        plan_is_legacy = plan.get("schema_version") == LEGACY_RUN_PLAN_SCHEMA_VERSION
+        if plan.get("schema_version") not in {
+            RUN_PLAN_SCHEMA_VERSION,
+            LEGACY_RUN_PLAN_SCHEMA_VERSION,
+        }:
+            raise WechatDigestError("微信运行计划损坏。")
+        if require_receipt and plan_is_legacy:
             raise WechatDigestError("active legacy 微信运行必须显式升级。")
-        receipt = self.run_store.plan_receipt(active_run_id)
         fingerprint = _plan_fingerprint(plan)
-        if receipt.get("run_id") != active_run_id or status.get("run_id") != active_run_id or receipt.get("plan_fingerprint") != fingerprint or status.get("plan_fingerprint") != fingerprint:
+        if require_receipt:
+            receipt = self.run_store.plan_receipt(active_run_id)
+            if receipt.get("run_id") != active_run_id or receipt.get("plan_fingerprint") != fingerprint:
+                raise WechatDigestError("微信运行计划 receipt 不一致。")
+        if status.get("run_id") != active_run_id:
             raise WechatDigestError("微信运行计划 receipt 不一致。")
+        status_fingerprint = status.get("plan_fingerprint")
+        expected_status_keys = {
+            "schema_version",
+            "run_id",
+            "state",
+            "failure_category",
+            "checkpoint_published",
+            "items",
+            "updated_at",
+        }
+        if plan_is_legacy:
+            if status_fingerprint is not None:
+                raise WechatDigestError("微信运行状态 legacy 形态损坏。")
+        elif status_fingerprint != fingerprint and not (
+            allow_legacy_status and status_fingerprint is None
+        ):
+            raise WechatDigestError("微信运行计划 receipt 不一致。")
+        if status_fingerprint is not None:
+            expected_status_keys.add("plan_fingerprint")
+        if set(status) != expected_status_keys:
+            raise WechatDigestError("微信运行状态形态损坏。")
         expected, _ = _build_plan(capture, clock=lambda: created_at, run_id=run_id,
             created_at=created_at, semantic_batch_size=self._plan_batch_size(plan))
         comparable = dict(plan)
@@ -1251,7 +1327,7 @@ class WechatDigestService:
         if comparable != expected:
             raise WechatDigestError("微信 durable plan 与 fixed capture 不一致。")
         items = status.get("items")
-        if status.get("run_id") != active_run_id or not isinstance(items, dict):
+        if not isinstance(items, dict):
             raise WechatDigestError("微信运行状态 items 损坏。")
         expected_items = {
             **{f"conversation:{item['conversation_key']}": ("conversation", item["source_id"]) for item in _plan_sequence(plan.get("conversations"), "conversations")},
@@ -1267,6 +1343,20 @@ class WechatDigestService:
                 representation_id = item.get("representation_id")
                 if not isinstance(representation_id, str):
                     raise WechatDigestError("微信运行状态 receipt 损坏。")
+                source = self.source_repository.get(str(source_id))
+                expected_source = next(
+                    candidate
+                    for candidate in (
+                        _plan_sequence(plan.get("conversations"), "conversations")
+                        + _plan_sequence(plan.get("attachments"), "attachments")
+                    )
+                    if candidate.get("source_id") == source_id
+                )
+                if (
+                    source.content_hash != expected_source.get("content_hash")
+                    or source.size_bytes != expected_source.get("size_bytes")
+                ):
+                    raise WechatDigestError("微信运行状态 Source binding 损坏。")
                 if self.representation_repository.get(representation_id).source_id != source_id:
                     raise WechatDigestError("微信运行状态 Representation binding 损坏。")
                 representation = self.representation_repository.get(representation_id)
