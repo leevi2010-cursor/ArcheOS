@@ -566,6 +566,7 @@ class WechatDigestRunStore:
         clock: Callable[[], str] = _utc_now,
         before_checkpoint_publish: Callable[[], None] | None = None,
         before_upgrade_status_write: Callable[[], None] | None = None,
+        after_upgrade_receipt_write: Callable[[], None] | None = None,
     ) -> None:
         self.root = Path(root)
         self.runs_root = self.root / "runs"
@@ -575,6 +576,7 @@ class WechatDigestRunStore:
         self.clock = clock
         self.before_checkpoint_publish = before_checkpoint_publish
         self.before_upgrade_status_write = before_upgrade_status_write
+        self.after_upgrade_receipt_write = after_upgrade_receipt_write
 
     @contextmanager
     def lock(self) -> Iterator[None]:
@@ -623,7 +625,11 @@ class WechatDigestRunStore:
 
     def plan_receipt(self, run_id: str) -> dict[str, object]:
         value = self._read_json(self.runs_root / run_id / "run-plan-receipt.json")
-        if not isinstance(value, dict) or set(value) != {"schema_version", "run_id", "plan_fingerprint"}:
+        if (
+            not isinstance(value, dict)
+            or set(value) != {"schema_version", "run_id", "plan_fingerprint"}
+            or value.get("schema_version") != "wechat-digest-run-plan-receipt/1.0"
+        ):
             raise WechatDigestError("微信运行计划 receipt 损坏。")
         return value
 
@@ -678,6 +684,8 @@ class WechatDigestRunStore:
                 "plan_fingerprint": _plan_fingerprint(plan),
             },
         )
+        if self.after_upgrade_receipt_write is not None:
+            self.after_upgrade_receipt_write()
 
     def publish_checkpoint(self, run_id: str, cursor: WechatCursor) -> None:
         if self.before_checkpoint_publish is not None:
@@ -1178,8 +1186,24 @@ class WechatDigestService:
             status = dict(status)
             status["plan_fingerprint"] = _plan_fingerprint(plan)
             self.run_store.complete_upgrade(run_id, plan, status)
-            self._verify_plan_and_status(run_id, capture, plan, self.run_store.status(run_id))
-            return run_id
+            active_run_id = self.run_store.active_run_id()
+            if active_run_id != run_id:
+                raise WechatDigestError("微信升级 active run 读回不一致。")
+            disk_plan = self.run_store.plan(active_run_id)
+            disk_status = self.run_store.status(active_run_id)
+            receipt = self.run_store.plan_receipt(active_run_id)
+            if (
+                disk_plan.get("schema_version") != RUN_PLAN_SCHEMA_VERSION
+                or disk_plan.get("run_id") != active_run_id
+                or disk_status.get("run_id") != active_run_id
+                or receipt.get("run_id") != active_run_id
+            ):
+                raise WechatDigestError("微信升级 durable run 读回不一致。")
+            self._verify_capture_against_plan(capture, disk_plan)
+            self._verify_plan_and_status(
+                active_run_id, capture, disk_plan, disk_status
+            )
+            return active_run_id
 
     def _prepare_next_semantic_locked(
         self,
