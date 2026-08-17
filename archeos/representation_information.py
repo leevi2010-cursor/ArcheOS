@@ -306,12 +306,10 @@ def _external_agent_v3_analysis_schema(
         "type": "array",
         "items": {"type": "string", "enum": anchor_ids},
         "minItems": 1,
-        "uniqueItems": True,
     }
     context_refs: dict[str, object] = {
         "type": "array",
         "items": {"type": "string", "enum": context_ids},
-        "uniqueItems": True,
     }
     return {
         "$schema": "https://json-schema.org/draft/2020-12/schema",

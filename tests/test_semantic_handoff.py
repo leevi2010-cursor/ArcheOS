@@ -394,6 +394,12 @@ class SemanticHandoffTest(unittest.TestCase):
             residue["anchor_unit_ids"]["items"]["enum"],
             [self.unit().unit_id],
         )
+        for references in (
+            candidate["anchor_unit_ids"],
+            candidate["supporting_evidence_unit_ids"],
+            residue["anchor_unit_ids"],
+        ):
+            self.assertNotIn("uniqueItems", references)
 
     def test_v3_rejects_invalid_anchor_and_context_accounting(self) -> None:
         evidence_context = replace(
