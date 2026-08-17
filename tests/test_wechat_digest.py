@@ -729,7 +729,7 @@ class WechatDigestTests(unittest.TestCase):
         plan = json.loads(plan_path.read_text())
         plan["conversations"][0]["content_hash"] = "sha256:" + "0" * 64
         plan_path.write_text(json.dumps(plan), encoding="utf-8")
-        with self.assertRaisesRegex(WechatDigestError, "durable plan"):
+        with self.assertRaisesRegex(WechatDigestError, "receipt"):
             service.prepare_next_semantic()
         self.assertEqual(self.semantic.provider.calls, 0)
 
@@ -749,7 +749,7 @@ class WechatDigestTests(unittest.TestCase):
         plan.pop("semantic_batch_size")
         plan["schema_version"] = "wechat-digest-run-plan/1.0"
         plan_path.write_text(json.dumps(plan), encoding="utf-8")
-        with self.assertRaisesRegex(WechatDigestError, "多个 batch"):
+        with self.assertRaisesRegex(WechatDigestError, "显式升级"):
             service.prepare_next_semantic(batch_size=40)
 
     def test_concurrent_digest_fails_without_reading_capture(self) -> None:

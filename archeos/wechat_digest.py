@@ -619,6 +619,12 @@ class WechatDigestRunStore:
             raise WechatDigestError("微信运行计划损坏。")
         return value
 
+    def plan_receipt(self, run_id: str) -> dict[str, object]:
+        value = self._read_json(self.runs_root / run_id / "run-plan-receipt.json")
+        if not isinstance(value, dict) or set(value) != {"schema_version", "run_id", "plan_fingerprint"}:
+            raise WechatDigestError("微信运行计划 receipt 损坏。")
+        return value
+
     def status(self, run_id: str) -> dict[str, object]:
         value = self._read_json(self.runs_root / run_id / "status.json")
         if not isinstance(value, dict) or value.get("schema_version") != RUN_STATUS_SCHEMA_VERSION:
@@ -635,10 +641,23 @@ class WechatDigestRunStore:
             run_dir.mkdir(parents=True)
             _atomic_write_json(run_dir / "plan.json", plan)
             _atomic_write_json(run_dir / "status.json", status)
+            _atomic_write_json(run_dir / "run-plan-receipt.json", {
+                "schema_version": "wechat-digest-run-plan-receipt/1.0",
+                "run_id": run_id,
+                "plan_fingerprint": _plan_fingerprint(plan),
+            })
         _atomic_write_json(self.active_path, {"active_run_id": run_id})
 
     def update_status(self, run_id: str, status: dict[str, object]) -> None:
         _atomic_write_json(self.runs_root / run_id / "status.json", status)
+
+    def upgrade_plan(self, run_id: str, plan: dict[str, object], status: dict[str, object]) -> None:
+        if self.plan(run_id).get("schema_version") != LEGACY_RUN_PLAN_SCHEMA_VERSION:
+            raise WechatDigestError("仅允许升级 active v1 微信运行。")
+        fingerprint = _plan_fingerprint(plan)
+        _atomic_write_json(self.runs_root / run_id / "plan.json", plan)
+        _atomic_write_json(self.runs_root / run_id / "status.json", status)
+        _atomic_write_json(self.runs_root / run_id / "run-plan-receipt.json", {"schema_version": "wechat-digest-run-plan-receipt/1.0", "run_id": run_id, "plan_fingerprint": fingerprint})
 
     def publish_checkpoint(self, run_id: str, cursor: WechatCursor) -> None:
         if self.before_checkpoint_publish is not None:
@@ -953,16 +972,23 @@ def _build_plan(
             "message_count": 0,
             "attachment_status": attachment["status"],
         }
+    plan_fingerprint = _plan_fingerprint(plan)
     status: dict[str, object] = {
         "schema_version": RUN_STATUS_SCHEMA_VERSION,
         "run_id": run_id,
         "state": "planned",
         "failure_category": None,
         "checkpoint_published": False,
+        "plan_fingerprint": plan_fingerprint,
         "items": items,
         "updated_at": clock(),
     }
     return plan, status
+
+
+def _plan_fingerprint(plan: Mapping[str, object]) -> str:
+    keys = ("schema_version", "run_id", "after_cursor", "upper_bound", "capture_fingerprint", "semantic_batch_size", "conversations")
+    return _sha256_bytes(_canonical_json({key: plan.get(key) for key in keys}).encode("utf-8"))
 
 
 def _plan_sequence(value: object, field: str) -> list[dict[str, object]]:
@@ -1176,6 +1202,12 @@ class WechatDigestService:
         created_at = plan.get("created_at")
         if not isinstance(run_id, str) or not isinstance(created_at, str):
             raise WechatDigestError("微信运行计划损坏。")
+        if plan.get("schema_version") != RUN_PLAN_SCHEMA_VERSION:
+            raise WechatDigestError("active legacy 微信运行必须显式升级。")
+        receipt = self.run_store.plan_receipt(run_id)
+        fingerprint = _plan_fingerprint(plan)
+        if receipt.get("run_id") != run_id or receipt.get("plan_fingerprint") != fingerprint or status.get("plan_fingerprint") != fingerprint:
+            raise WechatDigestError("微信运行计划 receipt 不一致。")
         expected, _ = _build_plan(capture, clock=lambda: created_at, run_id=run_id,
             created_at=created_at, semantic_batch_size=self._plan_batch_size(plan))
         comparable = dict(plan)
