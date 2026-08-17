@@ -3,6 +3,7 @@ from __future__ import annotations
 import inspect
 import json
 import os
+import stat
 import subprocess
 import sys
 import tempfile
@@ -337,7 +338,7 @@ class SequenceRunner(FakeRunner):
 class SemanticHandoffTest(unittest.TestCase):
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory()
-        self.root = Path(self.temp.name)
+        self.root = Path(self.temp.name).resolve()
 
     def tearDown(self) -> None:
         self.temp.cleanup()
@@ -929,6 +930,24 @@ class SemanticHandoffTest(unittest.TestCase):
             route="approved",
             receipt_fingerprint="sha256:" + "9" * 64,
         )
+
+    @staticmethod
+    def tree_snapshot(root: Path) -> tuple[tuple[object, ...], ...]:
+        if not os.path.lexists(root):
+            return ()
+        paths = [root, *sorted(root.rglob("*"))]
+        snapshot: list[tuple[object, ...]] = []
+        for path in paths:
+            metadata = path.lstat()
+            relative = "." if path == root else path.relative_to(root).as_posix()
+            if path.is_symlink():
+                value: object = ("symlink", os.readlink(path))
+            elif path.is_file():
+                value = ("file", path.read_bytes())
+            else:
+                value = ("directory",)
+            snapshot.append((relative, stat.S_IMODE(metadata.st_mode), value))
+        return tuple(snapshot)
 
     def build_wechat_service(self):
         root = self.root / "wechat"
@@ -1538,6 +1557,207 @@ class SemanticHandoffTest(unittest.TestCase):
         self.assertEqual(preflight.conservatively_counted_attempts, 0)
         self.assertEqual(provider.execution_records, [])
         self.assertFalse(any(audit_root.glob("semantic_run_*")))
+
+    def test_recovery_root_attacks_fail_closed_before_provider(self) -> None:
+        for attack in (
+            "mode_0755",
+            "mode_0777",
+            "file",
+            "symlink",
+            "unexpected",
+            "parent_symlink",
+        ):
+            with self.subTest(attack=attack):
+                root = self.root / attack
+                representation, service = self.build_service(blocks=1, root=root)
+                audit_root = root / "audits"
+                if attack == "mode_0755":
+                    audit_root.mkdir(mode=0o755)
+                    os.chmod(audit_root, 0o755)
+                elif attack == "mode_0777":
+                    audit_root.mkdir(mode=0o777)
+                    os.chmod(audit_root, 0o777)
+                elif attack == "file":
+                    audit_root.write_text("synthetic", encoding="utf-8")
+                elif attack == "symlink":
+                    target = root / "real-audits"
+                    target.mkdir(mode=0o700)
+                    audit_root.symlink_to(target, target_is_directory=True)
+                elif attack == "unexpected":
+                    audit_root.mkdir(mode=0o700)
+                    os.chmod(audit_root, 0o700)
+                    unexpected = audit_root / "unexpected.json"
+                    unexpected.write_text("{}", encoding="utf-8")
+                    os.chmod(unexpected, 0o600)
+                else:
+                    real_parent = root / "real-parent"
+                    real_parent.mkdir(mode=0o700)
+                    linked_parent = root / "linked-parent"
+                    linked_parent.symlink_to(real_parent, target_is_directory=True)
+                    audit_root = linked_parent / "audits"
+                before = self.tree_snapshot(root)
+                runner = FakeRunner()
+                with self.assertRaises(SemanticHandoffError):
+                    ExternalAgentSemanticHandoffService(
+                        service,
+                        JsonlAtomicInformationStore(root / "atomic.jsonl"),
+                        audit_root,
+                    ).execute(
+                        representation.representation_id,
+                        CodexCliRepresentationAnalysisProvider(
+                            provider_version="0.147.0", runner=runner
+                        ),
+                        privacy_binding=self.privacy_binding(),
+                        new_call_authority=1,
+                    )
+                self.assertEqual(runner.calls, [])
+                self.assertEqual(self.tree_snapshot(root), before)
+                self.assertFalse(
+                    (root / "information" / representation.representation_id).exists()
+                )
+                self.assertFalse((root / "atomic.jsonl").exists())
+
+    def test_run_root_fsync_failure_never_commits_recovery_authority(self) -> None:
+        import archeos.semantic_handoff as handoff_module
+
+        representation, service = self.build_service(blocks=1)
+        audit_root = self.root / "audits"
+        handoff = ExternalAgentSemanticHandoffService(
+            service,
+            JsonlAtomicInformationStore(self.root / "atomic.jsonl"),
+            audit_root,
+        )
+        original_fsync = handoff_module._fsync_directory
+
+        def fail_run_root(path):
+            if path == audit_root and any(audit_root.glob("semantic_run_*")):
+                raise OSError("synthetic run root fsync failure")
+            return original_fsync(path)
+
+        runner = FakeRunner()
+        with (
+            patch.object(handoff_module, "_fsync_directory", fail_run_root),
+            self.assertRaises(OSError),
+        ):
+            handoff.execute(
+                representation.representation_id,
+                CodexCliRepresentationAnalysisProvider(
+                    provider_version="0.147.0", runner=runner
+                ),
+                privacy_binding=self.privacy_binding(),
+                new_call_authority=1,
+            )
+        self.assertEqual(runner.calls, [])
+        run = next(audit_root.glob("semantic_run_*"))
+        self.assertFalse((run / "run-commit.json").exists())
+        next_runner = FakeRunner()
+        with self.assertRaises(SemanticHandoffError):
+            handoff.recovery_preflight(
+                representation.representation_id,
+                CodexCliRepresentationAnalysisProvider(
+                    provider_version="0.147.0", runner=next_runner
+                ),
+                self.privacy_binding(),
+            )
+        self.assertEqual(next_runner.calls, [])
+
+    def test_result_commit_failures_are_unknown_and_never_replayed(self) -> None:
+        import archeos.semantic_handoff as handoff_module
+
+        for attack in (
+            "result_parent_fsync",
+            "marker_write",
+            "marker_fsync",
+            "crash_before_marker",
+        ):
+            with self.subTest(attack=attack):
+                root = self.root / attack
+                representation, service = self.build_service(blocks=1, root=root)
+                audit_root = root / "audits"
+                handoff = ExternalAgentSemanticHandoffService(
+                    service,
+                    JsonlAtomicInformationStore(root / "atomic.jsonl"),
+                    audit_root,
+                )
+                original_fsync = handoff_module._fsync_directory
+                original_marker = handoff_module._publish_private_json_marker
+
+                def fail_fsync(
+                    path, current_attack=attack, delegate=original_fsync
+                ):
+                    if (
+                        current_attack == "result_parent_fsync"
+                        and path.name == "results"
+                    ):
+                        raise OSError("synthetic result parent fsync failure")
+                    if (
+                        current_attack == "marker_fsync"
+                        and path.name == "batch_0001"
+                        and (path / "result-commit.json").exists()
+                    ):
+                        raise OSError("synthetic marker fsync failure")
+                    return delegate(path)
+
+                def fail_marker(
+                    path,
+                    payload,
+                    current_attack=attack,
+                    delegate=original_marker,
+                ):
+                    if path.name == "result-commit.json":
+                        if current_attack == "marker_write":
+                            raise OSError("synthetic marker write failure")
+                        if current_attack == "crash_before_marker":
+                            raise RuntimeError("synthetic process crash")
+                    return delegate(path, payload)
+
+                runner = FakeRunner()
+                expected_error = (
+                    RuntimeError if attack == "crash_before_marker" else Exception
+                )
+                with (
+                    patch.object(handoff_module, "_fsync_directory", fail_fsync),
+                    patch.object(
+                        handoff_module,
+                        "_publish_private_json_marker",
+                        fail_marker,
+                    ),
+                    self.assertRaises(expected_error),
+                ):
+                    handoff.execute(
+                        representation.representation_id,
+                        CodexCliRepresentationAnalysisProvider(
+                            provider_version="0.147.0", runner=runner
+                        ),
+                        privacy_binding=self.privacy_binding(),
+                        new_call_authority=1,
+                    )
+                self.assertEqual(len(runner.calls), 1)
+                self.assertFalse(
+                    (root / "information" / representation.representation_id).exists()
+                )
+                self.assertFalse((root / "atomic.jsonl").exists())
+                next_runner = FakeRunner()
+                preflight = handoff.recovery_preflight(
+                    representation.representation_id,
+                    CodexCliRepresentationAnalysisProvider(
+                        provider_version="0.147.0", runner=next_runner
+                    ),
+                    self.privacy_binding(),
+                )
+                self.assertEqual(preflight.replayable_batches, 0)
+                self.assertEqual(preflight.required_new_calls, 1)
+                self.assertEqual(preflight.conservatively_counted_attempts, 1)
+                with self.assertRaisesRegex(Exception, "LEAD_DECISION_REQUIRED"):
+                    handoff.execute(
+                        representation.representation_id,
+                        CodexCliRepresentationAnalysisProvider(
+                            provider_version="0.147.0", runner=next_runner
+                        ),
+                        privacy_binding=self.privacy_binding(),
+                        new_call_authority=1,
+                    )
+                self.assertEqual(next_runner.calls, [])
 
     def test_recovery_resumes_40_40_3_after_first_result_receipt(self) -> None:
         import archeos.semantic_handoff as handoff_module
