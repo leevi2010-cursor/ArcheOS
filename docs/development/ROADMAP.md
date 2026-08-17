@@ -338,8 +338,9 @@ Human View 是人类理解和治理 ArcheOS 的 Presentation 层，不是新的�
 - **Context Preview**：让用户看到 Agent 实际会读取到的 bounded Context，帮助发现缺失、噪声和错误结构化；
 - **Source / Intake Status**：查看 Source、Representation、processing/completeness/warnings，但不把前端变成通用文件管理器；
 - **Protocol 执行 / Decision 追溯 View**：按阶段查看一次 Protocol 执行使用了哪些 Context、产生了哪些 `Derived Artifact`、哪些 Evidence / unresolved / Hypothesis 支撑最终 Judgment；该页面是 `Projection / View`，不创建 `Thinking Run / Decision Trace` Core；
+- **Hypothesis 验证历史**：列出关键 Hypothesis、Revision、supporting / challenging Evidence、`supports / challenges / inconclusive` Feedback，以及由其产生或修订的 Pattern / Protocol / Policy / Principle 追溯；
 - **Protocol Library**：查看当前有哪些 canonical `Protocol`、各自解决什么类型的问题、当前 active version、历史版本、状态与变更记录；
-- **Pattern Library（前端可显示“模型库”）**：查看系统目前有哪些 canonical `Pattern`、适用于什么问题、输入输出、适用条件、限制、版本与状态，以及哪些 Protocol 阶段使用它；前端“模型”只是业务展示名称，不创建第二套 Model truth；
+- **Pattern Library**：查看系统目前有哪些 canonical `Pattern`、适用于什么问题、输入输出、适用条件、限制、版本与状态，以及哪些 Protocol 阶段使用它；`Model` 是否需要成为独立 canonical concept 尚未决定，Presentation 不得提前建立永久映射；
 - **Decision → Protocol / Pattern Drill-down**：Decision 页面显示本次使用的 Protocol version、Pattern version、Policy snapshot、关键 Hypothesis、Evidence 与外部基础模型运行 provenance，并可跳转到对应详情；
 - **Protocol / Pattern Governance**：未来允许用户观察、比较和追溯版本；编辑与激活分离，采用 draft → validate/compare → active → deprecated/rollback，不原地覆盖历史 Decision 使用过的版本。
 
@@ -466,7 +467,7 @@ Signal / Event / Human request
 → Protocol
 → Context Builder
 → 候选 Action + 预期结果 + Hypothesis
-→ Judgment：基于 Goal / Preference / Requirement / Policy / Evidence / Pattern
+→ Judgment：基于 Goal / Preference / Requirement / Policy / Evidence / Pattern / Hypothesis
 → Challenge（Protocol 阶段标签）
 → Atomic Information Candidate（Agent recommendation / judgment）
 → Human Decision
@@ -479,7 +480,7 @@ Signal / Event / Human request
 
 - `Protocol`：控制跨任务可复用的思考步骤、门禁和流转；
 - `Policy`：控制最少候选 Action 数、风险偏好、时间范围、是否强制 Challenge 等可调参数；
-- `Pattern`：承载反复问题对应的可复用解决结构；前端可以把 Pattern Library 显示为“模型库”；
+- `Pattern`：承载反复问题对应的可复用解决结构；不得仅因 UI 使用“模型”一词就把未决定的 Model 永久映射为 Pattern；
 - `Hypothesis`：记录会影响 Judgment / Decision、并可被后续 Evidence / Feedback 支持或反对的可检验命题；
 - `Context Builder`：提供 Goal / World Model / Information / Evidence / Preference / Requirement / previous Decision / Feedback 等 bounded Context；不建立 Decision Context Builder；
 - External Agent：执行真正推理；
@@ -507,12 +508,13 @@ Signal / Event / Human request
 - 新版本先 draft / validate，再 active；
 - 必要时可以 rollback；
 - 每次执行通过 Audit Event / Derived Artifact 固定记录实际使用的 Protocol version、Policy snapshot 与 Pattern version。
+- Protocol / Pattern 的创建或修订若来自已验证 Hypothesis，必须保留对应 Hypothesis / Evidence / Feedback provenance。
 
 用户未来可以调整 Protocol，但“可编辑”与“立即生效”必须分离。
 
-### M4-C — Pattern Library（前端可显示“模型库”，规划，未启动）
+### M4-C — Pattern Library（规划，未启动）
 
-优先复用 canonical `Pattern` 表达用户所说的“问题解决模型 / 决策模型”，不新增 ReasoningModel / DecisionModel Core。
+Pattern 继续只表达反复问题对应的可复用解决结构。`Model` 是否承担独立的解释 / 预测语义尚未决定；不得把“问题解决模型 / 决策模型”等口语或 UI label 永久映射为 Pattern，也不得在本阶段新增 ReasoningModel / DecisionModel Core。真实 Hypothesis / Pattern 复盘若证明现有概念不足，应另行执行 Concept Convergence Check。
 
 Pattern Library 至少需要回答：
 
@@ -636,6 +638,6 @@ ArcheOS / 新向阳经营系统始终沿一条主线演化：
 19. 使用 canonical `Protocol` 控制流程 / 门禁，`Policy` 控制可调参数，`Pattern` 承载可复用解决结构，`Hypothesis` 保存可检验命题，Prompt 只作为实现 artifact；
 20. 历史 Decision 必须固定引用当时使用的 Protocol / Policy / Pattern 版本或 snapshot，并能追溯关键 Hypothesis / Evidence；
 21. 决策可观测性通过 `Derived Artifact / Audit Event / Projection / View / Evidence` 实现，不新建 ThinkingRun / DecisionTrace truth，也不存储模型私有 chain-of-thought；
-22. 前端“模型库”是 canonical Pattern Library 的业务显示名称，不创建第二套 Model truth；
+22. `Model` 是否需要成为独立 canonical concept 尚未决定；UI label 不得建立永久概念映射，真实证据证明现有概念不足时另行执行 Concept Convergence Check；
 23. 用户未来可以观察、比较、调整 Protocol / Pattern，但编辑与激活必须分离，变更先验证再生效，并保留回滚能力；
 24. 不因为未来可能需要某个能力，就提前建设完整框架。
