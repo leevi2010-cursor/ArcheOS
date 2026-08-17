@@ -58,205 +58,75 @@ Stage 1 要证明的不是“功能够不够多”，而是：真实、异构、
 
 ---
 
-## Stage 1 已取得的能力与 Evidence
+## Stage 1 技术认知链状态
 
-以下能力已经形成，后续工作默认复用，不重复建设平行 contract：
+基于已完成的 Issue #17 真实旧数据 Pilot，当前技术认知链状态为：
 
-### A. Source / Representation / Evidence
+> **ESTABLISHED / REAL-WORLD VALIDATED**
 
-- Managed Source：稳定 `source_id`、不可变 managed bytes、verify / restore；
-- 音频 Processing 已切换到 verified Managed Source；
-- Normalized Representation 公共 contract；
-- Markdown、text PDF、XLSX、PPTX 与 image structural preflight Adapter；
-- Representation → canonical Analysis Unit / Analysis Batch；
-- Candidate + Residue 完整 coverage；
-- Evidence 可回到 Source / Representation stable locator。
+已取得的端到端 Evidence 包括：
 
-### B. Durable Information
+- 真实多来源资料通过 privacy gate、Managed Source 与 Normalized Representation 进入统一处理边界；
+- External Semantic Handoff 在 25 个真实 batches 上保持 strict schema、protocol/input binding、anchor coverage、Evidence、audit 与 package/readback PASS；
+- 275 条 Durable Atomic Information 成功写入，633 个 eligible Units 全部被 Candidate 或 Residue 守恒；
+- read-only Consolidation 保持 fail-closed，未覆盖原 Information、未产生未经证明的 relation write；
+- bounded Identity Gate 覆盖 `create_minimal / bind_existing / accumulate / human_review / no_object`，幂等、stale revision 与 collision 检查通过；
+- Product Owner 批准的 `business_line` Role update 通过既有 Governance 写入，pending identity 保持 `deferred`；
+- Context Builder 完成最终 readback 与 Product Owner 业务验收；
+- 真实 legacy pilot 完成，未留下未解决 P0 / P1、privacy breach、错误 identity、duplicate Object 或 false consolidation。
 
-- Atomic Information stable identity 与 append-only Revision；
-- Claim attribution；
-- production semantic types：`observation / preference / requirement / judgment / decision / commitment / action / question / other`；
-- `AtomicInformation.confidence` 只表达抽取 / 理解置信度，不表达现实真实性概率；
-- Conversation 与普通 Representation 进入同一 Information lifecycle。
+完整匿名证据见：
 
-### C. Conversation / External Semantic Execution
+- `docs/migration/v0.2.0/PILOT_RESULTS.md`；
+- `docs/migration/v0.2.0/manifest.json`。
 
-- 微信 Conversation Representation 已验证 stable replay 与 message-level locator；
-- Conversation / Message 不成为 Core Object；
-- production External Agent Semantic Handoff 已建立 strict result contract；
-- 真实微信 Semantic Digestion 已能产生可追溯 Durable Atomic Information；
-- semantic provider 不获得直接 World Model write 权限。
-
-### D. Information Consolidation
-
-Information Consolidation 已完成真实实验与最小 runtime，当前关系 vocabulary 为：
-
-```text
-equivalent
-derived
-complementary
-temporal_update
-conflict
-uncertain
-```
-
-并显式区分 Evidence independence：
-
-```text
-same_source_family
-independent
-unknown
-```
-
-Consolidation 不覆盖或删除原 Atomic Information；它负责帮助 Context、Identity Gate 和后续治理正确理解重复、派生、时间变化与冲突。
-
-### E. World Model / Identity Gate
-
-World Model 使用统一 Object 模型：
-
-```text
-Object
-+ Name(s)
-+ Role(s)
-+ Lifecycle
-+ Relationship(s)
-+ related Atomic Information / Evidence
-```
-
-Project 等业务名词继续通过 Role 表达，不建立平行 base entity。
-
-Object Emergence 已收敛为 Identity Gate：
-
-```text
-明确已有身份
-→ automatic bind existing Object
-
-明确新身份 + Evidence 足够 + 值得长期保持 + 低风险
-→ automatic create minimal Object
-
-Evidence 暂时不足
-→ accumulate Information
-
-identity ambiguity / duplicate risk / consequential
-→ Human Judgment
-
-没有长期 identity 价值
-→ Atomic Information only
-```
-
-`create minimal Object` 只确认 identity 与 Evidence-backed Name；不自动确认 Role / Relationship / Lifecycle / Claim truth。
-
-禁止使用 `confidence > 0.x` 作为 identity truth gate。merge / delete / identity boundary correction 仍需 Human Judgment。
-
-### F. Context / External Agent read boundary
-
-- canonical Context Builder 已建立 Object-scoped、bounded、provenance-aware、truncation-aware read contract；
-- External Agent 可以读取 canonical Context / Evidence；
-- ArcheOS Core 不建设 Sales Agent / Founder Agent / Project Agent 等领域 Agent。
+这证明技术链能够在本次真实边界内运行，不等于 Product Stage 1 已自动通过。
 
 ---
 
-## 当前剩余的 Stage 1 Evidence Gap
+## Stage 1 Gate Evidence
 
-基础认知链已经成形。当前最重要的不确定性已经从“能不能实现这些能力”转为：
+当前只保留两个 material Evidence Gap：
 
-> **当真实、多来源、长期、混乱的数据规模继续增长时，这条链是否仍然成立？**
+### 1. Consolidation truth coverage
 
-因此 Stage 1 后续主线不再优先增加 Core feature，而是进入真实压力验证。
+Issue #17 对 100 个有界真实候选对完成 read-only Consolidation，结果全部为 `uncertain`。这不是 runtime failure：runtime 正确地在证据不足时 fail closed，也没有制造错误 relation。
 
-当前要关闭的 Evidence Gap：
+但该结果尚未证明系统对真实 `equivalent / derived / temporal_update / conflict` 案例具有足够分类质量，`false_merge / false_split` 也因缺少人工 truth 仍为 `not_measurable_yet`。因此这里是 Evidence coverage gap，而不是新增 Consolidation runtime 的默认理由。
 
-```text
-真实多来源旧资料
-        ↓
-Managed Source / Representation
-        ↓
-Semantic Digestion / Atomic Information
-        ↓
-Information Consolidation
-        ↓
-Identity Gate / World Model
-        ↓
-Context Builder
-        ↓
-人工业务验收
-```
+### 2. Context breadth
 
-必须重点验证：
+Product Owner 已接受一个真实 Object 的最终 Context，2 条相关 Information 均被纳入，Evidence、Role 与 pending judgment 可读回。
 
-1. 完全重复与派生总结不会污染 Context；
-2. 时间变化不会被当作 equivalent；
-3. 冲突 Claim / Information 可以长期并存；
-4. independent Evidence 不会被错误折叠；
-5. Object auto-bind / auto-create 不产生错误 identity 或 duplicate Object；
-6. 弱 Evidence 能继续积累而不是强迫用户逐条审核；
-7. 错误结构可以通过治理纠正且历史仍可追溯；
-8. Context 在真实数据增长后仍然足够精华、完整、可展开 Evidence；
-9. 本地维护、人工判断和长期使用成本可接受。
-
-任何未解决 P0 / P1 阻止 Stage 1 完成。
+该结果证明了这个案例的 Source → Information → World Model → Context 链路，但尚未证明 multi-Object、更大规模、长期增长条件下 Context 的业务效用与治理成本。这是产品证据广度不足，不是 Context Builder contract failure。
 
 ---
 
-## 当前主线：#17 真实旧数据压力测试与 clean-cut readiness
+## 当前主线：Stage 1 Gate Review
 
-Issue #17 是下一阶段的综合 Stage 1 validation authority，但**进入执行前必须以当前 main 做一次 implementation preflight**，不得照搬其历史正文中的旧假设。
-
-#17 的当前 contract 必须遵守：
-
-- 使用当前已合并的 Information Consolidation runtime；
-- 使用当前 Identity Gate，而不是“所有新 Object 都人工批准”；
-- `auto_bind / auto_create_minimal / accumulate / human_review / no_object` 都必须有真实验收；
-- OCR / 扫描 PDF 不是 Stage 1 压力测试的强制前置；当前只有 text PDF 与 image structural preflight 属于已批准基础能力；
-- 不为了旧资料兼容建立新的 Core noun / legacy schema；
-- 真实资料只保存在本地，GitHub 只保存匿名统计与结论；
-- 旧系统是 migration source / design reference，不再是新系统 authority；
-- 不设计长期 dual-read / dual-write。
-
-推荐 pilot corpus：20–100 个 Source，至少覆盖多个格式 / source family，并包含：
-
-- exact duplicate；
-- derived duplicate；
-- temporal update；
-- conflict / uncertain；
-- existing Object；
-- clear new identity；
-- ambiguous identity；
-- no-object information。
-
-核心验收指标至少覆盖：
-
-```text
-source_total
-representation_complete / partial / failed
-analysis_units_total / eligible / excluded
-unaccounted_units
-atomic_information_created / existing
-residue_items
-consolidation_equivalent / derived / complementary / temporal / conflict / uncertain
-false_merge / false_split
-auto_bind / false_bind
-auto_create_minimal / false_create / duplicate_created
-accumulate / human_review / no_object
-context_information_total / included / grouped
-context_pending_judgments
-manual_missed_information
-manual_false_structuralization
-```
-
-#17 完成后，由 Product / Technical Lead 根据 Evidence 做 **Stage 1 Gate Review**：
+Issue #17 已完成；当前不再把新的 feature 或 validation Issue 预设为主线。Product / Technical Lead 下一步应基于上述证据作出 Stage 1 Gate Review：
 
 ```text
 PASS
-→ Product Owner 决定是否进入 Product Stage 2
+→ Product Owner 可以明确决定是否进入 Product Stage 2
 
-PARTIAL
-→ 只补当前暴露出的最小 Evidence Gap
+CONTINUE / PARTIAL
+→ 只选择关闭已识别缺口所需的最小实验
 
 FAIL
-→ 回到具体失败层修正路线，不增加无关能力
+→ 指明失败的具体层，并只修正该层
 ```
+
+若 Gate Review 选择 `CONTINUE / PARTIAL`，带人工 truth 的 Consolidation 验证与 multi-Object Context 验证只是候选工作；Lead 应决定执行其中一个、两个或都不执行，而不是把两项自动列为必做序列。
+
+在 Gate Review 与 Product Owner 的 Stage 2 明确决定之前：
+
+- 不启动 Issue #42；
+- 不建设 Decision Engine、自主 Agent 或 Protocol runtime；
+- 不启动大型 Human View / Frontend；
+- 不建设 Workspace multi-master；
+- 不另建 migration framework；
+- 不因未来能力清单自动创建新工作。
 
 ---
 
@@ -264,7 +134,7 @@ FAIL
 
 ### #89 — 移动硬盘资料 inventory
 
-只读资料盘点可以作为 #17 pilot corpus 准备或多来源补充，但不应抢占 Stage 1 主验证链。不得移动、删除、重命名原文件，也不得对全盘执行无目的 LLM 分析。
+该只读资料盘点保持 Deferred / Planned，不属于当前 Gate Review 的默认后续工作。不得移动、删除、重命名原文件，也不得对全盘执行无目的 LLM 分析。
 
 ### Conversation 扩展：Codex / ChatGPT
 
