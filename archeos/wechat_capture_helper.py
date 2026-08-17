@@ -54,6 +54,20 @@ def _cursor_dict(value: tuple[int, str, str]) -> dict[str, object]:
     }
 
 
+def _window_upper(
+    remaining: list[tuple[int, str, str]],
+    *,
+    window_days: int,
+    message_limit: int,
+) -> tuple[int, str, str]:
+    first_timestamp = min(cursor[0] for cursor in remaining)
+    cutoff = first_timestamp + window_days * 24 * 60 * 60
+    time_bounded = sorted(
+        cursor for cursor in remaining if cursor[0] < cutoff
+    )
+    return time_bounded[min(len(time_bounded), message_limit) - 1]
+
+
 def _message_type(local_type: object, app_type: int | None) -> str:
     from wechat_cli.core.messages import _split_msg_type
 
@@ -280,6 +294,7 @@ def _capture(request: dict[str, object]) -> dict[str, object]:
         "upper_bound",
         "observe_only",
         "window_days",
+        "window_message_limit",
     }:
         raise ValueError("capture request is invalid")
     config_path = request["config_path"]
@@ -294,6 +309,13 @@ def _capture(request: dict[str, object]) -> dict[str, object]:
         or not 1 <= window_days <= 366
     ):
         raise ValueError("window_days is invalid")
+    window_message_limit = request["window_message_limit"]
+    if (
+        isinstance(window_message_limit, bool)
+        or not isinstance(window_message_limit, int)
+        or window_message_limit < 1
+    ):
+        raise ValueError("window_message_limit is invalid")
     after = _cursor(request["after_cursor"], "after_cursor")
     fixed_upper = (
         None
@@ -344,10 +366,10 @@ def _capture(request: dict[str, object]) -> dict[str, object]:
         if cursor > after and (fixed_upper is None or cursor <= fixed_upper)
     ]
     if fixed_upper is None and remaining:
-        first_timestamp = min(cursor[0] for cursor in remaining)
-        cutoff = first_timestamp + window_days * 24 * 60 * 60
-        effective_upper = max(
-            cursor for cursor in remaining if cursor[0] < cutoff
+        effective_upper = _window_upper(
+            remaining,
+            window_days=window_days,
+            message_limit=window_message_limit,
         )
     else:
         effective_upper = fixed_upper or after

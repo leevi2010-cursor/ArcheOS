@@ -56,6 +56,7 @@ RUN_STATUS_SCHEMA_VERSION = "wechat-digest-run-status/1.0"
 CAPTURE_SCHEMA_VERSION = "wechat-cli-capture/1.0"
 SUPPORTED_WECHAT_CLI_VERSION = "0.5.0"
 DEFAULT_CAPTURE_WINDOW_DAYS = 30
+DEFAULT_CAPTURE_WINDOW_MESSAGES = 1000
 TERMINAL_ITEM_STATES = frozenset(
     {"processed", "local_only", "unsupported", "pending_human"}
 )
@@ -228,6 +229,7 @@ class WechatCliCaptureProvider:
         config_path: Path | None = None,
         timeout_seconds: float = 300.0,
         window_days: int = DEFAULT_CAPTURE_WINDOW_DAYS,
+        window_message_limit: int = DEFAULT_CAPTURE_WINDOW_MESSAGES,
         runner: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
     ) -> None:
         if not wechat_cli_binary.strip():
@@ -240,10 +242,17 @@ class WechatCliCaptureProvider:
             or not 1 <= window_days <= 366
         ):
             raise ValueError("window_days must be between 1 and 366")
+        if (
+            isinstance(window_message_limit, bool)
+            or not isinstance(window_message_limit, int)
+            or window_message_limit < 1
+        ):
+            raise ValueError("window_message_limit must be positive")
         self.wechat_cli_binary = wechat_cli_binary
         self.config_path = None if config_path is None else Path(config_path)
         self.timeout_seconds = float(timeout_seconds)
         self.window_days = window_days
+        self.window_message_limit = window_message_limit
         self.runner = runner
         self._executable = self._resolve_executable(wechat_cli_binary)
         self._python = self._resolve_python(self._executable)
@@ -307,6 +316,7 @@ class WechatCliCaptureProvider:
             "upper_bound": None if upper_bound is None else upper_bound.to_dict(),
             "observe_only": observe_only,
             "window_days": self.window_days,
+            "window_message_limit": self.window_message_limit,
         }
         helper = Path(__file__).with_name("wechat_capture_helper.py")
         try:

@@ -22,6 +22,7 @@ from archeos.representation_information import (
     RepresentationInformationService,
 )
 from archeos.source import LocalManagedSourceRepository
+from archeos.wechat_capture_helper import _window_upper
 from archeos.wechat_digest import (
     CapturedAttachment,
     CapturedMessage,
@@ -726,6 +727,42 @@ class WechatCliCaptureProviderTests(unittest.TestCase):
 
         return WechatCliCaptureProvider(
             wechat_cli_binary=str(self.executable), runner=runner
+        )
+
+    def test_capture_request_has_time_and_message_boundaries(self) -> None:
+        requests = []
+
+        def runner(command, **kwargs):
+            if command[-1] == "--version":
+                return subprocess.CompletedProcess(
+                    command, 0, "wechat-cli version 0.5.0", ""
+                )
+            requests.append(json.loads(kwargs["input"]))
+            return subprocess.CompletedProcess(
+                command, 0, json.dumps(self.capture_payload([])), ""
+            )
+
+        provider = WechatCliCaptureProvider(
+            wechat_cli_binary=str(self.executable), runner=runner
+        )
+        provider.capture(WechatCursor(0, "", ""))
+        self.assertEqual(requests[0]["window_days"], 30)
+        self.assertEqual(requests[0]["window_message_limit"], 1000)
+
+    def test_window_upper_uses_the_stricter_boundary(self) -> None:
+        day = 24 * 60 * 60
+        cursors = [(index, "conversation", f"message-{index}") for index in range(5)]
+        self.assertEqual(
+            _window_upper(cursors, window_days=30, message_limit=3),
+            cursors[2],
+        )
+        spread = [
+            (1, "conversation", "message-1"),
+            (1 + 31 * day, "conversation", "message-2"),
+        ]
+        self.assertEqual(
+            _window_upper(spread, window_days=30, message_limit=1000),
+            spread[0],
         )
 
     def test_structured_capture_hashes_exact_attachment(self) -> None:
