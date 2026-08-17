@@ -23,6 +23,7 @@ from archeos.representation import (
 from archeos.representation_information import (
     EXTERNAL_AGENT_PROTOCOL_V1,
     EXTERNAL_AGENT_PROTOCOL_V2,
+    EXTERNAL_AGENT_PROTOCOL_V3,
     EXTERNAL_AGENT_PROTOCOL_VERSION,
     CodexCliRepresentationAnalysisProvider,
     RepresentationAnalysisBatch,
@@ -30,6 +31,7 @@ from archeos.representation_information import (
     RepresentationInformationError,
     RepresentationInformationService,
     _analysis_batches,
+    _canonical_fingerprint,
     _external_agent_request,
     _units_from_representation,
     external_agent_representation_analysis_schema,
@@ -184,6 +186,39 @@ class FakeProcess:
                     ]
                     for item in result["anchor_accounting"]:
                         item["accounted_as"] = "residue"
+                elif self.mode == "mixed":
+                    midpoint = len(request["anchor_units"]) // 2
+                    result["candidates"] = result["candidates"][:midpoint]
+                    result["residue"] = [
+                        {
+                            "anchor_unit_ids": [unit["unit_id"]],
+                            "reason_not_absorbed": "Synthetic unresolved input.",
+                            "future_value_or_uncertainty": "Synthetic future value.",
+                        }
+                        for unit in request["anchor_units"][midpoint:]
+                    ]
+                    for item in result["anchor_accounting"][midpoint:]:
+                        item["accounted_as"] = "residue"
+                elif self.mode == "coverage_summary":
+                    anchors = request["anchor_units"]
+                    result["candidates"] = result["candidates"][:20]
+                    result["candidates"].append(
+                        {
+                            **result["candidates"][0],
+                            "statement": "Synthetic duplicate assignment.",
+                        }
+                    )
+                    result["residue"] = [
+                        {
+                            "anchor_unit_ids": [unit["unit_id"]],
+                            "reason_not_absorbed": "Synthetic unresolved input.",
+                            "future_value_or_uncertainty": "Synthetic future value.",
+                        }
+                        for unit in anchors[19:35]
+                    ]
+                    result["anchor_accounting"][-1]["anchor_unit_id"] = anchors[0][
+                        "unit_id"
+                    ]
                 elif self.mode == "candidate_no_anchor":
                     result["candidates"][0]["anchor_unit_ids"] = []
                 elif self.mode == "candidate_duplicate_anchor":
@@ -287,6 +322,17 @@ class SemanticHandoffTest(unittest.TestCase):
             analysis_eligible=True,
         )
 
+    def units(self, count: int, *, start: int = 1) -> tuple[RepresentationAnalysisUnit, ...]:
+        return tuple(
+            replace(
+                self.unit(),
+                unit_id=f"unit_{index:064x}",
+                content=f"Synthetic provider input {index}.",
+                locator={"line": index},
+            )
+            for index in range(start, start + count)
+        )
+
     def test_codex_cli_provider_preserves_strict_binding_and_schema_shape(self) -> None:
         runner = FakeRunner()
         provider = CodexCliRepresentationAnalysisProvider(
@@ -364,6 +410,126 @@ class SemanticHandoffTest(unittest.TestCase):
         self.assertIn("evidence_unit_ids", candidate_properties)
         self.assertNotIn("anchor_unit_ids", candidate_properties)
         self.assertIn("anchor_accounting", schema["properties"])
+
+    def test_v3_request_fingerprint_remains_exactly_readable(self) -> None:
+        request, fingerprint = _external_agent_request(
+            RepresentationAnalysisBatch((self.unit(),)),
+            protocol_version=EXTERNAL_AGENT_PROTOCOL_V3,
+        )
+        self.assertEqual(
+            fingerprint,
+            "sha256:9bca6a7775cea3f69aec21075bb43acdb729d7074ff672a3be15051fd005d43b",
+        )
+        self.assertNotIn("result_schema_fingerprint", request)
+        schema = external_agent_representation_analysis_schema(
+            EXTERNAL_AGENT_PROTOCOL_V3,
+            batch=RepresentationAnalysisBatch((self.unit(),)),
+        )
+        accounting = schema["properties"]["anchor_accounting"]
+        self.assertEqual(accounting["minItems"], 1)
+        self.assertEqual(accounting["maxItems"], 1)
+        candidate = schema["properties"]["candidates"]["items"]["properties"]
+        self.assertNotIn("maxItems", candidate["anchor_unit_ids"])
+
+    def test_v31_fingerprint_binds_the_exact_dynamic_schema(self) -> None:
+        batch = RepresentationAnalysisBatch(self.units(40), self.units(3, start=101))
+        schema = external_agent_representation_analysis_schema(batch=batch)
+        request, fingerprint = _external_agent_request(batch, result_schema=schema)
+        self.assertEqual(
+            request["result_schema_fingerprint"],
+            _canonical_fingerprint(schema),
+        )
+        changed = json.loads(json.dumps(schema))
+        changed["properties"]["anchor_accounting"]["maxItems"] = 39
+        changed_request, changed_fingerprint = _external_agent_request(
+            batch,
+            result_schema=changed,
+        )
+        self.assertNotEqual(fingerprint, changed_fingerprint)
+        self.assertNotEqual(
+            request["result_schema_fingerprint"],
+            changed_request["result_schema_fingerprint"],
+        )
+
+    def test_v31_schema_exactly_bounds_a_40_anchor_batch(self) -> None:
+        batch = RepresentationAnalysisBatch(self.units(40), self.units(3, start=101))
+        schema = external_agent_representation_analysis_schema(batch=batch)
+        accounting = schema["properties"]["anchor_accounting"]
+        self.assertEqual(accounting["minItems"], 40)
+        self.assertEqual(accounting["maxItems"], 40)
+        candidate = schema["properties"]["candidates"]["items"]["properties"]
+        residue = schema["properties"]["residue"]["items"]["properties"]
+        self.assertEqual(candidate["anchor_unit_ids"]["maxItems"], 40)
+        self.assertEqual(residue["anchor_unit_ids"]["maxItems"], 40)
+        self.assertEqual(candidate["supporting_evidence_unit_ids"]["maxItems"], 3)
+
+    def test_v31_accepts_40_anchors_all_as_candidates(self) -> None:
+        provider = CodexCliRepresentationAnalysisProvider(
+            provider_version="0.147.0",
+            runner=FakeRunner(),
+        )
+        result = provider.analyze(RepresentationAnalysisBatch(self.units(40)))
+        self.assertEqual(len(result.candidates), 40)
+        self.assertEqual(result.residue, ())
+        self.assertEqual(provider.execution_records[0].covered_units, 40)
+
+    def test_v31_accepts_40_anchors_all_as_residue(self) -> None:
+        provider = CodexCliRepresentationAnalysisProvider(
+            provider_version="0.147.0",
+            runner=FakeRunner("all_residue"),
+        )
+        result = provider.analyze(RepresentationAnalysisBatch(self.units(40)))
+        self.assertEqual(result.candidates, ())
+        self.assertEqual(len(result.residue), 40)
+        self.assertEqual(provider.execution_records[0].covered_units, 40)
+
+    def test_v31_accepts_a_mixed_40_anchor_assignment(self) -> None:
+        provider = CodexCliRepresentationAnalysisProvider(
+            provider_version="0.147.0",
+            runner=FakeRunner("mixed"),
+        )
+        result = provider.analyze(RepresentationAnalysisBatch(self.units(40)))
+        self.assertEqual(len(result.candidates), 20)
+        self.assertEqual(len(result.residue), 20)
+        self.assertEqual(provider.execution_records[0].covered_units, 40)
+
+    def test_v31_records_content_free_40_anchor_coverage_diagnostics(self) -> None:
+        provider = CodexCliRepresentationAnalysisProvider(
+            provider_version="0.147.0",
+            runner=FakeRunner("coverage_summary"),
+            diagnostic_root=self.root.resolve() / "diagnostics",
+        )
+        batch = RepresentationAnalysisBatch(self.units(40))
+        with self.assertRaisesRegex(Exception, "未产生可验证"):
+            provider.analyze(batch)
+        record = provider.execution_records[0]
+        self.assertEqual(record.contract_failure_detail, "anchor_coverage")
+        self.assertEqual(record.contract_failure_stage, "coverage")
+        self.assertEqual(record.covered_units, 35)
+        self.assertEqual(record.candidate_item_count, 21)
+        self.assertEqual(record.residue_item_count, 16)
+        self.assertEqual(record.accounting_item_count, 40)
+        self.assertEqual(record.candidate_anchor_ref_count, 21)
+        self.assertEqual(record.residue_anchor_ref_count, 16)
+        self.assertEqual(record.duplicate_anchor_ref_count, 1)
+        self.assertEqual(record.duplicate_accounting_count, 1)
+        self.assertEqual(record.dual_assignment_count, 1)
+        self.assertEqual(record.missing_anchor_count, 5)
+        self.assertRegex(record.result_fingerprint or "", r"^sha256:[0-9a-f]{64}$")
+        metadata_path = (
+            provider.diagnostic_root / record.processing_run_id / "metadata.json"
+        )
+        metadata_text = metadata_path.read_text(encoding="utf-8")
+        metadata = json.loads(metadata_text)
+        self.assertEqual(
+            metadata["diagnostic_schema_version"],
+            "external-agent-diagnostics/2.0",
+        )
+        self.assertEqual(metadata["covered_units"], 35)
+        self.assertEqual(metadata["missing_anchor_count"], 5)
+        self.assertNotIn("anchor_unit_ids", metadata)
+        self.assertNotIn(batch.anchor_units[0].unit_id, metadata_text)
+        self.assertNotIn(batch.anchor_units[0].content, metadata_text)
 
     def test_v3_schema_binds_anchor_and_evidence_context_enums(self) -> None:
         evidence_context = replace(
@@ -831,6 +997,63 @@ class SemanticHandoffTest(unittest.TestCase):
         self.assertEqual(replay.ingestion.existing, 1)
         self.assertEqual(replay_runner.calls, [])
 
+    def test_v3_package_and_audit_replay_without_a_provider_call(self) -> None:
+        representation, service = self.build_service()
+        audit_root = self.root / "audits"
+        handoff = ExternalAgentSemanticHandoffService(
+            service,
+            JsonlAtomicInformationStore(self.root / "atomic.jsonl"),
+            audit_root,
+        )
+        first = handoff.execute(
+            representation.representation_id,
+            CodexCliRepresentationAnalysisProvider(
+                provider_version="0.147.0",
+                runner=FakeRunner(),
+            ),
+        )
+        units = _units_from_representation(
+            representation,
+            service.representation_repository,
+        )
+        batch = _analysis_batches(units, service.batch_size)[0]
+        _, v3_fingerprint = _external_agent_request(
+            batch,
+            protocol_version=EXTERNAL_AGENT_PROTOCOL_V3,
+        )
+        audit_path = first.audit_paths[0]
+        historical = json.loads(audit_path.read_text(encoding="utf-8"))
+        historical["protocol_version"] = EXTERNAL_AGENT_PROTOCOL_V3
+        historical["input_fingerprint"] = v3_fingerprint
+        historical["diagnostic_schema_version"] = "external-agent-diagnostics/1.0"
+        for field in (
+            "contract_failure_stage",
+            "candidate_item_count",
+            "residue_item_count",
+            "accounting_item_count",
+            "candidate_anchor_ref_count",
+            "residue_anchor_ref_count",
+            "duplicate_anchor_ref_count",
+            "duplicate_accounting_count",
+            "dual_assignment_count",
+            "missing_anchor_count",
+            "unknown_anchor_ref_count",
+        ):
+            historical.pop(field)
+        audit_path.write_text(json.dumps(historical), encoding="utf-8")
+
+        replay_runner = FakeRunner()
+        replay = handoff.execute(
+            representation.representation_id,
+            CodexCliRepresentationAnalysisProvider(
+                provider_version="0.147.0",
+                runner=replay_runner,
+            ),
+        )
+        self.assertTrue(replay.replayed_existing_package)
+        self.assertEqual(replay.ingestion.existing, 1)
+        self.assertEqual(replay_runner.calls, [])
+
     def test_replay_accepts_pre_diagnostics_processing_run_audit(self) -> None:
         representation, service = self.build_service()
         audit_root = self.root / "audits"
@@ -861,6 +1084,17 @@ class SemanticHandoffTest(unittest.TestCase):
             "stdout_bytes",
             "stderr_bytes",
             "process_cleanup_status",
+            "contract_failure_stage",
+            "candidate_item_count",
+            "residue_item_count",
+            "accounting_item_count",
+            "candidate_anchor_ref_count",
+            "residue_anchor_ref_count",
+            "duplicate_anchor_ref_count",
+            "duplicate_accounting_count",
+            "dual_assignment_count",
+            "missing_anchor_count",
+            "unknown_anchor_ref_count",
         ):
             legacy.pop(field)
         audit_path.write_text(json.dumps(legacy), encoding="utf-8")
@@ -935,7 +1169,7 @@ class SemanticHandoffTest(unittest.TestCase):
         self.assertEqual(audit["model"], "gpt-5.6-terra")
         self.assertEqual(audit["reasoning_effort"], "medium")
         self.assertEqual(audit["fallback_policy"], "none")
-        self.assertEqual(audit["diagnostic_schema_version"], "external-agent-diagnostics/1.0")
+        self.assertEqual(audit["diagnostic_schema_version"], "external-agent-diagnostics/2.0")
         self.assertGreaterEqual(audit["stdout_bytes"], 0)
         self.assertGreater(audit["stderr_bytes"], 0)
         self.assertEqual(audit["provider_error_category"], "unknown")
@@ -965,6 +1199,36 @@ class SemanticHandoffTest(unittest.TestCase):
         self.assertFalse(audit["package_published"])
         self.assertFalse(audit["information_ingested"])
         self.assertNotIn("candidate does not match", audit_text)
+
+    def test_partial_coverage_audit_preserves_only_content_free_counts(self) -> None:
+        representation, service = self.build_service(blocks=40)
+        audit_root = self.root / "audits"
+        with self.assertRaisesRegex(Exception, "未确认新增 Durable"):
+            ExternalAgentSemanticHandoffService(
+                service,
+                JsonlAtomicInformationStore(self.root / "atomic.jsonl"),
+                audit_root,
+            ).execute(
+                representation.representation_id,
+                CodexCliRepresentationAnalysisProvider(
+                    provider_version="0.147.0",
+                    runner=FakeRunner("coverage_summary"),
+                    diagnostic_root=self.root.resolve() / "diagnostics",
+                ),
+            )
+        audit_path = next(audit_root.glob("*/processing-run-audit.json"))
+        audit_text = audit_path.read_text(encoding="utf-8")
+        audit = json.loads(audit_text)
+        self.assertEqual(audit["contract_failure_stage"], "coverage")
+        self.assertEqual(audit["eligible_units"], 40)
+        self.assertEqual(audit["covered_units"], 35)
+        self.assertEqual(audit["unaccounted_units"], 5)
+        self.assertEqual(audit["duplicate_anchor_ref_count"], 1)
+        self.assertEqual(audit["duplicate_accounting_count"], 1)
+        self.assertEqual(audit["dual_assignment_count"], 1)
+        self.assertEqual(audit["missing_anchor_count"], 5)
+        self.assertRegex(audit["result_fingerprint"], r"^sha256:[0-9a-f]{64}$")
+        self.assertNotIn("Synthetic business input", audit_text)
 
     def test_replay_rechecks_managed_source_before_store_write(self) -> None:
         representation, service = self.build_service()

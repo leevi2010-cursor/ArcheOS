@@ -14,6 +14,8 @@ from .atomic_information import IngestionResult, ingest_processing_package
 from .atomic_information.store import AtomicInformationStore
 from .representation_information import (
     CONTRACT_FAILURE_DETAILS,
+    DIAGNOSTIC_SCHEMA_V1,
+    DIAGNOSTIC_SCHEMA_VERSION,
     EXTERNAL_AGENT_PROTOCOL_VERSION,
     EXTERNAL_AGENT_ROUTE,
     SUPPORTED_EXTERNAL_AGENT_PROTOCOL_VERSIONS,
@@ -182,12 +184,36 @@ class ExternalAgentSemanticHandoffService:
     ) -> tuple[Path, ...]:
         paths: list[Path] = []
         for record in records:
+            contract_counts = (
+                record.candidate_item_count,
+                record.residue_item_count,
+                record.accounting_item_count,
+                record.candidate_anchor_ref_count,
+                record.residue_anchor_ref_count,
+                record.duplicate_anchor_ref_count,
+                record.duplicate_accounting_count,
+                record.dual_assignment_count,
+                record.missing_anchor_count,
+                record.unknown_anchor_ref_count,
+            )
             if (
                 record.failure_category == "result_contract_failure"
-                and record.contract_failure_detail not in CONTRACT_FAILURE_DETAILS
+                and (
+                    record.contract_failure_detail not in CONTRACT_FAILURE_DETAILS
+                    or record.contract_failure_stage is None
+                    or not _sha256_fingerprint(record.result_fingerprint)
+                )
             ) or (
                 record.failure_category != "result_contract_failure"
-                and record.contract_failure_detail is not None
+                and (
+                    record.contract_failure_detail is not None
+                    or record.contract_failure_stage is not None
+                    or any(contract_counts)
+                )
+            ) or (
+                any(isinstance(value, bool) or value < 0 for value in contract_counts)
+                or record.covered_units < 0
+                or record.covered_units > record.eligible_units
             ):
                 raise SemanticHandoffError("Processing Run 合同失败诊断字段无效。")
             payload = {
@@ -212,6 +238,17 @@ class ExternalAgentSemanticHandoffService:
                 "eligible_units": record.eligible_units,
                 "covered_units": record.covered_units,
                 "unaccounted_units": record.eligible_units - record.covered_units,
+                "contract_failure_stage": record.contract_failure_stage,
+                "candidate_item_count": record.candidate_item_count,
+                "residue_item_count": record.residue_item_count,
+                "accounting_item_count": record.accounting_item_count,
+                "candidate_anchor_ref_count": record.candidate_anchor_ref_count,
+                "residue_anchor_ref_count": record.residue_anchor_ref_count,
+                "duplicate_anchor_ref_count": record.duplicate_anchor_ref_count,
+                "duplicate_accounting_count": record.duplicate_accounting_count,
+                "dual_assignment_count": record.dual_assignment_count,
+                "missing_anchor_count": record.missing_anchor_count,
+                "unknown_anchor_ref_count": record.unknown_anchor_ref_count,
                 "diagnostic_schema_version": record.diagnostic_schema_version,
                 "elapsed_ms": record.elapsed_ms,
                 "deadline_ms": record.deadline_ms,
@@ -389,6 +426,22 @@ class ExternalAgentSemanticHandoffService:
                 or not _sha256_fingerprint(record.result_fingerprint)
                 or record.eligible_units != len(anchor_unit_ids)
                 or record.covered_units != len(anchor_unit_ids)
+                or record.diagnostic_schema_version != DIAGNOSTIC_SCHEMA_VERSION
+                or record.contract_failure_stage is not None
+                or any(
+                    (
+                        record.candidate_item_count,
+                        record.residue_item_count,
+                        record.accounting_item_count,
+                        record.candidate_anchor_ref_count,
+                        record.residue_anchor_ref_count,
+                        record.duplicate_anchor_ref_count,
+                        record.duplicate_accounting_count,
+                        record.dual_assignment_count,
+                        record.missing_anchor_count,
+                        record.unknown_anchor_ref_count,
+                    )
+                )
             ):
                 raise SemanticHandoffError("当前信息包 Processing Run 审计不匹配。")
 
@@ -424,6 +477,17 @@ class ExternalAgentSemanticHandoffService:
             "eligible_units",
             "covered_units",
             "unaccounted_units",
+            "contract_failure_stage",
+            "candidate_item_count",
+            "residue_item_count",
+            "accounting_item_count",
+            "candidate_anchor_ref_count",
+            "residue_anchor_ref_count",
+            "duplicate_anchor_ref_count",
+            "duplicate_accounting_count",
+            "dual_assignment_count",
+            "missing_anchor_count",
+            "unknown_anchor_ref_count",
             "diagnostic_schema_version",
             "elapsed_ms",
             "deadline_ms",
@@ -458,20 +522,55 @@ class ExternalAgentSemanticHandoffService:
             "stderr_bytes",
             "process_cleanup_status",
         }
+        contract_diagnostic_fields = {
+            "contract_failure_stage",
+            "candidate_item_count",
+            "residue_item_count",
+            "accounting_item_count",
+            "candidate_anchor_ref_count",
+            "residue_anchor_ref_count",
+            "duplicate_anchor_ref_count",
+            "duplicate_accounting_count",
+            "dual_assignment_count",
+            "missing_anchor_count",
+            "unknown_anchor_ref_count",
+        }
         optional_fields = {"contract_failure_detail"}
-        legacy_required_fields = required_fields - diagnostic_fields
+        v1_required_fields = required_fields - contract_diagnostic_fields
+        legacy_required_fields = required_fields - diagnostic_fields - contract_diagnostic_fields
         observed_batches: set[tuple[str, ...]] = set()
         expected_by_anchor = dict(expected_batches)
         for path in paths:
             audit = _private_json_read(path)
             if set(audit) not in {
                 frozenset(required_fields),
+                frozenset(v1_required_fields),
                 frozenset(legacy_required_fields),
                 frozenset(required_fields | optional_fields),
+                frozenset(v1_required_fields | optional_fields),
                 frozenset(legacy_required_fields | optional_fields),
             }:
                 raise SemanticHandoffError("已存在的信息包审计不完整。")
             has_diagnostics = diagnostic_fields.issubset(audit)
+            has_contract_diagnostics = contract_diagnostic_fields.issubset(audit)
+            diagnostic_version = audit.get("diagnostic_schema_version")
+            valid_diagnostic_version = (
+                not has_diagnostics
+                or diagnostic_version == DIAGNOSTIC_SCHEMA_V1
+                and not has_contract_diagnostics
+                and protocol_version != EXTERNAL_AGENT_PROTOCOL_VERSION
+                or diagnostic_version == DIAGNOSTIC_SCHEMA_VERSION
+                and has_contract_diagnostics
+            )
+            valid_success_contract_diagnostics = (
+                not has_contract_diagnostics
+                or audit.get("contract_failure_stage") is None
+                and all(
+                    audit.get(field) == 0
+                    for field in contract_diagnostic_fields
+                    if field != "contract_failure_stage"
+                )
+            )
             anchor_unit_ids = audit.get("anchor_unit_ids")
             if (
                 not isinstance(anchor_unit_ids, list)
@@ -528,11 +627,11 @@ class ExternalAgentSemanticHandoffService:
                 or audit.get("eligible_units") != len(batch)
                 or audit.get("covered_units") != len(batch)
                 or audit.get("unaccounted_units") != 0
+                or not valid_diagnostic_version
+                or not valid_success_contract_diagnostics
                 or has_diagnostics
                 and (
-                    audit.get("diagnostic_schema_version")
-                    != "external-agent-diagnostics/1.0"
-                    or not isinstance(audit.get("elapsed_ms"), int)
+                    not isinstance(audit.get("elapsed_ms"), int)
                     or audit.get("elapsed_ms") < 0
                     or not isinstance(audit.get("deadline_ms"), int)
                     or audit.get("deadline_ms") <= 0

@@ -15,6 +15,7 @@ import tempfile
 import threading
 import time
 import uuid
+from collections import Counter
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
@@ -39,11 +40,13 @@ DEFAULT_CODEX_ANALYSIS_TIMEOUT_SECONDS = 120.0
 DEFAULT_EXTERNAL_AGENT_BATCH_SIZE = 40
 EXTERNAL_AGENT_PROTOCOL_V1 = "external-agent-semantic-handoff/1.0"
 EXTERNAL_AGENT_PROTOCOL_V2 = "external-agent-semantic-handoff/2.0"
-EXTERNAL_AGENT_PROTOCOL_VERSION = "external-agent-semantic-handoff/3.0"
+EXTERNAL_AGENT_PROTOCOL_V3 = "external-agent-semantic-handoff/3.0"
+EXTERNAL_AGENT_PROTOCOL_VERSION = "external-agent-semantic-handoff/3.1"
 SUPPORTED_EXTERNAL_AGENT_PROTOCOL_VERSIONS = frozenset(
     {
         EXTERNAL_AGENT_PROTOCOL_V1,
         EXTERNAL_AGENT_PROTOCOL_V2,
+        EXTERNAL_AGENT_PROTOCOL_V3,
         EXTERNAL_AGENT_PROTOCOL_VERSION,
     }
 )
@@ -236,10 +239,16 @@ def external_agent_representation_analysis_schema(
     """The #31 result contract with the #80 Codex serialization binding."""
     if protocol_version not in SUPPORTED_EXTERNAL_AGENT_PROTOCOL_VERSIONS:
         raise ValueError("unsupported External Agent protocol version")
-    if protocol_version == EXTERNAL_AGENT_PROTOCOL_VERSION:
+    if protocol_version in {
+        EXTERNAL_AGENT_PROTOCOL_V3,
+        EXTERNAL_AGENT_PROTOCOL_VERSION,
+    }:
         if batch is None:
             raise ValueError("v3 External Agent schema requires its bound batch")
-        schema = _external_agent_v3_analysis_schema(batch)
+        schema = _external_agent_v3_analysis_schema(
+            batch,
+            exact_accounting=protocol_version == EXTERNAL_AGENT_PROTOCOL_VERSION,
+        )
     else:
         schema = representation_analysis_schema()
     required = schema["required"]
@@ -257,6 +266,7 @@ def external_agent_representation_analysis_schema(
     }
     if protocol_version in {
         EXTERNAL_AGENT_PROTOCOL_V2,
+        EXTERNAL_AGENT_PROTOCOL_V3,
         EXTERNAL_AGENT_PROTOCOL_VERSION,
     }:
         required = ["anchor_accounting", *required]
@@ -264,7 +274,10 @@ def external_agent_representation_analysis_schema(
             "type": "string",
             "minLength": 1,
         }
-        if protocol_version == EXTERNAL_AGENT_PROTOCOL_VERSION:
+        if protocol_version in {
+            EXTERNAL_AGENT_PROTOCOL_V3,
+            EXTERNAL_AGENT_PROTOCOL_VERSION,
+        }:
             assert batch is not None
             anchor_unit_id = {
                 "type": "string",
@@ -286,8 +299,13 @@ def external_agent_representation_analysis_schema(
                 },
             },
         }
-        if protocol_version == EXTERNAL_AGENT_PROTOCOL_VERSION:
+        if protocol_version in {
+            EXTERNAL_AGENT_PROTOCOL_V3,
+            EXTERNAL_AGENT_PROTOCOL_VERSION,
+        }:
             assert batch is not None
+            if protocol_version == EXTERNAL_AGENT_PROTOCOL_VERSION:
+                accounting_schema["minItems"] = len(batch.anchor_units)
             accounting_schema["maxItems"] = len(batch.anchor_units)
         protocol_properties["anchor_accounting"] = accounting_schema
     schema["required"] = ["protocol_version", "input_fingerprint", *required]
@@ -297,6 +315,8 @@ def external_agent_representation_analysis_schema(
 
 def _external_agent_v3_analysis_schema(
     batch: RepresentationAnalysisBatch,
+    *,
+    exact_accounting: bool,
 ) -> dict[str, object]:
     anchor_ids = [unit.unit_id for unit in batch.anchor_units]
     context_ids = [
@@ -311,6 +331,9 @@ def _external_agent_v3_analysis_schema(
         "type": "array",
         "items": {"type": "string", "enum": context_ids},
     }
+    if exact_accounting:
+        anchor_refs["maxItems"] = len(anchor_ids)
+        context_refs["maxItems"] = len(context_ids)
     return {
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "type": "object",
@@ -585,6 +608,17 @@ class ExternalAgentExecutionRecord:
     result_fingerprint: str | None
     eligible_units: int
     covered_units: int
+    contract_failure_stage: str | None
+    candidate_item_count: int
+    residue_item_count: int
+    accounting_item_count: int
+    candidate_anchor_ref_count: int
+    residue_anchor_ref_count: int
+    duplicate_anchor_ref_count: int
+    duplicate_accounting_count: int
+    dual_assignment_count: int
+    missing_anchor_count: int
+    unknown_anchor_ref_count: int
     diagnostic_schema_version: str
     elapsed_ms: int
     deadline_ms: int
@@ -599,7 +633,8 @@ class ExternalAgentExecutionRecord:
     process_cleanup_status: str
 
 
-DIAGNOSTIC_SCHEMA_VERSION = "external-agent-diagnostics/1.0"
+DIAGNOSTIC_SCHEMA_V1 = "external-agent-diagnostics/1.0"
+DIAGNOSTIC_SCHEMA_VERSION = "external-agent-diagnostics/2.0"
 _MAX_DIAGNOSTIC_STREAM_BYTES = 64 * 1024
 _DIAGNOSTIC_TTL_SECONDS = 24 * 60 * 60
 CONTRACT_FAILURE_DETAILS = frozenset(
@@ -623,6 +658,112 @@ class _ExternalAgentContractFailure(RepresentationInformationError):
             raise ValueError("unsupported External Agent contract failure detail")
         super().__init__("result_contract_failure")
         self.detail = detail
+
+
+_CONTRACT_FAILURE_STAGES = {
+    "top_level_schema": "top_level",
+    "candidate_schema": "candidate",
+    "residue_schema": "residue",
+    "evidence_reference": "evidence_reference",
+    "anchor_coverage": "coverage",
+    "anchor_accounting": "accounting_cross_check",
+    "unknown": "validation",
+}
+
+
+def _empty_contract_failure_diagnostics() -> dict[str, object]:
+    return {
+        "contract_failure_stage": None,
+        "candidate_item_count": 0,
+        "residue_item_count": 0,
+        "accounting_item_count": 0,
+        "candidate_anchor_ref_count": 0,
+        "residue_anchor_ref_count": 0,
+        "duplicate_anchor_ref_count": 0,
+        "duplicate_accounting_count": 0,
+        "dual_assignment_count": 0,
+        "missing_anchor_count": 0,
+        "unknown_anchor_ref_count": 0,
+    }
+
+
+def _contract_failure_diagnostics(
+    raw: str,
+    batch: RepresentationAnalysisBatch,
+    detail: str,
+) -> dict[str, object]:
+    """Summarize a rejected result without retaining content or unit IDs."""
+
+    summary = _empty_contract_failure_diagnostics()
+    summary["contract_failure_stage"] = _CONTRACT_FAILURE_STAGES[detail]
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError:
+        return summary
+    if not isinstance(payload, dict):
+        return summary
+
+    def items(field: str) -> list[object]:
+        value = payload.get(field)
+        return value if isinstance(value, list) else []
+
+    def references(values: list[object], field: str) -> list[str]:
+        result: list[str] = []
+        for value in values:
+            if not isinstance(value, dict):
+                continue
+            refs = value.get(field)
+            if isinstance(refs, list):
+                result.extend(ref for ref in refs if isinstance(ref, str))
+        return result
+
+    candidates = items("candidates")
+    residue = items("residue")
+    accounting = items("anchor_accounting")
+    candidate_refs = references(candidates, "anchor_unit_ids")
+    residue_refs = references(residue, "anchor_unit_ids")
+    accounting_refs = [
+        value["anchor_unit_id"]
+        for value in accounting
+        if isinstance(value, dict) and isinstance(value.get("anchor_unit_id"), str)
+    ]
+    anchor_ids = {unit.unit_id for unit in batch.anchor_units}
+    candidate_known = [ref for ref in candidate_refs if ref in anchor_ids]
+    residue_known = [ref for ref in residue_refs if ref in anchor_ids]
+    accounting_known = [ref for ref in accounting_refs if ref in anchor_ids]
+    candidate_set = set(candidate_known)
+    residue_set = set(residue_known)
+    covered = candidate_set | residue_set
+    summary.update(
+        {
+            "candidate_item_count": len(candidates),
+            "residue_item_count": len(residue),
+            "accounting_item_count": len(accounting),
+            "candidate_anchor_ref_count": len(candidate_refs),
+            "residue_anchor_ref_count": len(residue_refs),
+            "duplicate_anchor_ref_count": sum(
+                count - 1
+                for count in (
+                    *Counter(candidate_known).values(),
+                    *Counter(residue_known).values(),
+                )
+                if count > 1
+            ),
+            "duplicate_accounting_count": sum(
+                count - 1
+                for count in Counter(accounting_known).values()
+                if count > 1
+            ),
+            "dual_assignment_count": len(candidate_set & residue_set),
+            "missing_anchor_count": len(anchor_ids - covered),
+            "unknown_anchor_ref_count": sum(
+                ref not in anchor_ids
+                for ref in (*candidate_refs, *residue_refs, *accounting_refs)
+            ),
+            "covered_units": len(covered),
+        }
+    )
+    return summary
 
 
 class CodexCliRepresentationAnalysisProvider:
@@ -697,7 +838,11 @@ class CodexCliRepresentationAnalysisProvider:
         diagnostic_root_ready = _purge_expired_diagnostic_bundles(
             self.diagnostic_root
         )
-        request, fingerprint = _external_agent_request(batch)
+        schema = external_agent_representation_analysis_schema(batch=batch)
+        request, fingerprint = _external_agent_request(
+            batch,
+            result_schema=schema,
+        )
         record_base = {
             "processing_run_id": "run_" + uuid.uuid4().hex,
             "protocol_version": EXTERNAL_AGENT_PROTOCOL_VERSION,
@@ -722,6 +867,7 @@ class CodexCliRepresentationAnalysisProvider:
                     result_fingerprint=None,
                     eligible_units=len(batch.anchor_units),
                     covered_units=0,
+                    **_empty_contract_failure_diagnostics(),
                     diagnostic_schema_version=DIAGNOSTIC_SCHEMA_VERSION,
                     elapsed_ms=_elapsed_ms(started_monotonic),
                     deadline_ms=round(self.timeout_seconds * 1000),
@@ -739,10 +885,11 @@ class CodexCliRepresentationAnalysisProvider:
             raise RepresentationInformationError(
                 "External Agent 诊断目录不安全；未启动 Provider。"
             )
-        schema = external_agent_representation_analysis_schema(batch=batch)
         _require_codex_schema_compatibility(schema)
         result_file_present = False
         result_size_bytes = 0
+        result_fingerprint: str | None = None
+        raw: str | None = None
         with tempfile.TemporaryDirectory(prefix="archeos-external-agent-") as directory:
             temp = Path(directory)
             os.chmod(temp, 0o700)
@@ -784,6 +931,10 @@ class CodexCliRepresentationAnalysisProvider:
                 result_file_present, result_size_bytes = _result_file_metadata(
                     result_path
                 )
+                if result_file_present:
+                    result_fingerprint = "sha256:" + hashlib.sha256(
+                        result_path.read_bytes()
+                    ).hexdigest()
                 if outcome.failure_category is not None:
                     raise RepresentationInformationError(outcome.failure_category)
                 if not result_file_present:
@@ -814,6 +965,20 @@ class CodexCliRepresentationAnalysisProvider:
                     contract_failure_detail = contract_failure_detail or "unknown"
                 else:
                     contract_failure_detail = None
+                contract_diagnostics = _empty_contract_failure_diagnostics()
+                covered_units = 0
+                if (
+                    contract_failure_detail is not None
+                    and raw is not None
+                ):
+                    contract_diagnostics = _contract_failure_diagnostics(
+                        raw,
+                        batch,
+                        contract_failure_detail,
+                    )
+                    covered_units = int(
+                        contract_diagnostics.pop("covered_units", 0)
+                    )
                 record = ExternalAgentExecutionRecord(
                     **record_base,
                     finished_at=_utc_timestamp(),
@@ -821,9 +986,10 @@ class CodexCliRepresentationAnalysisProvider:
                     failure_category=category,
                     contract_failure_detail=contract_failure_detail,
                     strict_validation_status="failed",
-                    result_fingerprint=None,
+                    result_fingerprint=result_fingerprint,
                     eligible_units=len(batch.anchor_units),
-                    covered_units=0,
+                    covered_units=covered_units,
+                    **contract_diagnostics,
                     diagnostic_schema_version=DIAGNOSTIC_SCHEMA_VERSION,
                     elapsed_ms=_elapsed_ms(started_monotonic),
                     deadline_ms=round(self.timeout_seconds * 1000),
@@ -847,6 +1013,7 @@ class CodexCliRepresentationAnalysisProvider:
                 raise RepresentationInformationError(
                     "External Agent 未产生可验证的结构化结果；未发布信息包。"
                 ) from exc
+        assert raw is not None and result_fingerprint is not None
         self.execution_records.append(
             ExternalAgentExecutionRecord(
                 **record_base,
@@ -855,10 +1022,10 @@ class CodexCliRepresentationAnalysisProvider:
                 failure_category=None,
                 contract_failure_detail=None,
                 strict_validation_status="passed",
-                result_fingerprint="sha256:"
-                + hashlib.sha256(raw.encode("utf-8")).hexdigest(),
+                result_fingerprint=result_fingerprint,
                 eligible_units=len(batch.anchor_units),
                 covered_units=len(batch.anchor_units),
+                **_empty_contract_failure_diagnostics(),
                 diagnostic_schema_version=DIAGNOSTIC_SCHEMA_VERSION,
                 elapsed_ms=_elapsed_ms(started_monotonic),
                 deadline_ms=round(self.timeout_seconds * 1000),
@@ -1322,6 +1489,18 @@ def _write_failure_diagnostic_bundle(
             "input_fingerprint": record.input_fingerprint,
             "eligible_units": record.eligible_units,
             "covered_units": record.covered_units,
+            "contract_failure_stage": record.contract_failure_stage,
+            "candidate_item_count": record.candidate_item_count,
+            "residue_item_count": record.residue_item_count,
+            "accounting_item_count": record.accounting_item_count,
+            "candidate_anchor_ref_count": record.candidate_anchor_ref_count,
+            "residue_anchor_ref_count": record.residue_anchor_ref_count,
+            "duplicate_anchor_ref_count": record.duplicate_anchor_ref_count,
+            "duplicate_accounting_count": record.duplicate_accounting_count,
+            "dual_assignment_count": record.dual_assignment_count,
+            "missing_anchor_count": record.missing_anchor_count,
+            "unknown_anchor_ref_count": record.unknown_anchor_ref_count,
+            "result_fingerprint": record.result_fingerprint,
             "started_at": record.started_at,
             "finished_at": record.finished_at,
             "created_at": record.finished_at,
@@ -1381,6 +1560,8 @@ def _utc_timestamp() -> str:
 def _external_agent_request(
     batch: RepresentationAnalysisBatch,
     protocol_version: str = EXTERNAL_AGENT_PROTOCOL_VERSION,
+    *,
+    result_schema: Mapping[str, object] | None = None,
 ) -> tuple[dict[str, object], str]:
     if protocol_version not in SUPPORTED_EXTERNAL_AGENT_PROTOCOL_VERSIONS:
         raise ValueError("unsupported External Agent protocol version")
@@ -1392,13 +1573,17 @@ def _external_agent_request(
     ]
     if protocol_version in {
         EXTERNAL_AGENT_PROTOCOL_V2,
+        EXTERNAL_AGENT_PROTOCOL_V3,
         EXTERNAL_AGENT_PROTOCOL_VERSION,
     }:
         rules.insert(
             2,
             "Emit exactly one anchor_accounting item for every supplied anchor; accounted_as must match whether that anchor is cited by Candidate or Residue.",
         )
-    if protocol_version == EXTERNAL_AGENT_PROTOCOL_VERSION:
+    if protocol_version in {
+        EXTERNAL_AGENT_PROTOCOL_V3,
+        EXTERNAL_AGENT_PROTOCOL_VERSION,
+    }:
         rules.insert(
             3,
             "For each Candidate, separate anchor_unit_ids from evidence-capable supporting_evidence_unit_ids; Residue may reference anchors only.",
@@ -1412,6 +1597,13 @@ def _external_agent_request(
             for unit in batch.context_support_units
         ],
     }
+    if protocol_version == EXTERNAL_AGENT_PROTOCOL_VERSION:
+        if result_schema is None:
+            result_schema = external_agent_representation_analysis_schema(
+                protocol_version,
+                batch=batch,
+            )
+        payload["result_schema_fingerprint"] = _canonical_fingerprint(result_schema)
     fingerprint = _canonical_fingerprint(payload)
     return ({**payload, "input_fingerprint": fingerprint}, fingerprint)
 
@@ -1447,6 +1639,7 @@ def _parse_external_agent_result(
     }
     if expected_protocol_version in {
         EXTERNAL_AGENT_PROTOCOL_V2,
+        EXTERNAL_AGENT_PROTOCOL_V3,
         EXTERNAL_AGENT_PROTOCOL_VERSION,
     }:
         expected_fields.add("anchor_accounting")
@@ -1457,7 +1650,10 @@ def _parse_external_agent_result(
         or payload["input_fingerprint"] != expected_fingerprint
     ):
         raise RepresentationInformationError("result_binding_failure")
-    if expected_protocol_version == EXTERNAL_AGENT_PROTOCOL_VERSION:
+    if expected_protocol_version in {
+        EXTERNAL_AGENT_PROTOCOL_V3,
+        EXTERNAL_AGENT_PROTOCOL_VERSION,
+    }:
         candidates = _v3_candidate_drafts(payload["candidates"], batch)
         residue = _v3_residue_drafts(payload["residue"], batch)
     else:
@@ -1478,6 +1674,7 @@ def _parse_external_agent_result(
     accounting: tuple[_AnchorAccounting, ...] | None = None
     if expected_protocol_version in {
         EXTERNAL_AGENT_PROTOCOL_V2,
+        EXTERNAL_AGENT_PROTOCOL_V3,
         EXTERNAL_AGENT_PROTOCOL_VERSION,
     }:
         try:
