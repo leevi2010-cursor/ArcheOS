@@ -186,6 +186,13 @@ def _versioned_audit_contract(
             current_provider_version,
         )
     if (
+        protocol_version == EXTERNAL_AGENT_PROTOCOL_V3_1
+        and package_provider != _provider_manifest(provider)
+    ):
+        raise SemanticHandoffError(
+            "已发布的信息包 Provider execution profile 已漂移。"
+        )
+    if (
         any(
             not isinstance(package_provider.get(field), str)
             or re.fullmatch(
@@ -209,20 +216,7 @@ def _versioned_audit_contract(
         EXTERNAL_AGENT_PROTOCOL_V2,
         EXTERNAL_AGENT_PROTOCOL_V3,
     }:
-        shapes = frozenset(
-            {
-                frozenset(_COMPLETED_AUDIT_BASE_FIELDS),
-                frozenset(
-                    _COMPLETED_AUDIT_BASE_FIELDS
-                    - {"contract_failure_detail"}
-                ),
-                frozenset(
-                    _COMPLETED_AUDIT_BASE_FIELDS
-                    - _AUDIT_DIAGNOSTIC_FIELDS
-                    - {"contract_failure_detail"}
-                ),
-            }
-        )
+        shapes = frozenset({frozenset(_COMPLETED_AUDIT_BASE_FIELDS)})
         diagnostic_version = DIAGNOSTIC_SCHEMA_V1
     elif protocol_version == EXTERNAL_AGENT_PROTOCOL_V3_1:
         shapes = frozenset(
@@ -788,11 +782,11 @@ class ExternalAgentSemanticHandoffService:
         protocol_version: str,
     ) -> tuple[tuple[tuple[str, ...], str], ...]:
         package_provider = manifest.get("provider")
-        if (
-            not isinstance(package_provider, dict)
-            or package_provider != _provider_manifest(provider)
-        ):
-            raise SemanticHandoffError("已存在的信息包 Provider 不匹配当前交接合同。")
+        _versioned_audit_contract(
+            protocol_version,
+            package_provider,
+            provider,
+        )
         manifest_batches = manifest.get("batches")
         if not isinstance(manifest_batches, list):
             raise SemanticHandoffError("已存在的信息包批次清单不可读。")

@@ -1229,6 +1229,17 @@ class WechatDigestTests(unittest.TestCase):
             messages=[message(1)],
             suffix="pre_diagnostics_v1",
         )
+        package = next(
+            (
+                service.workspace / "02_processing" / "information"
+            ).iterdir()
+        )
+        manifest = json.loads(
+            (package / "manifest.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(
+            manifest["provider"], {"name": "external-agent-codex-cli"}
+        )
         audit_path = next(
             (
                 service.workspace
@@ -1257,6 +1268,59 @@ class WechatDigestTests(unittest.TestCase):
         calls = semantic.provider.calls
         self.assertEqual(service.upgrade_active_v2_all_history(), run_id)
         self.assertEqual(semantic.provider.calls, calls)
+
+    def test_active_v2_upgrade_rejects_profiled_v2_prediagnostics_mix(self) -> None:
+        service, semantic, run_id = self._make_active_v2_processed_run(
+            mode="all_candidate",
+            messages=[message(1)],
+            suffix="profiled_v2_prediagnostics_mix",
+            protocol_version=EXTERNAL_AGENT_PROTOCOL_V2,
+        )
+        audit_path = next(
+            (
+                service.workspace
+                / "02_processing"
+                / "semantic_handoff_runs"
+            ).glob("*/processing-run-audit.json")
+        )
+        audit = json.loads(audit_path.read_text(encoding="utf-8"))
+        for field in (
+            "contract_failure_detail",
+            "diagnostic_schema_version",
+            "elapsed_ms",
+            "deadline_ms",
+            "exit_code",
+            "termination_signal",
+            "timeout_phase",
+            "provider_error_category",
+            "result_file_present",
+            "result_size_bytes",
+            "stdout_bytes",
+            "stderr_bytes",
+            "process_cleanup_status",
+        ):
+            audit.pop(field)
+        audit_path.write_text(json.dumps(audit), encoding="utf-8")
+        run_root = service.run_store.runs_root / run_id
+        before = {
+            path.relative_to(run_root): path.read_bytes()
+            for path in run_root.rglob("*")
+            if path.is_file()
+        }
+        calls = semantic.provider.calls
+
+        with self.assertRaisesRegex(WechatDigestError, "semantic receipt"):
+            service.upgrade_active_v2_all_history()
+
+        self.assertEqual(semantic.provider.calls, calls)
+        self.assertEqual(
+            {
+                path.relative_to(run_root): path.read_bytes()
+                for path in run_root.rglob("*")
+                if path.is_file()
+            },
+            before,
+        )
 
     def test_active_v2_upgrade_rejects_semantic_receipt_tamper(self) -> None:
         cases = (

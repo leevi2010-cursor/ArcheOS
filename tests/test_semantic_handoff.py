@@ -58,6 +58,20 @@ _CONTRACT_DIAGNOSTIC_FIELDS = (
     "missing_anchor_count",
     "unknown_anchor_ref_count",
 )
+_AUDIT_DIAGNOSTIC_FIELDS = (
+    "diagnostic_schema_version",
+    "elapsed_ms",
+    "deadline_ms",
+    "exit_code",
+    "termination_signal",
+    "timeout_phase",
+    "provider_error_category",
+    "result_file_present",
+    "result_size_bytes",
+    "stdout_bytes",
+    "stderr_bytes",
+    "process_cleanup_status",
+)
 
 
 class JsonAdapter:
@@ -1036,7 +1050,9 @@ class SemanticHandoffTest(unittest.TestCase):
         replay = handoff.execute(
             representation.representation_id,
             CodexCliRepresentationAnalysisProvider(
-                provider_version="0.147.0", runner=replay_runner
+                provider_version="0.147.0",
+                reasoning_effort="high",
+                runner=replay_runner,
             ),
         )
         self.assertTrue(replay.replayed_existing_package)
@@ -1077,12 +1093,56 @@ class SemanticHandoffTest(unittest.TestCase):
         replay = handoff.execute(
             representation.representation_id,
             CodexCliRepresentationAnalysisProvider(
-                provider_version="0.147.0", runner=replay_runner
+                provider_version="0.147.0",
+                reasoning_effort="high",
+                runner=replay_runner,
             ),
         )
         self.assertTrue(replay.replayed_existing_package)
         self.assertEqual(replay.ingestion.existing, 1)
         self.assertEqual(replay_runner.calls, [])
+
+    def test_replay_rejects_profiled_v2_prediagnostics_mixed_audit(self) -> None:
+        representation, service = self.build_service()
+        audit_root = self.root / "audits"
+        handoff = ExternalAgentSemanticHandoffService(
+            service,
+            JsonlAtomicInformationStore(self.root / "atomic.jsonl"),
+            audit_root,
+        )
+        handoff.execute(
+            representation.representation_id,
+            CodexCliRepresentationAnalysisProvider(
+                provider_version="0.147.0", runner=FakeRunner()
+            ),
+        )
+        units = _units_from_representation(
+            representation, service.representation_repository
+        )
+        batch = _analysis_batches(units, service.batch_size)[0]
+        _, v2_fingerprint = _external_agent_request(
+            batch, protocol_version=EXTERNAL_AGENT_PROTOCOL_V2
+        )
+        audit_path = next(audit_root.glob("*/processing-run-audit.json"))
+        impossible = json.loads(audit_path.read_text(encoding="utf-8"))
+        impossible["protocol_version"] = EXTERNAL_AGENT_PROTOCOL_V2
+        impossible["input_fingerprint"] = v2_fingerprint
+        for field in (
+            "contract_failure_detail",
+            *_AUDIT_DIAGNOSTIC_FIELDS,
+            *_CONTRACT_DIAGNOSTIC_FIELDS,
+        ):
+            impossible.pop(field)
+        audit_path.write_text(json.dumps(impossible), encoding="utf-8")
+
+        replay_runner = FakeRunner()
+        replay_provider = CodexCliRepresentationAnalysisProvider(
+            provider_version="0.147.0", runner=replay_runner
+        )
+        with self.assertRaisesRegex(Exception, "未能安全重放"):
+            handoff.execute(representation.representation_id, replay_provider)
+        self.assertEqual(replay_runner.calls, [])
+        self.assertEqual(replay_provider.execution_records, [])
 
     def test_v3_package_and_audit_replay_without_a_provider_call(self) -> None:
         representation, service = self.build_service()
@@ -1129,7 +1189,7 @@ class SemanticHandoffTest(unittest.TestCase):
         self.assertEqual(replay.ingestion.existing, 1)
         self.assertEqual(replay_runner.calls, [])
 
-    def test_replay_accepts_pre_diagnostics_processing_run_audit(self) -> None:
+    def test_replay_accepts_literal_name_only_prediagnostics_v1_package(self) -> None:
         representation, service = self.build_service()
         audit_root = self.root / "audits"
         handoff = ExternalAgentSemanticHandoffService(
@@ -1143,6 +1203,12 @@ class SemanticHandoffTest(unittest.TestCase):
                 provider_version="0.147.0", runner=FakeRunner()
             ),
         )
+        package = service.output_root / representation.representation_id
+        manifest_path = package / "manifest.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest["provider"] = {"name": "external-agent-codex-cli"}
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+        package_fingerprint = _package_fingerprint(package)
         audit_path = next(audit_root.glob("*/processing-run-audit.json"))
         legacy = json.loads(audit_path.read_text(encoding="utf-8"))
         units = _units_from_representation(
@@ -1154,8 +1220,12 @@ class SemanticHandoffTest(unittest.TestCase):
         )
         legacy["protocol_version"] = EXTERNAL_AGENT_PROTOCOL_V1
         legacy["input_fingerprint"] = v1_fingerprint
+        legacy["package_fingerprint"] = package_fingerprint
         for field in (
             "contract_failure_detail",
+            "model",
+            "reasoning_effort",
+            "fallback_policy",
             "diagnostic_schema_version",
             "elapsed_ms",
             "deadline_ms",
@@ -1172,14 +1242,26 @@ class SemanticHandoffTest(unittest.TestCase):
         ):
             legacy.pop(field)
         audit_path.write_text(json.dumps(legacy), encoding="utf-8")
+        replay_provider = CodexCliRepresentationAnalysisProvider(
+            provider_version="0.147.0", runner=FakeRunner()
+        )
         replay = handoff.execute(
             representation.representation_id,
-            CodexCliRepresentationAnalysisProvider(
-                provider_version="0.147.0", runner=FakeRunner()
-            ),
+            replay_provider,
         )
         self.assertTrue(replay.replayed_existing_package)
         self.assertEqual(replay.ingestion.existing, 1)
+        self.assertEqual(replay_provider.execution_records, [])
+
+        changed_runner = FakeRunner()
+        with self.assertRaisesRegex(Exception, "未能安全重放"):
+            handoff.execute(
+                representation.representation_id,
+                CodexCliRepresentationAnalysisProvider(
+                    provider_version="0.148.0", runner=changed_runner
+                ),
+            )
+        self.assertEqual(changed_runner.calls, [])
 
     def test_wechat_representation_uses_the_production_handoff_and_exact_replay(self) -> None:
         representation, service = self.build_wechat_service()
