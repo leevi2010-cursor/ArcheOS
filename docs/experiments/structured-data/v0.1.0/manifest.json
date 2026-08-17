@@ -1,0 +1,18 @@
+{
+  "schema_version": "1.0",
+  "issue": 108,
+  "observed_at": "2026-08-17",
+  "scope": "synthetic-supplier-quote-structured-data",
+  "fixture_versions": 3,
+  "representation_adapter": {
+    "name": "xlsx",
+    "version": "3.1.5"
+  },
+  "architecture_recommendation": "C",
+  "privacy": {
+    "real_business_sources": 0,
+    "provider_calls": 0,
+    "world_model_writes": 0,
+    "public_fixture_kind": "synthetic"
+  }
+}
