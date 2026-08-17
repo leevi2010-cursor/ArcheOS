@@ -54,6 +54,8 @@ Stage 1 要证明的不是“功能够不够多”，而是：真实、异构、
 - Context 随数据增长变得更有用，而不是更混乱；
 - 人工治理成本可接受。
 
+这里的“异构”不仅包括不同自然语言文档和 Conversation，也包括真实经营中的结构化 / 半结构化数据，例如财务表、产品 master、供应商多版报价、系统 registry。表格格式存在不代表其 schema 正确；Stage 1 需要验证系统面对 schema drift、错误 key、隐藏字段、单位不一致和冲突值时，仍能保持 Source truth、Evidence、可修订 interpretation 与治理边界。
+
 当前不进入 Stage 2 的 autonomous decision / active cognition 主线。
 
 ---
@@ -86,7 +88,7 @@ Stage 1 要证明的不是“功能够不够多”，而是：真实、异构、
 
 ## Stage 1 Gate Evidence
 
-当前只保留两个 material Evidence Gap：
+当前存在三个 material Evidence Gap：
 
 ### 1. Consolidation truth coverage
 
@@ -100,11 +102,32 @@ Product Owner 已接受一个真实 Object 的最终 Context，2 条相关 Infor
 
 该结果证明了这个案例的 Source → Information → World Model → Context 链路，但尚未证明 multi-Object、更大规模、长期增长条件下 Context 的业务效用与治理成本。这是产品证据广度不足，不是 Context Builder contract failure。
 
+### 3. Structured / semi-structured business data boundary
+
+当前 XLSX Adapter 可以忠实产生 Normalized Representation，但尚未证明 ArcheOS 能正确吸收真实经营中的“脏结构化数据”：例如多版供应商报价、财务表和产品数据中出现 schema drift、non-unique key、字段语义错误、规格藏在备注、单位不一致、缺失值和冲突值。
+
+这一缺口的核心不是“再支持一种文件格式”，而是验证：
+
+```text
+Source truth
+→ faithful Representation
+→ structure / data-quality interpretation
+→ governed normalization / Projection
+→ Object / Atomic Information / Context
+```
+
+系统必须避免两个错误方向：
+
+- 因为输入是表格就把 source schema 当作正确业务 truth；
+- 为了统一 Information lifecycle 把整张表逐 cell 强制转成 Atomic Information。
+
+Issue #108 作为有界 Stage 1 架构实验验证该边界。开始时不新增 `Dataset / Table / Record / Schema / StructuredState` 等 canonical concept；若实验事实证明现有 Representation / Projection / Evidence 无法表达，应先 `LEAD_DECISION_REQUIRED`，再由 Lead 更新 `CONCEPTS.md` + ADR。
+
 ---
 
 ## 当前主线：Stage 1 Gate Review
 
-Issue #17 已完成；当前不再把新的 feature 或 validation Issue 预设为主线。Product / Technical Lead 下一步应基于上述证据作出 Stage 1 Gate Review：
+Issue #17 已完成；当前不再把新的 feature 自动预设为主线。Product / Technical Lead 应基于上述证据作出 Stage 1 Gate Review：
 
 ```text
 PASS
@@ -117,7 +140,13 @@ FAIL
 → 指明失败的具体层，并只修正该层
 ```
 
-若 Gate Review 选择 `CONTINUE / PARTIAL`，带人工 truth 的 Consolidation 验证与 multi-Object Context 验证只是候选工作；Lead 应决定执行其中一个、两个或都不执行，而不是把两项自动列为必做序列。
+若 Gate Review 选择 `CONTINUE / PARTIAL`，当前候选工作包括：
+
+- 带人工 truth 的 Consolidation 验证；
+- multi-Object Context 验证；
+- #108 脏结构化 / 半结构化数据边界实验。
+
+Lead 应根据哪个缺口最可能影响 Stage 1 产品结论来决定执行顺序，而不是把三项机械串行成固定功能 Roadmap。#108 的目的尤其是验证“真实异构经营数据”假设，不是建设完整 ETL / MDM / Data Warehouse。
 
 在 Gate Review 与 Product Owner 的 Stage 2 明确决定之前：
 
@@ -185,5 +214,7 @@ Stage 2 当前 authority 以 `docs/product/PRODUCT_ROADMAP.md` 与 blocked Issue
 - Context / View / Projection ≠ 第二份 truth；
 - Provider 不能绕过 strict validation 直接写 Durable Information / World Model；
 - TOS / R2 / S3 等只可作为 storage adapter / replica，不改变 identity；
+- 表格 / record schema 不是因为“看起来结构化”就自动成为业务 truth；
+- 结构化 current state 与 Atomic Information 可以共存，不要求把完整 dataset 强制原子化；
 - 不因为代码方便创建新的 Core noun；
 - canonical concept 不足时，先修改 `CONCEPTS.md` + ADR，再允许 implementation Issue Ready。
