@@ -117,6 +117,20 @@ archeos conversation wechat represent <source_id>
 
 该命令只产生私有、Git-ignored 的 Representation 与匿名覆盖指标，不调用 semantic provider，也不写入 Atomic Information 或 World Model。
 
+## 微信信息消化
+
+首次使用必须明确选择一个起点；成功后，日常运行只需执行增量命令：
+
+```bash
+archeos wechat digest --since 2026-08-01
+# 或：archeos wechat digest --from-now
+# 或：archeos wechat digest --all-history
+
+archeos wechat digest
+```
+
+ArcheOS 会把待处理历史切成连续的 30 日固定窗口；每个窗口内的消息与附件全部达到明确终态后，才推进本地 checkpoint。任一窗口失败时保留此前成功 checkpoint，下次从失败窗口原样恢复。隐私受限、暂不支持或需要人工判断的内容会保留并在业务摘要中单独报告。
+
 ## Codex 只读接入
 
 初始化 Workspace 后，可显式安装 ArcheOS 管理的本地 MCP 配置：
