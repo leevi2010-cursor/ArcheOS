@@ -171,59 +171,6 @@ def _sessions(
     )
 
 
-def _rows_for_session(
-    app: object,
-    username: str,
-    *,
-    start_timestamp: int,
-    end_timestamp: int | None,
-    table_locations: dict[str, tuple[tuple[str, str], ...]],
-) -> list[tuple[object, ...]]:
-    from wechat_cli.core.messages import _query_messages
-
-    table_name = "Msg_" + hashlib.md5(username.encode()).hexdigest()
-    rows: list[tuple[object, ...]] = []
-    for relative_key, database in table_locations.get(table_name, ()):
-        try:
-            with closing(sqlite3.connect(database)) as connection:
-                rows.extend(
-                    (relative_key, *row)
-                    for row in _query_messages(
-                        connection,
-                        table_name,
-                        start_ts=start_timestamp,
-                        end_ts=end_timestamp,
-                        limit=None,
-                    )
-                )
-        except sqlite3.Error:
-            raise RuntimeError("message database query failed") from None
-    return rows
-
-
-def _cursor_rows_for_session(
-    app: object,
-    username: str,
-    *,
-    start_timestamp: int,
-    table_locations: dict[str, tuple[tuple[str, str], ...]],
-) -> list[tuple[str, object, object]]:
-    table_name = "Msg_" + hashlib.md5(username.encode()).hexdigest()
-    rows: list[tuple[str, object, object]] = []
-    for relative_key, database in table_locations.get(table_name, ()):
-        try:
-            with closing(sqlite3.connect(database)) as connection:
-                values = connection.execute(
-                    f"SELECT local_id, create_time FROM [{table_name}] "
-                    "WHERE create_time >= ? ORDER BY create_time ASC",
-                    (start_timestamp,),
-                ).fetchall()
-                rows.extend((relative_key, *value) for value in values)
-        except sqlite3.Error:
-            raise RuntimeError("message cursor query failed") from None
-    return rows
-
-
 def _message_table_locations(
     app: object,
 ) -> dict[str, tuple[tuple[str, str], ...]]:
@@ -248,6 +195,73 @@ def _message_table_locations(
     return {
         table_name: tuple(values) for table_name, values in locations.items()
     }
+
+
+def _located_session_tables(
+    sessions: tuple[tuple[str, str, bool], ...],
+    table_locations: dict[str, tuple[tuple[str, str], ...]],
+) -> dict[str, tuple[tuple[str, str, str, bool, str], ...]]:
+    by_database: dict[str, list[tuple[str, str, str, bool, str]]] = {}
+    for username, display_name, is_group in sessions:
+        table_name = "Msg_" + hashlib.md5(username.encode()).hexdigest()
+        for relative_key, database in table_locations.get(table_name, ()):
+            by_database.setdefault(database, []).append(
+                (relative_key, username, display_name, is_group, table_name)
+            )
+    return {
+        database: tuple(values) for database, values in by_database.items()
+    }
+
+
+def _all_cursor_rows(
+    located_tables: dict[str, tuple[tuple[str, str, str, bool, str], ...]],
+    *,
+    start_timestamp: int,
+) -> list[tuple[str, str, object, object]]:
+    rows: list[tuple[str, str, object, object]] = []
+    for database, tables in located_tables.items():
+        try:
+            with closing(sqlite3.connect(database)) as connection:
+                for relative_key, username, _label, _group, table_name in tables:
+                    values = connection.execute(
+                        f"SELECT local_id, create_time FROM [{table_name}] "
+                        "WHERE create_time >= ? ORDER BY create_time ASC",
+                        (start_timestamp,),
+                    ).fetchall()
+                    rows.extend(
+                        (username, relative_key, *value) for value in values
+                    )
+        except sqlite3.Error:
+            raise RuntimeError("message cursor query failed") from None
+    return rows
+
+
+def _all_message_rows(
+    located_tables: dict[str, tuple[tuple[str, str, str, bool, str], ...]],
+    *,
+    start_timestamp: int,
+    end_timestamp: int,
+) -> list[tuple[object, ...]]:
+    from wechat_cli.core.messages import _query_messages
+
+    rows: list[tuple[object, ...]] = []
+    for database, tables in located_tables.items():
+        try:
+            with closing(sqlite3.connect(database)) as connection:
+                for relative_key, username, display_name, is_group, table_name in tables:
+                    rows.extend(
+                        (username, display_name, is_group, relative_key, *row)
+                        for row in _query_messages(
+                            connection,
+                            table_name,
+                            start_ts=start_timestamp,
+                            end_ts=end_timestamp,
+                            limit=None,
+                        )
+                    )
+        except sqlite3.Error:
+            raise RuntimeError("message database query failed") from None
+    return rows
 
 
 def _capture(request: dict[str, object]) -> dict[str, object]:
@@ -290,18 +304,16 @@ def _capture(request: dict[str, object]) -> dict[str, object]:
     names = get_contact_names(app.cache, app.decrypted_dir)
     sessions = _sessions(app, names)
     table_locations = _message_table_locations(app)
+    located_tables = _located_session_tables(sessions, table_locations)
+    all_cursor_rows = _all_cursor_rows(
+        located_tables, start_timestamp=after[0]
+    )
     if request["observe_only"]:
         cursors = [
             (create_time, _digest("wechat_conversation", username), _digest(
                 "wechat_message", username, database_key, local_id, create_time
             ))
-            for username, _display_name, _is_group in sessions
-            for database_key, local_id, create_time in _cursor_rows_for_session(
-                app,
-                username,
-                start_timestamp=after[0],
-                table_locations=table_locations,
-            )
+            for username, database_key, local_id, create_time in all_cursor_rows
             if isinstance(create_time, int) and not isinstance(create_time, bool)
         ]
         bounded = [
@@ -323,13 +335,7 @@ def _capture(request: dict[str, object]) -> dict[str, object]:
                 "wechat_message", username, database_key, local_id, create_time
             ),
         )
-        for username, _display_name, _is_group in sessions
-        for database_key, local_id, create_time in _cursor_rows_for_session(
-            app,
-            username,
-            start_timestamp=after[0],
-            table_locations=table_locations,
-        )
+        for username, database_key, local_id, create_time in all_cursor_rows
         if isinstance(create_time, int) and not isinstance(create_time, bool)
     ]
     remaining = [
@@ -356,90 +362,90 @@ def _capture(request: dict[str, object]) -> dict[str, object]:
         except sqlite3.Error:
             id_maps[relative_key] = {}
     messages: dict[str, dict[str, object]] = {}
-    for username, display_name, is_group in sessions:
-        conversation_key = _digest("wechat_conversation", username)
-        rows = _rows_for_session(
-            app,
+    rows = _all_message_rows(
+        located_tables,
+        start_timestamp=after[0],
+        end_timestamp=effective_upper[0],
+    )
+    for row in rows:
+        (
             username,
-            start_timestamp=after[0],
-            end_timestamp=effective_upper[0],
-            table_locations=table_locations,
+            display_name,
+            is_group,
+            database_key,
+            local_id,
+            local_type,
+            create_time,
+            real_sender_id,
+            raw_content,
+            compression,
+        ) = row
+        conversation_key = _digest("wechat_conversation", username)
+        if isinstance(create_time, bool) or not isinstance(create_time, int):
+            continue
+        message_key = _digest(
+            "wechat_message",
+            username,
+            database_key,
+            local_id,
+            create_time,
         )
-        for row in rows:
-            (
-                database_key,
-                local_id,
-                local_type,
-                create_time,
-                real_sender_id,
-                raw_content,
-                compression,
-            ) = row
-            if isinstance(create_time, bool) or not isinstance(create_time, int):
-                continue
-            message_key = _digest(
-                "wechat_message",
-                username,
-                database_key,
-                local_id,
-                create_time,
-            )
-            cursor = (create_time, conversation_key, message_key)
-            if cursor <= after or cursor > effective_upper:
-                continue
-            content = decompress_content(raw_content, compression)
-            if content is None:
-                content = "(unavailable)"
-            content = str(content)
-            app_type, _title = _app_message(content)
-            sender_from_content, visible_content = _format_message_text(
-                local_id,
-                local_type,
-                content,
-                is_group,
-                username,
-                display_name,
-                names,
-                app.display_name_fn,
-                db_dir=app.db_dir,
-                create_time_ts=create_time,
-                resolve_media=False,
-            )
-            sender_label = _resolve_sender_label(
-                real_sender_id,
-                sender_from_content,
-                is_group,
-                username,
-                display_name,
-                names,
-                id_maps.get(str(database_key), {}),
-                app.display_name_fn,
-            )
-            captured = {
-                "conversation_key": conversation_key,
-                "provider_conversation_id": username,
-                "conversation_label": display_name,
-                "is_group": is_group,
-                "message_key": message_key,
-                "cursor": _cursor_dict(cursor),
-                "sender_label": sender_label or "unavailable",
-                "message_type": _message_type(local_type, app_type),
-                "timestamp": create_time,
-                "sent_at": datetime.fromtimestamp(create_time).astimezone().isoformat(),
-                "visible_content": str(visible_content),
-                "structured_payload": content,
-                "attachments": _attachment(
-                    app=app,
-                    message_key=message_key,
-                    local_type=local_type,
-                    content=content,
-                    create_time=create_time,
-                ),
-            }
-            existing = messages.get(message_key)
-            if existing is not None and existing != captured:
-                raise RuntimeError("message identity collision")
-            messages[message_key] = captured
+        cursor = (create_time, conversation_key, message_key)
+        if cursor <= after or cursor > effective_upper:
+            continue
+        content = decompress_content(raw_content, compression)
+        if content is None:
+            content = "(unavailable)"
+        content = str(content)
+        app_type, _title = _app_message(content)
+        sender_from_content, visible_content = _format_message_text(
+            local_id,
+            local_type,
+            content,
+            is_group,
+            username,
+            display_name,
+            names,
+            app.display_name_fn,
+            db_dir=app.db_dir,
+            create_time_ts=create_time,
+            resolve_media=False,
+        )
+        sender_label = _resolve_sender_label(
+            real_sender_id,
+            sender_from_content,
+            is_group,
+            username,
+            display_name,
+            names,
+            id_maps.get(str(database_key), {}),
+            app.display_name_fn,
+        )
+        captured = {
+            "conversation_key": conversation_key,
+            "provider_conversation_id": username,
+            "conversation_label": display_name,
+            "is_group": is_group,
+            "message_key": message_key,
+            "cursor": _cursor_dict(cursor),
+            "sender_label": sender_label or "unavailable",
+            "message_type": _message_type(local_type, app_type),
+            "timestamp": create_time,
+            "sent_at": datetime.fromtimestamp(create_time).astimezone().isoformat(),
+            "visible_content": str(visible_content),
+            "structured_payload": content,
+            "attachments": _attachment(
+                app=app,
+                message_key=message_key,
+                local_type=local_type,
+                content=content,
+                create_time=create_time,
+            ),
+        }
+        existing = messages.get(message_key)
+        if existing is not None and existing != captured:
+            raise RuntimeError("message identity collision")
+        messages[message_key] = captured
     ordered = sorted(
         messages.values(),
         key=lambda item: _cursor(item["cursor"], "message.cursor"),
