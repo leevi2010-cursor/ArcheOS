@@ -23,6 +23,7 @@ from pathlib import Path
 from typing import Protocol
 
 from .atomic_information import JsonlAtomicInformationStore
+from .atomic_information.ingestion import _load_candidates
 from .consolidation import BoundedInformationCandidateRetriever
 from .context import ContextBuilder, ContextRequest
 from .digestion import (
@@ -42,10 +43,16 @@ from .representation.registry import production_adapter
 from .representation_information import (
     DEFAULT_EXTERNAL_AGENT_BATCH_SIZE,
     CodexCliRepresentationAnalysisProvider,
+    RepresentationInformationError,
     RepresentationInformationService,
     _units_from_representation,
+    validate_representation_information_package,
 )
-from .semantic_handoff import ExternalAgentSemanticHandoffService
+from .semantic_handoff import (
+    ExternalAgentSemanticHandoffService,
+    SemanticHandoffError,
+    _package_fingerprint,
+)
 from .source import LocalManagedSourceRepository, ManagedSourceService
 from .source.local_repository import SourceNotFoundError
 from .world_model import ObjectResolver, SQLiteWorldModelRepository
@@ -1842,8 +1849,193 @@ class WechatDigestService:
                     raise WechatDigestError("微信运行状态 privacy receipt 损坏。")
                 if item.get("state") == "local_only" and privacy.route != "local_only":
                     raise WechatDigestError("微信运行状态 privacy receipt 损坏。")
-                if item.get("state") in {"processed", "pending_human"} and (not self._existing_semantic_package(representation_id) or not item.get("atomic_information_ids")):
-                    raise WechatDigestError("微信运行状态 semantic receipt 损坏。")
+                if item.get("state") in {"processed", "pending_human"}:
+                    self._verify_semantic_receipts(representation_id, item)
+
+    def _verify_semantic_receipts(
+        self, representation_id: str, item: Mapping[str, object]
+    ) -> None:
+        package = (
+            self.workspace
+            / "02_processing"
+            / "information"
+            / representation_id
+        )
+        if not package.is_dir():
+            raise WechatDigestError("微信运行状态 semantic package 缺失。")
+        try:
+            manifest, candidates = validate_representation_information_package(
+                package
+            )
+            source = manifest.get("source")
+            representation = manifest.get("representation")
+            persisted_representation = self.representation_repository.get(
+                representation_id
+            )
+            if (
+                not isinstance(source, dict)
+                or not isinstance(representation, dict)
+                or representation.get("representation_id") != representation_id
+                or source.get("id") != persisted_representation.source_id
+                or source.get("content_hash")
+                != persisted_representation.source_content_hash
+            ):
+                raise WechatDigestError(
+                    "微信运行状态 semantic package binding 损坏。"
+                )
+            source_id = source.get("id")
+            if not isinstance(source_id, str):
+                raise WechatDigestError(
+                    "微信运行状态 semantic package binding 损坏。"
+                )
+            package_schema = manifest.get("schema_version")
+            if not isinstance(package_schema, str):
+                raise WechatDigestError(
+                    "微信运行状态 semantic package schema 损坏。"
+                )
+            revisions = _load_candidates(
+                package, package_schema, source_id
+            )
+            expected = {
+                revision.atomic_information_id: revision
+                for revision in revisions
+            }
+            if len(expected) != len(candidates):
+                raise WechatDigestError(
+                    "微信运行状态 semantic package Candidate 冲突。"
+                )
+            self._verify_semantic_audits(package, manifest)
+            observed = item.get("atomic_information_ids")
+            if (
+                not isinstance(observed, list)
+                or any(not isinstance(value, str) for value in observed)
+                or len(observed) != len(set(observed))
+                or set(observed) != set(expected)
+            ):
+                raise WechatDigestError(
+                    "微信运行状态 semantic receipt 不收敛。"
+                )
+            if item.get("state") == "pending_human" and not expected:
+                raise WechatDigestError(
+                    "微信运行状态 pending_human receipt 为空。"
+                )
+            for atomic_id, expected_revision in expected.items():
+                revision = self.information_store.get_current(atomic_id)
+                if (
+                    revision.atomic_information_id != atomic_id
+                    or revision.origin_source_id
+                    != expected_revision.origin_source_id
+                    or revision.origin_candidate_id
+                    != expected_revision.origin_candidate_id
+                    or revision.origin_fingerprint
+                    != expected_revision.origin_fingerprint
+                ):
+                    raise WechatDigestError(
+                        "微信运行状态 Atomic Information receipt 不收敛。"
+                    )
+        except WechatDigestError:
+            raise
+        except (
+            OSError,
+            TypeError,
+            ValueError,
+            RepresentationInformationError,
+            SemanticHandoffError,
+        ) as exc:
+            raise WechatDigestError(
+                "微信运行状态 semantic receipt 损坏。"
+            ) from exc
+
+    def _verify_semantic_audits(
+        self, package: Path, manifest: Mapping[str, object]
+    ) -> None:
+        raw_batches = manifest.get("batches")
+        if not isinstance(raw_batches, list) or not raw_batches:
+            raise WechatDigestError("微信运行状态 semantic audit 损坏。")
+        expected_batches: set[tuple[str, ...]] = set()
+        for value in raw_batches:
+            if not isinstance(value, dict):
+                raise WechatDigestError("微信运行状态 semantic audit 损坏。")
+            unit_ids = value.get("unit_ids")
+            if (
+                not isinstance(unit_ids, list)
+                or any(not isinstance(unit_id, str) for unit_id in unit_ids)
+            ):
+                raise WechatDigestError("微信运行状态 semantic audit 损坏。")
+            expected_batches.add(tuple(unit_ids))
+        if len(expected_batches) != len(raw_batches):
+            raise WechatDigestError("微信运行状态 semantic audit 批次损坏。")
+        package_fingerprint = _package_fingerprint(package)
+        audit_root = (
+            self.workspace / "02_processing" / "semantic_handoff_runs"
+        )
+        matching: list[dict[str, object]] = []
+        if audit_root.is_dir():
+            for path in sorted(
+                audit_root.glob("*/processing-run-audit.json")
+            ):
+                try:
+                    value = json.loads(path.read_text(encoding="utf-8"))
+                except (OSError, json.JSONDecodeError):
+                    continue
+                if (
+                    isinstance(value, dict)
+                    and value.get("package_fingerprint")
+                    == package_fingerprint
+                ):
+                    matching.append(value)
+        observed_batches: set[tuple[str, ...]] = set()
+        for audit in matching:
+            anchor_unit_ids = audit.get("anchor_unit_ids")
+            if (
+                not isinstance(anchor_unit_ids, list)
+                or any(
+                    not isinstance(unit_id, str)
+                    for unit_id in anchor_unit_ids
+                )
+            ):
+                raise WechatDigestError(
+                    "微信运行状态 semantic audit 损坏。"
+                )
+            batch = tuple(anchor_unit_ids)
+            if batch not in expected_batches or batch in observed_batches:
+                raise WechatDigestError(
+                    "微信运行状态 semantic audit 批次不收敛。"
+                )
+            observed_batches.add(batch)
+            if (
+                audit.get("schema_version") != "processing-run-audit/1.0"
+                or audit.get("execution_status") != "succeeded"
+                or audit.get("failure_category") is not None
+                or audit.get("contract_failure_detail") is not None
+                or audit.get("strict_validation_status") != "passed"
+                or not isinstance(audit.get("result_fingerprint"), str)
+                or re.fullmatch(
+                    r"sha256:[0-9a-f]{64}",
+                    str(audit.get("result_fingerprint")),
+                )
+                is None
+                or audit.get("eligible_units") != len(batch)
+                or audit.get("covered_units") != len(batch)
+                or audit.get("unaccounted_units") != 0
+                or audit.get("result_file_present") is not True
+                or audit.get("timeout_phase") is not None
+                or audit.get("provider_error_category") is not None
+                or audit.get("result_readback_status") != "verified"
+                or audit.get("process_cleanup_status") != "verified"
+                or audit.get("package_published") is not True
+                or audit.get("information_ingested") is not True
+                or audit.get("durable_ingestion_status") != "completed"
+                or audit.get("handoff_status") != "completed"
+                or audit.get("audit_readback_status") != "verified"
+            ):
+                raise WechatDigestError(
+                    "微信运行状态 semantic audit 未严格完成。"
+                )
+        if observed_batches != expected_batches:
+            raise WechatDigestError(
+                "微信运行状态 semantic audit 集合不完整。"
+            )
 
     def _run_locked(
         self, *, since: str | None, from_now: bool, all_history: bool

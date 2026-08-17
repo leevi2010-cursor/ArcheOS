@@ -20,7 +20,9 @@ from archeos.representation_information import (
     RepresentationAnalysisResult,
     RepresentationCandidateDraft,
     RepresentationInformationService,
+    RepresentationResidueDraft,
 )
+from archeos.semantic_handoff import _package_fingerprint
 from archeos.source import LocalManagedSourceRepository
 from archeos.wechat_capture_helper import _window_upper
 from archeos.wechat_digest import (
@@ -171,9 +173,18 @@ class SyntheticAnalysisProvider:
 
     def __init__(self) -> None:
         self.calls = 0
+        self.mode = "all_candidate"
 
     def analyze(self, batch):
         self.calls += 1
+        candidate_units = tuple(batch.anchor_units)
+        residue_units = ()
+        if self.mode == "all_residue":
+            candidate_units = ()
+            residue_units = tuple(batch.anchor_units)
+        elif self.mode == "mixed":
+            candidate_units = tuple(batch.anchor_units[::2])
+            residue_units = tuple(batch.anchor_units[1::2])
         return RepresentationAnalysisResult(
             candidates=tuple(
                 RepresentationCandidateDraft(
@@ -188,9 +199,16 @@ class SyntheticAnalysisProvider:
                     context="Synthetic bounded context.",
                     confidence=1.0,
                 )
-                for unit in batch.anchor_units
+                for unit in candidate_units
             ),
-            residue=(),
+            residue=tuple(
+                RepresentationResidueDraft(
+                    evidence_unit_ids=(unit.unit_id,),
+                    reason_not_absorbed="Synthetic unresolved detail.",
+                    future_value_or_uncertainty="Preserve for later evidence.",
+                )
+                for unit in residue_units
+            ),
         )
 
 
@@ -218,7 +236,55 @@ class SyntheticSemanticHandoff:
             ),
             output_root,
         ).extract(representation_id, self.provider)
-        return SimpleNamespace(ingestion=ingest_processing_package(package, store))
+        ingestion = ingest_processing_package(package, store)
+        self._write_success_audits(package)
+        return SimpleNamespace(ingestion=ingestion)
+
+    def _write_success_audits(self, package: Path) -> None:
+        manifest = json.loads(
+            (package / "manifest.json").read_text(encoding="utf-8")
+        )
+        package_fingerprint = _package_fingerprint(package)
+        audit_root = (
+            self.workspace / "02_processing" / "semantic_handoff_runs"
+        )
+        for index, batch in enumerate(manifest["batches"], start=1):
+            anchor_unit_ids = batch["unit_ids"]
+            processing_run_id = "run_" + hashlib.sha256(
+                f"{package.name}:{index}".encode()
+            ).hexdigest()[:32]
+            audit_path = (
+                audit_root / processing_run_id / "processing-run-audit.json"
+            )
+            audit_path.parent.mkdir(parents=True, exist_ok=True)
+            audit_path.write_text(
+                json.dumps(
+                    {
+                        "schema_version": "processing-run-audit/1.0",
+                        "anchor_unit_ids": anchor_unit_ids,
+                        "execution_status": "succeeded",
+                        "failure_category": None,
+                        "contract_failure_detail": None,
+                        "strict_validation_status": "passed",
+                        "result_fingerprint": "sha256:" + "1" * 64,
+                        "eligible_units": len(anchor_unit_ids),
+                        "covered_units": len(anchor_unit_ids),
+                        "unaccounted_units": 0,
+                        "result_file_present": True,
+                        "timeout_phase": None,
+                        "provider_error_category": None,
+                        "result_readback_status": "verified",
+                        "process_cleanup_status": "verified",
+                        "package_published": True,
+                        "package_fingerprint": package_fingerprint,
+                        "information_ingested": True,
+                        "durable_ingestion_status": "completed",
+                        "handoff_status": "completed",
+                        "audit_readback_status": "verified",
+                    }
+                ),
+                encoding="utf-8",
+            )
 
 
 class NoStructuralChangeProvider:
@@ -925,6 +991,66 @@ class WechatDigestTests(unittest.TestCase):
         receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
         return service, run_id
 
+    def _make_active_v2_processed_run(
+        self,
+        *,
+        mode: str,
+        messages: list[CapturedMessage],
+        suffix: str,
+    ) -> tuple[WechatDigestService, SyntheticSemanticHandoff, str]:
+        workspace = Path(self.temporary.name) / f"workspace_{suffix}"
+        for directory in (
+            "01_inbox",
+            "02_processing",
+            "03_information",
+            "04_core",
+        ):
+            (workspace / directory).mkdir(parents=True, exist_ok=True)
+        semantic = SyntheticSemanticHandoff(workspace)
+        semantic.provider.mode = mode
+        with SQLiteWorldModelRepository(
+            workspace / "04_core" / "archeos.sqlite3"
+        ) as repository:
+            repository.create_object("Synthetic Project")
+        failures = [True]
+
+        def interrupt_checkpoint() -> None:
+            if failures.pop():
+                raise RuntimeError("synthetic post-semantic interruption")
+
+        run_store = WechatDigestRunStore(
+            workspace / "02_processing" / "wechat_digest",
+            before_checkpoint_publish=interrupt_checkpoint,
+        )
+        service = WechatDigestService(
+            workspace=workspace,
+            capture_provider=SyntheticCaptureProvider(messages),
+            semantic_handoff_factory=lambda: semantic,
+            interpretation_provider=NoStructuralChangeProvider(),
+            run_store=run_store,
+        )
+        with self.assertRaisesRegex(WechatDigestError, "安全完成"):
+            service.run(all_history=True)
+        run_store.before_checkpoint_publish = None
+        run_id = run_store.active_run_id()
+        assert run_id is not None
+        run_dir = run_store.runs_root / run_id
+        plan_path = run_dir / "plan.json"
+        status_path = run_dir / "status.json"
+        receipt_path = run_dir / "run-plan-receipt.json"
+        plan = json.loads(plan_path.read_text(encoding="utf-8"))
+        plan["schema_version"] = "wechat-digest-run-plan/2.0"
+        plan.pop("all_history_upper_bound")
+        fingerprint = _plan_fingerprint(plan)
+        status = json.loads(status_path.read_text(encoding="utf-8"))
+        status["plan_fingerprint"] = fingerprint
+        receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+        receipt["plan_fingerprint"] = fingerprint
+        plan_path.write_text(json.dumps(plan), encoding="utf-8")
+        status_path.write_text(json.dumps(status), encoding="utf-8")
+        receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
+        return service, semantic, run_id
+
     def test_active_v2_all_history_requires_explicit_zero_provider_upgrade(
         self,
     ) -> None:
@@ -958,6 +1084,136 @@ class WechatDigestTests(unittest.TestCase):
         self.assertEqual(self.semantic.provider.calls, provider_calls)
         self.assertEqual(service.upgrade_active_v2_all_history(), run_id)
         self.assertEqual(self.semantic.provider.calls, provider_calls)
+
+    def test_active_v2_upgrade_accepts_strict_candidate_residue_receipts(
+        self,
+    ) -> None:
+        cases = (
+            ("all_residue", [message(1)], 0),
+            ("all_candidate", [message(1)], 1),
+            ("mixed", [message(1), message(2)], 1),
+        )
+        for mode, messages, expected_ids in cases:
+            with self.subTest(mode=mode):
+                service, semantic, run_id = self._make_active_v2_processed_run(
+                    mode=mode, messages=messages, suffix=mode
+                )
+                calls = semantic.provider.calls
+                self.assertEqual(
+                    service.upgrade_active_v2_all_history(), run_id
+                )
+                status = service.run_store.status(run_id)
+                item = next(iter(status["items"].values()))
+                self.assertEqual(
+                    len(item["atomic_information_ids"]), expected_ids
+                )
+                self.assertEqual(semantic.provider.calls, calls)
+
+    def test_active_v2_upgrade_rejects_semantic_receipt_tamper(self) -> None:
+        cases = (
+            "missing_status_id",
+            "extra_status_id",
+            "missing_package",
+            "missing_audit",
+            "cleanup",
+            "store",
+        )
+        for case in cases:
+            with self.subTest(case=case):
+                service, semantic, run_id = self._make_active_v2_processed_run(
+                    mode="all_candidate",
+                    messages=[message(1), message(2)],
+                    suffix=case,
+                )
+                status_path = service.run_store.runs_root / run_id / "status.json"
+                status = json.loads(status_path.read_text(encoding="utf-8"))
+                item = next(iter(status["items"].values()))
+                if case == "missing_status_id":
+                    item["atomic_information_ids"] = []
+                    status_path.write_text(json.dumps(status), encoding="utf-8")
+                elif case == "extra_status_id":
+                    item["atomic_information_ids"].append(
+                        "atomic_info_" + "0" * 32
+                    )
+                    status_path.write_text(json.dumps(status), encoding="utf-8")
+                elif case == "missing_package":
+                    package = (
+                        service.workspace
+                        / "02_processing"
+                        / "information"
+                        / item["representation_id"]
+                    )
+                    package.rename(package.with_name(package.name + ".missing"))
+                elif case in {"missing_audit", "cleanup"}:
+                    audit_path = next(
+                        (
+                            service.workspace
+                            / "02_processing"
+                            / "semantic_handoff_runs"
+                        ).glob("*/processing-run-audit.json")
+                    )
+                    if case == "missing_audit":
+                        audit_path.unlink()
+                    else:
+                        audit = json.loads(
+                            audit_path.read_text(encoding="utf-8")
+                        )
+                        audit["process_cleanup_status"] = "not_verified"
+                        audit_path.write_text(
+                            json.dumps(audit), encoding="utf-8"
+                        )
+                else:
+                    information_path = (
+                        service.workspace
+                        / "03_information"
+                        / "atomic_information.jsonl"
+                    )
+                    lines = information_path.read_text(encoding="utf-8").splitlines()
+                    payload = json.loads(lines[0])
+                    payload["origin_candidate_id"] = "candidate_" + "0" * 64
+                    lines[0] = json.dumps(payload)
+                    information_path.write_text(
+                        "\n".join(lines) + "\n", encoding="utf-8"
+                    )
+                calls = semantic.provider.calls
+                with self.assertRaisesRegex(
+                    WechatDigestError, "semantic|Atomic Information"
+                ):
+                    service.upgrade_active_v2_all_history()
+                self.assertEqual(semantic.provider.calls, calls)
+
+    def test_active_v2_upgrade_rejects_empty_pending_human_receipt(self) -> None:
+        service, semantic, run_id = self._make_active_v2_processed_run(
+            mode="all_residue", messages=[message(1)], suffix="pending_empty"
+        )
+        status_path = service.run_store.runs_root / run_id / "status.json"
+        status = json.loads(status_path.read_text(encoding="utf-8"))
+        item = next(iter(status["items"].values()))
+        item["state"] = "pending_human"
+        item["pending_human"] = True
+        status_path.write_text(json.dumps(status), encoding="utf-8")
+        calls = semantic.provider.calls
+        with self.assertRaisesRegex(WechatDigestError, "pending_human"):
+            service.upgrade_active_v2_all_history()
+        self.assertEqual(semantic.provider.calls, calls)
+
+    def test_active_v2_upgrade_keeps_represented_package_recoverable(self) -> None:
+        service, semantic, run_id = self._make_active_v2_processed_run(
+            mode="all_candidate", messages=[message(1)], suffix="represented"
+        )
+        status_path = service.run_store.runs_root / run_id / "status.json"
+        status = json.loads(status_path.read_text(encoding="utf-8"))
+        item = next(iter(status["items"].values()))
+        item["state"] = "represented"
+        item["atomic_information_ids"] = []
+        status_path.write_text(json.dumps(status), encoding="utf-8")
+        calls = semantic.provider.calls
+        self.assertEqual(service.upgrade_active_v2_all_history(), run_id)
+        upgraded_item = next(
+            iter(service.run_store.status(run_id)["items"].values())
+        )
+        self.assertEqual(upgraded_item["state"], "represented")
+        self.assertEqual(semantic.provider.calls, calls)
 
     def test_active_v2_upgrade_interruption_reuses_first_frozen_upper(self) -> None:
         day = 24 * 60 * 60
