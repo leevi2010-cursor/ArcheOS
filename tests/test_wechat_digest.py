@@ -34,6 +34,7 @@ from archeos.wechat_digest import (
     WechatDigestError,
     WechatDigestRunStore,
     WechatDigestService,
+    _build_plan,
     _plan_fingerprint,
 )
 from archeos.world_model import SQLiteWorldModelRepository
@@ -1002,6 +1003,249 @@ class WechatDigestTests(unittest.TestCase):
             _plan_fingerprint(run_store.plan(run_id)),
         )
         self.assertEqual(self.semantic.provider.calls, 0)
+
+    def test_active_v2_upgrade_rejects_upper_tamper_after_plan_write(self) -> None:
+        day = 24 * 60 * 60
+        capture = SyntheticCaptureProvider(
+            [message(1), message(2, timestamp=1_700_000_000 + 31 * day)],
+            window_seconds=30 * day,
+        )
+        fail_once = [True]
+
+        def interrupt_before_status() -> None:
+            if fail_once.pop():
+                raise RuntimeError("synthetic plan-only interruption")
+
+        run_store = WechatDigestRunStore(
+            self.workspace / "02_processing" / "wechat_digest",
+            before_upgrade_status_write=interrupt_before_status,
+        )
+        service, run_id = self._make_active_v2_run(
+            capture, run_store=run_store
+        )
+        with self.assertRaisesRegex(RuntimeError, "plan-only"):
+            service.upgrade_active_v2_all_history()
+        plan_path = run_store.runs_root / run_id / "plan.json"
+        plan = json.loads(plan_path.read_text(encoding="utf-8"))
+        plan["all_history_upper_bound"] = plan["upper_bound"]
+        plan_path.write_text(json.dumps(plan), encoding="utf-8")
+        run_store.before_upgrade_status_write = None
+        with self.assertRaisesRegex(WechatDigestError, "pending receipt|plan"):
+            service.upgrade_active_v2_all_history()
+        self.assertEqual(run_store.plan_receipt(run_id)["phase"], "pending")
+        self.assertEqual(self.semantic.provider.calls, 0)
+
+    def test_active_v2_upgrade_recovers_each_pending_transaction_stage(
+        self,
+    ) -> None:
+        day = 24 * 60 * 60
+        cases = (
+            (
+                "after_upgrade_pending_receipt_write",
+                "wechat-digest-run-plan/2.0",
+                "previous_plan_fingerprint",
+            ),
+            (
+                "before_upgrade_status_write",
+                "wechat-digest-run-plan/3.0",
+                "previous_plan_fingerprint",
+            ),
+            (
+                "before_upgrade_commit_receipt_write",
+                "wechat-digest-run-plan/3.0",
+                "target_plan_fingerprint",
+            ),
+        )
+        for index, (hook_name, plan_schema, status_fingerprint_key) in enumerate(
+            cases
+        ):
+            with self.subTest(hook=hook_name):
+                capture = SyntheticCaptureProvider(
+                    [
+                        message(1),
+                        message(2, timestamp=1_700_000_000 + 31 * day),
+                    ],
+                    window_seconds=30 * day,
+                )
+                failed = [True]
+
+                def interrupt(failed: list[bool] = failed) -> None:
+                    if failed.pop():
+                        raise RuntimeError("synthetic upgrade transaction")
+
+                run_store = WechatDigestRunStore(
+                    self.workspace
+                    / "02_processing"
+                    / f"wechat_digest_upgrade_{index}",
+                    **{hook_name: interrupt},
+                )
+                service, run_id = self._make_active_v2_run(
+                    capture, run_store=run_store
+                )
+                with self.assertRaisesRegex(RuntimeError, "transaction"):
+                    service.upgrade_active_v2_all_history()
+                pending = run_store.plan_receipt(run_id)
+                self.assertEqual(pending["phase"], "pending")
+                self.assertEqual(
+                    run_store.plan(run_id)["schema_version"], plan_schema
+                )
+                self.assertEqual(
+                    run_store.status(run_id)["plan_fingerprint"],
+                    pending[status_fingerprint_key],
+                )
+                first_upper = pending["all_history_upper_bound"]
+                capture.messages.append(
+                    message(3, timestamp=1_700_000_000 + 65 * day)
+                )
+                setattr(run_store, hook_name, None)
+                self.assertEqual(
+                    service.upgrade_active_v2_all_history(), run_id
+                )
+                committed_plan = run_store.plan(run_id)
+                committed_receipt = run_store.plan_receipt(run_id)
+                self.assertEqual(
+                    committed_plan["all_history_upper_bound"], first_upper
+                )
+                self.assertEqual(committed_receipt["phase"], "committed")
+                self.assertEqual(
+                    committed_receipt["plan_fingerprint"],
+                    _plan_fingerprint(committed_plan),
+                )
+                self.assertEqual(self.semantic.provider.calls, 0)
+
+    def test_run_create_recovers_each_partial_write_before_active_publish(
+        self,
+    ) -> None:
+        capture = SyntheticCaptureProvider([message(1)]).capture(ZERO_CURSOR)
+        plan, status = _build_plan(
+            capture, clock=lambda: "2026-08-18T00:00:00+00:00"
+        )
+        cases = (
+            ("before_create_status_write", (True, False, False)),
+            ("before_create_receipt_write", (True, True, False)),
+            ("before_create_active_write", (True, True, True)),
+        )
+        for index, (hook_name, expected_files) in enumerate(cases):
+            with self.subTest(hook=hook_name):
+                failed = [True]
+
+                def interrupt(failed: list[bool] = failed) -> None:
+                    if failed.pop():
+                        raise RuntimeError("synthetic create interruption")
+
+                root = (
+                    self.workspace
+                    / "02_processing"
+                    / f"wechat_digest_create_{index}"
+                )
+                run_store = WechatDigestRunStore(
+                    root, **{hook_name: interrupt}
+                )
+                with self.assertRaisesRegex(RuntimeError, "create interruption"):
+                    run_store.create(plan, status)
+                self.assertIsNone(run_store.active_run_id())
+                run_dir = run_store.runs_root / str(plan["run_id"])
+                self.assertEqual(
+                    tuple(
+                        (run_dir / name).exists()
+                        for name in (
+                            "plan.json",
+                            "status.json",
+                            "run-plan-receipt.json",
+                        )
+                    ),
+                    expected_files,
+                )
+                setattr(run_store, hook_name, None)
+                run_store.create(plan, status)
+                self.assertEqual(run_store.active_run_id(), plan["run_id"])
+                self.assertEqual(run_store.plan(str(plan["run_id"])), plan)
+                self.assertEqual(run_store.status(str(plan["run_id"])), status)
+                self.assertEqual(
+                    run_store.plan_receipt(str(plan["run_id"]))[
+                        "plan_fingerprint"
+                    ],
+                    _plan_fingerprint(plan),
+                )
+
+    def test_run_create_rejects_tampered_existing_status_and_receipt(self) -> None:
+        capture = SyntheticCaptureProvider([message(1)]).capture(ZERO_CURSOR)
+        plan, status = _build_plan(
+            capture, clock=lambda: "2026-08-18T00:00:00+00:00"
+        )
+        for field in ("status", "receipt"):
+            with self.subTest(field=field):
+                root = (
+                    self.workspace / "02_processing" / f"wechat_digest_{field}"
+                )
+                run_store = WechatDigestRunStore(root)
+                run_store.create(plan, status)
+                run_store.clear_active()
+                path = (
+                    run_store.runs_root
+                    / str(plan["run_id"])
+                    / (
+                        "status.json"
+                        if field == "status"
+                        else "run-plan-receipt.json"
+                    )
+                )
+                value = json.loads(path.read_text(encoding="utf-8"))
+                if field == "status":
+                    value["state"] = "failed"
+                else:
+                    value["plan_fingerprint"] = "sha256:" + "0" * 64
+                path.write_text(json.dumps(value), encoding="utf-8")
+                with self.assertRaisesRegex(
+                    WechatDigestError, "状态不一致|receipt 不一致"
+                ):
+                    run_store.create(plan, status)
+                self.assertIsNone(run_store.active_run_id())
+
+    def test_receipt_rejects_missing_fingerprint_and_impossible_create_order(
+        self,
+    ) -> None:
+        capture = SyntheticCaptureProvider([message(1)]).capture(ZERO_CURSOR)
+        plan, status = _build_plan(
+            capture, clock=lambda: "2026-08-18T00:00:00+00:00"
+        )
+        run_id = str(plan["run_id"])
+        root = self.workspace / "02_processing" / "wechat_digest_receipt"
+        run_store = WechatDigestRunStore(root)
+        run_store.create(plan, status)
+        receipt_path = (
+            run_store.runs_root / run_id / "run-plan-receipt.json"
+        )
+        receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+        receipt["plan_fingerprint"] = None
+        receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
+        with self.assertRaisesRegex(WechatDigestError, "receipt 损坏"):
+            run_store.plan_receipt(run_id)
+
+        impossible_root = (
+            self.workspace / "02_processing" / "wechat_digest_impossible"
+        )
+        impossible_store = WechatDigestRunStore(impossible_root)
+        impossible_dir = impossible_store.runs_root / run_id
+        impossible_dir.mkdir(parents=True)
+        (impossible_dir / "plan.json").write_text(
+            json.dumps(plan), encoding="utf-8"
+        )
+        (impossible_dir / "run-plan-receipt.json").write_text(
+            json.dumps(
+                {
+                    "schema_version": "wechat-digest-run-plan-receipt/2.0",
+                    "run_id": run_id,
+                    "phase": "committed",
+                    "plan_fingerprint": _plan_fingerprint(plan),
+                }
+            ),
+            encoding="utf-8",
+        )
+        with self.assertRaisesRegex(WechatDigestError, "顺序损坏"):
+            impossible_store.create(plan, status)
+        self.assertFalse((impossible_dir / "status.json").exists())
+        self.assertIsNone(impossible_store.active_run_id())
 
     def test_all_history_upper_tamper_fails_before_semantic_provider(self) -> None:
         capture = SyntheticCaptureProvider([message(1)])
