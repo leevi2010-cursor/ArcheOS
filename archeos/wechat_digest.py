@@ -52,6 +52,7 @@ from .semantic_handoff import (
     ExternalAgentSemanticHandoffService,
     SemanticHandoffError,
     _package_fingerprint,
+    validate_completed_published_audits,
 )
 from .source import LocalManagedSourceRepository, ManagedSourceService
 from .source.local_repository import SourceNotFoundError
@@ -1904,7 +1905,21 @@ class WechatDigestService:
                 raise WechatDigestError(
                     "微信运行状态 semantic package Candidate 冲突。"
                 )
-            self._verify_semantic_audits(package, manifest)
+            validate_completed_published_audits(
+                representation_service=RepresentationInformationService(
+                    self.source_repository,
+                    self.representation_repository,
+                    self.workspace / "02_processing" / "information",
+                ),
+                representation_id=representation_id,
+                manifest=manifest,
+                audit_root=(
+                    self.workspace
+                    / "02_processing"
+                    / "semantic_handoff_runs"
+                ),
+                package_fingerprint=_package_fingerprint(package),
+            )
             observed = item.get("atomic_information_ids")
             if (
                 not isinstance(observed, list)
@@ -1945,97 +1960,6 @@ class WechatDigestService:
             raise WechatDigestError(
                 "微信运行状态 semantic receipt 损坏。"
             ) from exc
-
-    def _verify_semantic_audits(
-        self, package: Path, manifest: Mapping[str, object]
-    ) -> None:
-        raw_batches = manifest.get("batches")
-        if not isinstance(raw_batches, list) or not raw_batches:
-            raise WechatDigestError("微信运行状态 semantic audit 损坏。")
-        expected_batches: set[tuple[str, ...]] = set()
-        for value in raw_batches:
-            if not isinstance(value, dict):
-                raise WechatDigestError("微信运行状态 semantic audit 损坏。")
-            unit_ids = value.get("unit_ids")
-            if (
-                not isinstance(unit_ids, list)
-                or any(not isinstance(unit_id, str) for unit_id in unit_ids)
-            ):
-                raise WechatDigestError("微信运行状态 semantic audit 损坏。")
-            expected_batches.add(tuple(unit_ids))
-        if len(expected_batches) != len(raw_batches):
-            raise WechatDigestError("微信运行状态 semantic audit 批次损坏。")
-        package_fingerprint = _package_fingerprint(package)
-        audit_root = (
-            self.workspace / "02_processing" / "semantic_handoff_runs"
-        )
-        matching: list[dict[str, object]] = []
-        if audit_root.is_dir():
-            for path in sorted(
-                audit_root.glob("*/processing-run-audit.json")
-            ):
-                try:
-                    value = json.loads(path.read_text(encoding="utf-8"))
-                except (OSError, json.JSONDecodeError):
-                    continue
-                if (
-                    isinstance(value, dict)
-                    and value.get("package_fingerprint")
-                    == package_fingerprint
-                ):
-                    matching.append(value)
-        observed_batches: set[tuple[str, ...]] = set()
-        for audit in matching:
-            anchor_unit_ids = audit.get("anchor_unit_ids")
-            if (
-                not isinstance(anchor_unit_ids, list)
-                or any(
-                    not isinstance(unit_id, str)
-                    for unit_id in anchor_unit_ids
-                )
-            ):
-                raise WechatDigestError(
-                    "微信运行状态 semantic audit 损坏。"
-                )
-            batch = tuple(anchor_unit_ids)
-            if batch not in expected_batches or batch in observed_batches:
-                raise WechatDigestError(
-                    "微信运行状态 semantic audit 批次不收敛。"
-                )
-            observed_batches.add(batch)
-            if (
-                audit.get("schema_version") != "processing-run-audit/1.0"
-                or audit.get("execution_status") != "succeeded"
-                or audit.get("failure_category") is not None
-                or audit.get("contract_failure_detail") is not None
-                or audit.get("strict_validation_status") != "passed"
-                or not isinstance(audit.get("result_fingerprint"), str)
-                or re.fullmatch(
-                    r"sha256:[0-9a-f]{64}",
-                    str(audit.get("result_fingerprint")),
-                )
-                is None
-                or audit.get("eligible_units") != len(batch)
-                or audit.get("covered_units") != len(batch)
-                or audit.get("unaccounted_units") != 0
-                or audit.get("result_file_present") is not True
-                or audit.get("timeout_phase") is not None
-                or audit.get("provider_error_category") is not None
-                or audit.get("result_readback_status") != "verified"
-                or audit.get("process_cleanup_status") != "verified"
-                or audit.get("package_published") is not True
-                or audit.get("information_ingested") is not True
-                or audit.get("durable_ingestion_status") != "completed"
-                or audit.get("handoff_status") != "completed"
-                or audit.get("audit_readback_status") != "verified"
-            ):
-                raise WechatDigestError(
-                    "微信运行状态 semantic audit 未严格完成。"
-                )
-        if observed_batches != expected_batches:
-            raise WechatDigestError(
-                "微信运行状态 semantic audit 集合不完整。"
-            )
 
     def _run_locked(
         self, *, since: str | None, from_now: bool, all_history: bool

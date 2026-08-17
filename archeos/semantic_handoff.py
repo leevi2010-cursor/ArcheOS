@@ -14,8 +14,13 @@ from .atomic_information import IngestionResult, ingest_processing_package
 from .atomic_information.store import AtomicInformationStore
 from .representation_information import (
     CONTRACT_FAILURE_DETAILS,
+    EXTERNAL_AGENT_PROTOCOL_V1,
+    EXTERNAL_AGENT_PROTOCOL_V2,
+    EXTERNAL_AGENT_PROTOCOL_V3,
+    EXTERNAL_AGENT_PROTOCOL_V3_1,
     EXTERNAL_AGENT_PROTOCOL_VERSION,
     EXTERNAL_AGENT_ROUTE,
+    SUPPORTED_EXTERNAL_AGENT_PROTOCOL_VERSIONS,
     CodexCliRepresentationAnalysisProvider,
     ExternalAgentExecutionRecord,
     RepresentationInformationError,
@@ -37,6 +42,275 @@ class SemanticHandoffResult:
     ingestion: IngestionResult
     audit_paths: tuple[Path, ...]
     replayed_existing_package: bool
+
+
+_COMPLETED_AUDIT_BASE_FIELDS = {
+    "schema_version",
+    "artifact_kind",
+    "processing_run_id",
+    "protocol_version",
+    "input_fingerprint",
+    "anchor_unit_ids",
+    "provider_route",
+    "provider_version",
+    "model",
+    "reasoning_effort",
+    "fallback_policy",
+    "started_at",
+    "finished_at",
+    "execution_status",
+    "failure_category",
+    "contract_failure_detail",
+    "strict_validation_status",
+    "result_fingerprint",
+    "eligible_units",
+    "covered_units",
+    "unaccounted_units",
+    "diagnostic_schema_version",
+    "elapsed_ms",
+    "deadline_ms",
+    "exit_code",
+    "termination_signal",
+    "timeout_phase",
+    "provider_error_category",
+    "result_file_present",
+    "result_size_bytes",
+    "stdout_bytes",
+    "stderr_bytes",
+    "process_cleanup_status",
+    "result_readback_status",
+    "package_published",
+    "package_fingerprint",
+    "information_ingested",
+    "durable_ingestion_status",
+    "handoff_status",
+    "audit_readback_status",
+}
+_COMPLETED_AUDIT_CONTRACT_DIAGNOSTIC_FIELDS = {
+    "contract_failure_stage",
+    "candidate_item_count",
+    "residue_item_count",
+    "accounting_item_count",
+    "candidate_anchor_ref_count",
+    "residue_anchor_ref_count",
+    "duplicate_anchor_ref_count",
+    "duplicate_accounting_count",
+    "dual_assignment_count",
+    "missing_anchor_count",
+    "unknown_anchor_ref_count",
+}
+_COMPLETED_AUDIT_PROFILE_FIELDS = {
+    "name",
+    "provider_version",
+    "model",
+    "reasoning_effort",
+    "fallback_policy",
+}
+
+
+def validate_completed_published_audits(
+    *,
+    representation_service: RepresentationInformationService,
+    representation_id: str,
+    manifest: dict[str, object],
+    audit_root: Path,
+    package_fingerprint: str,
+) -> tuple[Path, ...]:
+    """Read-only exact validation for completed historical External Agent runs."""
+    package_provider = manifest.get("provider")
+    if (
+        not isinstance(package_provider, dict)
+        or set(package_provider) != _COMPLETED_AUDIT_PROFILE_FIELDS
+        or package_provider.get("name") != "external-agent-codex-cli"
+        or any(
+            not isinstance(package_provider.get(field), str)
+            or re.fullmatch(
+                r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}",
+                str(package_provider.get(field)),
+            )
+            is None
+            for field in ("provider_version", "model")
+        )
+        or package_provider.get("reasoning_effort")
+        not in {"low", "medium", "high", "xhigh"}
+        or package_provider.get("fallback_policy") != "none"
+    ):
+        raise SemanticHandoffError(
+            "已发布的信息包缺少唯一 Provider execution profile。"
+        )
+    paths: list[Path] = []
+    payloads: list[dict[str, object]] = []
+    if Path(audit_root).is_dir():
+        for path in sorted(
+            Path(audit_root).glob("*/processing-run-audit.json")
+        ):
+            try:
+                payload = _private_json_read(path)
+            except (OSError, json.JSONDecodeError, SemanticHandoffError):
+                continue
+            if payload.get("package_fingerprint") == package_fingerprint:
+                paths.append(path)
+                payloads.append(payload)
+    protocols = {payload.get("protocol_version") for payload in payloads}
+    if len(protocols) != 1:
+        raise SemanticHandoffError(
+            "已发布的信息包审计缺少唯一 External Agent protocol。"
+        )
+    protocol_version = protocols.pop()
+    if protocol_version not in SUPPORTED_EXTERNAL_AGENT_PROTOCOL_VERSIONS:
+        raise SemanticHandoffError(
+            "已发布的信息包使用不受支持的 External Agent protocol。"
+        )
+    assert isinstance(protocol_version, str)
+    manifest_batches = manifest.get("batches")
+    if not isinstance(manifest_batches, list) or not manifest_batches:
+        raise SemanticHandoffError("已发布的信息包批次清单不可读。")
+    batch_unit_ids: list[tuple[str, ...]] = []
+    for package_batch in manifest_batches:
+        if not isinstance(package_batch, dict):
+            raise SemanticHandoffError("已发布的信息包批次清单不可读。")
+        unit_ids = package_batch.get("unit_ids")
+        if (
+            not isinstance(unit_ids, list)
+            or not unit_ids
+            or any(not isinstance(item, str) for item in unit_ids)
+        ):
+            raise SemanticHandoffError("已发布的信息包批次清单不可读。")
+        batch_unit_ids.append(tuple(unit_ids))
+    representation = representation_service.representation_repository.get(
+        representation_id
+    )
+    try:
+        batches = _analysis_batches_for_anchor_unit_ids(
+            _units_from_representation(
+                representation,
+                representation_service.representation_repository,
+            ),
+            batch_unit_ids,
+        )
+    except RepresentationInformationError as exc:
+        raise SemanticHandoffError(
+            "已发布的信息包批次不再匹配 canonical Analysis Units。"
+        ) from exc
+    expected: dict[tuple[str, ...], str] = {}
+    for batch_unit_id, batch in zip(batch_unit_ids, batches, strict=True):
+        _, fingerprint = _external_agent_request(
+            batch, protocol_version=protocol_version
+        )
+        if batch_unit_id in expected:
+            raise SemanticHandoffError("已发布的信息包批次 identity 冲突。")
+        expected[batch_unit_id] = fingerprint
+    if len(paths) != len(expected):
+        raise SemanticHandoffError("已发布的信息包审计集合不完整。")
+    observed: set[tuple[str, ...]] = set()
+    for path, audit in zip(paths, payloads, strict=True):
+        diagnostic_version = audit.get("diagnostic_schema_version")
+        if protocol_version in {
+            EXTERNAL_AGENT_PROTOCOL_V1,
+            EXTERNAL_AGENT_PROTOCOL_V2,
+            EXTERNAL_AGENT_PROTOCOL_V3,
+        }:
+            expected_fields = _COMPLETED_AUDIT_BASE_FIELDS
+            expected_diagnostic_version = "external-agent-diagnostics/1.0"
+        elif protocol_version == EXTERNAL_AGENT_PROTOCOL_V3_1:
+            expected_fields = (
+                _COMPLETED_AUDIT_BASE_FIELDS
+                | _COMPLETED_AUDIT_CONTRACT_DIAGNOSTIC_FIELDS
+            )
+            expected_diagnostic_version = "external-agent-diagnostics/2.0"
+        else:  # guarded by the supported set, retained for fail-closed evolution
+            raise SemanticHandoffError(
+                "已发布的信息包使用不受支持的 External Agent protocol。"
+            )
+        if set(audit) != expected_fields:
+            raise SemanticHandoffError("已发布的信息包审计字段不精确。")
+        processing_run_id = audit.get("processing_run_id")
+        anchor_unit_ids = audit.get("anchor_unit_ids")
+        if (
+            not _processing_run_id(processing_run_id)
+            or path.parent.name != processing_run_id
+            or not isinstance(anchor_unit_ids, list)
+            or not anchor_unit_ids
+            or any(not isinstance(item, str) for item in anchor_unit_ids)
+        ):
+            raise SemanticHandoffError("已发布的信息包审计 identity 损坏。")
+        batch = tuple(anchor_unit_ids)
+        expected_fingerprint = expected.get(batch)
+        if expected_fingerprint is None or batch in observed:
+            raise SemanticHandoffError("已发布的信息包审计批次不收敛。")
+        observed.add(batch)
+        if (
+            audit.get("schema_version") != "processing-run-audit/1.0"
+            or audit.get("artifact_kind") != "processing_run_audit"
+            or audit.get("protocol_version") != protocol_version
+            or audit.get("input_fingerprint") != expected_fingerprint
+            or audit.get("provider_route") != EXTERNAL_AGENT_ROUTE
+            or any(
+                audit.get(field) != package_provider.get(field)
+                for field in (
+                    "provider_version",
+                    "model",
+                    "reasoning_effort",
+                    "fallback_policy",
+                )
+            )
+            or not _timestamp(audit.get("started_at"))
+            or not _timestamp(audit.get("finished_at"))
+            or audit.get("execution_status") != "succeeded"
+            or audit.get("failure_category") is not None
+            or audit.get("contract_failure_detail") is not None
+            or audit.get("strict_validation_status") != "passed"
+            or not _sha256_fingerprint(audit.get("result_fingerprint"))
+            or audit.get("eligible_units") != len(batch)
+            or audit.get("covered_units") != len(batch)
+            or audit.get("unaccounted_units") != 0
+            or diagnostic_version != expected_diagnostic_version
+            or isinstance(audit.get("elapsed_ms"), bool)
+            or not isinstance(audit.get("elapsed_ms"), int)
+            or int(audit["elapsed_ms"]) < 0
+            or isinstance(audit.get("deadline_ms"), bool)
+            or not isinstance(audit.get("deadline_ms"), int)
+            or int(audit["deadline_ms"]) <= 0
+            or audit.get("exit_code") != 0
+            or audit.get("termination_signal") is not None
+            or audit.get("timeout_phase") is not None
+            or audit.get("provider_error_category") is not None
+            or audit.get("result_file_present") is not True
+            or isinstance(audit.get("result_size_bytes"), bool)
+            or not isinstance(audit.get("result_size_bytes"), int)
+            or int(audit["result_size_bytes"]) <= 0
+            or any(
+                isinstance(audit.get(field), bool)
+                or not isinstance(audit.get(field), int)
+                or int(audit[field]) < 0
+                for field in ("stdout_bytes", "stderr_bytes")
+            )
+            or audit.get("process_cleanup_status") != "verified"
+            or audit.get("result_readback_status") != "verified"
+            or audit.get("package_published") is not True
+            or audit.get("package_fingerprint") != package_fingerprint
+            or audit.get("information_ingested") is not True
+            or audit.get("durable_ingestion_status") != "completed"
+            or audit.get("handoff_status") != "completed"
+            or audit.get("audit_readback_status") != "verified"
+        ):
+            raise SemanticHandoffError(
+                "已发布的信息包审计未严格完成或 execution binding 漂移。"
+            )
+        if protocol_version == EXTERNAL_AGENT_PROTOCOL_V3_1 and (
+            audit.get("contract_failure_stage") is not None
+            or any(
+                audit.get(field) != 0
+                for field in _COMPLETED_AUDIT_CONTRACT_DIAGNOSTIC_FIELDS
+                if field != "contract_failure_stage"
+            )
+        ):
+            raise SemanticHandoffError(
+                "已发布的信息包 contract diagnostics 不收敛。"
+            )
+    if observed != set(expected):
+        raise SemanticHandoffError("已发布的信息包审计批次集合不完整。")
+    return tuple(paths)
 
 
 class ExternalAgentSemanticHandoffService:

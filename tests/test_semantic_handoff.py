@@ -20,12 +20,17 @@ from archeos.representation import (
     WechatConversationRepresentationAdapter,
 )
 from archeos.representation_information import (
+    EXTERNAL_AGENT_PROTOCOL_V1,
+    EXTERNAL_AGENT_PROTOCOL_V2,
+    EXTERNAL_AGENT_PROTOCOL_V3,
+    EXTERNAL_AGENT_PROTOCOL_V3_1,
     CodexCliRepresentationAnalysisProvider,
     RepresentationAnalysisBatch,
     RepresentationAnalysisUnit,
     RepresentationInformationError,
     RepresentationInformationService,
     _analysis_batches,
+    _external_agent_request,
     _units_from_representation,
 )
 from archeos.semantic_handoff import ExternalAgentSemanticHandoffService
@@ -211,6 +216,31 @@ class SemanticHandoffTest(unittest.TestCase):
             provider.execution_records[0].strict_validation_status, "passed"
         )
         self.assertIsNone(provider.execution_records[0].contract_failure_detail)
+
+    def test_historical_request_fingerprints_remain_exactly_readable(self) -> None:
+        expected = {
+            EXTERNAL_AGENT_PROTOCOL_V1: (
+                "sha256:5d2fd27e78f30ac37577df3216926cf770819c09d97b0320e1baac51c97cac91"
+            ),
+            EXTERNAL_AGENT_PROTOCOL_V2: (
+                "sha256:67ac01137cd702dc561a544920c883bece975eca54c643f0fdcb6287a2b588a1"
+            ),
+            EXTERNAL_AGENT_PROTOCOL_V3: (
+                "sha256:9bca6a7775cea3f69aec21075bb43acdb729d7074ff672a3be15051fd005d43b"
+            ),
+            EXTERNAL_AGENT_PROTOCOL_V3_1: (
+                "sha256:5afea47585cd10c55f0d60ca0a8ffa2c4d0c3c72e3fc15e6c332e8e66e27c187"
+            ),
+        }
+        batch = RepresentationAnalysisBatch((self.unit(),))
+        for protocol_version, fingerprint in expected.items():
+            with self.subTest(protocol=protocol_version):
+                self.assertEqual(
+                    _external_agent_request(
+                        batch, protocol_version=protocol_version
+                    )[1],
+                    fingerprint,
+                )
 
     def test_contract_failure_details_are_allowlisted(self) -> None:
         cases = {
@@ -1111,7 +1141,8 @@ class SemanticHandoffTest(unittest.TestCase):
 
         source = inspect.getsource(handoff_module)
         self.assertNotIn("world_model", source)
-        self.assertNotIn("fallback", source.lower())
+        self.assertNotIn("fallback_provider", source.lower())
+        self.assertNotIn("provider_switch", source.lower())
 
 
 if __name__ == "__main__":

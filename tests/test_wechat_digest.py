@@ -17,10 +17,17 @@ from archeos.atomic_information import (
 from archeos.digestion import InterpretationResult, WorldModelOperation
 from archeos.representation import LocalRepresentationRepository
 from archeos.representation_information import (
+    EXTERNAL_AGENT_PROTOCOL_V1,
+    EXTERNAL_AGENT_PROTOCOL_V2,
+    EXTERNAL_AGENT_PROTOCOL_V3,
+    EXTERNAL_AGENT_PROTOCOL_V3_1,
     RepresentationAnalysisResult,
     RepresentationCandidateDraft,
     RepresentationInformationService,
     RepresentationResidueDraft,
+    _analysis_batches_for_anchor_unit_ids,
+    _external_agent_request,
+    _units_from_representation,
 )
 from archeos.semantic_handoff import _package_fingerprint
 from archeos.source import LocalManagedSourceRepository
@@ -169,11 +176,15 @@ class SyntheticCaptureProvider:
 
 
 class SyntheticAnalysisProvider:
-    name = "synthetic-wechat-digest"
+    name = "external-agent-codex-cli"
 
     def __init__(self) -> None:
         self.calls = 0
         self.mode = "all_candidate"
+        self.provider_version = "0.147.0"
+        self.model = "gpt-5.6-terra"
+        self.reasoning_effort = "medium"
+        self.fallback_policy = "none"
 
     def analyze(self, batch):
         self.calls += 1
@@ -217,6 +228,7 @@ class SyntheticSemanticHandoff:
         self.workspace = workspace
         self.provider = SyntheticAnalysisProvider()
         self.failures_remaining = 0
+        self.protocol_version = EXTERNAL_AGENT_PROTOCOL_V1
 
     def execute(self, representation_id: str):
         output_root = self.workspace / "02_processing" / "information"
@@ -236,11 +248,23 @@ class SyntheticSemanticHandoff:
             ),
             output_root,
         ).extract(representation_id, self.provider)
+        manifest_path = package / "manifest.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest["provider"] = {
+            "name": self.provider.name,
+            "provider_version": self.provider.provider_version,
+            "model": self.provider.model,
+            "reasoning_effort": self.provider.reasoning_effort,
+            "fallback_policy": self.provider.fallback_policy,
+        }
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
         ingestion = ingest_processing_package(package, store)
-        self._write_success_audits(package)
+        self._write_success_audits(package, representation_id)
         return SimpleNamespace(ingestion=ingestion)
 
-    def _write_success_audits(self, package: Path) -> None:
+    def _write_success_audits(
+        self, package: Path, representation_id: str
+    ) -> None:
         manifest = json.loads(
             (package / "manifest.json").read_text(encoding="utf-8")
         )
@@ -248,8 +272,21 @@ class SyntheticSemanticHandoff:
         audit_root = (
             self.workspace / "02_processing" / "semantic_handoff_runs"
         )
-        for index, batch in enumerate(manifest["batches"], start=1):
-            anchor_unit_ids = batch["unit_ids"]
+        representation_repository = LocalRepresentationRepository(
+            self.workspace / "02_processing" / "representations"
+        )
+        representation = representation_repository.get(representation_id)
+        batches = _analysis_batches_for_anchor_unit_ids(
+            _units_from_representation(
+                representation, representation_repository
+            ),
+            [batch["unit_ids"] for batch in manifest["batches"]],
+        )
+        for index, batch in enumerate(batches, start=1):
+            anchor_unit_ids = [unit.unit_id for unit in batch.anchor_units]
+            _, input_fingerprint = _external_agent_request(
+                batch, protocol_version=self.protocol_version
+            )
             processing_run_id = "run_" + hashlib.sha256(
                 f"{package.name}:{index}".encode()
             ).hexdigest()[:32]
@@ -257,34 +294,69 @@ class SyntheticSemanticHandoff:
                 audit_root / processing_run_id / "processing-run-audit.json"
             )
             audit_path.parent.mkdir(parents=True, exist_ok=True)
-            audit_path.write_text(
-                json.dumps(
-                    {
-                        "schema_version": "processing-run-audit/1.0",
-                        "anchor_unit_ids": anchor_unit_ids,
-                        "execution_status": "succeeded",
-                        "failure_category": None,
-                        "contract_failure_detail": None,
-                        "strict_validation_status": "passed",
-                        "result_fingerprint": "sha256:" + "1" * 64,
-                        "eligible_units": len(anchor_unit_ids),
-                        "covered_units": len(anchor_unit_ids),
-                        "unaccounted_units": 0,
-                        "result_file_present": True,
-                        "timeout_phase": None,
-                        "provider_error_category": None,
-                        "result_readback_status": "verified",
-                        "process_cleanup_status": "verified",
-                        "package_published": True,
-                        "package_fingerprint": package_fingerprint,
-                        "information_ingested": True,
-                        "durable_ingestion_status": "completed",
-                        "handoff_status": "completed",
-                        "audit_readback_status": "verified",
-                    }
+            audit = {
+                "schema_version": "processing-run-audit/1.0",
+                "artifact_kind": "processing_run_audit",
+                "processing_run_id": processing_run_id,
+                "protocol_version": self.protocol_version,
+                "input_fingerprint": input_fingerprint,
+                "anchor_unit_ids": anchor_unit_ids,
+                "provider_route": "codex-cli",
+                "provider_version": self.provider.provider_version,
+                "model": self.provider.model,
+                "reasoning_effort": self.provider.reasoning_effort,
+                "fallback_policy": self.provider.fallback_policy,
+                "started_at": "2026-08-18T00:00:00.000Z",
+                "finished_at": "2026-08-18T00:00:01.000Z",
+                "execution_status": "succeeded",
+                "failure_category": None,
+                "contract_failure_detail": None,
+                "strict_validation_status": "passed",
+                "result_fingerprint": "sha256:" + "1" * 64,
+                "eligible_units": len(anchor_unit_ids),
+                "covered_units": len(anchor_unit_ids),
+                "unaccounted_units": 0,
+                "diagnostic_schema_version": (
+                    "external-agent-diagnostics/2.0"
+                    if self.protocol_version == EXTERNAL_AGENT_PROTOCOL_V3_1
+                    else "external-agent-diagnostics/1.0"
                 ),
-                encoding="utf-8",
-            )
+                "elapsed_ms": 1000,
+                "deadline_ms": 300000,
+                "exit_code": 0,
+                "termination_signal": None,
+                "timeout_phase": None,
+                "provider_error_category": None,
+                "result_file_present": True,
+                "result_size_bytes": 100,
+                "stdout_bytes": 0,
+                "stderr_bytes": 0,
+                "process_cleanup_status": "verified",
+                "result_readback_status": "verified",
+                "package_published": True,
+                "package_fingerprint": package_fingerprint,
+                "information_ingested": True,
+                "durable_ingestion_status": "completed",
+                "handoff_status": "completed",
+                "audit_readback_status": "verified",
+            }
+            if self.protocol_version == EXTERNAL_AGENT_PROTOCOL_V3_1:
+                audit.update(
+                    {
+                        "contract_failure_stage": None,
+                        "candidate_item_count": 0,
+                        "residue_item_count": 0,
+                        "accounting_item_count": 0,
+                        "candidate_anchor_ref_count": 0,
+                        "residue_anchor_ref_count": 0,
+                        "duplicate_anchor_ref_count": 0,
+                        "duplicate_accounting_count": 0,
+                        "dual_assignment_count": 0,
+                        "missing_anchor_count": 0,
+                        "unknown_anchor_ref_count": 0,
+                    }
+                )
+            audit_path.write_text(json.dumps(audit), encoding="utf-8")
 
 
 class NoStructuralChangeProvider:
@@ -997,6 +1069,7 @@ class WechatDigestTests(unittest.TestCase):
         mode: str,
         messages: list[CapturedMessage],
         suffix: str,
+        protocol_version: str = EXTERNAL_AGENT_PROTOCOL_V1,
     ) -> tuple[WechatDigestService, SyntheticSemanticHandoff, str]:
         workspace = Path(self.temporary.name) / f"workspace_{suffix}"
         for directory in (
@@ -1008,6 +1081,7 @@ class WechatDigestTests(unittest.TestCase):
             (workspace / directory).mkdir(parents=True, exist_ok=True)
         semantic = SyntheticSemanticHandoff(workspace)
         semantic.provider.mode = mode
+        semantic.protocol_version = protocol_version
         with SQLiteWorldModelRepository(
             workspace / "04_core" / "archeos.sqlite3"
         ) as repository:
@@ -1109,6 +1183,27 @@ class WechatDigestTests(unittest.TestCase):
                 )
                 self.assertEqual(semantic.provider.calls, calls)
 
+    def test_active_v2_upgrade_accepts_historical_audit_contracts(self) -> None:
+        protocols = (
+            EXTERNAL_AGENT_PROTOCOL_V1,
+            EXTERNAL_AGENT_PROTOCOL_V2,
+            EXTERNAL_AGENT_PROTOCOL_V3,
+            EXTERNAL_AGENT_PROTOCOL_V3_1,
+        )
+        for index, protocol_version in enumerate(protocols):
+            with self.subTest(protocol=protocol_version):
+                service, semantic, run_id = self._make_active_v2_processed_run(
+                    mode="all_residue",
+                    messages=[message(1)],
+                    suffix=f"protocol_{index}",
+                    protocol_version=protocol_version,
+                )
+                calls = semantic.provider.calls
+                self.assertEqual(
+                    service.upgrade_active_v2_all_history(), run_id
+                )
+                self.assertEqual(semantic.provider.calls, calls)
+
     def test_active_v2_upgrade_rejects_semantic_receipt_tamper(self) -> None:
         cases = (
             "missing_status_id",
@@ -1117,6 +1212,17 @@ class WechatDigestTests(unittest.TestCase):
             "missing_audit",
             "cleanup",
             "store",
+            "missing_field",
+            "missing_contract_field",
+            "extra_field",
+            "protocol",
+            "fingerprint",
+            "batch_order",
+            "diagnostic_version",
+            "provider_route",
+            "provider_version",
+            "provider_profile",
+            "run_path",
         )
         for case in cases:
             with self.subTest(case=case):
@@ -1162,6 +1268,60 @@ class WechatDigestTests(unittest.TestCase):
                         audit_path.write_text(
                             json.dumps(audit), encoding="utf-8"
                         )
+                elif case in {
+                    "missing_field",
+                    "missing_contract_field",
+                    "extra_field",
+                    "protocol",
+                    "fingerprint",
+                    "batch_order",
+                    "diagnostic_version",
+                    "provider_route",
+                    "provider_version",
+                    "provider_profile",
+                    "run_path",
+                }:
+                    audit_path = next(
+                        (
+                            service.workspace
+                            / "02_processing"
+                            / "semantic_handoff_runs"
+                        ).glob("*/processing-run-audit.json")
+                    )
+                    audit = json.loads(
+                        audit_path.read_text(encoding="utf-8")
+                    )
+                    if case == "missing_field":
+                        audit.pop("input_fingerprint")
+                    elif case == "missing_contract_field":
+                        audit.pop("contract_failure_detail")
+                    elif case == "extra_field":
+                        audit["unexpected_field"] = "synthetic"
+                    elif case == "protocol":
+                        audit["protocol_version"] = (
+                            "external-agent-semantic-handoff/999.0"
+                        )
+                    elif case == "fingerprint":
+                        audit["input_fingerprint"] = "sha256:" + "0" * 64
+                    elif case == "batch_order":
+                        audit["anchor_unit_ids"] = list(
+                            reversed(audit["anchor_unit_ids"])
+                        )
+                    elif case == "diagnostic_version":
+                        audit["diagnostic_schema_version"] = (
+                            "external-agent-diagnostics/999.0"
+                        )
+                    elif case == "provider_route":
+                        audit["provider_route"] = "other-route"
+                    elif case == "provider_version":
+                        audit["provider_version"] = "0.999.0"
+                    elif case == "provider_profile":
+                        audit["model"] = "other-model"
+                    else:
+                        audit["processing_run_id"] = "run_" + "0" * 32
+                    audit_path.write_text(
+                        json.dumps(audit), encoding="utf-8"
+                    )
                 else:
                     information_path = (
                         service.workspace
