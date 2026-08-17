@@ -51,7 +51,8 @@ from .source.local_repository import SourceNotFoundError
 from .world_model import ObjectResolver, SQLiteWorldModelRepository
 
 CHECKPOINT_SCHEMA_VERSION = "wechat-digest-checkpoint/1.0"
-RUN_PLAN_SCHEMA_VERSION = "wechat-digest-run-plan/1.0"
+RUN_PLAN_SCHEMA_VERSION = "wechat-digest-run-plan/2.0"
+LEGACY_RUN_PLAN_SCHEMA_VERSION = "wechat-digest-run-plan/1.0"
 RUN_STATUS_SCHEMA_VERSION = "wechat-digest-run-status/1.0"
 CAPTURE_SCHEMA_VERSION = "wechat-cli-capture/1.0"
 SUPPORTED_WECHAT_CLI_VERSION = "0.5.0"
@@ -84,6 +85,8 @@ class WechatSemanticPreparation:
     run_id: str
     representation_id: str
     anchor_unit_ids: tuple[str, ...]
+    semantic_provider_calls: int = 0
+    governance_provider_calls: int | None = None
 
 
 @dataclass(frozen=True, order=True)
@@ -612,7 +615,7 @@ class WechatDigestRunStore:
 
     def plan(self, run_id: str) -> dict[str, object]:
         value = self._read_json(self.runs_root / run_id / "plan.json")
-        if not isinstance(value, dict) or value.get("schema_version") != RUN_PLAN_SCHEMA_VERSION:
+        if not isinstance(value, dict) or value.get("schema_version") not in {RUN_PLAN_SCHEMA_VERSION, LEGACY_RUN_PLAN_SCHEMA_VERSION}:
             raise WechatDigestError("微信运行计划损坏。")
         return value
 
@@ -1156,7 +1159,12 @@ class WechatDigestService:
 
     @staticmethod
     def _plan_batch_size(plan: Mapping[str, object]) -> int:
-        value = plan.get("semantic_batch_size", DEFAULT_EXTERNAL_AGENT_BATCH_SIZE)
+        if plan.get("schema_version") == LEGACY_RUN_PLAN_SCHEMA_VERSION:
+            value = DEFAULT_EXTERNAL_AGENT_BATCH_SIZE
+        else:
+            if "semantic_batch_size" not in plan:
+                raise WechatDigestError("微信运行计划 semantic batch size 缺失。")
+            value = plan["semantic_batch_size"]
         if isinstance(value, bool) or not isinstance(value, int) or value < 1:
             raise WechatDigestError("微信运行计划 semantic batch size 损坏。")
         return value
@@ -1171,12 +1179,13 @@ class WechatDigestService:
         expected, _ = _build_plan(capture, clock=lambda: created_at, run_id=run_id,
             created_at=created_at, semantic_batch_size=self._plan_batch_size(plan))
         comparable = dict(plan)
-        if "semantic_batch_size" not in comparable:
+        if comparable.get("schema_version") == LEGACY_RUN_PLAN_SCHEMA_VERSION:
             expected.pop("semantic_batch_size")
+            expected["schema_version"] = LEGACY_RUN_PLAN_SCHEMA_VERSION
         if comparable != expected:
             raise WechatDigestError("微信 durable plan 与 fixed capture 不一致。")
         items = status.get("items")
-        if not isinstance(items, dict):
+        if status.get("run_id") != run_id or not isinstance(items, dict):
             raise WechatDigestError("微信运行状态 items 损坏。")
         expected_items = {
             **{f"conversation:{item['conversation_key']}": ("conversation", item["source_id"]) for item in _plan_sequence(plan.get("conversations"), "conversations")},
@@ -1188,6 +1197,12 @@ class WechatDigestService:
             item = self._item(items, item_id)
             if item.get("kind") != kind or item.get("source_id") != source_id:
                 raise WechatDigestError("微信运行状态 binding 损坏。")
+            if item.get("state") in {"represented", "local_only", "processed", "pending_human"}:
+                representation_id = item.get("representation_id")
+                if not isinstance(representation_id, str):
+                    raise WechatDigestError("微信运行状态 receipt 损坏。")
+                if self.representation_repository.get(representation_id).source_id != source_id:
+                    raise WechatDigestError("微信运行状态 Representation binding 损坏。")
 
     def _run_locked(
         self, *, since: str | None, from_now: bool, all_history: bool

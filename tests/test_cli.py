@@ -75,7 +75,8 @@ class CliTest(unittest.TestCase):
         with redirect_stdout(output):
             result = main(["wechat", "digest", "--prepare-next-semantic"])
         self.assertEqual(result, 0)
-        self.assertIn('"provider_calls": 0', output.getvalue())
+        self.assertIn('"semantic_provider_calls": 0', output.getvalue())
+        self.assertIn('"governance_provider_calls": "unavailable"', output.getvalue())
         digest_service.return_value.prepare_next_semantic.assert_called_once_with(batch_size=40)
         digest_service.return_value.run.assert_not_called()
         capture_provider.assert_called_once()

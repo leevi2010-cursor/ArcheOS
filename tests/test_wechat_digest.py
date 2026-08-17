@@ -747,6 +747,7 @@ class WechatDigestTests(unittest.TestCase):
         with self.assertRaisesRegex(WechatDigestError, "batch size"):
             service.prepare_next_semantic(batch_size=100)
         plan.pop("semantic_batch_size")
+        plan["schema_version"] = "wechat-digest-run-plan/1.0"
         plan_path.write_text(json.dumps(plan), encoding="utf-8")
         with self.assertRaisesRegex(WechatDigestError, "多个 batch"):
             service.prepare_next_semantic(batch_size=40)

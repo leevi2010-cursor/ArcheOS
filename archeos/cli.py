@@ -548,7 +548,7 @@ def build_parser() -> argparse.ArgumentParser:
     wechat_digest.add_argument(
         "--prepare-next-semantic",
         action="store_true",
-        help="仅恢复当前运行至下一个 semantic batch，不调用 Provider。",
+        help="仅准备下一 semantic batch；不新增 Semantic Handoff 调用。",
     )
     return parser
 
@@ -992,7 +992,8 @@ def _wechat_product_command(args: argparse.Namespace) -> int:
                         "run_id": prepared.run_id,
                         "representation_id": prepared.representation_id,
                         "anchor_unit_ids": list(prepared.anchor_unit_ids),
-                        "provider_calls": 0,
+                        "semantic_provider_calls": prepared.semantic_provider_calls,
+                        "governance_provider_calls": prepared.governance_provider_calls if prepared.governance_provider_calls is not None else "unavailable",
                         "checkpoint_published": False,
                     },
                     ensure_ascii=False,
