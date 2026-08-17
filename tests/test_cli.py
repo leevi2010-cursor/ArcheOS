@@ -81,6 +81,31 @@ class CliTest(unittest.TestCase):
         digest_service.return_value.run.assert_not_called()
         capture_provider.assert_called_once()
 
+    @patch("archeos.cli.WechatDigestService")
+    @patch("archeos.cli.WechatCliCaptureProvider")
+    @patch("archeos.cli.require_workspace")
+    def test_wechat_digest_explicitly_upgrades_active_v2_history_scope(
+        self,
+        require_workspace: Mock,
+        capture_provider: Mock,
+        digest_service: Mock,
+    ) -> None:
+        require_workspace.return_value = WorkspaceConfig(
+            Path("/workspace"), Path("/config")
+        )
+        run_id = "run_" + "a" * 32
+        digest_service.return_value.upgrade_active_v2_all_history.return_value = run_id
+        output = StringIO()
+        with redirect_stdout(output):
+            result = main(
+                ["wechat", "digest", "--upgrade-active-v2-all-history"]
+            )
+        self.assertEqual(result, 0)
+        self.assertIn('"semantic_provider_calls": 0', output.getvalue())
+        digest_service.return_value.upgrade_active_v2_all_history.assert_called_once_with()
+        digest_service.return_value.run.assert_not_called()
+        capture_provider.assert_called_once()
+
     @patch("archeos.cli.ingest_processing_package")
     @patch("archeos.cli.process_managed_audio")
     def test_constructs_file_backed_providers(

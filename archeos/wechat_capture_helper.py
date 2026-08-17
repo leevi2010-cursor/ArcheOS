@@ -292,6 +292,7 @@ def _capture(request: dict[str, object]) -> dict[str, object]:
         "config_path",
         "after_cursor",
         "upper_bound",
+        "all_history_upper_bound",
         "observe_only",
         "window_days",
         "window_message_limit",
@@ -322,6 +323,15 @@ def _capture(request: dict[str, object]) -> dict[str, object]:
         if request["upper_bound"] is None
         else _cursor(request["upper_bound"], "upper_bound")
     )
+    all_history_upper = (
+        None
+        if request["all_history_upper_bound"] is None
+        else _cursor(
+            request["all_history_upper_bound"], "all_history_upper_bound"
+        )
+    )
+    if fixed_upper is not None and all_history_upper is not None:
+        raise ValueError("capture boundaries conflict")
     app = AppContext(config_path)
     names = get_contact_names(app.cache, app.decrypted_dir)
     sessions = _sessions(app, names)
@@ -341,9 +351,15 @@ def _capture(request: dict[str, object]) -> dict[str, object]:
         bounded = [
             cursor
             for cursor in cursors
-            if cursor > after and (fixed_upper is None or cursor <= fixed_upper)
+            if cursor > after
+            and (fixed_upper is None or cursor <= fixed_upper)
+            and (all_history_upper is None or cursor <= all_history_upper)
         ]
-        observed_upper = fixed_upper or (max(bounded) if bounded else after)
+        observed_upper = (
+            fixed_upper
+            or all_history_upper
+            or (max(bounded) if bounded else after)
+        )
         return {
             "schema_version": "wechat-cli-capture/1.0",
             "observed_upper": _cursor_dict(observed_upper),
@@ -363,7 +379,9 @@ def _capture(request: dict[str, object]) -> dict[str, object]:
     remaining = [
         cursor
         for cursor in cursor_rows
-        if cursor > after and (fixed_upper is None or cursor <= fixed_upper)
+        if cursor > after
+        and (fixed_upper is None or cursor <= fixed_upper)
+        and (all_history_upper is None or cursor <= all_history_upper)
     ]
     if fixed_upper is None and remaining:
         effective_upper = _window_upper(

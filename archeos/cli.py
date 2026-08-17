@@ -550,7 +550,16 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="仅准备下一 semantic batch；不新增 Semantic Handoff 调用。",
     )
-    wechat_digest.add_argument("--upgrade-active-v1", action="store_true", help="零 Provider 升级当前 active v1 run 到 v2。")
+    wechat_digest.add_argument(
+        "--upgrade-active-v1",
+        action="store_true",
+        help="零 Provider 升级当前 active v1 run 到当前计划版本。",
+    )
+    wechat_digest.add_argument(
+        "--upgrade-active-v2-all-history",
+        action="store_true",
+        help="零 Provider 为当前 active v2 全历史运行冻结全局上界。",
+    )
     return parser
 
 
@@ -947,6 +956,19 @@ def _conversation_command(args: argparse.Namespace) -> int:
 def _wechat_product_command(args: argparse.Namespace) -> int:
     if args.wechat_command != "digest":  # pragma: no cover - argparse enforces this
         return 2
+    maintenance_count = sum(
+        (
+            args.prepare_next_semantic,
+            args.upgrade_active_v1,
+            args.upgrade_active_v2_all_history,
+        )
+    )
+    if maintenance_count > 1 or (
+        maintenance_count
+        and any((args.since is not None, args.from_now, args.all_history))
+    ):
+        print("error: 恢复维护入口不能与首次起点或其他维护入口同时使用。")
+        return 2
     try:
         workspace = require_workspace(args.config).workspace
         capture = WechatCliCaptureProvider(
@@ -1004,6 +1026,17 @@ def _wechat_product_command(args: argparse.Namespace) -> int:
             return 0
         if args.upgrade_active_v1:
             print(json.dumps({"run_id": service.upgrade_active_v1(), "semantic_provider_calls": 0}, ensure_ascii=False))
+            return 0
+        if args.upgrade_active_v2_all_history:
+            print(
+                json.dumps(
+                    {
+                        "run_id": service.upgrade_active_v2_all_history(),
+                        "semantic_provider_calls": 0,
+                    },
+                    ensure_ascii=False,
+                )
+            )
             return 0
         result = service.run(
             since=args.since,
