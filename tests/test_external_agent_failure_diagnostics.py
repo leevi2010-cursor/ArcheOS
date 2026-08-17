@@ -158,6 +158,12 @@ class ExternalAgentFailureDiagnosticsTest(unittest.TestCase):
         self.assertGreater(record.stderr_bytes, len("partial stderr"))
         self.assertIn("drained stdout", (bundle / "stdout.tail").read_text())
         self.assertNotIn("secret-value", (bundle / "stderr.tail").read_text())
+        metadata = json.loads((bundle / "metadata.json").read_text())
+        self.assertEqual(metadata["model"], "gpt-5.6")
+        self.assertEqual(metadata["reasoning_effort"], "medium")
+        self.assertEqual(metadata["fallback_policy"], "none")
+        self.assertNotIn("chain_of_thought", metadata)
+        self.assertNotIn("reasoning_content", metadata)
 
     def test_timeout_escalates_to_kill_and_captures_final_drain(self) -> None:
         class KillDrainProcess(_Process):

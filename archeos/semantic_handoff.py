@@ -22,6 +22,7 @@ from .representation_information import (
     RepresentationInformationService,
     _analysis_batches_for_anchor_unit_ids,
     _external_agent_request,
+    _provider_manifest,
     _units_from_representation,
     validate_representation_information_package,
 )
@@ -189,6 +190,9 @@ class ExternalAgentSemanticHandoffService:
                 "anchor_unit_ids": list(record.anchor_unit_ids),
                 "provider_route": record.provider_route,
                 "provider_version": record.provider_version,
+                "model": record.model,
+                "reasoning_effort": record.reasoning_effort,
+                "fallback_policy": record.fallback_policy,
                 "started_at": record.started_at,
                 "finished_at": record.finished_at,
                 "execution_status": (record.execution_status),
@@ -285,7 +289,7 @@ class ExternalAgentSemanticHandoffService:
         package_provider = manifest.get("provider")
         if (
             not isinstance(package_provider, dict)
-            or package_provider.get("name") != provider.name
+            or package_provider != _provider_manifest(provider)
         ):
             raise SemanticHandoffError("已存在的信息包 Provider 不匹配当前交接合同。")
         manifest_batches = manifest.get("batches")
@@ -345,6 +349,9 @@ class ExternalAgentSemanticHandoffService:
                 or record.anchor_unit_ids != anchor_unit_ids
                 or record.provider_route != EXTERNAL_AGENT_ROUTE
                 or record.provider_version != provider.provider_version
+                or record.model != provider.model
+                or record.reasoning_effort != provider.reasoning_effort
+                or record.fallback_policy != provider.fallback_policy
                 or record.execution_status != "succeeded"
                 or record.failure_category is not None
                 or record.contract_failure_detail is not None
@@ -373,6 +380,9 @@ class ExternalAgentSemanticHandoffService:
             "anchor_unit_ids",
             "provider_route",
             "provider_version",
+            "model",
+            "reasoning_effort",
+            "fallback_policy",
             "started_at",
             "finished_at",
             "execution_status",
@@ -473,6 +483,9 @@ class ExternalAgentSemanticHandoffService:
                 or audit.get("input_fingerprint") != expected_fingerprint
                 or audit.get("provider_route") != EXTERNAL_AGENT_ROUTE
                 or audit.get("provider_version") != provider.provider_version
+                or audit.get("model") != provider.model
+                or audit.get("reasoning_effort") != provider.reasoning_effort
+                or audit.get("fallback_policy") != provider.fallback_policy
                 or not _timestamp(audit.get("started_at"))
                 or not _timestamp(audit.get("finished_at"))
                 or audit.get("execution_status") != "succeeded"

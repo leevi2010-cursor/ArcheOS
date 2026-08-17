@@ -32,6 +32,8 @@ from .representation import (
 from .representation.registry import production_adapter
 from .representation_information import (
     DEFAULT_EXTERNAL_AGENT_BATCH_SIZE,
+    DEFAULT_SEMANTIC_MODEL,
+    DEFAULT_SEMANTIC_REASONING_EFFORT,
     CodexCliRepresentationAnalysisProvider,
     FileRepresentationAnalysisProvider,
     RepresentationInformationError,
@@ -256,6 +258,10 @@ def build_parser() -> argparse.ArgumentParser:
     extract.add_argument("--provider-version", help="Required safe provider version label for the External Agent audit.")
     extract.add_argument("--codex-bin", default="codex", help="Explicit Codex CLI executable for the approved route.")
     extract.add_argument("--timeout-seconds", type=float, default=120.0)
+    extract.add_argument("--model", default=DEFAULT_SEMANTIC_MODEL)
+    extract.add_argument(
+        "--reasoning-effort", default=DEFAULT_SEMANTIC_REASONING_EFFORT
+    )
     extract.add_argument(
         "--audit-root", type=Path, default=None
     )
@@ -542,6 +548,10 @@ def build_parser() -> argparse.ArgumentParser:
     wechat_digest.add_argument("--codex-bin", default="codex")
     wechat_digest.add_argument("--provider-version")
     wechat_digest.add_argument("--timeout-seconds", type=float, default=120.0)
+    wechat_digest.add_argument("--model", default=DEFAULT_SEMANTIC_MODEL)
+    wechat_digest.add_argument(
+        "--reasoning-effort", default=DEFAULT_SEMANTIC_REASONING_EFFORT
+    )
     wechat_digest.add_argument(
         "--batch-size", type=int, default=DEFAULT_EXTERNAL_AGENT_BATCH_SIZE
     )
@@ -678,6 +688,8 @@ def _information_command(args: argparse.Namespace) -> int:
                 provider = CodexCliRepresentationAnalysisProvider(
                     codex_binary=args.codex_bin,
                     provider_version=args.provider_version,
+                    model=args.model,
+                    reasoning_effort=args.reasoning_effort,
                     timeout_seconds=args.timeout_seconds,
                 )
                 handoff = ExternalAgentSemanticHandoffService(
@@ -968,6 +980,8 @@ def _wechat_product_command(args: argparse.Namespace) -> int:
                 audit_root=workspace / DEFAULT_SEMANTIC_HANDOFF_AUDIT_ROOT,
                 codex_binary=args.codex_bin,
                 provider_version=provider_version,
+                model=args.model,
+                reasoning_effort=args.reasoning_effort,
                 timeout_seconds=args.timeout_seconds,
                 batch_size=args.batch_size,
             )

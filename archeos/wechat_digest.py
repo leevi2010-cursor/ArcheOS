@@ -41,6 +41,8 @@ from .representation import (
 from .representation.registry import production_adapter
 from .representation_information import (
     DEFAULT_EXTERNAL_AGENT_BATCH_SIZE,
+    DEFAULT_SEMANTIC_MODEL,
+    DEFAULT_SEMANTIC_REASONING_EFFORT,
     CodexCliRepresentationAnalysisProvider,
     RepresentationInformationService,
     _units_from_representation,
@@ -702,6 +704,8 @@ class ExistingSemanticHandoff:
         codex_binary: str,
         provider_version: str,
         timeout_seconds: float,
+        model: str = DEFAULT_SEMANTIC_MODEL,
+        reasoning_effort: str = DEFAULT_SEMANTIC_REASONING_EFFORT,
         batch_size: int = DEFAULT_EXTERNAL_AGENT_BATCH_SIZE,
     ) -> None:
         self.service = ExternalAgentSemanticHandoffService(
@@ -717,6 +721,8 @@ class ExistingSemanticHandoff:
         self.provider = CodexCliRepresentationAnalysisProvider(
             codex_binary=codex_binary,
             provider_version=provider_version,
+            model=model,
+            reasoning_effort=reasoning_effort,
             timeout_seconds=timeout_seconds,
         )
 

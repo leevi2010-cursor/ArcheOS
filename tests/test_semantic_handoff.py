@@ -211,6 +211,48 @@ class SemanticHandoffTest(unittest.TestCase):
             provider.execution_records[0].strict_validation_status, "passed"
         )
         self.assertIsNone(provider.execution_records[0].contract_failure_detail)
+        command = runner.calls[0]
+        self.assertIn("--ignore-user-config", command)
+        self.assertIn("--strict-config", command)
+        self.assertEqual(command[command.index("--model") + 1], "gpt-5.6")
+        self.assertEqual(
+            command[command.index("--config") + 1],
+            'model_reasoning_effort="medium"',
+        )
+        record = provider.execution_records[0]
+        self.assertEqual(record.model, "gpt-5.6")
+        self.assertEqual(record.reasoning_effort, "medium")
+        self.assertEqual(record.fallback_policy, "none")
+
+    def test_explicit_execution_profile_override_is_bound_to_command(self) -> None:
+        runner = FakeRunner()
+        provider = CodexCliRepresentationAnalysisProvider(
+            provider_version="0.147.0",
+            model="gpt-5.6",
+            reasoning_effort="high",
+            runner=runner,
+        )
+        provider.analyze(RepresentationAnalysisBatch((self.unit(),)))
+        command = runner.calls[0]
+        self.assertEqual(command[command.index("--model") + 1], "gpt-5.6")
+        self.assertEqual(
+            command[command.index("--config") + 1],
+            'model_reasoning_effort="high"',
+        )
+        self.assertEqual(provider.execution_records[0].reasoning_effort, "high")
+
+    def test_invalid_execution_profile_fails_before_provider_call(self) -> None:
+        runner = FakeRunner()
+        for arguments in (
+            {"model": "unsafe model"},
+            {"reasoning_effort": "unsupported"},
+            {"fallback_policy": "automatic"},
+        ):
+            with self.subTest(arguments=arguments), self.assertRaises(ValueError):
+                CodexCliRepresentationAnalysisProvider(
+                    provider_version="0.147.0", runner=runner, **arguments
+                )
+        self.assertEqual(runner.calls, [])
 
     def test_contract_failure_details_are_allowlisted(self) -> None:
         cases = {
@@ -409,6 +451,22 @@ class SemanticHandoffTest(unittest.TestCase):
         self.assertEqual(audit["durable_ingestion_status"], "completed")
         self.assertEqual(audit["unaccounted_units"], 0)
         self.assertEqual(audit["audit_readback_status"], "verified")
+        self.assertEqual(audit["model"], "gpt-5.6")
+        self.assertEqual(audit["reasoning_effort"], "medium")
+        self.assertEqual(audit["fallback_policy"], "none")
+        self.assertNotIn("chain_of_thought", audit)
+        self.assertNotIn("reasoning_content", audit)
+        manifest = json.loads((first.package / "manifest.json").read_text())
+        self.assertEqual(
+            manifest["provider"],
+            {
+                "name": "external-agent-codex-cli",
+                "provider_version": "0.147.0",
+                "model": "gpt-5.6",
+                "reasoning_effort": "medium",
+                "fallback_policy": "none",
+            },
+        )
         self.assertNotIn("Synthetic business input.", first.audit_paths[0].read_text())
         replay_provider = CodexCliRepresentationAnalysisProvider(
             provider_version="0.147.0", runner=FakeRunner()
@@ -417,6 +475,16 @@ class SemanticHandoffTest(unittest.TestCase):
         self.assertTrue(second.replayed_existing_package)
         self.assertEqual(second.ingestion.existing, 1)
         self.assertEqual(replay_provider.execution_records, [])
+
+        changed_runner = FakeRunner()
+        changed_profile = CodexCliRepresentationAnalysisProvider(
+            provider_version="0.147.0",
+            reasoning_effort="high",
+            runner=changed_runner,
+        )
+        with self.assertRaisesRegex(Exception, "未能安全重放"):
+            handoff.execute(representation.representation_id, changed_profile)
+        self.assertEqual(changed_runner.calls, [])
 
     def test_replay_accepts_pre_diagnostics_processing_run_audit(self) -> None:
         representation, service = self.build_service()
@@ -518,6 +586,10 @@ class SemanticHandoffTest(unittest.TestCase):
         audit_text = audits[0].read_text(encoding="utf-8")
         audit = json.loads(audit_text)
         self.assertNotIn("synthetic nonzero", audit_text)
+        self.assertEqual(len(provider.runner.calls), 1)
+        self.assertEqual(audit["model"], "gpt-5.6")
+        self.assertEqual(audit["reasoning_effort"], "medium")
+        self.assertEqual(audit["fallback_policy"], "none")
         self.assertEqual(audit["diagnostic_schema_version"], "external-agent-diagnostics/1.0")
         self.assertGreaterEqual(audit["stdout_bytes"], 0)
         self.assertGreater(audit["stderr_bytes"], 0)
@@ -1111,7 +1183,8 @@ class SemanticHandoffTest(unittest.TestCase):
 
         source = inspect.getsource(handoff_module)
         self.assertNotIn("world_model", source)
-        self.assertNotIn("fallback", source.lower())
+        self.assertNotIn("fallback_provider", source.lower())
+        self.assertNotIn("fallback_model", source.lower())
 
 
 if __name__ == "__main__":

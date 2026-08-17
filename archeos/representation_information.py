@@ -39,6 +39,10 @@ DEFAULT_CODEX_ANALYSIS_TIMEOUT_SECONDS = 120.0
 DEFAULT_EXTERNAL_AGENT_BATCH_SIZE = 40
 EXTERNAL_AGENT_PROTOCOL_VERSION = "external-agent-semantic-handoff/1.0"
 EXTERNAL_AGENT_ROUTE = "codex-cli"
+DEFAULT_SEMANTIC_MODEL = "gpt-5.6"
+DEFAULT_SEMANTIC_REASONING_EFFORT = "medium"
+DEFAULT_SEMANTIC_FALLBACK_POLICY = "none"
+SEMANTIC_REASONING_EFFORTS = frozenset({"low", "medium", "high", "xhigh"})
 
 
 class RepresentationInformationError(RuntimeError):
@@ -423,6 +427,9 @@ class ExternalAgentExecutionRecord:
     anchor_unit_ids: tuple[str, ...]
     provider_route: str
     provider_version: str
+    model: str
+    reasoning_effort: str
+    fallback_policy: str
     started_at: str
     finished_at: str
     execution_status: str
@@ -485,6 +492,9 @@ class CodexCliRepresentationAnalysisProvider:
         *,
         codex_binary: str = "codex",
         provider_version: str,
+        model: str = DEFAULT_SEMANTIC_MODEL,
+        reasoning_effort: str = DEFAULT_SEMANTIC_REASONING_EFFORT,
+        fallback_policy: str = DEFAULT_SEMANTIC_FALLBACK_POLICY,
         timeout_seconds: float = DEFAULT_CODEX_ANALYSIS_TIMEOUT_SECONDS,
         runner: Callable[..., Any] = subprocess.Popen,
         diagnostic_root: Path | None = None,
@@ -495,6 +505,14 @@ class CodexCliRepresentationAnalysisProvider:
             r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", provider_version
         ):
             raise ValueError("provider_version must be a safe non-empty version label")
+        if not isinstance(model, str) or not re.fullmatch(
+            r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", model
+        ):
+            raise ValueError("model must be a safe non-empty model label")
+        if reasoning_effort not in SEMANTIC_REASONING_EFFORTS:
+            raise ValueError("reasoning_effort is not supported")
+        if fallback_policy != "none":
+            raise ValueError("fallback_policy must be none")
         if (
             isinstance(timeout_seconds, bool)
             or not isinstance(timeout_seconds, (int, float))
@@ -503,6 +521,9 @@ class CodexCliRepresentationAnalysisProvider:
             raise ValueError("timeout_seconds must be a positive number")
         self.codex_binary = codex_binary
         self.provider_version = provider_version
+        self.model = model
+        self.reasoning_effort = reasoning_effort
+        self.fallback_policy = fallback_policy
         self.timeout_seconds = float(timeout_seconds)
         self.runner = runner
         self.diagnostic_root = (
@@ -537,6 +558,9 @@ class CodexCliRepresentationAnalysisProvider:
             "anchor_unit_ids": tuple(unit.unit_id for unit in batch.anchor_units),
             "provider_route": EXTERNAL_AGENT_ROUTE,
             "provider_version": self.provider_version,
+            "model": self.model,
+            "reasoning_effort": self.reasoning_effort,
+            "fallback_policy": self.fallback_policy,
             "started_at": _utc_timestamp(),
         }
         if not diagnostic_root_ready:
@@ -586,6 +610,12 @@ class CodexCliRepresentationAnalysisProvider:
                 self.codex_binary,
                 "exec",
                 "--ephemeral",
+                "--ignore-user-config",
+                "--strict-config",
+                "--model",
+                self.model,
+                "--config",
+                f'model_reasoning_effort="{self.reasoning_effort}"',
                 "--sandbox",
                 "read-only",
                 "--skip-git-repo-check",
@@ -1138,6 +1168,9 @@ def _write_failure_diagnostic_bundle(
             "diagnostic_schema_version": DIAGNOSTIC_SCHEMA_VERSION,
             "provider_route": record.provider_route,
             "provider_version": record.provider_version,
+            "model": record.model,
+            "reasoning_effort": record.reasoning_effort,
+            "fallback_policy": record.fallback_policy,
             "protocol_version": record.protocol_version,
             "input_fingerprint": record.input_fingerprint,
             "eligible_units": record.eligible_units,
@@ -1395,7 +1428,7 @@ class RepresentationInformationService:
             candidates,
             residue,
             batches,
-            provider.name,
+            provider,
             self._timestamp(),
         )
         self.output_root.mkdir(parents=True, exist_ok=True)
@@ -1800,12 +1833,30 @@ def _evidence(unit_ids: Sequence[str], by_id: Mapping[str, RepresentationAnalysi
     return result
 
 
-def _manifest(representation: NormalizedRepresentation, units: Sequence[RepresentationAnalysisUnit], candidates: Sequence[dict[str, object]], residue: Sequence[dict[str, object]], batches: Sequence[dict[str, object]], provider_name: str, processed_at: str) -> dict[str, object]:
+def _provider_manifest(provider: RepresentationAnalysisProvider) -> dict[str, str]:
+    payload = {"name": provider.name}
+    profile_fields = ("provider_version", "model", "reasoning_effort", "fallback_policy")
+    present = tuple(hasattr(provider, field) for field in profile_fields)
+    if any(present):
+        if not all(present):
+            raise RepresentationInformationError(
+                "Representation analysis provider execution profile is incomplete"
+            )
+        payload.update(
+            {
+                field: str(getattr(provider, field))
+                for field in profile_fields
+            }
+        )
+    return payload
+
+
+def _manifest(representation: NormalizedRepresentation, units: Sequence[RepresentationAnalysisUnit], candidates: Sequence[dict[str, object]], residue: Sequence[dict[str, object]], batches: Sequence[dict[str, object]], provider: RepresentationAnalysisProvider, processed_at: str) -> dict[str, object]:
     eligible = [unit for unit in units if unit.analysis_eligible]
     covered = {evidence["unit_id"] for item in (*candidates, *residue) for evidence in item["source_evidence"]}  # type: ignore[index]
     if covered != {unit.unit_id for unit in eligible}:
         raise RepresentationInformationError("eligible Representation unit coverage is incomplete")
-    return {"schema_version": PACKAGE_SCHEMA_VERSION, "package_kind": PACKAGE_KIND, "source": {"id": representation.source_id, "content_hash": representation.source_content_hash}, "representation": {"representation_id": representation.representation_id, "kind": representation.kind, "artifacts": [{"artifact_id": artifact.artifact_id, "locator": artifact.locator, "content_hash": artifact.content_hash} for artifact in representation.artifacts]}, "provider": {"name": provider_name}, "processed_at": processed_at, "artifacts": ["manifest.json", "atomic_information_candidates.jsonl", "residue.jsonl", "processing_summary.md"], "units": [{"unit_id": unit.unit_id, "artifact_id": unit.artifact_id, "kind": unit.kind, "locator": unit.locator, "analysis_eligible": unit.analysis_eligible, "exclusion_reason": unit.exclusion_reason} for unit in units], "batches": list(batches), "counts": {"total_units": len(units), "eligible_units": len(eligible), "excluded_units": len(units) - len(eligible), "atomic_information_candidates": len(candidates), "residue_items": len(residue), "unaccounted_eligible_units": 0}, "downstream": {"atomic_information_ingestion": "automatic_after_contract_validation", "world_model_write": "not_performed"}}
+    return {"schema_version": PACKAGE_SCHEMA_VERSION, "package_kind": PACKAGE_KIND, "source": {"id": representation.source_id, "content_hash": representation.source_content_hash}, "representation": {"representation_id": representation.representation_id, "kind": representation.kind, "artifacts": [{"artifact_id": artifact.artifact_id, "locator": artifact.locator, "content_hash": artifact.content_hash} for artifact in representation.artifacts]}, "provider": _provider_manifest(provider), "processed_at": processed_at, "artifacts": ["manifest.json", "atomic_information_candidates.jsonl", "residue.jsonl", "processing_summary.md"], "units": [{"unit_id": unit.unit_id, "artifact_id": unit.artifact_id, "kind": unit.kind, "locator": unit.locator, "analysis_eligible": unit.analysis_eligible, "exclusion_reason": unit.exclusion_reason} for unit in units], "batches": list(batches), "counts": {"total_units": len(units), "eligible_units": len(eligible), "excluded_units": len(units) - len(eligible), "atomic_information_candidates": len(candidates), "residue_items": len(residue), "unaccounted_eligible_units": 0}, "downstream": {"atomic_information_ingestion": "automatic_after_contract_validation", "world_model_write": "not_performed"}}
 
 
 def _jsonl(records: Sequence[dict[str, object]]) -> str:
@@ -1850,6 +1901,7 @@ def validate_representation_information_package(package: Path) -> tuple[dict[str
         raise RepresentationInformationError("unsupported Representation information package")
     source = manifest["source"]
     representation = manifest["representation"]
+    provider = manifest["provider"]
     if not isinstance(source, dict) or set(source) != {"id", "content_hash"}:
         raise RepresentationInformationError("Representation information source is invalid")
     require_managed_source_id(source["id"])
@@ -1857,6 +1909,37 @@ def validate_representation_information_package(package: Path) -> tuple[dict[str
         raise RepresentationInformationError("Representation information source hash is invalid")
     if not isinstance(representation, dict) or set(representation) != {"representation_id", "kind", "artifacts"}:
         raise RepresentationInformationError("Representation information representation is invalid")
+    if not isinstance(provider, dict) or frozenset(provider) not in {
+        frozenset({"name"}),
+        frozenset(
+            {
+                "name",
+                "provider_version",
+                "model",
+                "reasoning_effort",
+                "fallback_policy",
+            }
+        ),
+    }:
+        raise RepresentationInformationError(
+            "Representation information provider is invalid"
+        )
+    if not isinstance(provider.get("name"), str) or not provider["name"].strip():
+        raise RepresentationInformationError(
+            "Representation information provider name is invalid"
+        )
+    if len(provider) > 1 and (
+        any(
+            not isinstance(provider.get(field), str)
+            or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", provider[field])
+            for field in ("provider_version", "model")
+        )
+        or provider.get("reasoning_effort") not in SEMANTIC_REASONING_EFFORTS
+        or provider.get("fallback_policy") != "none"
+    ):
+        raise RepresentationInformationError(
+            "Representation information execution profile is invalid"
+        )
     require_representation_id(representation["representation_id"])
     if not isinstance(representation["artifacts"], list) or any(
         not isinstance(item, dict)
