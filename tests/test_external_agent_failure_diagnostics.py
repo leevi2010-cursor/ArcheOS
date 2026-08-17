@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import signal
@@ -12,13 +13,56 @@ from pathlib import Path
 from unittest.mock import patch
 
 from archeos.representation_information import (
-    _MAX_DIAGNOSTIC_STREAM_BYTES,
     CodexCliRepresentationAnalysisProvider,
     RepresentationAnalysisBatch,
     RepresentationAnalysisUnit,
-    _bounded_redacted_tail,
     _provider_error_category,
 )
+
+_SYNTHETIC_BODY = "Synthetic only."
+_SYNTHETIC_UNIT_ID = "unit_" + "a" * 64
+_DIAGNOSTIC_V2_METADATA_FIELDS = {
+    "accounting_item_count",
+    "candidate_anchor_ref_count",
+    "candidate_item_count",
+    "contract_failure_stage",
+    "covered_units",
+    "created_at",
+    "deadline_ms",
+    "diagnostic_schema_version",
+    "dual_assignment_count",
+    "duplicate_accounting_count",
+    "duplicate_anchor_ref_count",
+    "elapsed_ms",
+    "eligible_units",
+    "exit_code",
+    "expires_at",
+    "failure_category",
+    "fallback_policy",
+    "finished_at",
+    "input_fingerprint",
+    "missing_anchor_count",
+    "model",
+    "process_cleanup_status",
+    "protocol_version",
+    "provider_error_category",
+    "provider_route",
+    "provider_version",
+    "reasoning_effort",
+    "residue_anchor_ref_count",
+    "residue_item_count",
+    "result_file_present",
+    "result_fingerprint",
+    "result_size_bytes",
+    "started_at",
+    "stderr_bytes",
+    "stderr_sha256",
+    "stdout_bytes",
+    "stdout_sha256",
+    "termination_signal",
+    "timeout_phase",
+    "unknown_anchor_ref_count",
+}
 
 
 class _Process:
@@ -37,16 +81,23 @@ class _Process:
             raise subprocess.TimeoutExpired(
                 self.command,
                 1,
-                output="partial stdout ",
-                stderr="Authorization: Bearer secret-value partial stderr ",
+                output=f"partial stdout {_SYNTHETIC_BODY} ",
+                stderr=f"partial stderr {_SYNTHETIC_UNIT_ID} ",
             )
         if self.mode == "timeout":
             self.returncode = -signal.SIGTERM
-            return "drained stdout", "drained stderr"
+            return (
+                f"drained stdout {_SYNTHETIC_BODY}",
+                f"drained stderr {_SYNTHETIC_UNIT_ID}",
+            )
         if self.mode == "nonzero":
             self.returncode = 9
-            return "X" * (_MAX_DIAGNOSTIC_STREAM_BYTES + 100), (
-                "token=private-token " + "Y" * (_MAX_DIAGNOSTIC_STREAM_BYTES + 100)
+            return _SYNTHETIC_BODY, _SYNTHETIC_UNIT_ID
+        if self.mode == "transport":
+            self.returncode = 1
+            return (
+                _SYNTHETIC_BODY,
+                f"Codex provider transport connection reset {_SYNTHETIC_UNIT_ID}",
             )
         if self.mode == "known_error":
             self.returncode = 1
@@ -108,6 +159,43 @@ class ExternalAgentFailureDiagnosticsTest(unittest.TestCase):
             diagnostic_root=self.root / "diagnostics",
         )
 
+    def echoing_runner(self, mode: str):
+        from tests.test_semantic_handoff import FakeProcess, FakeRunner
+
+        class EchoingProcess(FakeProcess):
+            def communicate(self, *, input=None, timeout=None):
+                super().communicate(input=input, timeout=timeout)
+                return _SYNTHETIC_BODY, _SYNTHETIC_UNIT_ID
+
+        class EchoingRunner(FakeRunner):
+            def __call__(self, command, **_kwargs):
+                command = list(command)
+                self.schemas.append(
+                    json.loads(
+                        Path(
+                            command[command.index("--output-schema") + 1]
+                        ).read_text(encoding="utf-8")
+                    )
+                )
+                return EchoingProcess(command, mode=self.mode, calls=self.calls)
+
+        return EchoingRunner(mode)
+
+    def assert_content_free_bundle(self, bundle: Path) -> dict[str, object]:
+        self.assertEqual(
+            {path.name for path in bundle.iterdir()},
+            {"metadata.json"},
+        )
+        metadata_path = bundle / "metadata.json"
+        metadata_text = metadata_path.read_text(encoding="utf-8")
+        metadata = json.loads(metadata_text)
+        self.assertEqual(set(metadata), _DIAGNOSTIC_V2_METADATA_FIELDS)
+        self.assertRegex(metadata["stdout_sha256"], r"^sha256:[0-9a-f]{64}$")
+        self.assertRegex(metadata["stderr_sha256"], r"^sha256:[0-9a-f]{64}$")
+        self.assertNotIn(_SYNTHETIC_BODY, metadata_text)
+        self.assertNotIn(_SYNTHETIC_UNIT_ID, metadata_text)
+        return metadata
+
     def _run_failure(self, mode: str):
         provider = self.provider(mode)
         with (
@@ -121,11 +209,11 @@ class ExternalAgentFailureDiagnosticsTest(unittest.TestCase):
         return provider, provider.execution_records[0]
 
     def test_success_does_not_create_raw_bundle(self) -> None:
-        from tests.test_semantic_handoff import FakeRunner
-
         root = self.root / "diagnostics"
         provider = CodexCliRepresentationAnalysisProvider(
-            provider_version="synthetic-1", runner=FakeRunner(), diagnostic_root=root
+            provider_version="synthetic-1",
+            runner=self.echoing_runner("valid"),
+            diagnostic_root=root,
         )
         provider.analyze(self.batch())
         self.assertFalse(root.exists())
@@ -154,11 +242,9 @@ class ExternalAgentFailureDiagnosticsTest(unittest.TestCase):
         self.assertEqual(record.process_cleanup_status, "verified")
         self.assertEqual(record.timeout_phase, "initial_communicate")
         self.assertEqual(record.termination_signal, signal.SIGTERM)
-        self.assertGreater(record.stdout_bytes, len("partial stdout"))
-        self.assertGreater(record.stderr_bytes, len("partial stderr"))
-        self.assertIn("drained stdout", (bundle / "stdout.tail").read_text())
-        self.assertNotIn("secret-value", (bundle / "stderr.tail").read_text())
-        metadata = json.loads((bundle / "metadata.json").read_text())
+        self.assertGreater(record.stdout_bytes, len(_SYNTHETIC_BODY))
+        self.assertGreater(record.stderr_bytes, len(_SYNTHETIC_UNIT_ID))
+        metadata = self.assert_content_free_bundle(bundle)
         self.assertEqual(
             metadata["diagnostic_schema_version"],
             "external-agent-diagnostics/2.0",
@@ -216,30 +302,44 @@ class ExternalAgentFailureDiagnosticsTest(unittest.TestCase):
         self.assertIn(signal.SIGKILL, signals)
         self.assertGreater(record.stdout_bytes, len("initial"))
 
-    def test_nonzero_bundle_is_bounded_redacted_and_private(self) -> None:
+    def test_nonzero_bundle_is_metadata_only_and_private(self) -> None:
         provider, record = self._run_failure("nonzero")
         bundle = provider.diagnostic_root / record.processing_run_id
         self.assertEqual(record.failure_category, "runtime_nonzero_exit")
-        self.assertLessEqual((bundle / "stdout.tail").stat().st_size, _MAX_DIAGNOSTIC_STREAM_BYTES)
-        self.assertLessEqual((bundle / "stderr.tail").stat().st_size, _MAX_DIAGNOSTIC_STREAM_BYTES)
-        self.assertNotIn("private-token", (bundle / "stderr.tail").read_text())
+        metadata = self.assert_content_free_bundle(bundle)
+        self.assertEqual(metadata["stdout_bytes"], len(_SYNTHETIC_BODY))
+        self.assertEqual(metadata["stderr_bytes"], len(_SYNTHETIC_UNIT_ID))
+        self.assertEqual(
+            metadata["stdout_sha256"],
+            "sha256:" + hashlib.sha256(_SYNTHETIC_BODY.encode()).hexdigest(),
+        )
+        self.assertEqual(
+            metadata["stderr_sha256"],
+            "sha256:" + hashlib.sha256(_SYNTHETIC_UNIT_ID.encode()).hexdigest(),
+        )
         self.assertEqual(stat.S_IMODE(bundle.stat().st_mode), 0o700)
         for child in bundle.iterdir():
             self.assertEqual(stat.S_IMODE(child.stat().st_mode), 0o600)
 
-    def test_credential_redaction_covers_json_quoted_and_basic_forms(self) -> None:
-        raw = (
-            '{"access_token":"token-one","api_key":"key-two"} '
-            'password="password-three" Authorization: Basic basic-four'
-        )
-        tail = _bounded_redacted_tail(raw)
-        for secret in ("token-one", "key-two", "password-three", "basic-four"):
-            self.assertNotIn(secret, tail)
-        self.assertGreaterEqual(tail.count("[REDACTED]"), 4)
+    def test_transport_bundle_never_persists_stream_content(self) -> None:
+        provider, record = self._run_failure("transport")
+        self.assertEqual(record.provider_error_category, "network_or_transport")
+        bundle = provider.diagnostic_root / record.processing_run_id
+        self.assert_content_free_bundle(bundle)
 
-    def test_multibyte_tail_never_exceeds_64_kib_after_encoding(self) -> None:
-        tail = _bounded_redacted_tail("前" + "界" * _MAX_DIAGNOSTIC_STREAM_BYTES)
-        self.assertLessEqual(len(tail.encode("utf-8")), _MAX_DIAGNOSTIC_STREAM_BYTES)
+    def test_contract_bundle_never_persists_stream_content(self) -> None:
+        provider = CodexCliRepresentationAnalysisProvider(
+            provider_version="synthetic-1",
+            runner=self.echoing_runner("top_level_missing"),
+            diagnostic_root=self.root / "diagnostics",
+        )
+        with self.assertRaisesRegex(Exception, "未产生可验证"):
+            provider.analyze(self.batch())
+        record = provider.execution_records[0]
+        self.assertEqual(record.failure_category, "result_contract_failure")
+        self.assertEqual(record.contract_failure_stage, "top_level")
+        bundle = provider.diagnostic_root / record.processing_run_id
+        self.assert_content_free_bundle(bundle)
 
     def test_symlink_diagnostic_root_fails_closed_without_touching_target(self) -> None:
         target = self.root / "external-target"
@@ -341,7 +441,9 @@ class ExternalAgentFailureDiagnosticsTest(unittest.TestCase):
         root = self.root / "diagnostics"
         provider = CodexCliRepresentationAnalysisProvider(
             provider_version="synthetic-1",
-            runner=lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("synthetic")),
+            runner=lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                OSError(f"{_SYNTHETIC_BODY} {_SYNTHETIC_UNIT_ID}")
+            ),
             diagnostic_root=root,
         )
         with self.assertRaisesRegex(Exception, "未产生可验证"):
@@ -349,11 +451,7 @@ class ExternalAgentFailureDiagnosticsTest(unittest.TestCase):
         record = provider.execution_records[0]
         self.assertEqual(record.failure_category, "runtime_start_failure")
         self.assertEqual(record.process_cleanup_status, "not_started")
-        self.assertTrue((root / record.processing_run_id / "metadata.json").is_file())
-        self.assertIn(
-            "synthetic",
-            (root / record.processing_run_id / "stderr.tail").read_text(encoding="utf-8"),
-        )
+        self.assert_content_free_bundle(root / record.processing_run_id)
 
     def test_process_cleanup_failure_is_auditable(self) -> None:
         provider = self.provider("nonzero")
@@ -368,6 +466,40 @@ class ExternalAgentFailureDiagnosticsTest(unittest.TestCase):
         record = provider.execution_records[0]
         self.assertEqual(record.failure_category, "process_cleanup_failure")
         self.assertEqual(record.process_cleanup_status, "failed")
+        bundle = provider.diagnostic_root / record.processing_run_id
+        self.assert_content_free_bundle(bundle)
+
+    def test_unexpired_historical_v1_bundle_is_not_rewritten(self) -> None:
+        root = self.root / "diagnostics"
+        legacy = root / "run_legacy"
+        legacy.mkdir(parents=True, mode=0o700)
+        os.chmod(root, 0o700)
+        created_at = datetime.now(UTC)
+        legacy_files = {
+            "metadata.json": json.dumps(
+                {
+                    "diagnostic_schema_version": "external-agent-diagnostics/1.0",
+                    "created_at": created_at.isoformat().replace("+00:00", "Z"),
+                    "expires_at": (created_at + timedelta(hours=1))
+                    .isoformat()
+                    .replace("+00:00", "Z"),
+                },
+                sort_keys=True,
+            ).encode(),
+            "stdout.tail": b"historical synthetic stdout",
+            "stderr.tail": b"historical synthetic stderr",
+        }
+        for name, value in legacy_files.items():
+            path = legacy / name
+            path.write_bytes(value)
+            os.chmod(path, 0o600)
+
+        self._run_failure("unknown_error")
+
+        self.assertEqual(
+            {path.name: path.read_bytes() for path in legacy.iterdir()},
+            legacy_files,
+        )
 
     def test_expired_bundle_is_purged_and_explicit_cleanup_removes_all(self) -> None:
         root = self.root / "diagnostics"

@@ -635,7 +635,6 @@ class ExternalAgentExecutionRecord:
 
 DIAGNOSTIC_SCHEMA_V1 = "external-agent-diagnostics/1.0"
 DIAGNOSTIC_SCHEMA_VERSION = "external-agent-diagnostics/2.0"
-_MAX_DIAGNOSTIC_STREAM_BYTES = 64 * 1024
 _DIAGNOSTIC_TTL_SECONDS = 24 * 60 * 60
 CONTRACT_FAILURE_DETAILS = frozenset(
     {
@@ -1246,6 +1245,11 @@ def _stream_bytes(value: str) -> int:
     return len(value.encode("utf-8", errors="replace"))
 
 
+def _stream_fingerprint(value: str) -> str:
+    encoded = value.encode("utf-8", errors="replace")
+    return "sha256:" + hashlib.sha256(encoded).hexdigest()
+
+
 def _merge_stream_output(existing: str, incoming: str) -> str:
     if not incoming:
         return existing
@@ -1332,39 +1336,6 @@ def _provider_error_category(stderr: str) -> str:
         if re.search(pattern, normalized):
             return category
     return "unknown"
-
-
-_BEARER_CREDENTIAL = re.compile(
-    r"(?i)(?:authorization\s*[:=]\s*)?bearer\s+[^\s\"']+"
-)
-_BASIC_CREDENTIAL = re.compile(
-    r"(?i)(authorization\s*[:=]\s*)basic\s+[^\s\"']+"
-)
-_QUOTED_CREDENTIAL = re.compile(
-    r"(?i)((?:[\"']?(?:access[_ -]?token|api[_ -]?key|token|password|authorization)"
-    r"[\"']?)\s*[:=]\s*)([\"'])[^\"']*\2"
-)
-_KEY_VALUE_CREDENTIAL = re.compile(
-    r"(?i)((?:access[_ -]?token|api[_ -]?key|token|password|authorization)"
-    r"\s*[:=]\s*)[^\s\"']+"
-)
-
-
-def _redact_credential_like(value: str) -> str:
-    return _KEY_VALUE_CREDENTIAL.sub(
-        r"\1[REDACTED]",
-        _QUOTED_CREDENTIAL.sub(
-            r"\1\2[REDACTED]\2",
-            _BASIC_CREDENTIAL.sub(
-                r"\1[REDACTED]", _BEARER_CREDENTIAL.sub("[REDACTED]", value)
-            ),
-        ),
-    )
-
-
-def _bounded_redacted_tail(value: str) -> str:
-    encoded = _redact_credential_like(value).encode("utf-8", errors="replace")
-    return encoded[-_MAX_DIAGNOSTIC_STREAM_BYTES :].decode("utf-8", errors="ignore")
 
 
 def _diagnostic_root_is_safe(root: Path, *, require_private_root: bool = True) -> bool:
@@ -1516,14 +1487,10 @@ def _write_failure_diagnostic_bundle(
             "result_size_bytes": record.result_size_bytes,
             "stdout_bytes": record.stdout_bytes,
             "stderr_bytes": record.stderr_bytes,
+            "stdout_sha256": _stream_fingerprint(outcome.stdout),
+            "stderr_sha256": _stream_fingerprint(outcome.stderr),
             "process_cleanup_status": record.process_cleanup_status,
         }
-        _private_diagnostic_write(
-            staging / "stdout.tail", _bounded_redacted_tail(outcome.stdout)
-        )
-        _private_diagnostic_write(
-            staging / "stderr.tail", _bounded_redacted_tail(outcome.stderr)
-        )
         _private_diagnostic_write(
             staging / "metadata.json",
             json.dumps(metadata, ensure_ascii=False, sort_keys=True) + "\n",
