@@ -550,6 +550,7 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="仅准备下一 semantic batch；不新增 Semantic Handoff 调用。",
     )
+    wechat_digest.add_argument("--upgrade-active-v1", action="store_true", help="零 Provider 升级当前 active v1 run 到 v2。")
     return parser
 
 
@@ -1000,6 +1001,9 @@ def _wechat_product_command(args: argparse.Namespace) -> int:
                     indent=2,
                 )
             )
+            return 0
+        if args.upgrade_active_v1:
+            print(json.dumps({"run_id": service.upgrade_active_v1(), "semantic_provider_calls": 0}, ensure_ascii=False))
             return 0
         result = service.run(
             since=args.since,

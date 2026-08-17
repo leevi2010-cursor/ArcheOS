@@ -1108,6 +1108,40 @@ class WechatDigestService:
                 batch_size=effective_batch_size,
             )
 
+    def upgrade_active_v1(self) -> str:
+        """Explicit, audited, zero-Provider upgrade for the active legacy run only."""
+        with self.run_store.lock():
+            run_id = self.run_store.active_run_id()
+            if run_id is None:
+                raise WechatDigestError("不存在可升级的 active v1 微信运行。")
+            legacy = self.run_store.plan(run_id)
+            if legacy.get("schema_version") != LEGACY_RUN_PLAN_SCHEMA_VERSION:
+                raise WechatDigestError("active 微信运行不是可升级的 v1。")
+            capture = self.capture_provider.capture(
+                WechatCursor.from_dict(legacy["after_cursor"], "plan.after_cursor"),
+                upper_bound=WechatCursor.from_dict(legacy["upper_bound"], "plan.upper_bound"),
+            )
+            self._verify_capture_against_plan(capture, legacy)
+            created_at = legacy.get("created_at")
+            if not isinstance(created_at, str) or legacy.get("run_id") != run_id:
+                raise WechatDigestError("active v1 微信运行损坏。")
+            plan, _ = _build_plan(capture, clock=lambda: created_at, run_id=run_id,
+                created_at=created_at, semantic_batch_size=DEFAULT_EXTERNAL_AGENT_BATCH_SIZE)
+            expected_legacy = dict(plan)
+            expected_legacy["schema_version"] = LEGACY_RUN_PLAN_SCHEMA_VERSION
+            expected_legacy.pop("semantic_batch_size")
+            if legacy != expected_legacy:
+                raise WechatDigestError("active v1 与 fixed capture 不一致。")
+            status = self.run_store.status(run_id)
+            items = status.get("items")
+            if status.get("run_id") != run_id or not isinstance(items, dict):
+                raise WechatDigestError("active v1 status 损坏。")
+            status = dict(status)
+            status["plan_fingerprint"] = _plan_fingerprint(plan)
+            self.run_store.upgrade_plan(run_id, plan, status)
+            self._verify_plan_and_status(run_id, capture, plan, self.run_store.status(run_id))
+            return run_id
+
     def _prepare_next_semantic_locked(
         self,
         run_id: str,
