@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import re
+import secrets
 import stat
 import tempfile
 from collections.abc import Mapping
@@ -75,11 +76,10 @@ class SemanticRecoveryPreflight:
     conservatively_counted_attempts: int
 
 
-_RECOVERY_RUN_SCHEMA = "semantic-handoff-run-receipt/1.0"
-_RECOVERY_RUN_COMMIT_SCHEMA = "semantic-handoff-run-commit/1.0"
-_RECOVERY_ATTEMPT_SCHEMA = "semantic-handoff-attempt-receipt/1.0"
-_RECOVERY_RESULT_SCHEMA = "semantic-handoff-batch-result-receipt/1.0"
-_RECOVERY_RESULT_COMMIT_SCHEMA = "semantic-handoff-batch-result-commit/1.0"
+_RECOVERY_RUN_SCHEMA = "semantic-handoff-run-receipt/2.0"
+_RECOVERY_ATTEMPT_SCHEMA = "semantic-handoff-attempt-receipt/2.0"
+_RECOVERY_RESULT_SCHEMA = "semantic-handoff-batch-result-receipt/2.0"
+_RECOVERY_RESULT_PHASE_SCHEMA = "semantic-handoff-batch-result-phase/1.0"
 _LOCAL_VALIDATOR_CONTRACT_VERSION = "external-agent-local-validator/3.1"
 _EXECUTION_RECORD_FIELDS = frozenset(
     ExternalAgentExecutionRecord.__dataclass_fields__
@@ -108,6 +108,14 @@ def _payloads_exactly_equal(first: object, second: object) -> bool:
 
 
 def _fsync_directory(path: Path) -> None:
+    descriptor = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _fsync_file(path: Path) -> None:
     descriptor = os.open(path, os.O_RDONLY)
     try:
         os.fsync(descriptor)
@@ -203,27 +211,22 @@ def _publish_private_json_marker(
             temporary.unlink()
 
 
-def _mark_commit_unknown(path: Path, payload: Mapping[str, object]) -> None:
-    """Best-effort poison marker; its mere presence permanently blocks replay."""
+def _refsync_and_readback(
+    *, files: tuple[Path, ...], directories: tuple[Path, ...]
+) -> None:
+    """Re-establish durability in this process; prior fsync return is irrelevant."""
 
-    try:
-        descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-    except FileExistsError:
-        return
-    except OSError:
-        return
-    try:
-        with os.fdopen(descriptor, "wb") as target:
-            target.write(_canonical_bytes(payload) + b"\n")
-            target.flush()
-            os.fsync(target.fileno())
-        try:
-            _fsync_directory(path.parent)
-        except OSError:
-            pass
-    except OSError:
-        # Never delete or repair an uncertain durable entry.
-        pass
+    before = {path: _private_bytes_read(path) for path in files}
+    for path in files:
+        _fsync_file(path)
+    for path in directories:
+        _require_private_directory(path)
+        _fsync_directory(path)
+    after = {path: _private_bytes_read(path) for path in files}
+    if after != before:
+        raise SemanticHandoffError(
+            "Semantic recovery post-strict byte readback 漂移。"
+        )
 
 
 def _ensure_private_directory(path: Path) -> None:
@@ -286,7 +289,12 @@ def _validate_recovery_result_directory(path: Path) -> None:
     except OSError as exc:
         raise SemanticHandoffError("Semantic recovery result inventory 不可读。") from exc
     base = {"result.json", "result-receipt.json"}
-    optional = {"result-commit.json", "result-commit-unknown.json"}
+    optional = {
+        "result-commit.json",
+        "result-commit-unknown.json",
+        "phase-post-strict-pending.json",
+        "phase-committed.json",
+    }
     if not base.issubset(children) or not set(children) <= base | optional:
         raise SemanticHandoffError("Semantic recovery result inventory 损坏。")
     for child in children.values():
@@ -495,16 +503,15 @@ class _SemanticRecoveryRun:
             "batches": [contract["receipt"] for contract in self.batch_contracts],
         }
         self.contract_fingerprint = _fingerprint(receipt_without_fingerprint)
-        self.expected_run_receipt = {
+        run_receipt_without_fingerprint = {
             **receipt_without_fingerprint,
             "contract_fingerprint": self.contract_fingerprint,
         }
-        self.expected_run_commit = {
-            "schema_version": _RECOVERY_RUN_COMMIT_SCHEMA,
-            "artifact_kind": "semantic_handoff_recovery_run_commit",
-            "semantic_run_id": self.semantic_run_id,
-            "run_contract_fingerprint": self.contract_fingerprint,
-            "state": "committed",
+        self.expected_run_receipt = {
+            **run_receipt_without_fingerprint,
+            "run_receipt_fingerprint": _fingerprint(
+                run_receipt_without_fingerprint
+            ),
         }
 
     def _batch_contract(
@@ -538,10 +545,9 @@ class _SemanticRecoveryRun:
     def ensure_run_receipt(self) -> None:
         _validate_shared_recovery_root(self.audit_root, create=True)
         if self.exists:
-            self._validate_run_receipt()
+            self._converge_run_receipt()
             return
         staging: Path | None = None
-        published_here = False
         try:
             staging = Path(
                 tempfile.mkdtemp(
@@ -556,8 +562,6 @@ class _SemanticRecoveryRun:
             _fsync_directory(staging)
             publish_directory_no_replace(staging, self.run_dir)
             staging = None
-            _fsync_directory(self.audit_root)
-            published_here = True
         except FileExistsError:
             pass
         finally:
@@ -565,39 +569,18 @@ class _SemanticRecoveryRun:
                 for child in staging.iterdir():
                     child.unlink()
                 staging.rmdir()
-        if published_here:
-            try:
-                _publish_private_json_marker(
-                    self.run_dir / "run-commit.json",
-                    self.expected_run_commit,
-                )
-            except (OSError, SemanticHandoffError):
-                _mark_commit_unknown(
-                    self.run_dir / "run-commit-unknown.json",
-                    {
-                        "schema_version": _RECOVERY_RUN_COMMIT_SCHEMA,
-                        "semantic_run_id": self.semantic_run_id,
-                        "state": "unknown",
-                    },
-                )
-                raise
-        self._validate_run_receipt()
+        self._converge_run_receipt()
 
-    def _validate_run_receipt(self) -> None:
+    def _validate_run_receipt_payload(self) -> None:
         _validate_shared_recovery_root(self.audit_root, create=False)
         _require_private_directory(self.run_dir)
-        allowed = {
-            "run-receipt.json",
-            "run-commit.json",
-            "attempts",
-            "results",
-        }
+        allowed = {"run-receipt.json", "attempts", "results"}
         try:
             inventory = {path.name for path in self.run_dir.iterdir()}
         except OSError as exc:
             raise SemanticHandoffError("Semantic recovery inventory 不可读。") from exc
         if (
-            not {"run-receipt.json", "run-commit.json"}.issubset(inventory)
+            "run-receipt.json" not in inventory
             or not inventory <= allowed
         ):
             raise SemanticHandoffError("Semantic recovery inventory 损坏。")
@@ -606,11 +589,14 @@ class _SemanticRecoveryRun:
             self.expected_run_receipt,
         ):
             raise SemanticHandoffError("Semantic recovery run binding 漂移。")
-        if not _payloads_exactly_equal(
-            _private_json_exact(self.run_dir / "run-commit.json"),
-            self.expected_run_commit,
-        ):
-            raise SemanticHandoffError("Semantic recovery run commit 损坏。")
+
+    def _converge_run_receipt(self) -> None:
+        self._validate_run_receipt_payload()
+        _refsync_and_readback(
+            files=(self.run_dir / "run-receipt.json",),
+            directories=(self.run_dir, self.audit_root),
+        )
+        self._validate_run_receipt_payload()
 
     def _attempt_path(self, ordinal: int) -> Path:
         return self.attempts_dir / f"batch_{ordinal:04d}.json"
@@ -618,36 +604,50 @@ class _SemanticRecoveryRun:
     def _result_path(self, ordinal: int) -> Path:
         return self.results_dir / f"batch_{ordinal:04d}"
 
-    def _result_commit_payload(
-        self, ordinal: int, result_receipt: Mapping[str, object]
+    def _result_phase_payload(
+        self,
+        ordinal: int,
+        result_receipt: Mapping[str, object],
+        phase: str,
     ) -> dict[str, object]:
+        if phase not in {"post_strict_pending", "committed"}:
+            raise SemanticHandoffError("Semantic recovery phase 无效。")
         batch_receipt = self.batch_contracts[ordinal - 1]["receipt"]
         assert isinstance(batch_receipt, dict)
         return {
-            "schema_version": _RECOVERY_RESULT_COMMIT_SCHEMA,
-            "artifact_kind": "semantic_handoff_batch_result_commit",
+            "schema_version": _RECOVERY_RESULT_PHASE_SCHEMA,
+            "artifact_kind": "semantic_handoff_batch_result_phase",
             "semantic_run_id": self.semantic_run_id,
             "run_contract_fingerprint": self.contract_fingerprint,
             "batch_ordinal": ordinal,
             "batch_contract_fingerprint": batch_receipt[
                 "batch_contract_fingerprint"
             ],
-            "attempt_id": self._attempt_payload(ordinal)["attempt_id"],
+            "attempt_id": result_receipt["attempt_id"],
+            "attempt_nonce": result_receipt["attempt_nonce"],
+            "attempt_receipt_fingerprint": result_receipt[
+                "attempt_receipt_fingerprint"
+            ],
             "result_sha256": result_receipt["result_sha256"],
-            "result_receipt_fingerprint": _fingerprint(result_receipt),
-            "state": "committed",
+            "result_receipt_fingerprint": result_receipt[
+                "result_receipt_fingerprint"
+            ],
+            "phase": phase,
         }
 
-    def _attempt_payload(self, ordinal: int) -> dict[str, object]:
+    def _attempt_payload(self, ordinal: int, attempt_nonce: str) -> dict[str, object]:
+        if re.fullmatch(r"[0-9a-f]{64}", attempt_nonce) is None:
+            raise SemanticHandoffError("Semantic recovery attempt nonce 无效。")
         batch_receipt = self.batch_contracts[ordinal - 1]["receipt"]
         assert isinstance(batch_receipt, dict)
         attempt_id = "attempt_" + hashlib.sha256(
-            f"{self.semantic_run_id}:{ordinal}:1".encode()
+            f"{self.semantic_run_id}:{ordinal}:{attempt_nonce}".encode()
         ).hexdigest()[:32]
-        return {
+        without_fingerprint: dict[str, object] = {
             "schema_version": _RECOVERY_ATTEMPT_SCHEMA,
             "artifact_kind": "semantic_handoff_attempt",
             "attempt_id": attempt_id,
+            "attempt_nonce": attempt_nonce,
             "semantic_run_id": self.semantic_run_id,
             "run_contract_fingerprint": self.contract_fingerprint,
             "batch_ordinal": ordinal,
@@ -657,12 +657,25 @@ class _SemanticRecoveryRun:
             "input_fingerprint": batch_receipt["input_fingerprint"],
             "state": "started",
         }
+        return {
+            **without_fingerprint,
+            "attempt_receipt_fingerprint": _fingerprint(without_fingerprint),
+        }
+
+    def _load_attempt(self, ordinal: int) -> dict[str, object]:
+        payload = _private_json_exact(self._attempt_path(ordinal))
+        nonce = payload.get("attempt_nonce")
+        if not isinstance(nonce, str) or not _payloads_exactly_equal(
+            payload, self._attempt_payload(ordinal, nonce)
+        ):
+            raise SemanticHandoffError("Semantic recovery attempt 损坏。")
+        return payload
 
     def publish_attempt(self, ordinal: int) -> dict[str, object]:
         self._validate_inventory()
         _ensure_private_directory(self.attempts_dir)
         path = self._attempt_path(ordinal)
-        expected = self._attempt_payload(ordinal)
+        expected = self._attempt_payload(ordinal, secrets.token_hex(32))
         temporary: Path | None = None
         try:
             with tempfile.NamedTemporaryFile(
@@ -691,7 +704,7 @@ class _SemanticRecoveryRun:
         return expected
 
     def _validate_inventory(self) -> None:
-        self._validate_run_receipt()
+        self._converge_run_receipt()
         total = len(self.batches)
         expected_names = {f"batch_{ordinal:04d}" for ordinal in range(1, total + 1)}
         if os.path.lexists(self.attempts_dir):
@@ -738,26 +751,20 @@ class _SemanticRecoveryRun:
                 raise SemanticHandoffError(
                     "Semantic recovery result 缺少 Provider attempt binding。"
                 )
-            if result_exists and self._result_is_committed(ordinal):
+            if result_exists:
                 if missing_seen:
                     raise SemanticHandoffError(
                         "Semantic recovery result 未按 canonical 顺序收敛。"
                     )
-                if not _payloads_exactly_equal(
-                    _private_json_exact(attempt_path),
-                    self._attempt_payload(ordinal),
-                ):
-                    raise SemanticHandoffError("Semantic recovery attempt 损坏。")
-                loaded.append(self._load_result(ordinal, contract))
+                attempt = self._load_attempt(ordinal)
+                loaded.append(
+                    self._converge_result(ordinal, contract, attempt)
+                )
                 continue
             missing_seen = True
             loaded.append(None)
             if attempt_exists:
-                if not _payloads_exactly_equal(
-                    _private_json_exact(attempt_path),
-                    self._attempt_payload(ordinal),
-                ):
-                    raise SemanticHandoffError("Semantic recovery attempt 损坏。")
+                self._load_attempt(ordinal)
                 unknown += 1
             if any(
                 os.path.lexists(self._attempt_path(later))
@@ -779,38 +786,73 @@ class _SemanticRecoveryRun:
             conservatively_counted_attempts=unknown,
         )
 
-    def _result_is_committed(self, ordinal: int) -> bool:
+    def _converge_result(
+        self,
+        ordinal: int,
+        contract: Mapping[str, object],
+        attempt: Mapping[str, object],
+    ) -> tuple[RepresentationAnalysisResult, ExternalAgentExecutionRecord]:
+        loaded = self._load_result(ordinal, contract, attempt)
         path = self._result_path(ordinal)
-        _validate_recovery_result_directory(path)
-        names = {child.name for child in path.iterdir()}
-        base = {"result.json", "result-receipt.json"}
-        if "result-commit-unknown.json" in names:
-            return False
-        if names == base:
-            return False
-        if names != base | {"result-commit.json"}:
-            raise SemanticHandoffError(
-                "Semantic recovery batch result commit inventory 损坏。"
+        committed_phase = path / "phase-committed.json"
+        self._refsync_result_bundle(ordinal)
+        loaded = self._load_result(ordinal, contract, attempt)
+        if not os.path.lexists(committed_phase):
+            receipt = _private_json_exact(path / "result-receipt.json")
+            _publish_private_json_marker(
+                committed_phase,
+                self._result_phase_payload(ordinal, receipt, "committed"),
             )
-        result_receipt = _private_json_exact(path / "result-receipt.json")
-        if not _payloads_exactly_equal(
-            _private_json_exact(path / "result-commit.json"),
-            self._result_commit_payload(ordinal, result_receipt),
-        ):
+        self._refsync_result_bundle(ordinal)
+        final_loaded = self._load_result(ordinal, contract, attempt)
+        if final_loaded != loaded:
             raise SemanticHandoffError(
-                "Semantic recovery batch result commit binding 损坏。"
+                "Semantic recovery post-strict convergence 漂移。"
             )
-        return True
+        return final_loaded
+
+    def _refsync_result_bundle(self, ordinal: int) -> None:
+        path = self._result_path(ordinal)
+        files = (
+            self.run_dir / "run-receipt.json",
+            self._attempt_path(ordinal),
+            path / "result.json",
+            path / "result-receipt.json",
+            path / "phase-post-strict-pending.json",
+            *(
+                (path / "phase-committed.json",)
+                if os.path.lexists(path / "phase-committed.json")
+                else ()
+            ),
+        )
+        _refsync_and_readback(
+            files=files,
+            directories=(
+                path,
+                self.results_dir,
+                self.attempts_dir,
+                self.run_dir,
+                self.audit_root,
+            ),
+        )
 
     def _load_result(
-        self, ordinal: int, contract: Mapping[str, object]
+        self,
+        ordinal: int,
+        contract: Mapping[str, object],
+        attempt: Mapping[str, object],
     ) -> tuple[RepresentationAnalysisResult, ExternalAgentExecutionRecord]:
         path = self._result_path(ordinal)
         _require_private_directory(path)
-        if {child.name for child in path.iterdir()} != {
+        names = frozenset(child.name for child in path.iterdir())
+        pending_names = {
             "result.json",
             "result-receipt.json",
-            "result-commit.json",
+            "phase-post-strict-pending.json",
+        }
+        if names not in {
+            frozenset(pending_names),
+            frozenset(pending_names | {"phase-committed.json"}),
         }:
             raise SemanticHandoffError("Semantic recovery batch result inventory 损坏。")
         raw = _private_bytes_read(path / "result.json")
@@ -827,6 +869,8 @@ class _SemanticRecoveryRun:
             "batch_ordinal",
             "batch_contract_fingerprint",
             "attempt_id",
+            "attempt_nonce",
+            "attempt_receipt_fingerprint",
             "processing_run_id",
             "result_sha256",
             "result_size_bytes",
@@ -834,8 +878,12 @@ class _SemanticRecoveryRun:
             "result_readback_status",
             "process_cleanup_status",
             "execution_record",
+            "result_receipt_fingerprint",
         }
-        attempt = self._attempt_payload(ordinal)
+        receipt_without_fingerprint = dict(receipt)
+        receipt_fingerprint = receipt_without_fingerprint.pop(
+            "result_receipt_fingerprint", None
+        )
         if (
             set(receipt) != expected_keys
             or receipt.get("schema_version") != _RECOVERY_RESULT_SCHEMA
@@ -848,17 +896,35 @@ class _SemanticRecoveryRun:
             or receipt.get("batch_contract_fingerprint")
             != batch_receipt.get("batch_contract_fingerprint")
             or receipt.get("attempt_id") != attempt["attempt_id"]
+            or receipt.get("attempt_nonce") != attempt["attempt_nonce"]
+            or receipt.get("attempt_receipt_fingerprint")
+            != attempt["attempt_receipt_fingerprint"]
             or receipt.get("result_sha256") != _bytes_fingerprint(raw)
             or isinstance(receipt.get("result_size_bytes"), bool)
             or receipt.get("result_size_bytes") != len(raw)
             or receipt.get("strict_validation_status") != "passed"
             or receipt.get("result_readback_status") != "verified"
             or receipt.get("process_cleanup_status") != "verified"
+            or receipt_fingerprint != _fingerprint(receipt_without_fingerprint)
         ):
             raise SemanticHandoffError("Semantic recovery batch result binding 损坏。")
+        pending_phase = self._result_phase_payload(
+            ordinal, receipt, "post_strict_pending"
+        )
+        if not _payloads_exactly_equal(
+            _private_json_exact(path / "phase-post-strict-pending.json"),
+            pending_phase,
+        ):
+            raise SemanticHandoffError("Semantic recovery pending phase 损坏。")
+        if "phase-committed.json" in names and not _payloads_exactly_equal(
+            _private_json_exact(path / "phase-committed.json"),
+            self._result_phase_payload(ordinal, receipt, "committed"),
+        ):
+            raise SemanticHandoffError("Semantic recovery committed phase 损坏。")
         record = _record_from_payload(receipt.get("execution_record"))
         if receipt.get("processing_run_id") != record.processing_run_id:
             raise SemanticHandoffError("Semantic recovery Processing Run binding 损坏。")
+        self._reject_conflicting_failure_audit(record)
         self._validate_success_record(record, ordinal, raw)
         try:
             parsed = _parse_external_agent_result(
@@ -871,6 +937,28 @@ class _SemanticRecoveryRun:
                 "Semantic recovery batch result strict readback 失败。"
             ) from exc
         return parsed, record
+
+    def _reject_conflicting_failure_audit(
+        self, record: ExternalAgentExecutionRecord
+    ) -> None:
+        path = (
+            self.audit_root
+            / record.processing_run_id
+            / "processing-run-audit.json"
+        )
+        if not os.path.lexists(path):
+            return
+        audit = _private_json_exact(path)
+        if (
+            audit.get("processing_run_id") != record.processing_run_id
+            or audit.get("execution_status") != "succeeded"
+            or audit.get("failure_category") is not None
+            or audit.get("strict_validation_status") != "passed"
+            or audit.get("result_fingerprint") != record.result_fingerprint
+        ):
+            raise SemanticHandoffError(
+                "Semantic recovery success bundle 与 failure audit 冲突。"
+            )
 
     def _validate_success_record(
         self, record: ExternalAgentExecutionRecord, ordinal: int, raw: bytes
@@ -962,10 +1050,10 @@ class _SemanticRecoveryRun:
             or raw_result.input_fingerprint != record.input_fingerprint
         ):
             raise SemanticHandoffError("Semantic recovery raw result binding 损坏。")
-        attempt = self._attempt_payload(ordinal)
+        attempt = self._load_attempt(ordinal)
         receipt = self.batch_contracts[ordinal - 1]["receipt"]
         assert isinstance(receipt, dict)
-        result_receipt: dict[str, object] = {
+        result_receipt_without_fingerprint: dict[str, object] = {
             "schema_version": _RECOVERY_RESULT_SCHEMA,
             "artifact_kind": "semantic_handoff_batch_result",
             "semantic_run_id": self.semantic_run_id,
@@ -975,6 +1063,10 @@ class _SemanticRecoveryRun:
                 "batch_contract_fingerprint"
             ],
             "attempt_id": attempt["attempt_id"],
+            "attempt_nonce": attempt["attempt_nonce"],
+            "attempt_receipt_fingerprint": attempt[
+                "attempt_receipt_fingerprint"
+            ],
             "processing_run_id": record.processing_run_id,
             "result_sha256": _bytes_fingerprint(raw),
             "result_size_bytes": len(raw),
@@ -983,7 +1075,15 @@ class _SemanticRecoveryRun:
             "process_cleanup_status": "verified",
             "execution_record": _record_payload(record),
         }
-        result_commit = self._result_commit_payload(ordinal, result_receipt)
+        result_receipt = {
+            **result_receipt_without_fingerprint,
+            "result_receipt_fingerprint": _fingerprint(
+                result_receipt_without_fingerprint
+            ),
+        }
+        pending_phase = self._result_phase_payload(
+            ordinal, result_receipt, "post_strict_pending"
+        )
         _ensure_private_directory(self.results_dir)
         final = self._result_path(ordinal)
         staging: Path | None = None
@@ -1000,11 +1100,21 @@ class _SemanticRecoveryRun:
                 staging / "result-receipt.json",
                 _canonical_bytes(result_receipt) + b"\n",
             )
+            _write_staging_file(
+                staging / "phase-post-strict-pending.json",
+                _canonical_bytes(pending_phase) + b"\n",
+            )
             if (
                 _private_bytes_read(staging / "result.json") != raw
                 or not _payloads_exactly_equal(
                     _private_json_exact(staging / "result-receipt.json"),
                     result_receipt,
+                )
+                or not _payloads_exactly_equal(
+                    _private_json_exact(
+                        staging / "phase-post-strict-pending.json"
+                    ),
+                    pending_phase,
                 )
             ):
                 raise SemanticHandoffError(
@@ -1014,43 +1124,24 @@ class _SemanticRecoveryRun:
             publish_directory_no_replace(staging, final)
             staging = None
             published_here = True
-            _fsync_directory(self.results_dir)
-            _publish_private_json_marker(
-                final / "result-commit.json",
-                result_commit,
-            )
         except FileExistsError as exc:
-            if published_here:
-                _mark_commit_unknown(
-                    final / "result-commit-unknown.json",
-                    {
-                        "schema_version": _RECOVERY_RESULT_COMMIT_SCHEMA,
-                        "semantic_run_id": self.semantic_run_id,
-                        "batch_ordinal": ordinal,
-                        "state": "unknown",
-                    },
-                )
             raise SemanticHandoffError(
                 "Semantic recovery batch result collision；未覆盖。"
             ) from exc
-        except (OSError, SemanticHandoffError):
-            if published_here:
-                _mark_commit_unknown(
-                    final / "result-commit-unknown.json",
-                    {
-                        "schema_version": _RECOVERY_RESULT_COMMIT_SCHEMA,
-                        "semantic_run_id": self.semantic_run_id,
-                        "batch_ordinal": ordinal,
-                        "state": "unknown",
-                    },
-                )
-            raise
         finally:
             if staging is not None and staging.exists():
                 for child in staging.iterdir():
                     child.unlink()
                 staging.rmdir()
-        loaded = self._load_result(ordinal, self.batch_contracts[ordinal - 1])
+        if not published_here:
+            raise SemanticHandoffError(
+                "Semantic recovery batch result 未发布。"
+            )
+        loaded = self._converge_result(
+            ordinal,
+            self.batch_contracts[ordinal - 1],
+            attempt,
+        )
         if loaded[1] != record:
             raise SemanticHandoffError("Semantic recovery batch result 读回不一致。")
         return loaded
@@ -1757,7 +1848,7 @@ class ExternalAgentSemanticHandoffService:
         provider: CodexCliRepresentationAnalysisProvider,
         privacy_binding: SemanticPrivacyBinding,
     ) -> SemanticRecoveryPreflight:
-        """Read-only receipt accounting; historical audits are never results."""
+        """Zero-Provider local convergence; historical audits are never results."""
 
         return _SemanticRecoveryRun(
             self.representation_service,
