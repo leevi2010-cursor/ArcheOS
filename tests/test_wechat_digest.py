@@ -826,6 +826,53 @@ class WechatDigestTests(unittest.TestCase):
         with self.assertRaisesRegex(WechatDigestError, "已经完成升级"):
             service.upgrade_active_v1()
 
+    def test_upgrade_receipt_schema_tamper_fails_closed(self) -> None:
+        capture = SyntheticCaptureProvider([message(1)])
+        service, run_id = self._make_active_legacy_run(capture)
+        self.assertEqual(service.upgrade_active_v1(), run_id)
+        receipt_path = service.run_store.runs_root / run_id / "run-plan-receipt.json"
+        receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+        receipt["schema_version"] = "wechat-digest-run-plan-receipt/0.0"
+        receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
+        with self.assertRaisesRegex(WechatDigestError, "receipt"):
+            service.prepare_next_semantic()
+        self.assertEqual(self.semantic.provider.calls, 0)
+
+    def test_upgrade_readback_rejects_disk_plan_tamper_after_commit(self) -> None:
+        capture = SyntheticCaptureProvider([message(1)])
+        run_store = WechatDigestRunStore(
+            self.workspace / "02_processing" / "wechat_digest"
+        )
+        service, run_id = self._make_active_legacy_run(capture, run_store=run_store)
+
+        def tamper_plan() -> None:
+            path = run_store.runs_root / run_id / "plan.json"
+            plan = json.loads(path.read_text(encoding="utf-8"))
+            plan["conversations"][0]["content_hash"] = "sha256:" + "0" * 64
+            path.write_text(json.dumps(plan), encoding="utf-8")
+
+        run_store.after_upgrade_receipt_write = tamper_plan
+        with self.assertRaisesRegex(WechatDigestError, "读回|不一致"):
+            service.upgrade_active_v1()
+        self.assertEqual(self.semantic.provider.calls, 0)
+
+    def test_upgrade_readback_rejects_active_tamper_after_commit(self) -> None:
+        capture = SyntheticCaptureProvider([message(1)])
+        run_store = WechatDigestRunStore(
+            self.workspace / "02_processing" / "wechat_digest"
+        )
+        service, _ = self._make_active_legacy_run(capture, run_store=run_store)
+
+        def tamper_active() -> None:
+            run_store.active_path.write_text(
+                json.dumps({"active_run_id": None}), encoding="utf-8"
+            )
+
+        run_store.after_upgrade_receipt_write = tamper_active
+        with self.assertRaisesRegex(WechatDigestError, "active run 读回"):
+            service.upgrade_active_v1()
+        self.assertEqual(self.semantic.provider.calls, 0)
+
     def test_concurrent_digest_fails_without_reading_capture(self) -> None:
         capture = SyntheticCaptureProvider([])
         service = self.service(capture)
