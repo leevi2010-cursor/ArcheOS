@@ -24,6 +24,7 @@ from archeos.representation_information import (
     EXTERNAL_AGENT_PROTOCOL_V1,
     EXTERNAL_AGENT_PROTOCOL_V2,
     EXTERNAL_AGENT_PROTOCOL_V3,
+    EXTERNAL_AGENT_PROTOCOL_V3_1,
     EXTERNAL_AGENT_PROTOCOL_VERSION,
     CodexCliRepresentationAnalysisProvider,
     RepresentationAnalysisBatch,
@@ -35,9 +36,28 @@ from archeos.representation_information import (
     _external_agent_request,
     _units_from_representation,
     external_agent_representation_analysis_schema,
+    validate_representation_information_package,
 )
-from archeos.semantic_handoff import ExternalAgentSemanticHandoffService
+from archeos.semantic_handoff import (
+    ExternalAgentSemanticHandoffService,
+    _package_fingerprint,
+    validate_completed_published_audits,
+)
 from archeos.source import LocalManagedSourceRepository
+
+_CONTRACT_DIAGNOSTIC_FIELDS = (
+    "contract_failure_stage",
+    "candidate_item_count",
+    "residue_item_count",
+    "accounting_item_count",
+    "candidate_anchor_ref_count",
+    "residue_anchor_ref_count",
+    "duplicate_anchor_ref_count",
+    "duplicate_accounting_count",
+    "dual_assignment_count",
+    "missing_anchor_count",
+    "unknown_anchor_ref_count",
+)
 
 
 class JsonAdapter:
@@ -685,6 +705,67 @@ class SemanticHandoffTest(unittest.TestCase):
                 )
         self.assertEqual(runner.calls, [])
 
+    def test_historical_request_fingerprints_remain_exactly_readable(self) -> None:
+        expected = {
+            EXTERNAL_AGENT_PROTOCOL_V1: (
+                "sha256:5d2fd27e78f30ac37577df3216926cf770819c09d97b0320e1baac51c97cac91"
+            ),
+            EXTERNAL_AGENT_PROTOCOL_V2: (
+                "sha256:67ac01137cd702dc561a544920c883bece975eca54c643f0fdcb6287a2b588a1"
+            ),
+            EXTERNAL_AGENT_PROTOCOL_V3: (
+                "sha256:9bca6a7775cea3f69aec21075bb43acdb729d7074ff672a3be15051fd005d43b"
+            ),
+            EXTERNAL_AGENT_PROTOCOL_V3_1: (
+                "sha256:5afea47585cd10c55f0d60ca0a8ffa2c4d0c3c72e3fc15e6c332e8e66e27c187"
+            ),
+        }
+        batch = RepresentationAnalysisBatch((self.unit(),))
+        for protocol_version, fingerprint in expected.items():
+            with self.subTest(protocol=protocol_version):
+                self.assertEqual(
+                    _external_agent_request(
+                        batch, protocol_version=protocol_version
+                    )[1],
+                    fingerprint,
+                )
+
+    def test_current_v31_producer_passes_the_shared_audit_validator(self) -> None:
+        representation, service = self.build_service()
+        provider = CodexCliRepresentationAnalysisProvider(
+            provider_version="0.147.0", runner=FakeRunner()
+        )
+        audit_root = self.root / "audits"
+        result = ExternalAgentSemanticHandoffService(
+            service,
+            JsonlAtomicInformationStore(self.root / "atomic.jsonl"),
+            audit_root,
+        ).execute(representation.representation_id, provider)
+        manifest, _ = validate_representation_information_package(
+            result.package
+        )
+        self.assertEqual(
+            manifest["provider"],
+            {
+                "name": provider.name,
+                "provider_version": provider.provider_version,
+                "model": provider.model,
+                "reasoning_effort": provider.reasoning_effort,
+                "fallback_policy": provider.fallback_policy,
+            },
+        )
+        self.assertEqual(
+            validate_completed_published_audits(
+                representation_service=service,
+                representation_id=representation.representation_id,
+                manifest=manifest,
+                audit_root=audit_root,
+                package_fingerprint=_package_fingerprint(result.package),
+                provider=provider,
+            ),
+            result.audit_paths,
+        )
+
     def test_contract_failure_details_are_allowlisted(self) -> None:
         cases = {
             "top_level_missing": "top_level_schema",
@@ -946,6 +1027,9 @@ class SemanticHandoffTest(unittest.TestCase):
         historical = json.loads(audit_path.read_text(encoding="utf-8"))
         historical["protocol_version"] = EXTERNAL_AGENT_PROTOCOL_V1
         historical["input_fingerprint"] = v1_fingerprint
+        historical["diagnostic_schema_version"] = "external-agent-diagnostics/1.0"
+        for field in _CONTRACT_DIAGNOSTIC_FIELDS:
+            historical.pop(field)
         audit_path.write_text(json.dumps(historical), encoding="utf-8")
 
         replay_runner = FakeRunner()
@@ -984,6 +1068,9 @@ class SemanticHandoffTest(unittest.TestCase):
         historical = json.loads(audit_path.read_text(encoding="utf-8"))
         historical["protocol_version"] = EXTERNAL_AGENT_PROTOCOL_V2
         historical["input_fingerprint"] = v2_fingerprint
+        historical["diagnostic_schema_version"] = "external-agent-diagnostics/1.0"
+        for field in _CONTRACT_DIAGNOSTIC_FIELDS:
+            historical.pop(field)
         audit_path.write_text(json.dumps(historical), encoding="utf-8")
 
         replay_runner = FakeRunner()
@@ -1026,19 +1113,7 @@ class SemanticHandoffTest(unittest.TestCase):
         historical["protocol_version"] = EXTERNAL_AGENT_PROTOCOL_V3
         historical["input_fingerprint"] = v3_fingerprint
         historical["diagnostic_schema_version"] = "external-agent-diagnostics/1.0"
-        for field in (
-            "contract_failure_stage",
-            "candidate_item_count",
-            "residue_item_count",
-            "accounting_item_count",
-            "candidate_anchor_ref_count",
-            "residue_anchor_ref_count",
-            "duplicate_anchor_ref_count",
-            "duplicate_accounting_count",
-            "dual_assignment_count",
-            "missing_anchor_count",
-            "unknown_anchor_ref_count",
-        ):
+        for field in _CONTRACT_DIAGNOSTIC_FIELDS:
             historical.pop(field)
         audit_path.write_text(json.dumps(historical), encoding="utf-8")
 
@@ -1070,6 +1145,15 @@ class SemanticHandoffTest(unittest.TestCase):
         )
         audit_path = next(audit_root.glob("*/processing-run-audit.json"))
         legacy = json.loads(audit_path.read_text(encoding="utf-8"))
+        units = _units_from_representation(
+            representation, service.representation_repository
+        )
+        batch = _analysis_batches(units, service.batch_size)[0]
+        _, v1_fingerprint = _external_agent_request(
+            batch, protocol_version=EXTERNAL_AGENT_PROTOCOL_V1
+        )
+        legacy["protocol_version"] = EXTERNAL_AGENT_PROTOCOL_V1
+        legacy["input_fingerprint"] = v1_fingerprint
         for field in (
             "contract_failure_detail",
             "diagnostic_schema_version",
@@ -1084,17 +1168,7 @@ class SemanticHandoffTest(unittest.TestCase):
             "stdout_bytes",
             "stderr_bytes",
             "process_cleanup_status",
-            "contract_failure_stage",
-            "candidate_item_count",
-            "residue_item_count",
-            "accounting_item_count",
-            "candidate_anchor_ref_count",
-            "residue_anchor_ref_count",
-            "duplicate_anchor_ref_count",
-            "duplicate_accounting_count",
-            "dual_assignment_count",
-            "missing_anchor_count",
-            "unknown_anchor_ref_count",
+            *_CONTRACT_DIAGNOSTIC_FIELDS,
         ):
             legacy.pop(field)
         audit_path.write_text(json.dumps(legacy), encoding="utf-8")
@@ -1794,6 +1868,7 @@ class SemanticHandoffTest(unittest.TestCase):
         self.assertNotIn("world_model", source)
         self.assertNotIn("fallback_provider", source.lower())
         self.assertNotIn("fallback_model", source.lower())
+        self.assertNotIn("provider_switch", source.lower())
 
 
 if __name__ == "__main__":

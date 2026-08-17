@@ -41,13 +41,14 @@ DEFAULT_EXTERNAL_AGENT_BATCH_SIZE = 40
 EXTERNAL_AGENT_PROTOCOL_V1 = "external-agent-semantic-handoff/1.0"
 EXTERNAL_AGENT_PROTOCOL_V2 = "external-agent-semantic-handoff/2.0"
 EXTERNAL_AGENT_PROTOCOL_V3 = "external-agent-semantic-handoff/3.0"
-EXTERNAL_AGENT_PROTOCOL_VERSION = "external-agent-semantic-handoff/3.1"
+EXTERNAL_AGENT_PROTOCOL_V3_1 = "external-agent-semantic-handoff/3.1"
+EXTERNAL_AGENT_PROTOCOL_VERSION = EXTERNAL_AGENT_PROTOCOL_V3_1
 SUPPORTED_EXTERNAL_AGENT_PROTOCOL_VERSIONS = frozenset(
     {
         EXTERNAL_AGENT_PROTOCOL_V1,
         EXTERNAL_AGENT_PROTOCOL_V2,
         EXTERNAL_AGENT_PROTOCOL_V3,
-        EXTERNAL_AGENT_PROTOCOL_VERSION,
+        EXTERNAL_AGENT_PROTOCOL_V3_1,
     }
 )
 EXTERNAL_AGENT_ROUTE = "codex-cli"
@@ -241,13 +242,13 @@ def external_agent_representation_analysis_schema(
         raise ValueError("unsupported External Agent protocol version")
     if protocol_version in {
         EXTERNAL_AGENT_PROTOCOL_V3,
-        EXTERNAL_AGENT_PROTOCOL_VERSION,
+        EXTERNAL_AGENT_PROTOCOL_V3_1,
     }:
         if batch is None:
             raise ValueError("v3 External Agent schema requires its bound batch")
         schema = _external_agent_v3_analysis_schema(
             batch,
-            exact_accounting=protocol_version == EXTERNAL_AGENT_PROTOCOL_VERSION,
+            exact_accounting=protocol_version == EXTERNAL_AGENT_PROTOCOL_V3_1,
         )
     else:
         schema = representation_analysis_schema()
@@ -267,7 +268,7 @@ def external_agent_representation_analysis_schema(
     if protocol_version in {
         EXTERNAL_AGENT_PROTOCOL_V2,
         EXTERNAL_AGENT_PROTOCOL_V3,
-        EXTERNAL_AGENT_PROTOCOL_VERSION,
+        EXTERNAL_AGENT_PROTOCOL_V3_1,
     }:
         required = ["anchor_accounting", *required]
         anchor_unit_id: dict[str, object] = {
@@ -276,7 +277,7 @@ def external_agent_representation_analysis_schema(
         }
         if protocol_version in {
             EXTERNAL_AGENT_PROTOCOL_V3,
-            EXTERNAL_AGENT_PROTOCOL_VERSION,
+            EXTERNAL_AGENT_PROTOCOL_V3_1,
         }:
             assert batch is not None
             anchor_unit_id = {
@@ -301,10 +302,10 @@ def external_agent_representation_analysis_schema(
         }
         if protocol_version in {
             EXTERNAL_AGENT_PROTOCOL_V3,
-            EXTERNAL_AGENT_PROTOCOL_VERSION,
+            EXTERNAL_AGENT_PROTOCOL_V3_1,
         }:
             assert batch is not None
-            if protocol_version == EXTERNAL_AGENT_PROTOCOL_VERSION:
+            if protocol_version == EXTERNAL_AGENT_PROTOCOL_V3_1:
                 accounting_schema["minItems"] = len(batch.anchor_units)
             accounting_schema["maxItems"] = len(batch.anchor_units)
         protocol_properties["anchor_accounting"] = accounting_schema
@@ -320,7 +321,9 @@ def _external_agent_v3_analysis_schema(
 ) -> dict[str, object]:
     anchor_ids = [unit.unit_id for unit in batch.anchor_units]
     context_ids = [
-        unit.unit_id for unit in batch.context_support_units if unit.analysis_eligible
+        unit.unit_id
+        for unit in batch.context_support_units
+        if unit.analysis_eligible
     ]
     anchor_refs = {
         "type": "array",
@@ -1541,7 +1544,7 @@ def _external_agent_request(
     if protocol_version in {
         EXTERNAL_AGENT_PROTOCOL_V2,
         EXTERNAL_AGENT_PROTOCOL_V3,
-        EXTERNAL_AGENT_PROTOCOL_VERSION,
+        EXTERNAL_AGENT_PROTOCOL_V3_1,
     }:
         rules.insert(
             2,
@@ -1549,7 +1552,7 @@ def _external_agent_request(
         )
     if protocol_version in {
         EXTERNAL_AGENT_PROTOCOL_V3,
-        EXTERNAL_AGENT_PROTOCOL_VERSION,
+        EXTERNAL_AGENT_PROTOCOL_V3_1,
     }:
         rules.insert(
             3,
@@ -1564,7 +1567,7 @@ def _external_agent_request(
             for unit in batch.context_support_units
         ],
     }
-    if protocol_version == EXTERNAL_AGENT_PROTOCOL_VERSION:
+    if protocol_version == EXTERNAL_AGENT_PROTOCOL_V3_1:
         if result_schema is None:
             result_schema = external_agent_representation_analysis_schema(
                 protocol_version,

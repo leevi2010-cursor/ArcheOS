@@ -17,10 +17,19 @@ from archeos.atomic_information import (
 from archeos.digestion import InterpretationResult, WorldModelOperation
 from archeos.representation import LocalRepresentationRepository
 from archeos.representation_information import (
+    EXTERNAL_AGENT_PROTOCOL_V1,
+    EXTERNAL_AGENT_PROTOCOL_V2,
+    EXTERNAL_AGENT_PROTOCOL_V3,
+    EXTERNAL_AGENT_PROTOCOL_V3_1,
     RepresentationAnalysisResult,
     RepresentationCandidateDraft,
     RepresentationInformationService,
+    RepresentationResidueDraft,
+    _analysis_batches_for_anchor_unit_ids,
+    _external_agent_request,
+    _units_from_representation,
 )
+from archeos.semantic_handoff import _package_fingerprint
 from archeos.source import LocalManagedSourceRepository
 from archeos.wechat_capture_helper import _window_upper
 from archeos.wechat_digest import (
@@ -167,13 +176,26 @@ class SyntheticCaptureProvider:
 
 
 class SyntheticAnalysisProvider:
-    name = "synthetic-wechat-digest"
+    name = "external-agent-codex-cli"
 
     def __init__(self) -> None:
         self.calls = 0
+        self.mode = "all_candidate"
+        self.provider_version = "0.147.0"
+        self.model = "gpt-5.6-terra"
+        self.reasoning_effort = "medium"
+        self.fallback_policy = "none"
 
     def analyze(self, batch):
         self.calls += 1
+        candidate_units = tuple(batch.anchor_units)
+        residue_units = ()
+        if self.mode == "all_residue":
+            candidate_units = ()
+            residue_units = tuple(batch.anchor_units)
+        elif self.mode == "mixed":
+            candidate_units = tuple(batch.anchor_units[::2])
+            residue_units = tuple(batch.anchor_units[1::2])
         return RepresentationAnalysisResult(
             candidates=tuple(
                 RepresentationCandidateDraft(
@@ -188,9 +210,16 @@ class SyntheticAnalysisProvider:
                     context="Synthetic bounded context.",
                     confidence=1.0,
                 )
-                for unit in batch.anchor_units
+                for unit in candidate_units
             ),
-            residue=(),
+            residue=tuple(
+                RepresentationResidueDraft(
+                    evidence_unit_ids=(unit.unit_id,),
+                    reason_not_absorbed="Synthetic unresolved detail.",
+                    future_value_or_uncertainty="Preserve for later evidence.",
+                )
+                for unit in residue_units
+            ),
         )
 
 
@@ -199,6 +228,8 @@ class SyntheticSemanticHandoff:
         self.workspace = workspace
         self.provider = SyntheticAnalysisProvider()
         self.failures_remaining = 0
+        self.protocol_version = EXTERNAL_AGENT_PROTOCOL_V1
+        self.profiled_v1 = False
 
     def execute(self, representation_id: str):
         output_root = self.workspace / "02_processing" / "information"
@@ -218,7 +249,129 @@ class SyntheticSemanticHandoff:
             ),
             output_root,
         ).extract(representation_id, self.provider)
-        return SimpleNamespace(ingestion=ingest_processing_package(package, store))
+        manifest_path = package / "manifest.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        if (
+            self.protocol_version == EXTERNAL_AGENT_PROTOCOL_V1
+            and not self.profiled_v1
+        ):
+            manifest["provider"] = {"name": "external-agent-codex-cli"}
+        else:
+            manifest["provider"] = {
+                "name": "external-agent-codex-cli",
+                "provider_version": "0.147.0",
+                "model": "gpt-5.6-terra",
+                "reasoning_effort": "medium",
+                "fallback_policy": "none",
+            }
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+        ingestion = ingest_processing_package(package, store)
+        self._write_success_audits(package, representation_id)
+        return SimpleNamespace(ingestion=ingestion)
+
+    def _write_success_audits(
+        self, package: Path, representation_id: str
+    ) -> None:
+        manifest = json.loads(
+            (package / "manifest.json").read_text(encoding="utf-8")
+        )
+        package_fingerprint = _package_fingerprint(package)
+        audit_root = (
+            self.workspace / "02_processing" / "semantic_handoff_runs"
+        )
+        representation_repository = LocalRepresentationRepository(
+            self.workspace / "02_processing" / "representations"
+        )
+        representation = representation_repository.get(representation_id)
+        batches = _analysis_batches_for_anchor_unit_ids(
+            _units_from_representation(
+                representation, representation_repository
+            ),
+            [batch["unit_ids"] for batch in manifest["batches"]],
+        )
+        for index, batch in enumerate(batches, start=1):
+            anchor_unit_ids = [unit.unit_id for unit in batch.anchor_units]
+            _, input_fingerprint = _external_agent_request(
+                batch, protocol_version=self.protocol_version
+            )
+            processing_run_id = "run_" + hashlib.sha256(
+                f"{package.name}:{index}".encode()
+            ).hexdigest()[:32]
+            audit_path = (
+                audit_root / processing_run_id / "processing-run-audit.json"
+            )
+            audit_path.parent.mkdir(parents=True, exist_ok=True)
+            audit = {
+                "schema_version": "processing-run-audit/1.0",
+                "artifact_kind": "processing_run_audit",
+                "processing_run_id": processing_run_id,
+                "protocol_version": self.protocol_version,
+                "input_fingerprint": input_fingerprint,
+                "anchor_unit_ids": anchor_unit_ids,
+                "provider_route": "codex-cli",
+                "provider_version": self.provider.provider_version,
+                "started_at": "2026-08-18T00:00:00.000Z",
+                "finished_at": "2026-08-18T00:00:01.000Z",
+                "execution_status": "succeeded",
+                "failure_category": None,
+                "contract_failure_detail": None,
+                "strict_validation_status": "passed",
+                "result_fingerprint": "sha256:" + "1" * 64,
+                "eligible_units": len(anchor_unit_ids),
+                "covered_units": len(anchor_unit_ids),
+                "unaccounted_units": 0,
+                "diagnostic_schema_version": (
+                    "external-agent-diagnostics/2.0"
+                    if self.protocol_version == EXTERNAL_AGENT_PROTOCOL_V3_1
+                    else "external-agent-diagnostics/1.0"
+                ),
+                "elapsed_ms": 1000,
+                "deadline_ms": 300000,
+                "exit_code": 0,
+                "termination_signal": None,
+                "timeout_phase": None,
+                "provider_error_category": None,
+                "result_file_present": True,
+                "result_size_bytes": 100,
+                "stdout_bytes": 0,
+                "stderr_bytes": 0,
+                "process_cleanup_status": "verified",
+                "result_readback_status": "verified",
+                "package_published": True,
+                "package_fingerprint": package_fingerprint,
+                "information_ingested": True,
+                "durable_ingestion_status": "completed",
+                "handoff_status": "completed",
+                "audit_readback_status": "verified",
+            }
+            if (
+                self.protocol_version != EXTERNAL_AGENT_PROTOCOL_V1
+                or self.profiled_v1
+            ):
+                audit.update(
+                    {
+                        "model": "gpt-5.6-terra",
+                        "reasoning_effort": "medium",
+                        "fallback_policy": "none",
+                    }
+                )
+            if self.protocol_version == EXTERNAL_AGENT_PROTOCOL_V3_1:
+                audit.update(
+                    {
+                        "contract_failure_stage": None,
+                        "candidate_item_count": 0,
+                        "residue_item_count": 0,
+                        "accounting_item_count": 0,
+                        "candidate_anchor_ref_count": 0,
+                        "residue_anchor_ref_count": 0,
+                        "duplicate_anchor_ref_count": 0,
+                        "duplicate_accounting_count": 0,
+                        "dual_assignment_count": 0,
+                        "missing_anchor_count": 0,
+                        "unknown_anchor_ref_count": 0,
+                    }
+                )
+            audit_path.write_text(json.dumps(audit), encoding="utf-8")
 
 
 class NoStructuralChangeProvider:
@@ -925,6 +1078,70 @@ class WechatDigestTests(unittest.TestCase):
         receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
         return service, run_id
 
+    def _make_active_v2_processed_run(
+        self,
+        *,
+        mode: str,
+        messages: list[CapturedMessage],
+        suffix: str,
+        protocol_version: str = EXTERNAL_AGENT_PROTOCOL_V1,
+        profiled_v1: bool = False,
+    ) -> tuple[WechatDigestService, SyntheticSemanticHandoff, str]:
+        workspace = Path(self.temporary.name) / f"workspace_{suffix}"
+        for directory in (
+            "01_inbox",
+            "02_processing",
+            "03_information",
+            "04_core",
+        ):
+            (workspace / directory).mkdir(parents=True, exist_ok=True)
+        semantic = SyntheticSemanticHandoff(workspace)
+        semantic.provider.mode = mode
+        semantic.protocol_version = protocol_version
+        semantic.profiled_v1 = profiled_v1
+        with SQLiteWorldModelRepository(
+            workspace / "04_core" / "archeos.sqlite3"
+        ) as repository:
+            repository.create_object("Synthetic Project")
+        failures = [True]
+
+        def interrupt_checkpoint() -> None:
+            if failures.pop():
+                raise RuntimeError("synthetic post-semantic interruption")
+
+        run_store = WechatDigestRunStore(
+            workspace / "02_processing" / "wechat_digest",
+            before_checkpoint_publish=interrupt_checkpoint,
+        )
+        service = WechatDigestService(
+            workspace=workspace,
+            capture_provider=SyntheticCaptureProvider(messages),
+            semantic_handoff_factory=lambda: semantic,
+            interpretation_provider=NoStructuralChangeProvider(),
+            run_store=run_store,
+        )
+        with self.assertRaisesRegex(WechatDigestError, "安全完成"):
+            service.run(all_history=True)
+        run_store.before_checkpoint_publish = None
+        run_id = run_store.active_run_id()
+        assert run_id is not None
+        run_dir = run_store.runs_root / run_id
+        plan_path = run_dir / "plan.json"
+        status_path = run_dir / "status.json"
+        receipt_path = run_dir / "run-plan-receipt.json"
+        plan = json.loads(plan_path.read_text(encoding="utf-8"))
+        plan["schema_version"] = "wechat-digest-run-plan/2.0"
+        plan.pop("all_history_upper_bound")
+        fingerprint = _plan_fingerprint(plan)
+        status = json.loads(status_path.read_text(encoding="utf-8"))
+        status["plan_fingerprint"] = fingerprint
+        receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+        receipt["plan_fingerprint"] = fingerprint
+        plan_path.write_text(json.dumps(plan), encoding="utf-8")
+        status_path.write_text(json.dumps(status), encoding="utf-8")
+        receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
+        return service, semantic, run_id
+
     def test_active_v2_all_history_requires_explicit_zero_provider_upgrade(
         self,
     ) -> None:
@@ -958,6 +1175,283 @@ class WechatDigestTests(unittest.TestCase):
         self.assertEqual(self.semantic.provider.calls, provider_calls)
         self.assertEqual(service.upgrade_active_v2_all_history(), run_id)
         self.assertEqual(self.semantic.provider.calls, provider_calls)
+
+    def test_active_v2_upgrade_accepts_strict_candidate_residue_receipts(
+        self,
+    ) -> None:
+        cases = (
+            ("all_residue", [message(1)], 0),
+            ("all_candidate", [message(1)], 1),
+            ("mixed", [message(1), message(2)], 1),
+        )
+        for mode, messages, expected_ids in cases:
+            with self.subTest(mode=mode):
+                service, semantic, run_id = self._make_active_v2_processed_run(
+                    mode=mode, messages=messages, suffix=mode
+                )
+                calls = semantic.provider.calls
+                self.assertEqual(
+                    service.upgrade_active_v2_all_history(), run_id
+                )
+                status = service.run_store.status(run_id)
+                item = next(iter(status["items"].values()))
+                self.assertEqual(
+                    len(item["atomic_information_ids"]), expected_ids
+                )
+                self.assertEqual(semantic.provider.calls, calls)
+
+    def test_active_v2_upgrade_accepts_historical_audit_contracts(self) -> None:
+        protocols = (
+            (EXTERNAL_AGENT_PROTOCOL_V1, False),
+            (EXTERNAL_AGENT_PROTOCOL_V1, True),
+            (EXTERNAL_AGENT_PROTOCOL_V2, False),
+            (EXTERNAL_AGENT_PROTOCOL_V3, False),
+            (EXTERNAL_AGENT_PROTOCOL_V3_1, False),
+        )
+        for index, (protocol_version, profiled_v1) in enumerate(protocols):
+            with self.subTest(protocol=protocol_version):
+                service, semantic, run_id = self._make_active_v2_processed_run(
+                    mode="all_residue",
+                    messages=[message(1)],
+                    suffix=f"protocol_{index}",
+                    protocol_version=protocol_version,
+                    profiled_v1=profiled_v1,
+                )
+                calls = semantic.provider.calls
+                self.assertEqual(
+                    service.upgrade_active_v2_all_history(), run_id
+                )
+                self.assertEqual(semantic.provider.calls, calls)
+
+    def test_active_v2_upgrade_accepts_pre_diagnostics_v1_audit(self) -> None:
+        service, semantic, run_id = self._make_active_v2_processed_run(
+            mode="all_candidate",
+            messages=[message(1)],
+            suffix="pre_diagnostics_v1",
+        )
+        audit_path = next(
+            (
+                service.workspace
+                / "02_processing"
+                / "semantic_handoff_runs"
+            ).glob("*/processing-run-audit.json")
+        )
+        audit = json.loads(audit_path.read_text(encoding="utf-8"))
+        for field in (
+            "diagnostic_schema_version",
+            "elapsed_ms",
+            "deadline_ms",
+            "exit_code",
+            "termination_signal",
+            "timeout_phase",
+            "provider_error_category",
+            "result_file_present",
+            "result_size_bytes",
+            "stdout_bytes",
+            "stderr_bytes",
+            "process_cleanup_status",
+            "contract_failure_detail",
+        ):
+            audit.pop(field)
+        audit_path.write_text(json.dumps(audit), encoding="utf-8")
+        calls = semantic.provider.calls
+        self.assertEqual(service.upgrade_active_v2_all_history(), run_id)
+        self.assertEqual(semantic.provider.calls, calls)
+
+    def test_active_v2_upgrade_rejects_semantic_receipt_tamper(self) -> None:
+        cases = (
+            "missing_status_id",
+            "extra_status_id",
+            "missing_package",
+            "missing_audit",
+            "cleanup",
+            "store",
+            "missing_field",
+            "missing_contract_field",
+            "impossible_legacy_shape",
+            "extra_field",
+            "protocol",
+            "fingerprint",
+            "batch_order",
+            "diagnostic_version",
+            "provider_route",
+            "provider_version",
+            "provider_profile",
+            "run_path",
+        )
+        for case in cases:
+            with self.subTest(case=case):
+                service, semantic, run_id = self._make_active_v2_processed_run(
+                    mode="all_candidate",
+                    messages=[message(1), message(2)],
+                    suffix=case,
+                    protocol_version=(
+                        EXTERNAL_AGENT_PROTOCOL_V3_1
+                        if case
+                        in {"missing_contract_field", "provider_profile"}
+                        else EXTERNAL_AGENT_PROTOCOL_V1
+                    ),
+                )
+                status_path = service.run_store.runs_root / run_id / "status.json"
+                status = json.loads(status_path.read_text(encoding="utf-8"))
+                item = next(iter(status["items"].values()))
+                if case == "missing_status_id":
+                    item["atomic_information_ids"] = []
+                    status_path.write_text(json.dumps(status), encoding="utf-8")
+                elif case == "extra_status_id":
+                    item["atomic_information_ids"].append(
+                        "atomic_info_" + "0" * 32
+                    )
+                    status_path.write_text(json.dumps(status), encoding="utf-8")
+                elif case == "missing_package":
+                    package = (
+                        service.workspace
+                        / "02_processing"
+                        / "information"
+                        / item["representation_id"]
+                    )
+                    package.rename(package.with_name(package.name + ".missing"))
+                elif case in {"missing_audit", "cleanup"}:
+                    audit_path = next(
+                        (
+                            service.workspace
+                            / "02_processing"
+                            / "semantic_handoff_runs"
+                        ).glob("*/processing-run-audit.json")
+                    )
+                    if case == "missing_audit":
+                        audit_path.unlink()
+                    else:
+                        audit = json.loads(
+                            audit_path.read_text(encoding="utf-8")
+                        )
+                        audit["process_cleanup_status"] = "not_verified"
+                        audit_path.write_text(
+                            json.dumps(audit), encoding="utf-8"
+                        )
+                elif case in {
+                    "missing_field",
+                    "missing_contract_field",
+                    "impossible_legacy_shape",
+                    "extra_field",
+                    "protocol",
+                    "fingerprint",
+                    "batch_order",
+                    "diagnostic_version",
+                    "provider_route",
+                    "provider_version",
+                    "provider_profile",
+                    "run_path",
+                }:
+                    audit_path = next(
+                        (
+                            service.workspace
+                            / "02_processing"
+                            / "semantic_handoff_runs"
+                        ).glob("*/processing-run-audit.json")
+                    )
+                    audit = json.loads(
+                        audit_path.read_text(encoding="utf-8")
+                    )
+                    if case == "missing_field":
+                        audit.pop("input_fingerprint")
+                    elif case == "missing_contract_field":
+                        audit.pop("contract_failure_detail")
+                    elif case == "impossible_legacy_shape":
+                        for field in (
+                            "diagnostic_schema_version",
+                            "elapsed_ms",
+                            "deadline_ms",
+                            "exit_code",
+                            "termination_signal",
+                            "timeout_phase",
+                            "provider_error_category",
+                            "result_file_present",
+                            "result_size_bytes",
+                            "stdout_bytes",
+                            "stderr_bytes",
+                            "process_cleanup_status",
+                        ):
+                            audit.pop(field)
+                    elif case == "extra_field":
+                        audit["unexpected_field"] = "synthetic"
+                    elif case == "protocol":
+                        audit["protocol_version"] = (
+                            "external-agent-semantic-handoff/999.0"
+                        )
+                    elif case == "fingerprint":
+                        audit["input_fingerprint"] = "sha256:" + "0" * 64
+                    elif case == "batch_order":
+                        audit["anchor_unit_ids"] = list(
+                            reversed(audit["anchor_unit_ids"])
+                        )
+                    elif case == "diagnostic_version":
+                        audit["diagnostic_schema_version"] = (
+                            "external-agent-diagnostics/999.0"
+                        )
+                    elif case == "provider_route":
+                        audit["provider_route"] = "other-route"
+                    elif case == "provider_version":
+                        audit["provider_version"] = "0.999.0"
+                    elif case == "provider_profile":
+                        audit["model"] = "other-model"
+                    else:
+                        audit["processing_run_id"] = "run_" + "0" * 32
+                    audit_path.write_text(
+                        json.dumps(audit), encoding="utf-8"
+                    )
+                else:
+                    information_path = (
+                        service.workspace
+                        / "03_information"
+                        / "atomic_information.jsonl"
+                    )
+                    lines = information_path.read_text(encoding="utf-8").splitlines()
+                    payload = json.loads(lines[0])
+                    payload["origin_candidate_id"] = "candidate_" + "0" * 64
+                    lines[0] = json.dumps(payload)
+                    information_path.write_text(
+                        "\n".join(lines) + "\n", encoding="utf-8"
+                    )
+                calls = semantic.provider.calls
+                with self.assertRaisesRegex(
+                    WechatDigestError, "semantic|Atomic Information"
+                ):
+                    service.upgrade_active_v2_all_history()
+                self.assertEqual(semantic.provider.calls, calls)
+
+    def test_active_v2_upgrade_rejects_empty_pending_human_receipt(self) -> None:
+        service, semantic, run_id = self._make_active_v2_processed_run(
+            mode="all_residue", messages=[message(1)], suffix="pending_empty"
+        )
+        status_path = service.run_store.runs_root / run_id / "status.json"
+        status = json.loads(status_path.read_text(encoding="utf-8"))
+        item = next(iter(status["items"].values()))
+        item["state"] = "pending_human"
+        item["pending_human"] = True
+        status_path.write_text(json.dumps(status), encoding="utf-8")
+        calls = semantic.provider.calls
+        with self.assertRaisesRegex(WechatDigestError, "pending_human"):
+            service.upgrade_active_v2_all_history()
+        self.assertEqual(semantic.provider.calls, calls)
+
+    def test_active_v2_upgrade_keeps_represented_package_recoverable(self) -> None:
+        service, semantic, run_id = self._make_active_v2_processed_run(
+            mode="all_candidate", messages=[message(1)], suffix="represented"
+        )
+        status_path = service.run_store.runs_root / run_id / "status.json"
+        status = json.loads(status_path.read_text(encoding="utf-8"))
+        item = next(iter(status["items"].values()))
+        item["state"] = "represented"
+        item["atomic_information_ids"] = []
+        status_path.write_text(json.dumps(status), encoding="utf-8")
+        calls = semantic.provider.calls
+        self.assertEqual(service.upgrade_active_v2_all_history(), run_id)
+        upgraded_item = next(
+            iter(service.run_store.status(run_id)["items"].values())
+        )
+        self.assertEqual(upgraded_item["state"], "represented")
+        self.assertEqual(semantic.provider.calls, calls)
 
     def test_active_v2_upgrade_interruption_reuses_first_frozen_upper(self) -> None:
         day = 24 * 60 * 60
