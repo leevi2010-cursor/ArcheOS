@@ -1099,7 +1099,7 @@ class WechatDigestService:
                 ),
             )
             self._verify_capture_against_plan(capture, plan)
-            self._verify_plan_and_status(capture, plan, self.run_store.status(run_id))
+            self._verify_plan_and_status(run_id, capture, plan, self.run_store.status(run_id))
             return self._prepare_next_semantic_locked(
                 run_id,
                 capture,
@@ -1196,17 +1196,17 @@ class WechatDigestService:
         return value
 
     def _verify_plan_and_status(
-        self, capture: WechatCapture, plan: dict[str, object], status: dict[str, object]
+        self, active_run_id: str, capture: WechatCapture, plan: dict[str, object], status: dict[str, object]
     ) -> None:
         run_id = plan.get("run_id")
         created_at = plan.get("created_at")
-        if not isinstance(run_id, str) or not isinstance(created_at, str):
+        if not isinstance(run_id, str) or run_id != active_run_id or not isinstance(created_at, str):
             raise WechatDigestError("微信运行计划损坏。")
         if plan.get("schema_version") != RUN_PLAN_SCHEMA_VERSION:
             raise WechatDigestError("active legacy 微信运行必须显式升级。")
-        receipt = self.run_store.plan_receipt(run_id)
+        receipt = self.run_store.plan_receipt(active_run_id)
         fingerprint = _plan_fingerprint(plan)
-        if receipt.get("run_id") != run_id or receipt.get("plan_fingerprint") != fingerprint or status.get("plan_fingerprint") != fingerprint:
+        if receipt.get("run_id") != active_run_id or status.get("run_id") != active_run_id or receipt.get("plan_fingerprint") != fingerprint or status.get("plan_fingerprint") != fingerprint:
             raise WechatDigestError("微信运行计划 receipt 不一致。")
         expected, _ = _build_plan(capture, clock=lambda: created_at, run_id=run_id,
             created_at=created_at, semantic_batch_size=self._plan_batch_size(plan))
@@ -1217,7 +1217,7 @@ class WechatDigestService:
         if comparable != expected:
             raise WechatDigestError("微信 durable plan 与 fixed capture 不一致。")
         items = status.get("items")
-        if status.get("run_id") != run_id or not isinstance(items, dict):
+        if status.get("run_id") != active_run_id or not isinstance(items, dict):
             raise WechatDigestError("微信运行状态 items 损坏。")
         expected_items = {
             **{f"conversation:{item['conversation_key']}": ("conversation", item["source_id"]) for item in _plan_sequence(plan.get("conversations"), "conversations")},
@@ -1235,6 +1235,14 @@ class WechatDigestService:
                     raise WechatDigestError("微信运行状态 receipt 损坏。")
                 if self.representation_repository.get(representation_id).source_id != source_id:
                     raise WechatDigestError("微信运行状态 Representation binding 损坏。")
+                representation = self.representation_repository.get(representation_id)
+                privacy = self.privacy_gate.evaluate(self._representation_texts(representation_id), semantic_completeness_known=(representation.status == "complete" and representation.completeness == 1.0 and not representation.warnings))
+                if item.get("state") == "represented" and privacy.route != "approved":
+                    raise WechatDigestError("微信运行状态 privacy receipt 损坏。")
+                if item.get("state") == "local_only" and privacy.route != "local_only":
+                    raise WechatDigestError("微信运行状态 privacy receipt 损坏。")
+                if item.get("state") in {"processed", "pending_human"} and (not self._existing_semantic_package(representation_id) or not item.get("atomic_information_ids")):
+                    raise WechatDigestError("微信运行状态 semantic receipt 损坏。")
 
     def _run_locked(
         self, *, since: str | None, from_now: bool, all_history: bool
@@ -1253,7 +1261,7 @@ class WechatDigestService:
             status = self.run_store.status(active_run_id)
             if self.semantic_batch_size != self._plan_batch_size(plan):
                 raise WechatDigestError("semantic batch size 与 durable run 不一致。")
-            self._verify_plan_and_status(capture, plan, status)
+            self._verify_plan_and_status(active_run_id, capture, plan, status)
         else:
             if checkpoint is None:
                 if not any((since is not None, from_now, all_history)):
