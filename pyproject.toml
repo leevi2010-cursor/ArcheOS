@@ -11,11 +11,11 @@ requires-python = ">=3.11"
 license = { text = "MIT" }
 dependencies = [
   "mcp>=1.27,<2",
+  "openai-codex==0.144.4",
 ]
 
 [project.optional-dependencies]
 audio = [
-  "openai-codex==0.144.4",
   "pyannote.audio==4.0.7",
 ]
 document = [
