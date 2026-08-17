@@ -10,7 +10,7 @@ import re
 import secrets
 import stat
 import tempfile
-from collections.abc import Callable, Mapping
+from collections.abc import Mapping
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -40,6 +40,7 @@ from .representation_information import (
     _external_agent_prompt,
     _external_agent_request,
     _ExternalAgentSuccessfulResult,
+    _InternalAnalysisFinalization,
     _parse_external_agent_result,
     _provider_manifest,
     _units_from_representation,
@@ -1155,12 +1156,6 @@ def _analysis_results_fingerprint(
     return _fingerprint([asdict(output) for output in outputs])
 
 
-@dataclass(frozen=True)
-class _FinalizedRecoveryResults:
-    outputs: tuple[RepresentationAnalysisResult, ...]
-    verify_before_publish: Callable[[], None]
-
-
 class _RecoveryAwareProvider:
     """Feeds exact recovered batches into the unchanged complete package builder."""
 
@@ -1225,7 +1220,7 @@ class _RecoveryAwareProvider:
                         "Semantic recovery package publish 前发生漂移。"
                     )
 
-            finalization = _FinalizedRecoveryResults(
+            finalization = _InternalAnalysisFinalization(
                 outputs=outputs,
                 verify_before_publish=verify_before_publish,
             )
@@ -1853,9 +1848,17 @@ class ExternalAgentSemanticHandoffService:
         audit_paths: tuple[Path, ...] = ()
         ingestion: IngestionResult | None = None
         try:
-            package = self.representation_service.extract(
-                representation_id, analysis_provider  # type: ignore[arg-type]
-            )
+            if isinstance(analysis_provider, _RecoveryAwareProvider):
+                package = self.representation_service._extract_with_internal_finalization(
+                    representation_id,
+                    analysis_provider,
+                    analysis_provider.finalize_results,
+                )
+            else:
+                package = self.representation_service.extract(
+                    representation_id,
+                    analysis_provider,  # type: ignore[arg-type]
+                )
             manifest = self._verify_replay_input(representation_id, package)
             package_fingerprint = _package_fingerprint(package)
             records = (

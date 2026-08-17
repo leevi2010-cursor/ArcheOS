@@ -120,6 +120,12 @@ class RepresentationAnalysisResult:
 
 
 @dataclass(frozen=True)
+class _InternalAnalysisFinalization:
+    outputs: tuple[RepresentationAnalysisResult, ...]
+    verify_before_publish: Callable[[], None]
+
+
+@dataclass(frozen=True)
 class _AnchorAccounting:
     anchor_unit_id: str
     accounted_as: str
@@ -1934,6 +1940,36 @@ class RepresentationInformationService:
         representation_id: str,
         provider: RepresentationAnalysisProvider,
     ) -> Path:
+        return self._extract(
+            representation_id,
+            provider,
+            finalize_results=None,
+        )
+
+    def _extract_with_internal_finalization(
+        self,
+        representation_id: str,
+        provider: RepresentationAnalysisProvider,
+        finalize_results: Callable[
+            [tuple[RepresentationAnalysisResult, ...]], object
+        ],
+    ) -> Path:
+        return self._extract(
+            representation_id,
+            provider,
+            finalize_results=finalize_results,
+        )
+
+    def _extract(
+        self,
+        representation_id: str,
+        provider: RepresentationAnalysisProvider,
+        *,
+        finalize_results: Callable[
+            [tuple[RepresentationAnalysisResult, ...]], object
+        ]
+        | None,
+    ) -> Path:
         try:
             representation_id = require_representation_id(representation_id)
             representation = self.representation_repository.get(representation_id)
@@ -1955,24 +1991,23 @@ class RepresentationInformationService:
                 raise
             raise RepresentationInformationError(str(exc)) from exc
 
-        finalize = getattr(provider, "finalize_results", None)
         finalization_context = (
-            finalize(tuple(outputs))
-            if callable(finalize)
-            else nullcontext(tuple(outputs))
+            finalize_results(tuple(outputs))
+            if finalize_results is not None
+            else nullcontext(
+                _InternalAnalysisFinalization(tuple(outputs), lambda: None)
+            )
         )
         with finalization_context as finalization:
-            finalized_outputs = getattr(finalization, "outputs", finalization)
-            if (
-                not isinstance(finalized_outputs, tuple)
-                or len(finalized_outputs) != len(batches)
-                or any(
-                    not isinstance(item, RepresentationAnalysisResult)
-                    for item in finalized_outputs
-                )
-            ):
+            if type(finalization) is not _InternalAnalysisFinalization:
                 raise RepresentationInformationError(
                     "Representation finalization returned invalid results"
+                )
+            finalized_outputs = finalization.outputs
+            if finalize_results is not None:
+                canonical_batches = _analysis_batches(units, self.batch_size)
+                self._validate_finalized_outputs(
+                    canonical_batches, finalized_outputs
                 )
             candidates, residue = _output_records(
                 units, list(finalized_outputs), self._timestamp()
@@ -2013,11 +2048,7 @@ class RepresentationInformationService:
                     raise RepresentationInformationError(
                         "Representation changed during extraction"
                     )
-                verify_before_publish = getattr(
-                    finalization, "verify_before_publish", None
-                )
-                if callable(verify_before_publish):
-                    verify_before_publish()
+                finalization.verify_before_publish()
                 try:
                     publish_directory_no_replace(staging, final)
                 except (FileExistsError, OSError) as exc:
@@ -2072,6 +2103,42 @@ class RepresentationInformationService:
                 {"batch_id": f"batch_{len(batches) + 1:04d}", "unit_ids": [unit.unit_id for unit in batch.anchor_units]}
             )
         return outputs, batches
+
+    @classmethod
+    def _validate_finalized_outputs(
+        cls,
+        batches: tuple[RepresentationAnalysisBatch, ...],
+        outputs: tuple[RepresentationAnalysisResult, ...],
+    ) -> None:
+        if len(outputs) != len(batches) or any(
+            not isinstance(item, RepresentationAnalysisResult) for item in outputs
+        ):
+            raise RepresentationInformationError(
+                "Representation finalization returned invalid results"
+            )
+        for batch, result in zip(batches, outputs, strict=True):
+            anchor_ids = {unit.unit_id for unit in batch.anchor_units}
+            candidate_refs = {
+                unit_id
+                for item in result.candidates
+                if isinstance(item, RepresentationCandidateDraft)
+                for unit_id in item.evidence_unit_ids
+                if unit_id in anchor_ids
+            }
+            accounting = tuple(
+                _AnchorAccounting(
+                    anchor_unit_id=unit.unit_id,
+                    accounted_as=(
+                        "candidate" if unit.unit_id in candidate_refs else "residue"
+                    ),
+                )
+                for unit in batch.anchor_units
+            )
+            cls._validate_batch_result(
+                batch,
+                result,
+                anchor_accounting=accounting,
+            )
 
     @staticmethod
     def _validate_batch_result(

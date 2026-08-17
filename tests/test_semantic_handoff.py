@@ -10,6 +10,7 @@ import tempfile
 import threading
 import time
 import unittest
+from contextlib import contextmanager
 from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
@@ -30,9 +31,12 @@ from archeos.representation_information import (
     EXTERNAL_AGENT_PROTOCOL_VERSION,
     CodexCliRepresentationAnalysisProvider,
     RepresentationAnalysisBatch,
+    RepresentationAnalysisResult,
     RepresentationAnalysisUnit,
+    RepresentationCandidateDraft,
     RepresentationInformationError,
     RepresentationInformationService,
+    RepresentationResidueDraft,
     _analysis_batches,
     _canonical_fingerprint,
     _external_agent_request,
@@ -2063,6 +2067,191 @@ class SemanticHandoffTest(unittest.TestCase):
         self.assertFalse(
             (self.root / "information" / representation.representation_id).exists()
         )
+
+    def test_ordinary_provider_cannot_duck_type_an_output_finalizer(self) -> None:
+        representation, service = self.build_service(blocks=1)
+
+        class DuckFinalizingProvider:
+            name = "synthetic-duck-finalizer"
+
+            def __init__(inner_self) -> None:
+                inner_self.finalize_called = False
+
+            def analyze(
+                inner_self, batch: RepresentationAnalysisBatch
+            ) -> RepresentationAnalysisResult:
+                anchor = batch.anchor_units[0]
+                return RepresentationAnalysisResult(
+                    candidates=(
+                        RepresentationCandidateDraft(
+                            statement="Synthetic retained statement.",
+                            semantic_type="observation",
+                            concerns=("Synthetic",),
+                            evidence_unit_ids=(anchor.unit_id,),
+                            context=anchor.context,
+                            confidence=1.0,
+                        ),
+                    ),
+                    residue=(),
+                )
+
+            def finalize_results(inner_self, _outputs):
+                inner_self.finalize_called = True
+                raise AssertionError(
+                    "ordinary providers cannot replace validated outputs"
+                )
+
+        provider = DuckFinalizingProvider()
+        package = service.extract(representation.representation_id, provider)
+        self.assertFalse(provider.finalize_called)
+        self.assertTrue(package.is_dir())
+
+    def test_recovered_finalized_outputs_are_strictly_revalidated_zero_call(
+        self,
+    ) -> None:
+        import archeos.representation_information as information_module
+        import archeos.semantic_handoff as handoff_module
+
+        def attacked_outputs(mode, outputs):
+            first = outputs[0]
+            candidate = first.candidates[0]
+            if mode == "dual_assignment":
+                changed = replace(
+                    first,
+                    residue=(
+                        RepresentationResidueDraft(
+                            evidence_unit_ids=(candidate.evidence_unit_ids[0],),
+                            reason_not_absorbed="Synthetic conflicting residue.",
+                            future_value_or_uncertainty="Synthetic future value.",
+                        ),
+                    ),
+                )
+                return (changed,)
+            if mode == "duplicate_candidate":
+                return (replace(first, candidates=(*first.candidates, candidate)),)
+            if mode == "wrong_evidence":
+                changed_candidate = replace(
+                    candidate,
+                    evidence_unit_ids=("unit_" + "f" * 64,),
+                )
+                return (replace(first, candidates=(changed_candidate,)),)
+            if mode == "anchor_omission":
+                return (RepresentationAnalysisResult(candidates=(), residue=()),)
+            if mode == "missing_output":
+                return outputs[:-1]
+            if mode == "extra_output":
+                return (*outputs, first)
+            if mode == "shape_drift":
+                return (object(),)
+            raise AssertionError(mode)
+
+        for mode in (
+            "dual_assignment",
+            "duplicate_candidate",
+            "wrong_evidence",
+            "anchor_omission",
+            "missing_output",
+            "extra_output",
+            "shape_drift",
+        ):
+            with self.subTest(mode=mode):
+                root = self.root / mode
+                representation, service = self.build_service(blocks=1, root=root)
+                audit_root = root / "audits"
+                store_path = root / "atomic.jsonl"
+                handoff = ExternalAgentSemanticHandoffService(
+                    service,
+                    JsonlAtomicInformationStore(store_path),
+                    audit_root,
+                )
+                first_runner = FakeRunner()
+                original_package_publish = (
+                    information_module.publish_directory_no_replace
+                )
+
+                expected_package = (
+                    service.output_root / representation.representation_id
+                )
+
+                def fail_package_publish(
+                    staging,
+                    final,
+                    expected=expected_package,
+                    delegate=original_package_publish,
+                ):
+                    if final == expected:
+                        raise OSError("synthetic package publish interruption")
+                    return delegate(staging, final)
+
+                with (
+                    patch.object(
+                        information_module,
+                        "publish_directory_no_replace",
+                        fail_package_publish,
+                    ),
+                    self.assertRaises(SemanticHandoffError),
+                ):
+                    handoff.execute(
+                        representation.representation_id,
+                        CodexCliRepresentationAnalysisProvider(
+                            provider_version="0.147.0",
+                            runner=first_runner,
+                        ),
+                        privacy_binding=self.privacy_binding(),
+                        new_call_authority=1,
+                    )
+                self.assertEqual(len(first_runner.calls), 1)
+                self.assertFalse(store_path.exists())
+                self.assertFalse(
+                    (
+                        service.output_root / representation.representation_id
+                    ).exists()
+                )
+
+                original_finalize = (
+                    handoff_module._RecoveryAwareProvider.finalize_results
+                )
+
+                @contextmanager
+                def malicious_finalize(
+                    instance,
+                    early_outputs,
+                    current_mode=mode,
+                    delegate=original_finalize,
+                ):
+                    with delegate(instance, early_outputs) as finalized:
+                        yield replace(
+                            finalized,
+                            outputs=attacked_outputs(
+                                current_mode, finalized.outputs
+                            ),
+                        )
+
+                resume_runner = FakeRunner()
+                with (
+                    patch.object(
+                        handoff_module._RecoveryAwareProvider,
+                        "finalize_results",
+                        malicious_finalize,
+                    ),
+                    self.assertRaises(SemanticHandoffError),
+                ):
+                    handoff.execute(
+                        representation.representation_id,
+                        CodexCliRepresentationAnalysisProvider(
+                            provider_version="0.147.0",
+                            runner=resume_runner,
+                        ),
+                        privacy_binding=self.privacy_binding(),
+                        new_call_authority=0,
+                    )
+                self.assertEqual(resume_runner.calls, [])
+                self.assertFalse(store_path.exists())
+                self.assertFalse(
+                    (
+                        service.output_root / representation.representation_id
+                    ).exists()
+                )
 
     def test_recovery_2_receipt_attacks_and_legacy_1_fail_closed(self) -> None:
         import archeos.semantic_handoff as handoff_module
