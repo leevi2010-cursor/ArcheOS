@@ -636,6 +636,15 @@ class ExternalAgentExecutionRecord:
     process_cleanup_status: str
 
 
+@dataclass(frozen=True)
+class _ExternalAgentSuccessfulResult:
+    """Private in-memory handoff for a strict result before temp cleanup."""
+
+    processing_run_id: str
+    input_fingerprint: str
+    raw_bytes: bytes
+
+
 DIAGNOSTIC_SCHEMA_V1 = "external-agent-diagnostics/1.0"
 DIAGNOSTIC_SCHEMA_VERSION = "external-agent-diagnostics/2.0"
 _DIAGNOSTIC_TTL_SECONDS = 24 * 60 * 60
@@ -823,6 +832,8 @@ class CodexCliRepresentationAnalysisProvider:
             else Path(diagnostic_root).expanduser()
         )
         self.execution_records: list[ExternalAgentExecutionRecord] = []
+        self._successful_results: list[_ExternalAgentSuccessfulResult] = []
+        self._capture_successful_raw = False
 
     def cleanup_failure_diagnostics(self) -> bool:
         """Explicitly remove local-only failure diagnostics after review."""
@@ -892,6 +903,7 @@ class CodexCliRepresentationAnalysisProvider:
         result_size_bytes = 0
         result_fingerprint: str | None = None
         raw: str | None = None
+        raw_bytes: bytes | None = None
         with tempfile.TemporaryDirectory(prefix="archeos-external-agent-") as directory:
             temp = Path(directory)
             os.chmod(temp, 0o700)
@@ -941,7 +953,8 @@ class CodexCliRepresentationAnalysisProvider:
                     raise RepresentationInformationError(outcome.failure_category)
                 if not result_file_present:
                     raise RepresentationInformationError("no_result")
-                raw = result_path.read_text(encoding="utf-8")
+                raw_bytes = result_path.read_bytes()
+                raw = raw_bytes.decode("utf-8")
                 result = _parse_external_agent_result(raw, batch, fingerprint)
             except (OSError, RuntimeError, ValueError, json.JSONDecodeError) as exc:
                 category = str(exc)
@@ -1015,33 +1028,44 @@ class CodexCliRepresentationAnalysisProvider:
                 raise RepresentationInformationError(
                     "External Agent 未产生可验证的结构化结果；未发布信息包。"
                 ) from exc
-        assert raw is not None and result_fingerprint is not None
-        self.execution_records.append(
-            ExternalAgentExecutionRecord(
-                **record_base,
-                finished_at=_utc_timestamp(),
-                execution_status="succeeded",
-                failure_category=None,
-                contract_failure_detail=None,
-                strict_validation_status="passed",
-                result_fingerprint=result_fingerprint,
-                eligible_units=len(batch.anchor_units),
-                covered_units=len(batch.anchor_units),
-                **_empty_contract_failure_diagnostics(),
-                diagnostic_schema_version=DIAGNOSTIC_SCHEMA_VERSION,
-                elapsed_ms=_elapsed_ms(started_monotonic),
-                deadline_ms=round(self.timeout_seconds * 1000),
-                exit_code=outcome.exit_code,
-                termination_signal=outcome.termination_signal,
-                timeout_phase=outcome.timeout_phase,
-                provider_error_category=None,
-                result_file_present=result_file_present,
-                result_size_bytes=result_size_bytes,
-                stdout_bytes=_stream_bytes(outcome.stdout),
-                stderr_bytes=_stream_bytes(outcome.stderr),
-                process_cleanup_status=outcome.process_cleanup_status,
-            )
+        assert (
+            raw is not None
+            and raw_bytes is not None
+            and result_fingerprint is not None
         )
+        success_record = ExternalAgentExecutionRecord(
+            **record_base,
+            finished_at=_utc_timestamp(),
+            execution_status="succeeded",
+            failure_category=None,
+            contract_failure_detail=None,
+            strict_validation_status="passed",
+            result_fingerprint=result_fingerprint,
+            eligible_units=len(batch.anchor_units),
+            covered_units=len(batch.anchor_units),
+            **_empty_contract_failure_diagnostics(),
+            diagnostic_schema_version=DIAGNOSTIC_SCHEMA_VERSION,
+            elapsed_ms=_elapsed_ms(started_monotonic),
+            deadline_ms=round(self.timeout_seconds * 1000),
+            exit_code=outcome.exit_code,
+            termination_signal=outcome.termination_signal,
+            timeout_phase=outcome.timeout_phase,
+            provider_error_category=None,
+            result_file_present=result_file_present,
+            result_size_bytes=result_size_bytes,
+            stdout_bytes=_stream_bytes(outcome.stdout),
+            stderr_bytes=_stream_bytes(outcome.stderr),
+            process_cleanup_status=outcome.process_cleanup_status,
+        )
+        self.execution_records.append(success_record)
+        if self._capture_successful_raw:
+            self._successful_results.append(
+                _ExternalAgentSuccessfulResult(
+                    processing_run_id=success_record.processing_run_id,
+                    input_fingerprint=fingerprint,
+                    raw_bytes=raw_bytes,
+                )
+            )
         return result
 
 

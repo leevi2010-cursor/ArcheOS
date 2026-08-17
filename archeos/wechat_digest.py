@@ -47,12 +47,14 @@ from .representation_information import (
     CodexCliRepresentationAnalysisProvider,
     RepresentationInformationError,
     RepresentationInformationService,
+    _analysis_batches,
     _units_from_representation,
     validate_representation_information_package,
 )
 from .semantic_handoff import (
     ExternalAgentSemanticHandoffService,
     SemanticHandoffError,
+    SemanticPrivacyBinding,
     _package_fingerprint,
     validate_completed_published_audits,
 )
@@ -85,6 +87,8 @@ SEMANTIC_ATTACHMENT_ADAPTERS = {
     "application/vnd.ms-powerpoint.presentation.macroenabled.12": "pptx",
 }
 IMAGE_MEDIA_TYPES = frozenset({"image/jpeg", "image/png", "image/gif"})
+SEMANTIC_PRIVACY_POLICY = "wechat-local-deterministic-privacy-gate"
+SEMANTIC_PRIVACY_POLICY_VERSION = "1.0"
 
 
 class WechatDigestError(RuntimeError):
@@ -189,7 +193,13 @@ class WechatCaptureProvider(Protocol):
 class SemanticHandoffPort(Protocol):
     provider: CodexCliRepresentationAnalysisProvider
 
-    def execute(self, representation_id: str): ...
+    def execute(
+        self,
+        representation_id: str,
+        *,
+        privacy_binding: SemanticPrivacyBinding,
+        new_call_authority: int,
+    ): ...
 
 
 def _canonical_json(value: object) -> str:
@@ -946,8 +956,19 @@ class ExistingSemanticHandoff:
             timeout_seconds=timeout_seconds,
         )
 
-    def execute(self, representation_id: str):
-        return self.service.execute(representation_id, self.provider)
+    def execute(
+        self,
+        representation_id: str,
+        *,
+        privacy_binding: SemanticPrivacyBinding,
+        new_call_authority: int,
+    ):
+        return self.service.execute(
+            representation_id,
+            self.provider,
+            privacy_binding=privacy_binding,
+            new_call_authority=new_call_authority,
+        )
 
 
 @dataclass(frozen=True)
@@ -1699,18 +1720,19 @@ class WechatDigestService:
         self, run_id: str, representation_id: str, batch_size: int
     ) -> WechatSemanticPreparation:
         representation = self.representation_repository.get(representation_id)
-        eligible = tuple(
-            unit.unit_id
-            for unit in _units_from_representation(
+        batches = _analysis_batches(
+            _units_from_representation(
                 representation, self.representation_repository
-            )
-            if unit.analysis_eligible
+            ),
+            batch_size,
         )
-        if not eligible:
+        if not batches:
             raise WechatDigestError("semantic item 缺少 eligible units。")
-        if len(eligible) > batch_size:
-            raise WechatDigestError("下一个 semantic item 需要多个 batch；未跳过该 item。")
-        return WechatSemanticPreparation(run_id, representation_id, eligible)
+        return WechatSemanticPreparation(
+            run_id,
+            representation_id,
+            tuple(unit.unit_id for unit in batches[0].anchor_units),
+        )
 
     @staticmethod
     def _plan_batch_size(plan: Mapping[str, object]) -> int:
@@ -2417,7 +2439,7 @@ class WechatDigestService:
             representation.representation_id
         ):
             return representation.representation_id
-        atomic_ids = self._semantic(representation.representation_id)
+        atomic_ids = self._semantic(representation.representation_id, privacy)
         pending, object_ids = self._govern(atomic_ids)
         self._update_item(
             run_id,
@@ -2495,7 +2517,7 @@ class WechatDigestService:
             representation.representation_id
         ):
             return representation.representation_id
-        atomic_ids = self._semantic(representation.representation_id)
+        atomic_ids = self._semantic(representation.representation_id, privacy)
         pending, object_ids = self._govern(atomic_ids)
         self._update_item(
             run_id,
@@ -2528,8 +2550,37 @@ class WechatDigestService:
                 continue
         return tuple(texts)
 
-    def _semantic(self, representation_id: str) -> tuple[str, ...]:
-        result = self._semantic_port().execute(representation_id)
+    def _semantic(
+        self, representation_id: str, privacy: PrivacyDecision
+    ) -> tuple[str, ...]:
+        representation = self.representation_repository.get(representation_id)
+        privacy_payload = {
+            "policy": SEMANTIC_PRIVACY_POLICY,
+            "policy_version": SEMANTIC_PRIVACY_POLICY_VERSION,
+            "route": privacy.route,
+            "categories": list(privacy.categories),
+            "representation_id": representation.representation_id,
+            "representation_manifest_fingerprint": _sha256_bytes(
+                _canonical_json(representation.to_manifest_dict()).encode("utf-8")
+            ),
+        }
+        privacy_binding = SemanticPrivacyBinding(
+            policy=SEMANTIC_PRIVACY_POLICY,
+            policy_version=SEMANTIC_PRIVACY_POLICY_VERSION,
+            route=privacy.route,
+            receipt_fingerprint=_sha256_bytes(_canonical_json(privacy_payload).encode()),
+        )
+        units = _units_from_representation(
+            representation, self.representation_repository
+        )
+        new_call_authority = len(
+            _analysis_batches(units, self.semantic_batch_size)
+        )
+        result = self._semantic_port().execute(
+            representation_id,
+            privacy_binding=privacy_binding,
+            new_call_authority=new_call_authority,
+        )
         atomic_ids = tuple(result.ingestion.atomic_information_ids)
         for atomic_id in atomic_ids:
             self.information_store.get_current(atomic_id)

@@ -231,7 +231,17 @@ class SyntheticSemanticHandoff:
         self.protocol_version = EXTERNAL_AGENT_PROTOCOL_V1
         self.profiled_v1 = False
 
-    def execute(self, representation_id: str):
+    def execute(
+        self,
+        representation_id: str,
+        *,
+        privacy_binding=None,
+        new_call_authority=None,
+    ):
+        if privacy_binding is not None:
+            assert privacy_binding.route == "approved"
+            assert isinstance(new_call_authority, int)
+            assert new_call_authority > 0
         output_root = self.workspace / "02_processing" / "information"
         package = output_root / representation_id
         store = JsonlAtomicInformationStore(
@@ -967,14 +977,14 @@ class WechatDigestTests(unittest.TestCase):
         self.assertEqual(self.semantic.provider.calls, provider_calls)
         self.assertEqual(service.run_store.status(prepared.run_id)["items"]["attachment:attachment_1"]["state"], "unsupported")
 
-    def test_prepare_stops_at_multi_batch_item(self) -> None:
+    def test_prepare_returns_first_canonical_batch_for_multi_batch_item(self) -> None:
         capture = SyntheticCaptureProvider([message(number) for number in range(1, 42)])
         self.semantic.failures_remaining = 1
         service = self.service(capture)
         with self.assertRaises(WechatDigestError):
             service.run(all_history=True)
-        with self.assertRaisesRegex(WechatDigestError, "多个 batch"):
-            service.prepare_next_semantic(batch_size=40)
+        prepared = service.prepare_next_semantic(batch_size=40)
+        self.assertEqual(len(prepared.anchor_unit_ids), 40)
         run_id = service.run_store.active_run_id()
         assert run_id is not None
         self.assertEqual(next(iter(service.run_store.status(run_id)["items"].values()))["state"], "represented")

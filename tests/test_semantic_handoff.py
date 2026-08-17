@@ -6,6 +6,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from dataclasses import replace
@@ -40,6 +41,8 @@ from archeos.representation_information import (
 )
 from archeos.semantic_handoff import (
     ExternalAgentSemanticHandoffService,
+    SemanticHandoffError,
+    SemanticPrivacyBinding,
     _package_fingerprint,
     validate_completed_published_audits,
 )
@@ -919,6 +922,14 @@ class SemanticHandoffTest(unittest.TestCase):
         )
         return representation, service
 
+    def privacy_binding(self) -> SemanticPrivacyBinding:
+        return SemanticPrivacyBinding(
+            policy="synthetic-local-privacy-gate",
+            policy_version="1.0",
+            route="approved",
+            receipt_fingerprint="sha256:" + "9" * 64,
+        )
+
     def build_wechat_service(self):
         root = self.root / "wechat"
         source_path = root / "private.json"
@@ -1494,6 +1505,644 @@ class SemanticHandoffTest(unittest.TestCase):
             (self.root / "information" / representation.representation_id).exists()
         )
         self.assertFalse((self.root / "atomic.jsonl").exists())
+
+    def test_recovery_preflight_does_not_treat_old_success_audit_as_result(
+        self,
+    ) -> None:
+        representation, service = self.build_service(blocks=83)
+        audit_root = self.root / "audits"
+        handoff = ExternalAgentSemanticHandoffService(
+            service,
+            JsonlAtomicInformationStore(self.root / "atomic.jsonl"),
+            audit_root,
+        )
+        historical = CodexCliRepresentationAnalysisProvider(
+            provider_version="0.147.0",
+            runner=SequenceRunner("valid", "nonzero"),
+        )
+        with self.assertRaisesRegex(Exception, "未确认新增 Durable"):
+            handoff.execute(representation.representation_id, historical)
+        self.assertEqual(len(historical.execution_records), 2)
+
+        provider = CodexCliRepresentationAnalysisProvider(
+            provider_version="0.147.0", runner=FakeRunner()
+        )
+        preflight = handoff.recovery_preflight(
+            representation.representation_id,
+            provider,
+            self.privacy_binding(),
+        )
+        self.assertEqual(preflight.total_batches, 3)
+        self.assertEqual(preflight.replayable_batches, 0)
+        self.assertEqual(preflight.required_new_calls, 3)
+        self.assertEqual(preflight.conservatively_counted_attempts, 0)
+        self.assertEqual(provider.execution_records, [])
+        self.assertFalse(any(audit_root.glob("semantic_run_*")))
+
+    def test_recovery_resumes_40_40_3_after_first_result_receipt(self) -> None:
+        import archeos.semantic_handoff as handoff_module
+
+        representation, service = self.build_service(blocks=83)
+        audit_root = self.root / "audits"
+        store_path = self.root / "atomic.jsonl"
+        handoff = ExternalAgentSemanticHandoffService(
+            service, JsonlAtomicInformationStore(store_path), audit_root
+        )
+        first_provider = CodexCliRepresentationAnalysisProvider(
+            provider_version="0.147.0", runner=FakeRunner()
+        )
+        original_publish = handoff_module._SemanticRecoveryRun.publish_result
+
+        def crash_after_first_receipt(run, ordinal, raw_result, record):
+            loaded = original_publish(run, ordinal, raw_result, record)
+            if ordinal == 1:
+                raise OSError("synthetic crash after durable batch receipt")
+            return loaded
+
+        with (
+            patch.object(
+                handoff_module._SemanticRecoveryRun,
+                "publish_result",
+                crash_after_first_receipt,
+            ),
+            self.assertRaises(SemanticHandoffError),
+        ):
+            handoff.execute(
+                representation.representation_id,
+                first_provider,
+                privacy_binding=self.privacy_binding(),
+                new_call_authority=3,
+            )
+        self.assertEqual(len(first_provider.execution_records), 1)
+        self.assertFalse(
+            (self.root / "information" / representation.representation_id).exists()
+        )
+        self.assertFalse(store_path.exists())
+
+        resume_runner = SequenceRunner("valid", "valid")
+        resume_provider = CodexCliRepresentationAnalysisProvider(
+            provider_version="0.147.0", runner=resume_runner
+        )
+        preflight = handoff.recovery_preflight(
+            representation.representation_id,
+            resume_provider,
+            self.privacy_binding(),
+        )
+        self.assertEqual(preflight.replayable_batches, 1)
+        self.assertEqual(preflight.required_new_calls, 2)
+        result = handoff.execute(
+            representation.representation_id,
+            resume_provider,
+            privacy_binding=self.privacy_binding(),
+            new_call_authority=2,
+        )
+        self.assertEqual(len(resume_runner.calls), 2)
+        self.assertEqual(result.ingestion.created, 83)
+        manifest = json.loads((result.package / "manifest.json").read_text())
+        self.assertEqual(
+            [len(batch["unit_ids"]) for batch in manifest["batches"]],
+            [40, 40, 3],
+        )
+        recovery_run = next(audit_root.glob("semantic_run_*"))
+        for directory in (
+            recovery_run,
+            recovery_run / "attempts",
+            recovery_run / "results",
+            *(recovery_run / "results").glob("batch_*"),
+        ):
+            self.assertEqual(directory.stat().st_mode & 0o777, 0o700)
+        for path in recovery_run.rglob("*.json"):
+            self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+
+    def test_failed_recovery_attempt_is_conservatively_counted_and_not_retried(
+        self,
+    ) -> None:
+        representation, service = self.build_service(blocks=83)
+        audit_root = self.root / "audits"
+        handoff = ExternalAgentSemanticHandoffService(
+            service,
+            JsonlAtomicInformationStore(self.root / "atomic.jsonl"),
+            audit_root,
+        )
+        provider = CodexCliRepresentationAnalysisProvider(
+            provider_version="0.147.0",
+            runner=SequenceRunner("valid", "nonzero"),
+        )
+        with self.assertRaisesRegex(Exception, "未确认新增 Durable"):
+            handoff.execute(
+                representation.representation_id,
+                provider,
+                privacy_binding=self.privacy_binding(),
+                new_call_authority=3,
+            )
+        self.assertEqual(len(provider.execution_records), 2)
+        self.assertFalse(
+            (self.root / "information" / representation.representation_id).exists()
+        )
+        self.assertFalse((self.root / "atomic.jsonl").exists())
+
+        next_runner = FakeRunner()
+        next_provider = CodexCliRepresentationAnalysisProvider(
+            provider_version="0.147.0", runner=next_runner
+        )
+        preflight = handoff.recovery_preflight(
+            representation.representation_id,
+            next_provider,
+            self.privacy_binding(),
+        )
+        self.assertEqual(preflight.replayable_batches, 1)
+        self.assertEqual(preflight.required_new_calls, 2)
+        self.assertEqual(preflight.conservatively_counted_attempts, 1)
+        with self.assertRaisesRegex(Exception, "LEAD_DECISION_REQUIRED"):
+            handoff.execute(
+                representation.representation_id,
+                next_provider,
+                privacy_binding=self.privacy_binding(),
+                new_call_authority=2,
+            )
+        self.assertEqual(next_runner.calls, [])
+
+    def test_recovery_supports_candidate_residue_and_mixed_40_anchor_results(
+        self,
+    ) -> None:
+        expected_counts = {
+            "valid": (40, 0),
+            "all_residue": (0, 40),
+            "mixed": (20, 20),
+        }
+        for mode, expected in expected_counts.items():
+            with self.subTest(mode=mode):
+                root = self.root / mode
+                representation, service = self.build_service(blocks=40, root=root)
+                runner = FakeRunner(mode)
+                result = ExternalAgentSemanticHandoffService(
+                    service,
+                    JsonlAtomicInformationStore(root / "atomic.jsonl"),
+                    root / "audits",
+                ).execute(
+                    representation.representation_id,
+                    CodexCliRepresentationAnalysisProvider(
+                        provider_version="0.147.0", runner=runner
+                    ),
+                    privacy_binding=self.privacy_binding(),
+                    new_call_authority=1,
+                )
+                manifest = json.loads((result.package / "manifest.json").read_text())
+                self.assertEqual(
+                    (
+                        manifest["counts"]["atomic_information_candidates"],
+                        manifest["counts"]["residue_items"],
+                    ),
+                    expected,
+                )
+                self.assertEqual(len(runner.calls), 1)
+
+    def test_cross_batch_candidate_collision_stays_partial_and_zero_call_replays(
+        self,
+    ) -> None:
+        import archeos.representation_information as information_module
+
+        representation, service = self.build_service(blocks=83)
+        audit_root = self.root / "audits"
+        handoff = ExternalAgentSemanticHandoffService(
+            service,
+            JsonlAtomicInformationStore(self.root / "atomic.jsonl"),
+            audit_root,
+        )
+        first_runner = FakeRunner()
+        with (
+            patch.object(
+                information_module,
+                "_candidate_id",
+                return_value="candidate_" + "0" * 64,
+            ),
+            self.assertRaises(SemanticHandoffError),
+        ):
+            handoff.execute(
+                representation.representation_id,
+                CodexCliRepresentationAnalysisProvider(
+                    provider_version="0.147.0", runner=first_runner
+                ),
+                privacy_binding=self.privacy_binding(),
+                new_call_authority=3,
+            )
+        self.assertEqual(len(first_runner.calls), 3)
+        self.assertFalse(
+            (self.root / "information" / representation.representation_id).exists()
+        )
+        self.assertFalse((self.root / "atomic.jsonl").exists())
+        replay_runner = FakeRunner()
+        preflight = handoff.recovery_preflight(
+            representation.representation_id,
+            CodexCliRepresentationAnalysisProvider(
+                provider_version="0.147.0", runner=replay_runner
+            ),
+            self.privacy_binding(),
+        )
+        self.assertEqual(preflight.replayable_batches, 3)
+        self.assertEqual(preflight.required_new_calls, 0)
+        with (
+            patch.object(
+                information_module,
+                "_candidate_id",
+                return_value="candidate_" + "0" * 64,
+            ),
+            self.assertRaises(SemanticHandoffError),
+        ):
+            handoff.execute(
+                representation.representation_id,
+                CodexCliRepresentationAnalysisProvider(
+                    provider_version="0.147.0", runner=replay_runner
+                ),
+                privacy_binding=self.privacy_binding(),
+                new_call_authority=0,
+            )
+        self.assertEqual(replay_runner.calls, [])
+
+    def test_recovery_attempt_is_durable_before_provider_start(self) -> None:
+        representation, service = self.build_service(blocks=40)
+        audit_root = self.root / "audits"
+
+        class StartFailRunner:
+            calls = 0
+
+            def __call__(inner_self, _command, **_kwargs):
+                inner_self.calls += 1
+                attempt = next(
+                    audit_root.glob("semantic_run_*/attempts/batch_0001.json")
+                )
+                self.assertEqual(attempt.stat().st_mode & 0o777, 0o600)
+                payload = json.loads(attempt.read_text())
+                self.assertEqual(payload["state"], "started")
+                raise OSError("synthetic process start failure")
+
+        runner = StartFailRunner()
+        handoff = ExternalAgentSemanticHandoffService(
+            service,
+            JsonlAtomicInformationStore(self.root / "atomic.jsonl"),
+            audit_root,
+        )
+        with self.assertRaisesRegex(Exception, "未确认新增 Durable"):
+            handoff.execute(
+                representation.representation_id,
+                CodexCliRepresentationAnalysisProvider(
+                    provider_version="0.147.0", runner=runner
+                ),
+                privacy_binding=self.privacy_binding(),
+                new_call_authority=1,
+            )
+        self.assertEqual(runner.calls, 1)
+        next_runner = FakeRunner()
+        with self.assertRaisesRegex(Exception, "LEAD_DECISION_REQUIRED"):
+            handoff.execute(
+                representation.representation_id,
+                CodexCliRepresentationAnalysisProvider(
+                    provider_version="0.147.0", runner=next_runner
+                ),
+                privacy_binding=self.privacy_binding(),
+                new_call_authority=1,
+            )
+        self.assertEqual(next_runner.calls, [])
+
+    def test_recovery_tamper_and_profile_drift_fail_before_provider(self) -> None:
+        import archeos.semantic_handoff as handoff_module
+
+        for attack in (
+            "raw",
+            "mode",
+            "symlink",
+            "run_binding",
+            "prompt",
+            "schema",
+            "partition",
+            "privacy",
+            "inventory",
+            "batch_swap",
+            "profile",
+        ):
+            with self.subTest(attack=attack):
+                root = self.root / attack
+                representation, service = self.build_service(blocks=83, root=root)
+                handoff = ExternalAgentSemanticHandoffService(
+                    service,
+                    JsonlAtomicInformationStore(root / "atomic.jsonl"),
+                    root / "audits",
+                )
+                original_publish = handoff_module._SemanticRecoveryRun.publish_result
+
+                def crash(
+                    run,
+                    ordinal,
+                    raw_result,
+                    record,
+                    publish=original_publish,
+                ):
+                    publish(run, ordinal, raw_result, record)
+                    raise OSError("synthetic crash")
+
+                with (
+                    patch.object(
+                        handoff_module._SemanticRecoveryRun,
+                        "publish_result",
+                        crash,
+                    ),
+                    self.assertRaises(SemanticHandoffError),
+                ):
+                    handoff.execute(
+                        representation.representation_id,
+                        CodexCliRepresentationAnalysisProvider(
+                            provider_version="0.147.0", runner=FakeRunner()
+                        ),
+                        privacy_binding=self.privacy_binding(),
+                        new_call_authority=3,
+                    )
+                run = next((root / "audits").glob("semantic_run_*"))
+                result = run / "results" / "batch_0001"
+                if attack == "raw":
+                    (result / "result.json").write_bytes(b"{}")
+                elif attack == "mode":
+                    os.chmod(result / "result.json", 0o644)
+                elif attack == "symlink":
+                    (result / "result.json").unlink()
+                    (result / "result.json").symlink_to("result-receipt.json")
+                elif attack in {
+                    "run_binding",
+                    "prompt",
+                    "schema",
+                    "partition",
+                    "privacy",
+                }:
+                    receipt_path = run / "run-receipt.json"
+                    receipt = json.loads(receipt_path.read_text())
+                    if attack == "run_binding":
+                        receipt["semantic_batch_size"] = 41
+                    elif attack == "prompt":
+                        receipt["prompt_template_fingerprint"] = "sha256:" + "0" * 64
+                    elif attack == "schema":
+                        receipt["batches"][0]["result_schema_fingerprint"] = (
+                            "sha256:" + "0" * 64
+                        )
+                    elif attack == "partition":
+                        receipt["batches"][0]["anchor_unit_ids"][:2] = reversed(
+                            receipt["batches"][0]["anchor_unit_ids"][:2]
+                        )
+                    else:
+                        receipt["privacy"]["receipt_fingerprint"] = (
+                            "sha256:" + "0" * 64
+                        )
+                    receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
+                elif attack == "inventory":
+                    unexpected = run / "unexpected.json"
+                    unexpected.write_text("{}", encoding="utf-8")
+                    os.chmod(unexpected, 0o600)
+                elif attack == "batch_swap":
+                    (run / "results" / "batch_0001").rename(
+                        run / "results" / "batch_0002"
+                    )
+                next_provider = CodexCliRepresentationAnalysisProvider(
+                    provider_version=(
+                        "0.148.0" if attack == "profile" else "0.147.0"
+                    ),
+                    runner=FakeRunner(),
+                )
+                with self.assertRaises(SemanticHandoffError):
+                    handoff.recovery_preflight(
+                        representation.representation_id,
+                        next_provider,
+                        self.privacy_binding(),
+                    )
+                self.assertEqual(next_provider.execution_records, [])
+
+    def test_recovery_call_authority_is_checked_before_any_attempt(self) -> None:
+        representation, service = self.build_service(blocks=83)
+        audit_root = self.root / "audits"
+        runner = FakeRunner()
+        with self.assertRaisesRegex(Exception, "调用授权不足"):
+            ExternalAgentSemanticHandoffService(
+                service,
+                JsonlAtomicInformationStore(self.root / "atomic.jsonl"),
+                audit_root,
+            ).execute(
+                representation.representation_id,
+                CodexCliRepresentationAnalysisProvider(
+                    provider_version="0.147.0", runner=runner
+                ),
+                privacy_binding=self.privacy_binding(),
+                new_call_authority=2,
+            )
+        self.assertEqual(runner.calls, [])
+        self.assertFalse(audit_root.exists())
+
+    def test_concurrent_recovery_runner_cannot_duplicate_a_batch_call(self) -> None:
+        representation, service = self.build_service(blocks=40)
+        audit_root = self.root / "audits"
+        started = threading.Event()
+        release = threading.Event()
+
+        class BlockingRunner(FakeRunner):
+            def __call__(inner_self, command, **kwargs):
+                started.set()
+                if not release.wait(5):
+                    raise AssertionError("synthetic concurrency release timed out")
+                return super().__call__(command, **kwargs)
+
+        winner_runner = BlockingRunner()
+        winner_result: list[object] = []
+        winner_error: list[BaseException] = []
+
+        def run_winner() -> None:
+            try:
+                winner_result.append(
+                    ExternalAgentSemanticHandoffService(
+                        service,
+                        JsonlAtomicInformationStore(self.root / "atomic.jsonl"),
+                        audit_root,
+                    ).execute(
+                        representation.representation_id,
+                        CodexCliRepresentationAnalysisProvider(
+                            provider_version="0.147.0", runner=winner_runner
+                        ),
+                        privacy_binding=self.privacy_binding(),
+                        new_call_authority=1,
+                    )
+                )
+            except BaseException as exc:  # noqa: BLE001 - thread evidence capture.
+                winner_error.append(exc)
+
+        thread = threading.Thread(target=run_winner)
+        thread.start()
+        self.assertTrue(started.wait(5))
+        loser_runner = FakeRunner()
+        try:
+            with self.assertRaisesRegex(Exception, "LEAD_DECISION_REQUIRED"):
+                ExternalAgentSemanticHandoffService(
+                    service,
+                    JsonlAtomicInformationStore(self.root / "atomic.jsonl"),
+                    audit_root,
+                ).execute(
+                    representation.representation_id,
+                    CodexCliRepresentationAnalysisProvider(
+                        provider_version="0.147.0", runner=loser_runner
+                    ),
+                    privacy_binding=self.privacy_binding(),
+                    new_call_authority=1,
+                )
+        finally:
+            release.set()
+            thread.join(5)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(winner_error, [])
+        self.assertEqual(len(winner_result), 1)
+        self.assertEqual(len(winner_runner.calls), 1)
+        self.assertEqual(loser_runner.calls, [])
+
+    def test_result_publish_collision_stops_without_package_or_retry(self) -> None:
+        import archeos.semantic_handoff as handoff_module
+
+        representation, service = self.build_service(blocks=40)
+        audit_root = self.root / "audits"
+        runner = FakeRunner()
+        original_publish = handoff_module.publish_directory_no_replace
+
+        def collide_on_batch(staging, final):
+            if final.name == "batch_0001":
+                raise FileExistsError("synthetic result collision")
+            return original_publish(staging, final)
+
+        with (
+            patch.object(
+                handoff_module,
+                "publish_directory_no_replace",
+                collide_on_batch,
+            ),
+            self.assertRaises(SemanticHandoffError),
+        ):
+            ExternalAgentSemanticHandoffService(
+                service,
+                JsonlAtomicInformationStore(self.root / "atomic.jsonl"),
+                audit_root,
+            ).execute(
+                representation.representation_id,
+                CodexCliRepresentationAnalysisProvider(
+                    provider_version="0.147.0", runner=runner
+                ),
+                privacy_binding=self.privacy_binding(),
+                new_call_authority=1,
+            )
+        self.assertEqual(len(runner.calls), 1)
+        self.assertFalse(
+            (self.root / "information" / representation.representation_id).exists()
+        )
+        self.assertFalse((self.root / "atomic.jsonl").exists())
+        retry_runner = FakeRunner()
+        with self.assertRaisesRegex(Exception, "LEAD_DECISION_REQUIRED"):
+            ExternalAgentSemanticHandoffService(
+                service,
+                JsonlAtomicInformationStore(self.root / "atomic.jsonl"),
+                audit_root,
+            ).execute(
+                representation.representation_id,
+                CodexCliRepresentationAnalysisProvider(
+                    provider_version="0.147.0", runner=retry_runner
+                ),
+                privacy_binding=self.privacy_binding(),
+                new_call_authority=1,
+            )
+        self.assertEqual(retry_runner.calls, [])
+
+    def test_success_raw_body_is_only_in_private_batch_artifact(self) -> None:
+        representation, service = self.build_service(blocks=1)
+        audit_root = self.root / "audits"
+        provider = CodexCliRepresentationAnalysisProvider(
+            provider_version="0.147.0", runner=FakeRunner()
+        )
+        ExternalAgentSemanticHandoffService(
+            service,
+            JsonlAtomicInformationStore(self.root / "atomic.jsonl"),
+            audit_root,
+        ).execute(
+            representation.representation_id,
+            provider,
+            privacy_binding=self.privacy_binding(),
+            new_call_authority=1,
+        )
+        result_path = next(
+            audit_root.glob("semantic_run_*/results/batch_0001/result.json")
+        )
+        self.assertIn("Synthetic statement.", result_path.read_text())
+        for path in audit_root.glob("run_*/processing-run-audit.json"):
+            self.assertNotIn("Synthetic statement.", path.read_text())
+        self.assertEqual(provider._successful_results, [])
+
+    def test_complete_package_publish_crash_recovers_without_provider_call(
+        self,
+    ) -> None:
+        representation, service = self.build_service(blocks=83)
+        audit_root = self.root / "audits"
+        store_path = self.root / "atomic.jsonl"
+        handoff = ExternalAgentSemanticHandoffService(
+            service, JsonlAtomicInformationStore(store_path), audit_root
+        )
+        provider = CodexCliRepresentationAnalysisProvider(
+            provider_version="0.147.0", runner=FakeRunner()
+        )
+        with (
+            patch.object(
+                ExternalAgentSemanticHandoffService,
+                "_persist_audits",
+                side_effect=OSError("synthetic pre-audit crash"),
+            ),
+            self.assertRaises(OSError),
+        ):
+            handoff.execute(
+                representation.representation_id,
+                provider,
+                privacy_binding=self.privacy_binding(),
+                new_call_authority=3,
+            )
+        package = self.root / "information" / representation.representation_id
+        self.assertTrue(package.is_dir())
+        self.assertFalse(store_path.exists())
+        self.assertEqual(len(provider.execution_records), 3)
+
+        replay_runner = FakeRunner()
+        replay = handoff.execute(
+            representation.representation_id,
+            CodexCliRepresentationAnalysisProvider(
+                provider_version="0.147.0", runner=replay_runner
+            ),
+            privacy_binding=self.privacy_binding(),
+            new_call_authority=0,
+        )
+        self.assertEqual(replay_runner.calls, [])
+        self.assertTrue(replay.replayed_existing_package)
+        self.assertEqual(replay.ingestion.created, 83)
+
+    def test_historical_package_replay_ignores_absent_recovery_receipts(self) -> None:
+        representation, service = self.build_service(blocks=2)
+        audit_root = self.root / "audits"
+        handoff = ExternalAgentSemanticHandoffService(
+            service,
+            JsonlAtomicInformationStore(self.root / "atomic.jsonl"),
+            audit_root,
+        )
+        handoff.execute(
+            representation.representation_id,
+            CodexCliRepresentationAnalysisProvider(
+                provider_version="0.147.0", runner=FakeRunner()
+            ),
+        )
+        replay_runner = FakeRunner()
+        replay = handoff.execute(
+            representation.representation_id,
+            CodexCliRepresentationAnalysisProvider(
+                provider_version="0.147.0", runner=replay_runner
+            ),
+            privacy_binding=self.privacy_binding(),
+            new_call_authority=0,
+        )
+        self.assertTrue(replay.replayed_existing_package)
+        self.assertEqual(replay_runner.calls, [])
 
     def test_smaller_default_partition_is_deterministic_and_replays_published_batches(
         self,
