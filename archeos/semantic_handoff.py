@@ -3834,6 +3834,90 @@ _PROCESSING_AUDIT_DURABLE_STATES = frozenset(
 )
 
 
+@dataclass(frozen=True)
+class _ProcessingAuditFailureState:
+    """One execution state emitted by a versioned Provider adapter."""
+
+    result_presence: str
+    cleanup_status: str
+    exit_status: str
+    signal_status: str
+    timeout_status: str
+    provider_error_status: str
+    contract_coverage: bool = False
+
+
+def _versioned_processing_audit_failure_states(
+    protocol_version: str,
+) -> dict[str, tuple[_ProcessingAuditFailureState, ...]]:
+    """Freeze the reachable failure projections of historical producers."""
+
+    if protocol_version not in SUPPORTED_EXTERNAL_AGENT_PROTOCOL_VERSIONS:
+        raise SemanticHandoffError("Processing Run audit protocol 无法解释。")
+    contract_coverage = protocol_version in {
+        EXTERNAL_AGENT_PROTOCOL_V3_1,
+        EXTERNAL_AGENT_PROTOCOL_V3_2,
+        EXTERNAL_AGENT_PROTOCOL_V3_3,
+        EXTERNAL_AGENT_PROTOCOL_V3_4,
+    }
+    return {
+        "runtime_start_failure": (
+            _ProcessingAuditFailureState(
+                "absent", "not_started", "none", "none", "none", "none"
+            ),
+        ),
+        "timeout": (
+            _ProcessingAuditFailureState(
+                "either", "verified", "either", "either", "present", "present"
+            ),
+        ),
+        "runtime_nonzero_exit": (
+            _ProcessingAuditFailureState(
+                "either", "verified", "nonzero", "either", "either", "present"
+            ),
+        ),
+        "runtime_execution_failure": (
+            _ProcessingAuditFailureState(
+                "absent", "not_started", "none", "none", "none", "none"
+            ),
+            _ProcessingAuditFailureState(
+                "either", "verified", "either", "either", "either", "either"
+            ),
+        ),
+        "process_cleanup_failure": (
+            _ProcessingAuditFailureState(
+                "either", "failed", "either", "either", "either", "either"
+            ),
+        ),
+        "no_result": (
+            _ProcessingAuditFailureState(
+                "absent", "verified", "zero", "none", "none", "none"
+            ),
+        ),
+        "invalid_json": (
+            _ProcessingAuditFailureState(
+                "present", "verified", "zero", "none", "none", "none"
+            ),
+        ),
+        "result_binding_failure": (
+            _ProcessingAuditFailureState(
+                "present", "verified", "zero", "none", "none", "none"
+            ),
+        ),
+        "result_contract_failure": (
+            _ProcessingAuditFailureState(
+                "present",
+                "verified",
+                "zero",
+                "none",
+                "none",
+                "none",
+                contract_coverage=contract_coverage,
+            ),
+        ),
+    }
+
+
 def _versioned_processing_audit_shapes(
     protocol_version: str,
     *,
@@ -3936,87 +4020,120 @@ def _validate_processing_audit_diagnostics(
         and audit.get("result_size_bytes") != 0
         or audit.get("result_file_present") is False
         and audit.get("result_fingerprint") is not None
-        or audit.get("result_file_present") is True
-        and not _sha256_fingerprint(audit.get("result_fingerprint"))
         or isinstance(audit.get("exit_code"), int)
         and int(audit["exit_code"]) < 0
         and audit.get("termination_signal") != -int(audit["exit_code"])
     ):
         raise SemanticHandoffError("Processing Run audit diagnostics 损坏。")
 
-    if execution_succeeded:
-        if (
-            audit.get("exit_code") != 0
-            or audit.get("termination_signal") is not None
-            or audit.get("timeout_phase") is not None
-            or audit.get("provider_error_category") is not None
-            or audit.get("result_file_present") is not True
-            or not _audit_integer(audit, "result_size_bytes", positive=True)
-            or audit.get("process_cleanup_status") != "verified"
-        ):
-            raise SemanticHandoffError(
-                "Processing Run audit success diagnostics 损坏。"
-            )
-        return
-
-    category = audit.get("failure_category")
-    if category == "runtime_start_failure":
-        valid = (
-            audit.get("exit_code") is None
-            and audit.get("termination_signal") is None
-            and audit.get("timeout_phase") is None
-            and audit.get("provider_error_category") is None
-            and audit.get("result_file_present") is False
-            and audit.get("process_cleanup_status") == "not_started"
-        )
-    elif category == "timeout":
-        valid = (
-            audit.get("timeout_phase") is not None
-            and audit.get("process_cleanup_status") == "verified"
-        )
-    elif category == "runtime_nonzero_exit":
-        valid = (
-            isinstance(audit.get("exit_code"), int)
-            and not isinstance(audit.get("exit_code"), bool)
-            and audit.get("exit_code") != 0
-            and audit.get("process_cleanup_status") == "verified"
-        )
-    elif category == "process_cleanup_failure":
-        valid = audit.get("process_cleanup_status") == "failed"
-    elif category in {
-        "no_result",
-        "invalid_json",
-        "result_binding_failure",
-        "result_contract_failure",
-    }:
-        valid = (
-            audit.get("exit_code") == 0
-            and audit.get("termination_signal") is None
-            and audit.get("timeout_phase") is None
-            and audit.get("provider_error_category") is None
-            and audit.get("process_cleanup_status") == "verified"
-            and (
-                audit.get("result_file_present") is False
-                if category == "no_result"
-                else audit.get("result_file_present") is True
-            )
-        )
-    else:
-        valid = category == "runtime_execution_failure" and (
-            audit.get("process_cleanup_status") in {"not_started", "verified"}
-        )
-        if valid and audit.get("process_cleanup_status") == "not_started":
-            valid = (
-                audit.get("exit_code") is None
-                and audit.get("termination_signal") is None
-                and audit.get("timeout_phase") is None
-                and audit.get("provider_error_category") is None
-                and audit.get("result_file_present") is False
-            )
-    if not valid:
+    if execution_succeeded and (
+        audit.get("exit_code") != 0
+        or audit.get("termination_signal") is not None
+        or audit.get("timeout_phase") is not None
+        or audit.get("provider_error_category") is not None
+        or audit.get("result_file_present") is not True
+        or not _audit_integer(audit, "result_size_bytes", positive=True)
+        or audit.get("process_cleanup_status") != "verified"
+    ):
         raise SemanticHandoffError(
-            "Processing Run audit failure diagnostics 损坏。"
+            "Processing Run audit success diagnostics 损坏。"
         )
+
+
+def _audit_optional_state(value: object, expected: str) -> bool:
+    if expected == "either":
+        return True
+    if expected == "none":
+        return value is None
+    if expected == "present":
+        return value is not None
+    if expected == "zero":
+        return value == 0
+    if expected == "nonzero":
+        return isinstance(value, int) and not isinstance(value, bool) and value != 0
+    raise AssertionError(f"unknown audit state: {expected}")
+
+
+def _processing_audit_failure_state_matches(
+    audit: Mapping[str, object],
+    state: _ProcessingAuditFailureState,
+    *,
+    protocol_version: str,
+    has_diagnostics: bool,
+    has_contract_diagnostics: bool,
+    has_grouping_diagnostics: bool,
+) -> bool:
+    eligible = int(audit["eligible_units"])
+    covered = int(audit["covered_units"])
+    if state.contract_coverage:
+        coverage_valid = 0 <= covered <= eligible
+    else:
+        coverage_valid = covered == 0
+    if not coverage_valid or audit.get("unaccounted_units") != eligible - covered:
+        return False
+
+    if has_diagnostics:
+        result_present = audit.get("result_file_present")
+        if state.result_presence != "either" and result_present is not (
+            state.result_presence == "present"
+        ):
+            return False
+        if (
+            audit.get("process_cleanup_status") != state.cleanup_status
+            or not _audit_optional_state(audit.get("exit_code"), state.exit_status)
+            or not _audit_optional_state(
+                audit.get("termination_signal"), state.signal_status
+            )
+            or not _audit_optional_state(
+                audit.get("timeout_phase"), state.timeout_status
+            )
+            or not _audit_optional_state(
+                audit.get("provider_error_category"), state.provider_error_status
+            )
+        ):
+            return False
+        historical_result_fingerprint = protocol_version in {
+            EXTERNAL_AGENT_PROTOCOL_V1,
+            EXTERNAL_AGENT_PROTOCOL_V2,
+            EXTERNAL_AGENT_PROTOCOL_V3,
+        }
+        if historical_result_fingerprint:
+            if audit.get("result_fingerprint") is not None:
+                return False
+        elif result_present is True:
+            if not _sha256_fingerprint(audit.get("result_fingerprint")):
+                return False
+        elif audit.get("result_fingerprint") is not None:
+            return False
+    elif audit.get("result_fingerprint") is not None:
+        return False
+
+    count_fields = (
+        _COMPLETED_AUDIT_CONTRACT_DIAGNOSTIC_FIELDS - {"contract_failure_stage"}
+    )
+    if (
+        has_contract_diagnostics
+        and not state.contract_coverage
+        and any(audit.get(field) != 0 for field in count_fields)
+    ):
+        return False
+    if has_grouping_diagnostics:
+        if state.contract_coverage:
+            if (
+                int(audit["raw_record_count"])
+                < int(audit["projected_record_count"])
+                or int(audit["duplicate_exact_body_count"])
+                > int(audit["raw_record_count"])
+                or int(audit["grouping_collision_count"])
+                > int(audit["projected_record_count"])
+            ):
+                return False
+        elif any(
+            audit.get(field) != 0
+            for field in _COMPLETED_AUDIT_GROUPING_DIAGNOSTIC_FIELDS
+        ):
+            return False
+    return True
 
 
 def _validate_versioned_processing_run_audit(
@@ -4135,7 +4252,13 @@ def _validate_versioned_processing_run_audit(
             category not in _PROCESSING_AUDIT_FAILURE_CATEGORIES
             or audit.get("strict_validation_status") != "failed"
             or audit.get("result_readback_status") != "not_applicable"
-            or audit.get("package_published") is not False
+            or (
+                audit.get("package_published"),
+                audit.get("information_ingested"),
+                audit.get("durable_ingestion_status"),
+                audit.get("handoff_status"),
+            )
+            != (False, False, "ingestion_not_completed", "failed")
         ):
             raise SemanticHandoffError("Processing Run audit failure 状态损坏。")
         detail = audit.get("contract_failure_detail")
@@ -4161,6 +4284,21 @@ def _validate_versioned_processing_run_audit(
             raise SemanticHandoffError(
                 "Processing Run audit failure detail 损坏。"
             )
+        states = _versioned_processing_audit_failure_states(protocol)[category]
+        if not any(
+            _processing_audit_failure_state_matches(
+                audit,
+                state,
+                protocol_version=protocol,
+                has_diagnostics=has_diagnostics,
+                has_contract_diagnostics=has_contract_diagnostics,
+                has_grouping_diagnostics=has_grouping_diagnostics,
+            )
+            for state in states
+        ):
+            raise SemanticHandoffError(
+                "Processing Run audit failure projection 损坏。"
+            )
 
     if has_contract_diagnostics:
         count_fields = (
@@ -4170,12 +4308,6 @@ def _validate_versioned_processing_run_audit(
         if any(not _audit_integer(audit, field) for field in count_fields):
             raise SemanticHandoffError(
                 "Processing Run audit contract counts 损坏。"
-            )
-        if audit.get("failure_category") != "result_contract_failure" and any(
-            audit.get(field) != 0 for field in count_fields
-        ):
-            raise SemanticHandoffError(
-                "Processing Run audit contract counts 状态损坏。"
             )
     if has_grouping_diagnostics:
         if any(
@@ -4192,18 +4324,6 @@ def _validate_versioned_processing_run_audit(
         ):
             raise SemanticHandoffError(
                 "Processing Run audit success grouping 状态损坏。"
-            )
-        if (
-            not execution_succeeded
-            and
-            audit.get("failure_category") != "result_contract_failure"
-            and any(
-                audit.get(field) != 0
-                for field in _COMPLETED_AUDIT_GROUPING_DIAGNOSTIC_FIELDS
-            )
-        ):
-            raise SemanticHandoffError(
-                "Processing Run audit failure grouping 状态损坏。"
             )
     return audit
 
