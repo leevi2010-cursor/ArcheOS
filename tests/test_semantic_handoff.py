@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import inspect
 import json
 import os
@@ -43,6 +44,7 @@ from archeos.representation_information import (
     RepresentationResidueDraft,
     _analysis_batches,
     _canonical_fingerprint,
+    _contract_failure_diagnostics,
     _external_agent_request,
     _parse_external_agent_result,
     _units_from_representation,
@@ -133,10 +135,18 @@ class JsonAdapter:
 
 
 class FakeProcess:
-    def __init__(self, command, *, mode: str, calls: list[list[str]]):
+    def __init__(
+        self,
+        command,
+        *,
+        mode: str,
+        calls: list[list[str]],
+        accounting_refs: tuple[str, ...] | None = None,
+    ):
         self.command = list(command)
         self.mode = mode
         self.calls = calls
+        self.accounting_refs = accounting_refs
         self.pid = 99999999
         self.returncode: int | None = None
         calls.append(self.command)
@@ -600,6 +610,14 @@ class FakeProcess:
                         result["anchor_accounting"][0]["anchor_unit_id"] = (
                             "unit_" + "e" * 64
                         )
+                if self.accounting_refs is not None:
+                    result["anchor_accounting"] = [
+                        {
+                            "anchor_unit_id": anchor_id,
+                            "accounted_as": "candidate",
+                        }
+                        for anchor_id in self.accounting_refs
+                    ]
                 raw_result = json.dumps(result)
                 if self.mode == "accounting_duplicate_key" and is_v32:
                     key = json.dumps(anchor_ids[0])
@@ -5532,6 +5550,123 @@ class SemanticHandoffTest(unittest.TestCase):
                     provider,
                 )
                 self.assertEqual(grant["legacy_attempt_inventory_count"], 1)
+
+    def test_global_authority_inventory_accepts_genuine_v31_accounting_projections(
+        self,
+    ) -> None:
+        projections: set[tuple[int, int, int]] = set()
+        for name, symbolic_refs in (
+            ("empty", ()),
+            ("one-known", ("a",)),
+            ("one-unknown", ("u",)),
+            ("duplicate-known", ("a", "a")),
+            ("known-unknown", ("a", "u")),
+            ("duplicate-unknown", ("u", "u")),
+            ("distinct-unknown", ("u", "v")),
+            ("extra-known-duplicate", ("a", "b", "a")),
+            ("extra-known-triplicate", ("a", "a", "a")),
+            ("extra-one-unknown", ("a", "b", "u")),
+            ("extra-duplicate-unknown", ("a", "u", "u")),
+            ("extra-triplicate-unknown", ("u", "u", "u")),
+        ):
+            with self.subTest(name=name):
+                root = self.root / f"inventory-v31-raw-{name}"
+                (
+                    _representation,
+                    _service,
+                    handoff,
+                    provider,
+                    batch,
+                    audit_path,
+                ) = self.build_historical_inventory_audit(
+                    root,
+                    runner_mode="candidate_shape",
+                    blocks=2,
+                )
+                known_a, known_b = (
+                    unit.unit_id for unit in batch.anchor_units
+                )
+                unknown_u = "unit_" + "f" * 64
+                unknown_v = "unit_" + "e" * 64
+                references = {
+                    "a": known_a,
+                    "b": known_b,
+                    "u": unknown_u,
+                    "v": unknown_v,
+                }
+                accounting_refs = tuple(
+                    references[value] for value in symbolic_refs
+                )
+                schema = external_agent_representation_analysis_schema(
+                    EXTERNAL_AGENT_PROTOCOL_V3_1,
+                    batch=batch,
+                )
+                request, fingerprint = _external_agent_request(
+                    batch,
+                    protocol_version=EXTERNAL_AGENT_PROTOCOL_V3_1,
+                    result_schema=schema,
+                )
+                with tempfile.TemporaryDirectory() as directory:
+                    result_path = Path(directory) / "result.json"
+                    process = FakeProcess(
+                        ["codex", "--output-last-message", str(result_path)],
+                        mode="success",
+                        calls=[],
+                        accounting_refs=accounting_refs,
+                    )
+                    process.communicate(
+                        input="Request:\n" + json.dumps(request)
+                    )
+                    raw = result_path.read_text(encoding="utf-8")
+                with self.assertRaises(RepresentationInformationError) as raised:
+                    _parse_external_agent_result(
+                        raw,
+                        batch,
+                        fingerprint,
+                        expected_protocol_version=EXTERNAL_AGENT_PROTOCOL_V3_1,
+                    )
+                self.assertEqual(
+                    getattr(raised.exception, "detail", None),
+                    "anchor_coverage",
+                )
+                diagnostics = _contract_failure_diagnostics(
+                    raw,
+                    batch,
+                    "anchor_coverage",
+                )
+                projection = (
+                    int(diagnostics["accounting_item_count"]),
+                    int(diagnostics["unknown_anchor_ref_count"]),
+                    int(diagnostics["duplicate_accounting_count"]),
+                )
+                projections.add(projection)
+                if name == "duplicate-unknown":
+                    self.assertEqual(projection, (2, 2, 1))
+
+                audit = json.loads(audit_path.read_text(encoding="utf-8"))
+                covered_units = int(diagnostics.pop("covered_units"))
+                audit.update(
+                    protocol_version=EXTERNAL_AGENT_PROTOCOL_V3_1,
+                    input_fingerprint=fingerprint,
+                    contract_failure_detail="anchor_coverage",
+                    covered_units=covered_units,
+                    unaccounted_units=audit["eligible_units"] - covered_units,
+                    result_fingerprint=(
+                        "sha256:" + hashlib.sha256(raw.encode()).hexdigest()
+                    ),
+                    result_size_bytes=len(raw.encode()),
+                    diagnostic_schema_version="external-agent-diagnostics/2.0",
+                    **diagnostics,
+                )
+                for field in _GROUPING_DIAGNOSTIC_FIELDS:
+                    audit.pop(field)
+                audit_path.write_text(json.dumps(audit), encoding="utf-8")
+                grant = self.install_historical_inventory_authority(
+                    handoff,
+                    provider,
+                )
+                self.assertEqual(grant["legacy_attempt_inventory_count"], 1)
+        self.assertEqual(len(projections), 12)
 
     def test_global_authority_inventory_rejects_anchor_coverage_signal_drift(
         self,

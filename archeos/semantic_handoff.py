@@ -4294,8 +4294,6 @@ def _validate_processing_audit_count_projection(
                 or candidate_refs < candidate_items
                 or residue_refs < residue_items
                 or unknown > accounting_items
-                or duplicate_accounting
-                > max(accounting_items - unknown - 1, 0)
             )
         elif family == "legacy_map":
             coverage_signal_invalid = (
