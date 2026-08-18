@@ -421,6 +421,9 @@ class SyntheticSemanticGateTest(unittest.TestCase):
             ("missing_anchor_count", 1),
             ("raw_record_count", 1),
             ("raw_record_count", "invalid"),
+            ("stdout_bytes", 1),
+            ("stderr_bytes", 1),
+            ("result_size_bytes", 999999),
         )):
             with self.subTest(field=field):
                 provider = self.provider("shared_candidate")
@@ -457,6 +460,14 @@ class SyntheticSemanticGateTest(unittest.TestCase):
             (
                 {"result_readback_status": "not_applicable"},
                 {"stdout_sha256": "sha256:" + "1" * 64},
+                {"stdout_bytes": 1},
+                {"stderr_bytes": 1},
+                {"result_size_bytes": 999999},
+                {"result_file_present": False},
+                {"exit_code": 9},
+                {"termination_signal": 9},
+                {"provider_error_category": "unknown"},
+                {"process_cleanup_status": "failed"},
             )
         ):
             with self.subTest(changes=changes):
@@ -487,6 +498,94 @@ class SyntheticSemanticGateTest(unittest.TestCase):
                 self.assertEqual(run.receipt["technical_gate_status"], "unknown")
                 self.assertTrue(run.receipt_path.is_file())
                 self.assertEqual(self.read_run(run), run.receipt)
+
+    def test_coherent_record_and_observation_drift_is_outcome_unknown(self) -> None:
+        attacks = (
+            ({"covered_units": 1}, {"covered_units": 1}),
+            ({"raw_record_count": 1}, {"raw_record_count": 1}),
+            ({"stdout_bytes": 1}, {"stdout_bytes": 1}),
+            ({"stderr_bytes": 1}, {"stderr_bytes": 1}),
+            ({"result_size_bytes": 999999}, {"result_size_bytes": 999999}),
+            ({"result_file_present": False}, {"result_file_present": False}),
+            ({"exit_code": 9}, {"exit_code": 9}),
+            ({"termination_signal": 9}, {"termination_signal": 9}),
+            (
+                {"provider_error_category": "unknown"},
+                {"provider_error_category": "unknown"},
+            ),
+            (
+                {"process_cleanup_status": "failed"},
+                {"process_cleanup_status": "failed"},
+            ),
+        )
+        for index, (record_changes, observation_changes) in enumerate(attacks):
+            with self.subTest(record_changes=record_changes):
+                provider = self.provider("shared_candidate")
+                analyze = provider.analyze
+
+                def drift_both(
+                    batch,
+                    *,
+                    _analyze=analyze,
+                    _provider=provider,
+                    _record_changes=record_changes,
+                    _observation_changes=observation_changes,
+                ):
+                    result = _analyze(batch)
+                    _provider.execution_records[-1] = replace(
+                        _provider.execution_records[-1], **_record_changes
+                    )
+                    _provider.technical_observations[-1] = replace(
+                        _provider.technical_observations[-1],
+                        **_observation_changes,
+                    )
+                    return result
+
+                provider.analyze = drift_both  # type: ignore[method-assign]
+                run = self.execute_provider(
+                    provider, f"receipt-coherent-projection-drift-{index}"
+                )
+
+                self.assertEqual(provider.provider_start_count, 1)
+                self.assertEqual(run.receipt["provider_call_counted"], 1)
+                self.assertTrue(run.receipt["provider_outcome_unknown"])
+                self.assertEqual(run.receipt["technical_gate_status"], "unknown")
+                self.assertIsNone(run.receipt["stdout_bytes"])
+                self.assertIsNone(run.receipt["result_size_bytes"])
+                self.assertEqual(self.read_run(run), run.receipt)
+
+    def test_strict_success_accepts_exact_nonzero_stream_and_result_projection(
+        self,
+    ) -> None:
+        base_runner = FakeRunner("shared_candidate")
+
+        class NonzeroStreamProcess:
+            def __init__(self, process):
+                self._process = process
+                self.pid = process.pid
+
+            @property
+            def returncode(self):
+                return self._process.returncode
+
+            def communicate(self, *, input=None, timeout=None):
+                self._process.communicate(input=input, timeout=timeout)
+                return "safe synthetic stdout", "safe synthetic stderr"
+
+        provider = self.provider("shared_candidate")
+        provider.runner = lambda *args, **kwargs: NonzeroStreamProcess(
+            base_runner(*args, **kwargs)
+        )
+        run = self.execute_provider(provider, "receipt-nonzero-success")
+
+        self.assertEqual(provider.provider_start_count, 1)
+        self.assertEqual(run.receipt["technical_gate_status"], "passed")
+        self.assertGreater(run.receipt["stdout_bytes"], 0)
+        self.assertGreater(run.receipt["stderr_bytes"], 0)
+        self.assertGreater(run.receipt["result_size_bytes"], 0)
+        self.assertEqual(run.receipt["result_readback_status"], "verified")
+        self.assertEqual(self.read_run(run), run.receipt)
+        self.assert_private_content_free(run)
 
     def test_reader_requires_original_external_authority_and_fingerprint(self) -> None:
         _provider, run = self.execute("shared_candidate")

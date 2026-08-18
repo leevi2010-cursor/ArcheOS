@@ -922,9 +922,37 @@ class ExternalAgentTechnicalObservation:
     """Content-free, in-memory execution details for the synthetic Gate only."""
 
     processing_run_id: str
+    execution_status: str
+    failure_category: str | None
+    contract_failure_detail: str | None
+    strict_validation_status: str
+    covered_units: int
+    contract_failure_stage: str | None
+    candidate_item_count: int
+    residue_item_count: int
+    accounting_item_count: int
+    candidate_anchor_ref_count: int
+    residue_anchor_ref_count: int
+    duplicate_anchor_ref_count: int
+    duplicate_accounting_count: int
+    dual_assignment_count: int
+    missing_anchor_count: int
+    unknown_anchor_ref_count: int
+    raw_record_count: int
+    projected_record_count: int
+    duplicate_exact_body_count: int
+    grouping_collision_count: int
+    exit_code: int | None
+    termination_signal: int | None
+    provider_error_category: str | None
+    result_file_present: bool
+    result_size_bytes: int
+    stdout_bytes: int
+    stderr_bytes: int
     stdout_sha256: str
     stderr_sha256: str
     result_readback_status: str
+    process_cleanup_status: str
     diagnostic_persistence_status: str
 
 
@@ -1263,6 +1291,9 @@ class CodexCliRepresentationAnalysisProvider:
         )
         self.execution_records: list[ExternalAgentExecutionRecord] = []
         self.technical_observations: list[ExternalAgentTechnicalObservation] = []
+        self._immutable_technical_observations: list[
+            ExternalAgentTechnicalObservation
+        ] = []
         self._successful_results: list[_ExternalAgentSuccessfulResult] = []
         self._capture_successful_raw = False
         self.provider_start_count = 0
@@ -1326,14 +1357,12 @@ class CodexCliRepresentationAnalysisProvider:
                 process_cleanup_status="not_started",
             )
             self.execution_records.append(record)
-            self.technical_observations.append(
-                ExternalAgentTechnicalObservation(
-                    processing_run_id=record.processing_run_id,
-                    stdout_sha256=_stream_fingerprint(""),
-                    stderr_sha256=_stream_fingerprint(""),
-                    result_readback_status="not_applicable",
-                    diagnostic_persistence_status="preflight_failed",
-                )
+            self._append_technical_observation(
+                record,
+                stdout="",
+                stderr="",
+                result_readback_status="not_applicable",
+                diagnostic_persistence_status="preflight_failed",
             )
             raise RepresentationInformationError(
                 "External Agent 诊断目录不安全；未启动 Provider。"
@@ -1466,20 +1495,18 @@ class CodexCliRepresentationAnalysisProvider:
                     # limited to its approved allowlist.
                     _LOGGER.warning("External Agent 本机失败诊断材料写入失败")
                 self.execution_records.append(record)
-                self.technical_observations.append(
-                    ExternalAgentTechnicalObservation(
-                        processing_run_id=record.processing_run_id,
-                        stdout_sha256=_stream_fingerprint(outcome.stdout),
-                        stderr_sha256=_stream_fingerprint(outcome.stderr),
-                        result_readback_status=(
-                            "verified"
-                            if result_file_present and result_fingerprint is not None
-                            else "not_applicable"
-                        ),
-                        diagnostic_persistence_status=(
-                            "verified" if diagnostic_written else "failed"
-                        ),
-                    )
+                self._append_technical_observation(
+                    record,
+                    stdout=outcome.stdout,
+                    stderr=outcome.stderr,
+                    result_readback_status=(
+                        "verified"
+                        if result_file_present and result_fingerprint is not None
+                        else "not_applicable"
+                    ),
+                    diagnostic_persistence_status=(
+                        "verified" if diagnostic_written else "failed"
+                    ),
                 )
                 raise RepresentationInformationError(
                     "External Agent 未产生可验证的结构化结果；未发布信息包。"
@@ -1515,14 +1542,12 @@ class CodexCliRepresentationAnalysisProvider:
             process_cleanup_status=outcome.process_cleanup_status,
         )
         self.execution_records.append(success_record)
-        self.technical_observations.append(
-            ExternalAgentTechnicalObservation(
-                processing_run_id=success_record.processing_run_id,
-                stdout_sha256=_stream_fingerprint(outcome.stdout),
-                stderr_sha256=_stream_fingerprint(outcome.stderr),
-                result_readback_status="verified",
-                diagnostic_persistence_status="not_applicable",
-            )
+        self._append_technical_observation(
+            success_record,
+            stdout=outcome.stdout,
+            stderr=outcome.stderr,
+            result_readback_status="verified",
+            diagnostic_persistence_status="not_applicable",
         )
         if self._capture_successful_raw:
             self._successful_results.append(
@@ -1533,6 +1558,55 @@ class CodexCliRepresentationAnalysisProvider:
                 )
             )
         return result
+
+    def _append_technical_observation(
+        self,
+        record: ExternalAgentExecutionRecord,
+        *,
+        stdout: str,
+        stderr: str,
+        result_readback_status: str,
+        diagnostic_persistence_status: str,
+    ) -> None:
+        """Freeze the exact content-free execution projection at its trusted source."""
+
+        observation = ExternalAgentTechnicalObservation(
+            processing_run_id=record.processing_run_id,
+            execution_status=record.execution_status,
+            failure_category=record.failure_category,
+            contract_failure_detail=record.contract_failure_detail,
+            strict_validation_status=record.strict_validation_status,
+            covered_units=record.covered_units,
+            contract_failure_stage=record.contract_failure_stage,
+            candidate_item_count=record.candidate_item_count,
+            residue_item_count=record.residue_item_count,
+            accounting_item_count=record.accounting_item_count,
+            candidate_anchor_ref_count=record.candidate_anchor_ref_count,
+            residue_anchor_ref_count=record.residue_anchor_ref_count,
+            duplicate_anchor_ref_count=record.duplicate_anchor_ref_count,
+            duplicate_accounting_count=record.duplicate_accounting_count,
+            dual_assignment_count=record.dual_assignment_count,
+            missing_anchor_count=record.missing_anchor_count,
+            unknown_anchor_ref_count=record.unknown_anchor_ref_count,
+            raw_record_count=record.raw_record_count,
+            projected_record_count=record.projected_record_count,
+            duplicate_exact_body_count=record.duplicate_exact_body_count,
+            grouping_collision_count=record.grouping_collision_count,
+            exit_code=record.exit_code,
+            termination_signal=record.termination_signal,
+            provider_error_category=record.provider_error_category,
+            result_file_present=record.result_file_present,
+            result_size_bytes=record.result_size_bytes,
+            stdout_bytes=record.stdout_bytes,
+            stderr_bytes=record.stderr_bytes,
+            stdout_sha256=_stream_fingerprint(stdout),
+            stderr_sha256=_stream_fingerprint(stderr),
+            result_readback_status=result_readback_status,
+            process_cleanup_status=record.process_cleanup_status,
+            diagnostic_persistence_status=diagnostic_persistence_status,
+        )
+        self.technical_observations.append(observation)
+        self._immutable_technical_observations.append(observation)
 
     def _start_provider(self, *args: object, **kwargs: object) -> Any:
         """Count only a process that the configured production runner started."""

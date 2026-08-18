@@ -229,6 +229,9 @@ def execute_synthetic_semantic_gate(
     _prepare_receipt_root(root)
     before_records = len(provider.execution_records)
     before_observations = len(provider.technical_observations)
+    before_immutable_observations = len(
+        provider._immutable_technical_observations
+    )
     before_starts = provider.provider_start_count
     result: RepresentationAnalysisResult | None = None
     provider_exception = False
@@ -241,19 +244,33 @@ def execute_synthetic_semantic_gate(
 
     records = provider.execution_records[before_records:]
     observations = provider.technical_observations[before_observations:]
+    immutable_observations = provider._immutable_technical_observations[
+        before_immutable_observations:
+    ]
     start_delta = provider.provider_start_count - before_starts
     record = records[0] if len(records) == 1 else None
     observation = observations[0] if len(observations) == 1 else None
+    immutable_observation = (
+        immutable_observations[0] if len(immutable_observations) == 1 else None
+    )
     harness_failure: str | None = None
     if (
         len(records) > 1
         or len(observations) > 1
+        or len(immutable_observations) > 1
         or start_delta not in {0, 1}
         or (record is None) != (observation is None)
+        or (record is None) != (immutable_observation is None)
         or (
             record is not None
             and observation is not None
-            and record.processing_run_id != observation.processing_run_id
+            and immutable_observation is not None
+            and (
+                observation != immutable_observation
+                or not _record_matches_technical_observation(
+                    record, immutable_observation
+                )
+            )
         )
         or (
             record is not None
@@ -457,6 +474,54 @@ def _record_matches_expected_authority(
         and record.input_fingerprint == authority.input_fingerprint
         and record.diagnostic_schema_version == DIAGNOSTIC_SCHEMA_VERSION
         and record.deadline_ms == authority.deadline_ms
+    )
+
+
+def _record_matches_technical_observation(
+    record: ExternalAgentExecutionRecord,
+    observation: ExternalAgentTechnicalObservation,
+) -> bool:
+    """Require the record to match the adapter's immutable technical projection."""
+
+    readback_verified = (
+        record.result_file_present and record.result_fingerprint is not None
+    )
+    return (
+        record.processing_run_id == observation.processing_run_id
+        and record.execution_status == observation.execution_status
+        and record.failure_category == observation.failure_category
+        and record.contract_failure_detail == observation.contract_failure_detail
+        and record.strict_validation_status == observation.strict_validation_status
+        and record.covered_units == observation.covered_units
+        and record.contract_failure_stage == observation.contract_failure_stage
+        and record.candidate_item_count == observation.candidate_item_count
+        and record.residue_item_count == observation.residue_item_count
+        and record.accounting_item_count == observation.accounting_item_count
+        and record.candidate_anchor_ref_count
+        == observation.candidate_anchor_ref_count
+        and record.residue_anchor_ref_count == observation.residue_anchor_ref_count
+        and record.duplicate_anchor_ref_count
+        == observation.duplicate_anchor_ref_count
+        and record.duplicate_accounting_count
+        == observation.duplicate_accounting_count
+        and record.dual_assignment_count == observation.dual_assignment_count
+        and record.missing_anchor_count == observation.missing_anchor_count
+        and record.unknown_anchor_ref_count == observation.unknown_anchor_ref_count
+        and record.raw_record_count == observation.raw_record_count
+        and record.projected_record_count == observation.projected_record_count
+        and record.duplicate_exact_body_count
+        == observation.duplicate_exact_body_count
+        and record.grouping_collision_count == observation.grouping_collision_count
+        and record.exit_code == observation.exit_code
+        and record.termination_signal == observation.termination_signal
+        and record.provider_error_category == observation.provider_error_category
+        and record.result_file_present == observation.result_file_present
+        and record.result_size_bytes == observation.result_size_bytes
+        and record.stdout_bytes == observation.stdout_bytes
+        and record.stderr_bytes == observation.stderr_bytes
+        and record.process_cleanup_status == observation.process_cleanup_status
+        and observation.result_readback_status
+        == ("verified" if readback_verified else "not_applicable")
     )
 
 
