@@ -233,18 +233,20 @@ class SyntheticSemanticHandoff:
         self.failures_remaining = 0
         self.protocol_version = EXTERNAL_AGENT_PROTOCOL_V1
         self.profiled_v1 = False
+        self.reviewed_git_head = "6" * 40
+        self.installed_grant = None
+        self.campaign_binding = None
 
     def execute(
         self,
         representation_id: str,
         *,
         privacy_binding=None,
-        new_call_authority=None,
+        authority_binding=None,
     ):
         if privacy_binding is not None:
             assert privacy_binding.route == "approved"
-            assert isinstance(new_call_authority, int)
-            assert new_call_authority > 0
+            assert authority_binding is not None
         output_root = self.workspace / "02_processing" / "information"
         package = output_root / representation_id
         store = JsonlAtomicInformationStore(
@@ -281,6 +283,42 @@ class SyntheticSemanticHandoff:
         ingestion = ingest_processing_package(package, store)
         self._write_success_audits(package, representation_id)
         return SimpleNamespace(ingestion=ingestion)
+
+    def install_global_authority(
+        self,
+        *,
+        authority_ref,
+        expected_total,
+        max_new,
+        absolute_cap,
+        window_binding,
+    ):
+        assert authority_ref.startswith("sha256:")
+        assert (expected_total, max_new, absolute_cap) == (80, 20, 100)
+        expected = {
+            "authority_ref": authority_ref,
+            "baseline_total": 80,
+            "max_new": 20,
+            "absolute_cap": 100,
+            "global_authority_fingerprint": "sha256:" + "5" * 64,
+        }
+        if self.installed_grant is not None and self.installed_grant != expected:
+            raise RuntimeError("synthetic authority drift")
+        self.installed_grant = expected
+        self.campaign_binding = SimpleNamespace(
+            created_at=window_binding.campaign_created_at,
+            lower_cursor=window_binding.campaign_lower_cursor,
+            frozen_global_upper_cursor=(
+                window_binding.frozen_global_upper_cursor
+            ),
+            capture_provider_version=window_binding.capture_provider_version,
+            semantic_batch_size=window_binding.semantic_batch_size,
+            reviewed_git_head=window_binding.reviewed_git_head,
+        )
+        return expected
+
+    def global_campaign_binding(self):
+        return self.campaign_binding
 
     def _write_success_audits(
         self, package: Path, representation_id: str
@@ -1855,6 +1893,40 @@ class WechatDigestTests(unittest.TestCase):
         provider_calls = self.semantic.provider.calls
         with self.assertRaisesRegex(WechatDigestError, "边界|receipt"):
             service.run()
+        self.assertEqual(self.semantic.provider.calls, provider_calls)
+
+    def test_global_semantic_authority_binds_active_all_history_plan(self) -> None:
+        capture = SyntheticCaptureProvider([message(1)])
+        self.semantic.failures_remaining = 1
+        service = self.service(capture)
+        with self.assertRaises(WechatDigestError):
+            service.run(all_history=True)
+        provider_calls = self.semantic.provider.calls
+        grant = service.install_semantic_authority(
+            authority_ref="sha256:" + "a" * 64,
+            expected_total=80,
+            max_new=20,
+            absolute_cap=100,
+        )
+        self.assertEqual(grant["baseline_total"], 80)
+        self.assertEqual(grant["max_new"], 20)
+        self.assertEqual(self.semantic.provider.calls, provider_calls)
+        self.assertEqual(
+            service.install_semantic_authority(
+                authority_ref="sha256:" + "a" * 64,
+                expected_total=80,
+                max_new=20,
+                absolute_cap=100,
+            ),
+            grant,
+        )
+        with self.assertRaises(RuntimeError):
+            service.install_semantic_authority(
+                authority_ref="sha256:" + "b" * 64,
+                expected_total=80,
+                max_new=20,
+                absolute_cap=100,
+            )
         self.assertEqual(self.semantic.provider.calls, provider_calls)
 
     def test_upgrade_rejects_tampered_legacy_binding_before_any_write(self) -> None:

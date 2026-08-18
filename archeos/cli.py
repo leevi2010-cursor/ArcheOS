@@ -547,7 +547,7 @@ def build_parser() -> argparse.ArgumentParser:
     wechat_digest.add_argument("--wechat-config", type=Path)
     wechat_digest.add_argument("--codex-bin", default="codex")
     wechat_digest.add_argument("--provider-version")
-    wechat_digest.add_argument("--timeout-seconds", type=float, default=120.0)
+    wechat_digest.add_argument("--timeout-seconds", type=float, default=300.0)
     wechat_digest.add_argument("--model", default=DEFAULT_SEMANTIC_MODEL)
     wechat_digest.add_argument(
         "--reasoning-effort", default=DEFAULT_SEMANTIC_REASONING_EFFORT
@@ -570,6 +570,15 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="零 Provider 为当前 active v2 全历史运行冻结全局上界。",
     )
+    wechat_digest.add_argument(
+        "--install-semantic-authority",
+        action="store_true",
+        help="零 Provider 安装一次性 frozen-global-upper Semantic 调用授权。",
+    )
+    wechat_digest.add_argument("--expected-total", type=int)
+    wechat_digest.add_argument("--max-new", type=int)
+    wechat_digest.add_argument("--absolute-cap", type=int)
+    wechat_digest.add_argument("--authority-ref")
     return parser
 
 
@@ -973,6 +982,7 @@ def _wechat_product_command(args: argparse.Namespace) -> int:
             args.prepare_next_semantic,
             args.upgrade_active_v1,
             args.upgrade_active_v2_all_history,
+            args.install_semantic_authority,
         )
     )
     if maintenance_count > 1 or (
@@ -980,6 +990,26 @@ def _wechat_product_command(args: argparse.Namespace) -> int:
         and any((args.since is not None, args.from_now, args.all_history))
     ):
         print("error: 恢复维护入口不能与首次起点或其他维护入口同时使用。")
+        return 2
+    authority_values = (
+        args.expected_total,
+        args.max_new,
+        args.absolute_cap,
+        args.authority_ref,
+    )
+    if args.install_semantic_authority:
+        if any(value is None for value in authority_values):
+            print("error: 安装 Semantic authority 必须完整指定总账、增量、上限和授权引用。")
+            return 2
+        if (args.expected_total, args.max_new, args.absolute_cap) != (
+            80,
+            20,
+            100,
+        ):
+            print("error: Semantic authority 必须严格使用 80 + 20 = 100。")
+            return 2
+    elif any(value is not None for value in authority_values):
+        print("error: Semantic authority 参数只能与安装入口一起使用。")
         return 2
     try:
         workspace = require_workspace(args.config).workspace
@@ -1049,6 +1079,29 @@ def _wechat_product_command(args: argparse.Namespace) -> int:
                         "semantic_provider_calls": 0,
                     },
                     ensure_ascii=False,
+                )
+            )
+            return 0
+        if args.install_semantic_authority:
+            grant = service.install_semantic_authority(
+                authority_ref=args.authority_ref,
+                expected_total=args.expected_total,
+                max_new=args.max_new,
+                absolute_cap=args.absolute_cap,
+            )
+            print(
+                json.dumps(
+                    {
+                        "semantic_provider_calls": 0,
+                        "baseline_total": grant["baseline_total"],
+                        "max_new": grant["max_new"],
+                        "absolute_cap": grant["absolute_cap"],
+                        "global_authority_fingerprint": grant[
+                            "global_authority_fingerprint"
+                        ],
+                    },
+                    ensure_ascii=False,
+                    indent=2,
                 )
             )
             return 0
