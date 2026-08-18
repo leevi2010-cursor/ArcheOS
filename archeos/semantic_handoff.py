@@ -26,6 +26,7 @@ from .representation_information import (
     EXTERNAL_AGENT_PROTOCOL_V2,
     EXTERNAL_AGENT_PROTOCOL_V3,
     EXTERNAL_AGENT_PROTOCOL_V3_1,
+    EXTERNAL_AGENT_PROTOCOL_V3_2,
     EXTERNAL_AGENT_PROTOCOL_VERSION,
     EXTERNAL_AGENT_ROUTE,
     SUPPORTED_EXTERNAL_AGENT_PROTOCOL_VERSIONS,
@@ -77,13 +78,14 @@ class SemanticRecoveryPreflight:
     replayable_batches: int
     required_new_calls: int
     conservatively_counted_attempts: int
+    historical_counted_attempts: int = 0
 
 
 _RECOVERY_RUN_SCHEMA = "semantic-handoff-run-receipt/2.0"
 _RECOVERY_ATTEMPT_SCHEMA = "semantic-handoff-attempt-receipt/2.0"
 _RECOVERY_RESULT_SCHEMA = "semantic-handoff-batch-result-receipt/2.0"
 _RECOVERY_RESULT_PHASE_SCHEMA = "semantic-handoff-batch-result-phase/1.0"
-_LOCAL_VALIDATOR_CONTRACT_VERSION = "external-agent-local-validator/3.1"
+_LOCAL_VALIDATOR_CONTRACT_VERSION = "external-agent-local-validator/3.2"
 _EXECUTION_RECORD_FIELDS = frozenset(
     ExternalAgentExecutionRecord.__dataclass_fields__
 )
@@ -452,20 +454,11 @@ class _SemanticRecoveryRun:
         )
         if not self.batches:
             raise SemanticHandoffError("Semantic recovery 没有可执行的 canonical batch。")
-        self.semantic_run_id = "semantic_run_" + hashlib.sha256(
-            representation_id.encode("utf-8")
-        ).hexdigest()[:32]
-        self.run_dir = self.audit_root / self.semantic_run_id
-        self.attempts_dir = self.run_dir / "attempts"
-        self.results_dir = self.run_dir / "results"
         self.batch_contracts = tuple(
             self._batch_contract(batch, ordinal)
             for ordinal, batch in enumerate(self.batches, start=1)
         )
-        receipt_without_fingerprint: dict[str, object] = {
-            "schema_version": _RECOVERY_RUN_SCHEMA,
-            "artifact_kind": "semantic_handoff_recovery_run",
-            "semantic_run_id": self.semantic_run_id,
+        execution_identity: dict[str, object] = {
             "source": {
                 "source_id": representation.source_id,
                 "content_hash": representation.source_content_hash,
@@ -504,6 +497,23 @@ class _SemanticRecoveryRun:
                 _LOCAL_VALIDATOR_CONTRACT_VERSION
             ),
             "batches": [contract["receipt"] for contract in self.batch_contracts],
+        }
+        self.execution_identity_fingerprint = _fingerprint(execution_identity)
+        self.semantic_run_id = (
+            "semantic_run_"
+            + self.execution_identity_fingerprint.removeprefix("sha256:")[:32]
+        )
+        self.run_dir = self.audit_root / self.semantic_run_id
+        self.attempts_dir = self.run_dir / "attempts"
+        self.results_dir = self.run_dir / "results"
+        receipt_without_fingerprint: dict[str, object] = {
+            "schema_version": _RECOVERY_RUN_SCHEMA,
+            "artifact_kind": "semantic_handoff_recovery_run",
+            "semantic_run_id": self.semantic_run_id,
+            "execution_identity_fingerprint": (
+                self.execution_identity_fingerprint
+            ),
+            **execution_identity,
         }
         self.contract_fingerprint = _fingerprint(receipt_without_fingerprint)
         run_receipt_without_fingerprint = {
@@ -736,6 +746,7 @@ class _SemanticRecoveryRun:
             self.audit_root, create=False
         ):
             return tuple(None for _ in self.batches), 0
+        self._reject_conflicting_v32_runs()
         if not self.exists:
             return tuple(None for _ in self.batches), 0
         self._validate_inventory()
@@ -779,6 +790,23 @@ class _SemanticRecoveryRun:
                 )
         return tuple(loaded), unknown
 
+    def _reject_conflicting_v32_runs(self) -> None:
+        for path in self.audit_root.glob("semantic_run_*"):
+            if path == self.run_dir:
+                continue
+            receipt = _private_json_exact(path / "run-receipt.json")
+            representation = receipt.get("representation")
+            if (
+                receipt.get("protocol_version")
+                == EXTERNAL_AGENT_PROTOCOL_V3_2
+                and isinstance(representation, dict)
+                and representation.get("representation_id")
+                == self.representation.representation_id
+            ):
+                raise SemanticHandoffError(
+                    "Semantic recovery execution identity 已漂移。"
+                )
+
     def preflight(self) -> SemanticRecoveryPreflight:
         loaded, unknown = self.inspect()
         replayable = sum(item is not None for item in loaded)
@@ -787,7 +815,186 @@ class _SemanticRecoveryRun:
             replayable_batches=replayable,
             required_new_calls=len(loaded) - replayable,
             conservatively_counted_attempts=unknown,
+            historical_counted_attempts=(
+                self._historical_v31_attempt_count()
+            ),
         )
+
+    def _historical_v31_attempt_count(self) -> int:
+        legacy_run_id = "semantic_run_" + hashlib.sha256(
+            self.representation.representation_id.encode("utf-8")
+        ).hexdigest()[:32]
+        if legacy_run_id == self.semantic_run_id:
+            raise SemanticHandoffError("Semantic recovery protocol 路径未隔离。")
+        legacy_run = self.audit_root / legacy_run_id
+        if not os.path.lexists(legacy_run):
+            return 0
+        _validate_shared_recovery_root(self.audit_root, create=False)
+        receipt = _private_json_exact(legacy_run / "run-receipt.json")
+        run_receipt_fingerprint = receipt.get("run_receipt_fingerprint")
+        receipt_without_run_fingerprint = dict(receipt)
+        receipt_without_run_fingerprint.pop("run_receipt_fingerprint", None)
+        contract_fingerprint = receipt.get("contract_fingerprint")
+        receipt_without_contract = dict(receipt_without_run_fingerprint)
+        receipt_without_contract.pop("contract_fingerprint", None)
+        representation = receipt.get("representation")
+        expected_representation = {
+            "representation_id": self.representation.representation_id,
+            "manifest_fingerprint": _fingerprint(
+                self.representation.to_manifest_dict()
+            ),
+            "artifacts": [
+                {
+                    "artifact_id": artifact.artifact_id,
+                    "content_hash": artifact.content_hash,
+                }
+                for artifact in self.representation.artifacts
+            ],
+        }
+        expected_source = {
+            "source_id": self.representation.source_id,
+            "content_hash": self.representation.source_content_hash,
+        }
+        if (
+            set(receipt)
+            != {
+                "schema_version",
+                "artifact_kind",
+                "semantic_run_id",
+                "source",
+                "representation",
+                "privacy",
+                "protocol_version",
+                "provider_route",
+                "provider",
+                "execution_deadline_ms",
+                "semantic_batch_size",
+                "ordered_eligible_unit_ids",
+                "prompt_template_fingerprint",
+                "local_validator_contract_version",
+                "batches",
+                "contract_fingerprint",
+                "run_receipt_fingerprint",
+            }
+            or receipt.get("schema_version") != _RECOVERY_RUN_SCHEMA
+            or receipt.get("artifact_kind")
+            != "semantic_handoff_recovery_run"
+            or receipt.get("semantic_run_id") != legacy_run_id
+            or receipt.get("protocol_version")
+            != EXTERNAL_AGENT_PROTOCOL_V3_1
+            or receipt.get("local_validator_contract_version")
+            != "external-agent-local-validator/3.1"
+            or receipt.get("source") != expected_source
+            or representation != expected_representation
+            or contract_fingerprint != _fingerprint(receipt_without_contract)
+            or run_receipt_fingerprint
+            != _fingerprint(receipt_without_run_fingerprint)
+        ):
+            raise SemanticHandoffError("历史 v3.1 recovery binding 损坏。")
+        batches = receipt.get("batches")
+        if not isinstance(batches, list):
+            raise SemanticHandoffError("历史 v3.1 recovery batch binding 损坏。")
+        by_ordinal: dict[int, dict[str, object]] = {}
+        for value in batches:
+            if not isinstance(value, dict):
+                raise SemanticHandoffError(
+                    "历史 v3.1 recovery batch binding 损坏。"
+                )
+            ordinal = value.get("ordinal")
+            without_fingerprint = dict(value)
+            batch_fingerprint = without_fingerprint.pop(
+                "batch_contract_fingerprint", None
+            )
+            if (
+                set(value)
+                != {
+                    "ordinal",
+                    "total",
+                    "anchor_unit_ids",
+                    "context_support_unit_ids",
+                    "input_fingerprint",
+                    "result_schema_fingerprint",
+                    "batch_contract_fingerprint",
+                }
+                or isinstance(ordinal, bool)
+                or not isinstance(ordinal, int)
+                or ordinal < 1
+                or ordinal in by_ordinal
+                or value.get("total") != len(batches)
+                or not isinstance(value.get("anchor_unit_ids"), list)
+                or not isinstance(value.get("context_support_unit_ids"), list)
+                or any(
+                    not isinstance(unit_id, str)
+                    for unit_id in (
+                        *value.get("anchor_unit_ids", []),
+                        *value.get("context_support_unit_ids", []),
+                    )
+                )
+                or not _sha256_fingerprint(value.get("input_fingerprint"))
+                or not _sha256_fingerprint(
+                    value.get("result_schema_fingerprint")
+                )
+                or batch_fingerprint != _fingerprint(without_fingerprint)
+            ):
+                raise SemanticHandoffError(
+                    "历史 v3.1 recovery batch binding 损坏。"
+                )
+            by_ordinal[ordinal] = value
+        if set(by_ordinal) != set(range(1, len(batches) + 1)):
+            raise SemanticHandoffError("历史 v3.1 recovery batch binding 损坏。")
+        attempts_dir = legacy_run / "attempts"
+        if not os.path.lexists(attempts_dir):
+            return 0
+        count = 0
+        for path in sorted(attempts_dir.iterdir()):
+            attempt = _private_json_exact(path)
+            match = re.fullmatch(r"batch_(\d{4})\.json", path.name)
+            ordinal = int(match.group(1)) if match else 0
+            batch_receipt = by_ordinal.get(ordinal)
+            nonce = attempt.get("attempt_nonce")
+            attempt_without_fingerprint = dict(attempt)
+            attempt_fingerprint = attempt_without_fingerprint.pop(
+                "attempt_receipt_fingerprint", None
+            )
+            if (
+                batch_receipt is None
+                or set(attempt)
+                != {
+                    "schema_version",
+                    "artifact_kind",
+                    "attempt_id",
+                    "attempt_nonce",
+                    "semantic_run_id",
+                    "run_contract_fingerprint",
+                    "batch_ordinal",
+                    "batch_contract_fingerprint",
+                    "input_fingerprint",
+                    "state",
+                    "attempt_receipt_fingerprint",
+                }
+                or attempt.get("schema_version") != _RECOVERY_ATTEMPT_SCHEMA
+                or attempt.get("artifact_kind") != "semantic_handoff_attempt"
+                or attempt.get("attempt_id")
+                != "attempt_"
+                + hashlib.sha256(
+                    f"{legacy_run_id}:{ordinal}:{nonce}".encode()
+                ).hexdigest()[:32]
+                or not isinstance(nonce, str)
+                or re.fullmatch(r"[0-9a-f]{64}", nonce) is None
+                or attempt.get("semantic_run_id") != legacy_run_id
+                or attempt.get("run_contract_fingerprint")
+                != contract_fingerprint
+                or attempt.get("batch_ordinal") != ordinal
+                or attempt.get("batch_contract_fingerprint")
+                != batch_receipt["batch_contract_fingerprint"]
+                or attempt.get("input_fingerprint")
+                != batch_receipt["input_fingerprint"]
+                or attempt.get("state") != "started"
+                or attempt_fingerprint != _fingerprint(attempt_without_fingerprint)
+            ):
+                raise SemanticHandoffError("历史 v3.1 recovery attempt 损坏。")
+            count += 1
+        return count
 
     def _converge_result(
         self,
@@ -1448,7 +1655,8 @@ def _versioned_audit_contract(
             current_provider_version,
         )
     if (
-        protocol_version == EXTERNAL_AGENT_PROTOCOL_V3_1
+        protocol_version
+        in {EXTERNAL_AGENT_PROTOCOL_V3_1, EXTERNAL_AGENT_PROTOCOL_V3_2}
         and package_provider != _provider_manifest(provider)
     ):
         raise SemanticHandoffError(
@@ -1480,7 +1688,10 @@ def _versioned_audit_contract(
     }:
         shapes = frozenset({frozenset(_COMPLETED_AUDIT_BASE_FIELDS)})
         diagnostic_version = DIAGNOSTIC_SCHEMA_V1
-    elif protocol_version == EXTERNAL_AGENT_PROTOCOL_V3_1:
+    elif protocol_version in {
+        EXTERNAL_AGENT_PROTOCOL_V3_1,
+        EXTERNAL_AGENT_PROTOCOL_V3_2,
+    }:
         shapes = frozenset(
             {
                 frozenset(

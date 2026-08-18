@@ -21,6 +21,7 @@ from archeos.representation_information import (
     EXTERNAL_AGENT_PROTOCOL_V2,
     EXTERNAL_AGENT_PROTOCOL_V3,
     EXTERNAL_AGENT_PROTOCOL_V3_1,
+    EXTERNAL_AGENT_PROTOCOL_V3_2,
     RepresentationAnalysisResult,
     RepresentationCandidateDraft,
     RepresentationInformationService,
@@ -332,7 +333,11 @@ class SyntheticSemanticHandoff:
                 "unaccounted_units": 0,
                 "diagnostic_schema_version": (
                     "external-agent-diagnostics/2.0"
-                    if self.protocol_version == EXTERNAL_AGENT_PROTOCOL_V3_1
+                    if self.protocol_version
+                    in {
+                        EXTERNAL_AGENT_PROTOCOL_V3_1,
+                        EXTERNAL_AGENT_PROTOCOL_V3_2,
+                    }
                     else "external-agent-diagnostics/1.0"
                 ),
                 "elapsed_ms": 1000,
@@ -365,7 +370,10 @@ class SyntheticSemanticHandoff:
                         "fallback_policy": "none",
                     }
                 )
-            if self.protocol_version == EXTERNAL_AGENT_PROTOCOL_V3_1:
+            if self.protocol_version in {
+                EXTERNAL_AGENT_PROTOCOL_V3_1,
+                EXTERNAL_AGENT_PROTOCOL_V3_2,
+            }:
                 audit.update(
                     {
                         "contract_failure_stage": None,
@@ -1217,6 +1225,7 @@ class WechatDigestTests(unittest.TestCase):
             (EXTERNAL_AGENT_PROTOCOL_V2, False),
             (EXTERNAL_AGENT_PROTOCOL_V3, False),
             (EXTERNAL_AGENT_PROTOCOL_V3_1, False),
+            (EXTERNAL_AGENT_PROTOCOL_V3_2, False),
         )
         for index, (protocol_version, profiled_v1) in enumerate(protocols):
             with self.subTest(protocol=protocol_version):

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import inspect
 import json
 import os
@@ -28,6 +29,7 @@ from archeos.representation_information import (
     EXTERNAL_AGENT_PROTOCOL_V2,
     EXTERNAL_AGENT_PROTOCOL_V3,
     EXTERNAL_AGENT_PROTOCOL_V3_1,
+    EXTERNAL_AGENT_PROTOCOL_V3_2,
     EXTERNAL_AGENT_PROTOCOL_VERSION,
     CodexCliRepresentationAnalysisProvider,
     RepresentationAnalysisBatch,
@@ -40,6 +42,7 @@ from archeos.representation_information import (
     _analysis_batches,
     _canonical_fingerprint,
     _external_agent_request,
+    _parse_external_agent_result,
     _units_from_representation,
     external_agent_representation_analysis_schema,
     validate_representation_information_package,
@@ -145,17 +148,29 @@ class FakeProcess:
             self.command[self.command.index("--output-last-message") + 1]
         )
         if self.mode != "no_result":
-            is_v3 = request["protocol_version"] == EXTERNAL_AGENT_PROTOCOL_VERSION
+            is_v3 = request["protocol_version"] in {
+                EXTERNAL_AGENT_PROTOCOL_V3,
+                EXTERNAL_AGENT_PROTOCOL_V3_1,
+                EXTERNAL_AGENT_PROTOCOL_V3_2,
+            }
+            is_v32 = (
+                request["protocol_version"] == EXTERNAL_AGENT_PROTOCOL_V3_2
+            )
+            anchor_ids = [unit["unit_id"] for unit in request["anchor_units"]]
             result = {
                 "protocol_version": request["protocol_version"],
                 "input_fingerprint": request["input_fingerprint"],
-                "anchor_accounting": [
-                    {
-                        "anchor_unit_id": unit["unit_id"],
-                        "accounted_as": "candidate",
-                    }
-                    for unit in request["anchor_units"]
-                ],
+                "anchor_accounting": (
+                    {unit_id: "candidate" for unit_id in anchor_ids}
+                    if is_v32
+                    else [
+                        {
+                            "anchor_unit_id": unit_id,
+                            "accounted_as": "candidate",
+                        }
+                        for unit_id in anchor_ids
+                    ]
+                ),
                 "candidates": [
                     {
                         "statement": "Synthetic statement.",
@@ -176,6 +191,13 @@ class FakeProcess:
                 ],
                 "residue": [],
             }
+
+            def set_accounting(index: int, value: str) -> None:
+                if is_v32:
+                    result["anchor_accounting"][anchor_ids[index]] = value
+                else:
+                    result["anchor_accounting"][index]["accounted_as"] = value
+
             if self.mode == "invalid_json":
                 result_path.write_text("{synthetic", encoding="utf-8")
             else:
@@ -212,6 +234,14 @@ class FakeProcess:
                     ]
                 elif self.mode == "anchor_uncovered":
                     result["candidates"] = []
+                elif self.mode == "dual_assignment":
+                    result["residue"] = [
+                        {
+                            "anchor_unit_ids": [anchor_ids[0]],
+                            "reason_not_absorbed": "Synthetic conflict.",
+                            "future_value_or_uncertainty": "Synthetic uncertainty.",
+                        }
+                    ]
                 elif self.mode == "all_residue":
                     result["candidates"] = []
                     result["residue"] = [
@@ -226,8 +256,8 @@ class FakeProcess:
                         }
                         for unit in request["anchor_units"]
                     ]
-                    for item in result["anchor_accounting"]:
-                        item["accounted_as"] = "residue"
+                    for index in range(len(anchor_ids)):
+                        set_accounting(index, "residue")
                 elif self.mode == "mixed":
                     midpoint = len(request["anchor_units"]) // 2
                     result["candidates"] = result["candidates"][:midpoint]
@@ -239,8 +269,8 @@ class FakeProcess:
                         }
                         for unit in request["anchor_units"][midpoint:]
                     ]
-                    for item in result["anchor_accounting"][midpoint:]:
-                        item["accounted_as"] = "residue"
+                    for index in range(midpoint, len(anchor_ids)):
+                        set_accounting(index, "residue")
                 elif self.mode == "coverage_summary":
                     anchors = request["anchor_units"]
                     result["candidates"] = result["candidates"][:20]
@@ -258,9 +288,12 @@ class FakeProcess:
                         }
                         for unit in anchors[19:35]
                     ]
-                    result["anchor_accounting"][-1]["anchor_unit_id"] = anchors[0][
-                        "unit_id"
-                    ]
+                    if is_v32:
+                        result["anchor_accounting"].pop(anchor_ids[-1])
+                    else:
+                        result["anchor_accounting"][-1]["anchor_unit_id"] = (
+                            anchors[0]["unit_id"]
+                        )
                 elif self.mode == "candidate_no_anchor":
                     result["candidates"][0]["anchor_unit_ids"] = []
                 elif self.mode == "candidate_duplicate_anchor":
@@ -269,6 +302,13 @@ class FakeProcess:
                         anchor_id,
                         anchor_id,
                     ]
+                elif self.mode == "same_anchor_multiple_candidates":
+                    result["candidates"].append(
+                        {
+                            **result["candidates"][0],
+                            "statement": "Second synthetic statement.",
+                        }
+                    )
                 elif self.mode == "candidate_context_as_anchor":
                     result["candidates"][0]["anchor_unit_ids"] = [
                         request["context_support_units"][0]["unit_id"]
@@ -295,20 +335,47 @@ class FakeProcess:
                             "future_value_or_uncertainty": "Synthetic future value.",
                         }
                     ]
-                    result["anchor_accounting"][0]["accounted_as"] = "residue"
+                    set_accounting(0, "residue")
                 elif self.mode == "accounting_missing_anchor":
-                    result["anchor_accounting"] = []
+                    if is_v32:
+                        result["anchor_accounting"].pop(anchor_ids[-1])
+                    else:
+                        result["anchor_accounting"] = []
+                elif self.mode == "accounting_extra_anchor":
+                    if is_v32:
+                        result["anchor_accounting"]["unit_" + "f" * 64] = (
+                            "candidate"
+                        )
                 elif self.mode == "accounting_unknown_anchor":
-                    result["anchor_accounting"][0]["anchor_unit_id"] = (
-                        "unit_" + "f" * 64
-                    )
+                    if is_v32:
+                        value = result["anchor_accounting"].pop(anchor_ids[0])
+                        result["anchor_accounting"]["unit_" + "f" * 64] = value
+                    else:
+                        result["anchor_accounting"][0]["anchor_unit_id"] = (
+                            "unit_" + "f" * 64
+                        )
                 elif self.mode == "accounting_wrong_outcome":
-                    result["anchor_accounting"][0]["accounted_as"] = "residue"
+                    set_accounting(0, "residue")
+                elif self.mode == "accounting_wrong_enum":
+                    set_accounting(0, "unsupported")
                 elif self.mode == "accounting_context_only":
-                    result["anchor_accounting"][0]["anchor_unit_id"] = (
-                        "unit_" + "e" * 64
+                    if is_v32:
+                        value = result["anchor_accounting"].pop(anchor_ids[0])
+                        result["anchor_accounting"]["unit_" + "e" * 64] = value
+                    else:
+                        result["anchor_accounting"][0]["anchor_unit_id"] = (
+                            "unit_" + "e" * 64
+                        )
+                raw_result = json.dumps(result)
+                if self.mode == "accounting_duplicate_key" and is_v32:
+                    key = json.dumps(anchor_ids[0])
+                    value = json.dumps(result["anchor_accounting"][anchor_ids[0]])
+                    marker = f'"anchor_accounting": {{{key}: {value}'
+                    replacement = (
+                        f'"anchor_accounting": {{{key}: {value}, {key}: {value}'
                     )
-                result_path.write_text(json.dumps(result), encoding="utf-8")
+                    raw_result = raw_result.replace(marker, replacement, 1)
+                result_path.write_text(raw_result, encoding="utf-8")
         self.returncode = 0
         return "", ""
 
@@ -475,8 +542,15 @@ class SemanticHandoffTest(unittest.TestCase):
 
     def test_v31_fingerprint_binds_the_exact_dynamic_schema(self) -> None:
         batch = RepresentationAnalysisBatch(self.units(40), self.units(3, start=101))
-        schema = external_agent_representation_analysis_schema(batch=batch)
-        request, fingerprint = _external_agent_request(batch, result_schema=schema)
+        schema = external_agent_representation_analysis_schema(
+            EXTERNAL_AGENT_PROTOCOL_V3_1,
+            batch=batch,
+        )
+        request, fingerprint = _external_agent_request(
+            batch,
+            protocol_version=EXTERNAL_AGENT_PROTOCOL_V3_1,
+            result_schema=schema,
+        )
         self.assertEqual(
             request["result_schema_fingerprint"],
             _canonical_fingerprint(schema),
@@ -485,6 +559,7 @@ class SemanticHandoffTest(unittest.TestCase):
         changed["properties"]["anchor_accounting"]["maxItems"] = 39
         changed_request, changed_fingerprint = _external_agent_request(
             batch,
+            protocol_version=EXTERNAL_AGENT_PROTOCOL_V3_1,
             result_schema=changed,
         )
         self.assertNotEqual(fingerprint, changed_fingerprint)
@@ -495,7 +570,10 @@ class SemanticHandoffTest(unittest.TestCase):
 
     def test_v31_schema_exactly_bounds_a_40_anchor_batch(self) -> None:
         batch = RepresentationAnalysisBatch(self.units(40), self.units(3, start=101))
-        schema = external_agent_representation_analysis_schema(batch=batch)
+        schema = external_agent_representation_analysis_schema(
+            EXTERNAL_AGENT_PROTOCOL_V3_1,
+            batch=batch,
+        )
         accounting = schema["properties"]["anchor_accounting"]
         self.assertEqual(accounting["minItems"], 40)
         self.assertEqual(accounting["maxItems"], 40)
@@ -505,7 +583,66 @@ class SemanticHandoffTest(unittest.TestCase):
         self.assertEqual(residue["anchor_unit_ids"]["maxItems"], 40)
         self.assertEqual(candidate["supporting_evidence_unit_ids"]["maxItems"], 3)
 
-    def test_v31_accepts_40_anchors_all_as_candidates(self) -> None:
+    def test_v32_schema_uses_an_exact_accounting_map_for_1_and_40_anchors(
+        self,
+    ) -> None:
+        for count in (1, 40):
+            with self.subTest(count=count):
+                batch = RepresentationAnalysisBatch(
+                    self.units(count), self.units(3, start=101)
+                )
+                schema = external_agent_representation_analysis_schema(
+                    EXTERNAL_AGENT_PROTOCOL_V3_2,
+                    batch=batch,
+                )
+                accounting = schema["properties"]["anchor_accounting"]
+                anchor_ids = [unit.unit_id for unit in batch.anchor_units]
+                self.assertEqual(accounting["type"], "object")
+                self.assertEqual(list(accounting["properties"]), anchor_ids)
+                self.assertEqual(accounting["required"], anchor_ids)
+                self.assertFalse(accounting["additionalProperties"])
+                self.assertTrue(
+                    all(
+                        value == {
+                            "type": "string",
+                            "enum": ["candidate", "residue"],
+                        }
+                        for value in accounting["properties"].values()
+                    )
+                )
+                self.assertNotIn("uniqueItems", json.dumps(schema))
+
+    def test_v32_fingerprint_binds_the_exact_accounting_map_schema(self) -> None:
+        batch = RepresentationAnalysisBatch(self.units(40))
+        schema = external_agent_representation_analysis_schema(
+            EXTERNAL_AGENT_PROTOCOL_V3_2,
+            batch=batch,
+        )
+        request, fingerprint = _external_agent_request(
+            batch,
+            protocol_version=EXTERNAL_AGENT_PROTOCOL_V3_2,
+            result_schema=schema,
+        )
+        self.assertEqual(
+            request["result_schema_fingerprint"],
+            _canonical_fingerprint(schema),
+        )
+        changed = json.loads(json.dumps(schema))
+        changed["properties"]["anchor_accounting"]["required"] = [
+            *changed["properties"]["anchor_accounting"]["required"][:-1]
+        ]
+        changed_request, changed_fingerprint = _external_agent_request(
+            batch,
+            protocol_version=EXTERNAL_AGENT_PROTOCOL_V3_2,
+            result_schema=changed,
+        )
+        self.assertNotEqual(fingerprint, changed_fingerprint)
+        self.assertNotEqual(
+            request["result_schema_fingerprint"],
+            changed_request["result_schema_fingerprint"],
+        )
+
+    def test_v32_accepts_40_anchors_all_as_candidates(self) -> None:
         provider = CodexCliRepresentationAnalysisProvider(
             provider_version="0.147.0",
             runner=FakeRunner(),
@@ -515,7 +652,7 @@ class SemanticHandoffTest(unittest.TestCase):
         self.assertEqual(result.residue, ())
         self.assertEqual(provider.execution_records[0].covered_units, 40)
 
-    def test_v31_accepts_40_anchors_all_as_residue(self) -> None:
+    def test_v32_accepts_40_anchors_all_as_residue(self) -> None:
         provider = CodexCliRepresentationAnalysisProvider(
             provider_version="0.147.0",
             runner=FakeRunner("all_residue"),
@@ -525,7 +662,7 @@ class SemanticHandoffTest(unittest.TestCase):
         self.assertEqual(len(result.residue), 40)
         self.assertEqual(provider.execution_records[0].covered_units, 40)
 
-    def test_v31_accepts_a_mixed_40_anchor_assignment(self) -> None:
+    def test_v32_accepts_a_mixed_40_anchor_assignment(self) -> None:
         provider = CodexCliRepresentationAnalysisProvider(
             provider_version="0.147.0",
             runner=FakeRunner("mixed"),
@@ -535,7 +672,148 @@ class SemanticHandoffTest(unittest.TestCase):
         self.assertEqual(len(result.residue), 20)
         self.assertEqual(provider.execution_records[0].covered_units, 40)
 
-    def test_v31_records_content_free_40_anchor_coverage_diagnostics(self) -> None:
+    def test_v32_allows_one_anchor_to_support_multiple_candidates(self) -> None:
+        provider = CodexCliRepresentationAnalysisProvider(
+            provider_version="0.147.0",
+            runner=FakeRunner("same_anchor_multiple_candidates"),
+        )
+        result = provider.analyze(RepresentationAnalysisBatch((self.unit(),)))
+        self.assertEqual(len(result.candidates), 2)
+        self.assertEqual(result.residue, ())
+        self.assertEqual(provider.execution_records[0].covered_units, 1)
+
+    def test_v32_rejects_accounting_map_attacks(self) -> None:
+        cases = {
+            "accounting_missing_anchor": "anchor_coverage",
+            "accounting_extra_anchor": "anchor_coverage",
+            "accounting_unknown_anchor": "anchor_coverage",
+            "accounting_wrong_outcome": "anchor_accounting",
+            "accounting_wrong_enum": "anchor_accounting",
+            "accounting_duplicate_key": "anchor_accounting",
+            "dual_assignment": "anchor_accounting",
+            "anchor_uncovered": "anchor_coverage",
+        }
+        for mode, detail in cases.items():
+            with self.subTest(mode=mode):
+                provider = CodexCliRepresentationAnalysisProvider(
+                    provider_version="0.147.0", runner=FakeRunner(mode)
+                )
+                with self.assertRaisesRegex(Exception, "未产生可验证"):
+                    provider.analyze(
+                        RepresentationAnalysisBatch((self.unit(),))
+                    )
+                record = provider.execution_records[0]
+                self.assertEqual(record.failure_category, "result_contract_failure")
+                self.assertEqual(record.contract_failure_detail, detail)
+                if mode == "accounting_duplicate_key":
+                    self.assertEqual(record.duplicate_accounting_count, 1)
+                    self.assertEqual(
+                        record.contract_failure_stage,
+                        "accounting_cross_check",
+                    )
+                    self.assertRegex(
+                        record.result_fingerprint or "",
+                        r"^sha256:[0-9a-f]{64}$",
+                    )
+
+    def test_v32_rejects_context_only_accounting(self) -> None:
+        context = replace(self.unit(), unit_id="unit_" + "e" * 64)
+        provider = CodexCliRepresentationAnalysisProvider(
+            provider_version="0.147.0", runner=FakeRunner("accounting_context_only")
+        )
+        with self.assertRaisesRegex(Exception, "未产生可验证"):
+            provider.analyze(
+                RepresentationAnalysisBatch((self.unit(),), (context,))
+            )
+        self.assertEqual(
+            provider.execution_records[0].contract_failure_detail,
+            "anchor_coverage",
+        )
+
+    def test_v32_rejects_duplicate_or_colliding_batch_identity_before_call(
+        self,
+    ) -> None:
+        for batch in (
+            RepresentationAnalysisBatch((self.unit(), self.unit())),
+            RepresentationAnalysisBatch((self.unit(),), (self.unit(),)),
+        ):
+            with self.subTest(batch=batch), self.assertRaisesRegex(
+                ValueError, "batch identity"
+            ):
+                _external_agent_request(
+                    batch, protocol_version=EXTERNAL_AGENT_PROTOCOL_V3_2
+                )
+
+    def test_literal_v31_array_result_remains_strictly_readable(self) -> None:
+        batch = RepresentationAnalysisBatch((self.unit(),))
+        _, fingerprint = _external_agent_request(
+            batch,
+            protocol_version=EXTERNAL_AGENT_PROTOCOL_V3_1,
+        )
+        payload = {
+            "protocol_version": EXTERNAL_AGENT_PROTOCOL_V3_1,
+            "input_fingerprint": fingerprint,
+            "anchor_accounting": [
+                {
+                    "anchor_unit_id": self.unit().unit_id,
+                    "accounted_as": "candidate",
+                }
+            ],
+            "candidates": [
+                {
+                    "statement": "Synthetic statement.",
+                    "semantic_type": "observation",
+                    "concerns": ["Synthetic"],
+                    "anchor_unit_ids": [self.unit().unit_id],
+                    "supporting_evidence_unit_ids": [],
+                    "context": "Synthetic context.",
+                    "confidence": 0.9,
+                }
+            ],
+            "residue": [],
+        }
+        result = _parse_external_agent_result(
+            json.dumps(payload),
+            batch,
+            fingerprint,
+            expected_protocol_version=EXTERNAL_AGENT_PROTOCOL_V3_1,
+        )
+        self.assertEqual(len(result.candidates), 1)
+        self.assertEqual(result.residue, ())
+
+    def test_v32_contract_failures_publish_no_package_or_atomic_information(
+        self,
+    ) -> None:
+        for mode in (
+            "accounting_missing_anchor",
+            "accounting_extra_anchor",
+            "accounting_wrong_enum",
+            "accounting_duplicate_key",
+            "dual_assignment",
+            "anchor_uncovered",
+        ):
+            with self.subTest(mode=mode):
+                root = self.root / mode
+                representation, service = self.build_service(root=root)
+                atomic_path = root / "atomic.jsonl"
+                with self.assertRaisesRegex(Exception, "未确认新增 Durable"):
+                    ExternalAgentSemanticHandoffService(
+                        service,
+                        JsonlAtomicInformationStore(atomic_path),
+                        root / "audits",
+                    ).execute(
+                        representation.representation_id,
+                        CodexCliRepresentationAnalysisProvider(
+                            provider_version="0.147.0",
+                            runner=FakeRunner(mode),
+                        ),
+                    )
+                self.assertFalse(
+                    (root / "information" / representation.representation_id).exists()
+                )
+                self.assertFalse(atomic_path.exists())
+
+    def test_v32_records_content_free_40_anchor_coverage_diagnostics(self) -> None:
         provider = CodexCliRepresentationAnalysisProvider(
             provider_version="0.147.0",
             runner=FakeRunner("coverage_summary"),
@@ -550,11 +828,11 @@ class SemanticHandoffTest(unittest.TestCase):
         self.assertEqual(record.covered_units, 35)
         self.assertEqual(record.candidate_item_count, 21)
         self.assertEqual(record.residue_item_count, 16)
-        self.assertEqual(record.accounting_item_count, 40)
+        self.assertEqual(record.accounting_item_count, 39)
         self.assertEqual(record.candidate_anchor_ref_count, 21)
         self.assertEqual(record.residue_anchor_ref_count, 16)
         self.assertEqual(record.duplicate_anchor_ref_count, 1)
-        self.assertEqual(record.duplicate_accounting_count, 1)
+        self.assertEqual(record.duplicate_accounting_count, 0)
         self.assertEqual(record.dual_assignment_count, 1)
         self.assertEqual(record.missing_anchor_count, 5)
         self.assertRegex(record.result_fingerprint or "", r"^sha256:[0-9a-f]{64}$")
@@ -741,6 +1019,9 @@ class SemanticHandoffTest(unittest.TestCase):
             EXTERNAL_AGENT_PROTOCOL_V3_1: (
                 "sha256:5afea47585cd10c55f0d60ca0a8ffa2c4d0c3c72e3fc15e6c332e8e66e27c187"
             ),
+            EXTERNAL_AGENT_PROTOCOL_V3_2: (
+                "sha256:1014f3b4e797203817ec9b68b13b2509b2aa6f4679b6175ce60ff0203b146384"
+            ),
         }
         batch = RepresentationAnalysisBatch((self.unit(),))
         for protocol_version, fingerprint in expected.items():
@@ -752,7 +1033,7 @@ class SemanticHandoffTest(unittest.TestCase):
                     fingerprint,
                 )
 
-    def test_current_v31_producer_passes_the_shared_audit_validator(self) -> None:
+    def test_current_v32_producer_passes_the_shared_audit_validator(self) -> None:
         representation, service = self.build_service()
         provider = CodexCliRepresentationAnalysisProvider(
             provider_version="0.147.0", runner=FakeRunner()
@@ -1223,6 +1504,48 @@ class SemanticHandoffTest(unittest.TestCase):
         self.assertEqual(replay.ingestion.existing, 1)
         self.assertEqual(replay_runner.calls, [])
 
+    def test_v31_package_and_audit_replay_without_a_provider_call(self) -> None:
+        representation, service = self.build_service()
+        audit_root = self.root / "audits"
+        handoff = ExternalAgentSemanticHandoffService(
+            service,
+            JsonlAtomicInformationStore(self.root / "atomic.jsonl"),
+            audit_root,
+        )
+        first = handoff.execute(
+            representation.representation_id,
+            CodexCliRepresentationAnalysisProvider(
+                provider_version="0.147.0",
+                runner=FakeRunner(),
+            ),
+        )
+        units = _units_from_representation(
+            representation,
+            service.representation_repository,
+        )
+        batch = _analysis_batches(units, service.batch_size)[0]
+        _, v31_fingerprint = _external_agent_request(
+            batch,
+            protocol_version=EXTERNAL_AGENT_PROTOCOL_V3_1,
+        )
+        audit_path = first.audit_paths[0]
+        historical = json.loads(audit_path.read_text(encoding="utf-8"))
+        historical["protocol_version"] = EXTERNAL_AGENT_PROTOCOL_V3_1
+        historical["input_fingerprint"] = v31_fingerprint
+        audit_path.write_text(json.dumps(historical), encoding="utf-8")
+
+        replay_runner = FakeRunner()
+        replay = handoff.execute(
+            representation.representation_id,
+            CodexCliRepresentationAnalysisProvider(
+                provider_version="0.147.0",
+                runner=replay_runner,
+            ),
+        )
+        self.assertTrue(replay.replayed_existing_package)
+        self.assertEqual(replay.ingestion.existing, 1)
+        self.assertEqual(replay_runner.calls, [])
+
     def test_replay_accepts_literal_name_only_prediagnostics_v1_package(self) -> None:
         representation, service = self.build_service()
         audit_root = self.root / "audits"
@@ -1414,7 +1737,7 @@ class SemanticHandoffTest(unittest.TestCase):
         self.assertEqual(audit["covered_units"], 35)
         self.assertEqual(audit["unaccounted_units"], 5)
         self.assertEqual(audit["duplicate_anchor_ref_count"], 1)
-        self.assertEqual(audit["duplicate_accounting_count"], 1)
+        self.assertEqual(audit["duplicate_accounting_count"], 0)
         self.assertEqual(audit["dual_assignment_count"], 1)
         self.assertEqual(audit["missing_anchor_count"], 5)
         self.assertRegex(audit["result_fingerprint"], r"^sha256:[0-9a-f]{64}$")
@@ -1561,6 +1884,239 @@ class SemanticHandoffTest(unittest.TestCase):
         self.assertEqual(preflight.conservatively_counted_attempts, 0)
         self.assertEqual(provider.execution_records, [])
         self.assertFalse(any(audit_root.glob("semantic_run_*")))
+
+    def test_v31_attempt_is_counted_preserved_and_isolated_from_v32_run(
+        self,
+    ) -> None:
+        representation, service = self.build_service(blocks=1)
+        audit_root = self.root / "audits"
+        audit_root.mkdir(mode=0o700)
+        os.chmod(audit_root, 0o700)
+        provider = CodexCliRepresentationAnalysisProvider(
+            provider_version="0.147.0", runner=FakeRunner()
+        )
+        units = _units_from_representation(
+            representation, service.representation_repository
+        )
+        batch = _analysis_batches(units, service.batch_size)[0]
+        schema = external_agent_representation_analysis_schema(
+            EXTERNAL_AGENT_PROTOCOL_V3_1,
+            batch=batch,
+        )
+        _, input_fingerprint = _external_agent_request(
+            batch,
+            protocol_version=EXTERNAL_AGENT_PROTOCOL_V3_1,
+            result_schema=schema,
+        )
+        batch_receipt = {
+            "ordinal": 1,
+            "total": 1,
+            "anchor_unit_ids": [unit.unit_id for unit in batch.anchor_units],
+            "context_support_unit_ids": [
+                unit.unit_id for unit in batch.context_support_units
+            ],
+            "input_fingerprint": input_fingerprint,
+            "result_schema_fingerprint": _canonical_fingerprint(schema),
+        }
+        batch_receipt["batch_contract_fingerprint"] = _canonical_fingerprint(
+            batch_receipt
+        )
+        legacy_run_id = "semantic_run_" + hashlib.sha256(
+            representation.representation_id.encode("utf-8")
+        ).hexdigest()[:32]
+        receipt = {
+            "schema_version": "semantic-handoff-run-receipt/2.0",
+            "artifact_kind": "semantic_handoff_recovery_run",
+            "semantic_run_id": legacy_run_id,
+            "source": {
+                "source_id": representation.source_id,
+                "content_hash": representation.source_content_hash,
+            },
+            "representation": {
+                "representation_id": representation.representation_id,
+                "manifest_fingerprint": _canonical_fingerprint(
+                    representation.to_manifest_dict()
+                ),
+                "artifacts": [
+                    {
+                        "artifact_id": artifact.artifact_id,
+                        "content_hash": artifact.content_hash,
+                    }
+                    for artifact in representation.artifacts
+                ],
+            },
+            "privacy": {
+                "policy": self.privacy_binding().policy,
+                "policy_version": self.privacy_binding().policy_version,
+                "route": self.privacy_binding().route,
+                "receipt_fingerprint": (
+                    self.privacy_binding().receipt_fingerprint
+                ),
+            },
+            "protocol_version": EXTERNAL_AGENT_PROTOCOL_V3_1,
+            "provider_route": "external-agent-codex-cli",
+            "provider": {
+                "name": provider.name,
+                "provider_version": provider.provider_version,
+                "model": provider.model,
+                "reasoning_effort": provider.reasoning_effort,
+                "fallback_policy": provider.fallback_policy,
+            },
+            "execution_deadline_ms": round(provider.timeout_seconds * 1000),
+            "semantic_batch_size": service.batch_size,
+            "ordered_eligible_unit_ids": [
+                unit.unit_id for unit in units if unit.analysis_eligible
+            ],
+            "prompt_template_fingerprint": "sha256:" + "e" * 64,
+            "local_validator_contract_version": (
+                "external-agent-local-validator/3.1"
+            ),
+            "batches": [batch_receipt],
+        }
+        receipt["contract_fingerprint"] = _canonical_fingerprint(receipt)
+        receipt["run_receipt_fingerprint"] = _canonical_fingerprint(receipt)
+        nonce = "f" * 64
+        attempt = {
+            "schema_version": "semantic-handoff-attempt-receipt/2.0",
+            "artifact_kind": "semantic_handoff_attempt",
+            "attempt_id": "attempt_"
+            + hashlib.sha256(
+                f"{legacy_run_id}:1:{nonce}".encode()
+            ).hexdigest()[:32],
+            "attempt_nonce": nonce,
+            "semantic_run_id": legacy_run_id,
+            "run_contract_fingerprint": receipt["contract_fingerprint"],
+            "batch_ordinal": 1,
+            "batch_contract_fingerprint": batch_receipt[
+                "batch_contract_fingerprint"
+            ],
+            "input_fingerprint": batch_receipt["input_fingerprint"],
+            "state": "started",
+        }
+        attempt["attempt_receipt_fingerprint"] = _canonical_fingerprint(attempt)
+        legacy_run = audit_root / legacy_run_id
+        legacy_attempts = legacy_run / "attempts"
+        legacy_attempts.mkdir(parents=True, mode=0o700)
+        os.chmod(legacy_run, 0o700)
+        os.chmod(legacy_attempts, 0o700)
+        (legacy_run / "run-receipt.json").write_text(
+            json.dumps(receipt), encoding="utf-8"
+        )
+        (legacy_attempts / "batch_0001.json").write_text(
+            json.dumps(attempt), encoding="utf-8"
+        )
+        for path in legacy_run.rglob("*.json"):
+            os.chmod(path, 0o600)
+        before = self.tree_snapshot(legacy_run)
+
+        handoff = ExternalAgentSemanticHandoffService(
+            service,
+            JsonlAtomicInformationStore(self.root / "atomic.jsonl"),
+            audit_root,
+        )
+        preflight = handoff.recovery_preflight(
+            representation.representation_id,
+            provider,
+            self.privacy_binding(),
+        )
+        self.assertEqual(preflight.historical_counted_attempts, 1)
+        self.assertEqual(preflight.conservatively_counted_attempts, 0)
+        self.assertEqual(preflight.required_new_calls, 1)
+        self.assertEqual(provider.execution_records, [])
+        self.assertEqual(self.tree_snapshot(legacy_run), before)
+
+        result = handoff.execute(
+            representation.representation_id,
+            provider,
+            privacy_binding=self.privacy_binding(),
+            new_call_authority=1,
+        )
+        current_runs = [
+            path for path in audit_root.glob("semantic_run_*") if path != legacy_run
+        ]
+        self.assertEqual(len(current_runs), 1)
+        self.assertEqual(self.tree_snapshot(legacy_run), before)
+        self.assertEqual(result.ingestion.created, 1)
+
+    def test_v32_recovery_identity_is_stable_and_binds_execution_contract(
+        self,
+    ) -> None:
+        import archeos.semantic_handoff as handoff_module
+
+        representation, service = self.build_service(blocks=41)
+        provider = CodexCliRepresentationAnalysisProvider(
+            provider_version="0.147.0", runner=FakeRunner()
+        )
+        first = handoff_module._SemanticRecoveryRun(
+            service,
+            self.root / "audits",
+            representation.representation_id,
+            provider,
+            self.privacy_binding(),
+        )
+        same = handoff_module._SemanticRecoveryRun(
+            service,
+            self.root / "audits",
+            representation.representation_id,
+            provider,
+            self.privacy_binding(),
+        )
+        identity_keys = {
+            "source",
+            "representation",
+            "privacy",
+            "protocol_version",
+            "provider_route",
+            "provider",
+            "execution_deadline_ms",
+            "semantic_batch_size",
+            "ordered_eligible_unit_ids",
+            "prompt_template_fingerprint",
+            "local_validator_contract_version",
+            "batches",
+        }
+        identity = {
+            key: first.expected_run_receipt[key] for key in identity_keys
+        }
+        self.assertEqual(first.semantic_run_id, same.semantic_run_id)
+        self.assertEqual(
+            first.execution_identity_fingerprint,
+            _canonical_fingerprint(identity),
+        )
+        self.assertEqual(
+            first.semantic_run_id,
+            "semantic_run_"
+            + first.execution_identity_fingerprint.removeprefix("sha256:")[:32],
+        )
+        self.assertEqual(identity["protocol_version"], EXTERNAL_AGENT_PROTOCOL_V3_2)
+        self.assertEqual(identity["semantic_batch_size"], 40)
+        self.assertEqual(len(identity["batches"]), 2)
+        self.assertTrue(
+            all(
+                {
+                    "result_schema_fingerprint",
+                    "input_fingerprint",
+                    "batch_contract_fingerprint",
+                }
+                <= set(batch)
+                for batch in identity["batches"]
+            )
+        )
+
+        changed_provider = CodexCliRepresentationAnalysisProvider(
+            provider_version="0.147.0",
+            reasoning_effort="high",
+            timeout_seconds=301,
+            runner=FakeRunner(),
+        )
+        changed = handoff_module._SemanticRecoveryRun(
+            service,
+            self.root / "audits",
+            representation.representation_id,
+            changed_provider,
+            self.privacy_binding(),
+        )
+        self.assertNotEqual(first.semantic_run_id, changed.semantic_run_id)
 
     def test_recovery_root_attacks_fail_closed_before_provider(self) -> None:
         for attack in (

@@ -43,13 +43,15 @@ EXTERNAL_AGENT_PROTOCOL_V1 = "external-agent-semantic-handoff/1.0"
 EXTERNAL_AGENT_PROTOCOL_V2 = "external-agent-semantic-handoff/2.0"
 EXTERNAL_AGENT_PROTOCOL_V3 = "external-agent-semantic-handoff/3.0"
 EXTERNAL_AGENT_PROTOCOL_V3_1 = "external-agent-semantic-handoff/3.1"
-EXTERNAL_AGENT_PROTOCOL_VERSION = EXTERNAL_AGENT_PROTOCOL_V3_1
+EXTERNAL_AGENT_PROTOCOL_V3_2 = "external-agent-semantic-handoff/3.2"
+EXTERNAL_AGENT_PROTOCOL_VERSION = EXTERNAL_AGENT_PROTOCOL_V3_2
 SUPPORTED_EXTERNAL_AGENT_PROTOCOL_VERSIONS = frozenset(
     {
         EXTERNAL_AGENT_PROTOCOL_V1,
         EXTERNAL_AGENT_PROTOCOL_V2,
         EXTERNAL_AGENT_PROTOCOL_V3,
         EXTERNAL_AGENT_PROTOCOL_V3_1,
+        EXTERNAL_AGENT_PROTOCOL_V3_2,
     }
 )
 EXTERNAL_AGENT_ROUTE = "codex-cli"
@@ -250,12 +252,14 @@ def external_agent_representation_analysis_schema(
     if protocol_version in {
         EXTERNAL_AGENT_PROTOCOL_V3,
         EXTERNAL_AGENT_PROTOCOL_V3_1,
+        EXTERNAL_AGENT_PROTOCOL_V3_2,
     }:
         if batch is None:
             raise ValueError("v3 External Agent schema requires its bound batch")
         schema = _external_agent_v3_analysis_schema(
             batch,
-            exact_accounting=protocol_version == EXTERNAL_AGENT_PROTOCOL_V3_1,
+            exact_accounting=protocol_version
+            in {EXTERNAL_AGENT_PROTOCOL_V3_1, EXTERNAL_AGENT_PROTOCOL_V3_2},
         )
     else:
         schema = representation_analysis_schema()
@@ -276,8 +280,32 @@ def external_agent_representation_analysis_schema(
         EXTERNAL_AGENT_PROTOCOL_V2,
         EXTERNAL_AGENT_PROTOCOL_V3,
         EXTERNAL_AGENT_PROTOCOL_V3_1,
+        EXTERNAL_AGENT_PROTOCOL_V3_2,
     }:
         required = ["anchor_accounting", *required]
+        if protocol_version == EXTERNAL_AGENT_PROTOCOL_V3_2:
+            assert batch is not None
+            _validate_v32_batch_identity(batch)
+            anchor_ids = [unit.unit_id for unit in batch.anchor_units]
+            protocol_properties["anchor_accounting"] = {
+                "type": "object",
+                "properties": {
+                    unit_id: {
+                        "type": "string",
+                        "enum": ["candidate", "residue"],
+                    }
+                    for unit_id in anchor_ids
+                },
+                "required": anchor_ids,
+                "additionalProperties": False,
+            }
+            schema["required"] = [
+                "protocol_version",
+                "input_fingerprint",
+                *required,
+            ]
+            schema["properties"] = {**protocol_properties, **properties}
+            return schema
         anchor_unit_id: dict[str, object] = {
             "type": "string",
             "minLength": 1,
@@ -319,6 +347,18 @@ def external_agent_representation_analysis_schema(
     schema["required"] = ["protocol_version", "input_fingerprint", *required]
     schema["properties"] = {**protocol_properties, **properties}
     return schema
+
+
+def _validate_v32_batch_identity(batch: RepresentationAnalysisBatch) -> None:
+    anchor_ids = [unit.unit_id for unit in batch.anchor_units]
+    context_ids = [unit.unit_id for unit in batch.context_support_units]
+    if (
+        not anchor_ids
+        or len(set(anchor_ids)) != len(anchor_ids)
+        or len(set(context_ids)) != len(context_ids)
+        or set(anchor_ids).intersection(context_ids)
+    ):
+        raise ValueError("v3.2 External Agent batch identity is invalid")
 
 
 def _external_agent_v3_analysis_schema(
@@ -715,7 +755,7 @@ def _contract_failure_diagnostics(
     summary = _empty_contract_failure_diagnostics()
     summary["contract_failure_stage"] = _CONTRACT_FAILURE_STAGES[detail]
     try:
-        payload = json.loads(raw)
+        payload = json.loads(raw, object_pairs_hook=_DuplicateKeyAwareDict)
     except json.JSONDecodeError:
         return summary
     if not isinstance(payload, dict):
@@ -737,18 +777,34 @@ def _contract_failure_diagnostics(
 
     candidates = items("candidates")
     residue = items("residue")
-    accounting = items("anchor_accounting")
+    accounting_value = payload.get("anchor_accounting")
+    accounting = accounting_value if isinstance(accounting_value, list) else []
     candidate_refs = references(candidates, "anchor_unit_ids")
     residue_refs = references(residue, "anchor_unit_ids")
-    accounting_refs = [
-        value["anchor_unit_id"]
-        for value in accounting
-        if isinstance(value, dict) and isinstance(value.get("anchor_unit_id"), str)
-    ]
+    if isinstance(accounting_value, dict):
+        accounting_refs = list(accounting_value)
+        accounting_item_count = len(accounting_value)
+        duplicate_accounting_count = (
+            accounting_value.duplicate_key_count
+            if isinstance(accounting_value, _DuplicateKeyAwareDict)
+            else 0
+        )
+    else:
+        accounting_refs = [
+            value["anchor_unit_id"]
+            for value in accounting
+            if isinstance(value, dict)
+            and isinstance(value.get("anchor_unit_id"), str)
+        ]
+        accounting_item_count = len(accounting)
+        duplicate_accounting_count = sum(
+            count - 1
+            for count in Counter(accounting_refs).values()
+            if count > 1
+        )
     anchor_ids = {unit.unit_id for unit in batch.anchor_units}
     candidate_known = [ref for ref in candidate_refs if ref in anchor_ids]
     residue_known = [ref for ref in residue_refs if ref in anchor_ids]
-    accounting_known = [ref for ref in accounting_refs if ref in anchor_ids]
     candidate_set = set(candidate_known)
     residue_set = set(residue_known)
     covered = candidate_set | residue_set
@@ -756,7 +812,7 @@ def _contract_failure_diagnostics(
         {
             "candidate_item_count": len(candidates),
             "residue_item_count": len(residue),
-            "accounting_item_count": len(accounting),
+            "accounting_item_count": accounting_item_count,
             "candidate_anchor_ref_count": len(candidate_refs),
             "residue_anchor_ref_count": len(residue_refs),
             "duplicate_anchor_ref_count": sum(
@@ -767,11 +823,7 @@ def _contract_failure_diagnostics(
                 )
                 if count > 1
             ),
-            "duplicate_accounting_count": sum(
-                count - 1
-                for count in Counter(accounting_known).values()
-                if count > 1
-            ),
+            "duplicate_accounting_count": duplicate_accounting_count,
             "dual_assignment_count": len(candidate_set & residue_set),
             "missing_anchor_count": len(anchor_ids - covered),
             "unknown_anchor_ref_count": sum(
@@ -1566,6 +1618,8 @@ def _external_agent_request(
 ) -> tuple[dict[str, object], str]:
     if protocol_version not in SUPPORTED_EXTERNAL_AGENT_PROTOCOL_VERSIONS:
         raise ValueError("unsupported External Agent protocol version")
+    if protocol_version == EXTERNAL_AGENT_PROTOCOL_V3_2:
+        _validate_v32_batch_identity(batch)
     rules = [
         "Return only the strict structured result.",
         "Account for every anchor with Candidate or Residue.",
@@ -1581,9 +1635,15 @@ def _external_agent_request(
             2,
             "Emit exactly one anchor_accounting item for every supplied anchor; accounted_as must match whether that anchor is cited by Candidate or Residue.",
         )
+    elif protocol_version == EXTERNAL_AGENT_PROTOCOL_V3_2:
+        rules.insert(
+            2,
+            "Emit anchor_accounting as an object whose exact keys are every supplied anchor unit_id; each candidate|residue value must match that anchor's Candidate or Residue Evidence.",
+        )
     if protocol_version in {
         EXTERNAL_AGENT_PROTOCOL_V3,
         EXTERNAL_AGENT_PROTOCOL_V3_1,
+        EXTERNAL_AGENT_PROTOCOL_V3_2,
     }:
         rules.insert(
             3,
@@ -1598,7 +1658,10 @@ def _external_agent_request(
             for unit in batch.context_support_units
         ],
     }
-    if protocol_version == EXTERNAL_AGENT_PROTOCOL_V3_1:
+    if protocol_version in {
+        EXTERNAL_AGENT_PROTOCOL_V3_1,
+        EXTERNAL_AGENT_PROTOCOL_V3_2,
+    }:
         if result_schema is None:
             result_schema = external_agent_representation_analysis_schema(
                 protocol_version,
@@ -1620,6 +1683,25 @@ Request:
 """ + json.dumps(request, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
 
+class _DuplicateKeyAwareDict(dict[str, object]):
+    def __init__(self, pairs: list[tuple[str, object]]) -> None:
+        counts = Counter(key for key, _ in pairs)
+        self.duplicate_key_count = sum(
+            count - 1 for count in counts.values() if count > 1
+        )
+        super().__init__(pairs)
+
+
+def _contains_duplicate_json_key(value: object) -> bool:
+    if isinstance(value, _DuplicateKeyAwareDict):
+        return value.duplicate_key_count > 0 or any(
+            _contains_duplicate_json_key(item) for item in value.values()
+        )
+    if isinstance(value, list):
+        return any(_contains_duplicate_json_key(item) for item in value)
+    return False
+
+
 def _parse_external_agent_result(
     raw: str,
     batch: RepresentationAnalysisBatch,
@@ -1627,7 +1709,14 @@ def _parse_external_agent_result(
     expected_protocol_version: str = EXTERNAL_AGENT_PROTOCOL_VERSION,
 ) -> RepresentationAnalysisResult:
     try:
-        payload = json.loads(raw)
+        payload = json.loads(
+            raw,
+            object_pairs_hook=(
+                _DuplicateKeyAwareDict
+                if expected_protocol_version == EXTERNAL_AGENT_PROTOCOL_V3_2
+                else None
+            ),
+        )
     except json.JSONDecodeError as exc:
         raise RepresentationInformationError("invalid_json") from exc
     if expected_protocol_version not in SUPPORTED_EXTERNAL_AGENT_PROTOCOL_VERSIONS:
@@ -1641,7 +1730,8 @@ def _parse_external_agent_result(
     if expected_protocol_version in {
         EXTERNAL_AGENT_PROTOCOL_V2,
         EXTERNAL_AGENT_PROTOCOL_V3,
-        EXTERNAL_AGENT_PROTOCOL_VERSION,
+        EXTERNAL_AGENT_PROTOCOL_V3_1,
+        EXTERNAL_AGENT_PROTOCOL_V3_2,
     }:
         expected_fields.add("anchor_accounting")
     if not isinstance(payload, dict) or set(payload) != expected_fields:
@@ -1651,9 +1741,19 @@ def _parse_external_agent_result(
         or payload["input_fingerprint"] != expected_fingerprint
     ):
         raise RepresentationInformationError("result_binding_failure")
+    if expected_protocol_version == EXTERNAL_AGENT_PROTOCOL_V3_2:
+        accounting_value = payload["anchor_accounting"]
+        if (
+            isinstance(accounting_value, _DuplicateKeyAwareDict)
+            and accounting_value.duplicate_key_count
+        ):
+            raise _ExternalAgentContractFailure("anchor_accounting")
+        if _contains_duplicate_json_key(payload):
+            raise _ExternalAgentContractFailure("top_level_schema")
     if expected_protocol_version in {
         EXTERNAL_AGENT_PROTOCOL_V3,
-        EXTERNAL_AGENT_PROTOCOL_VERSION,
+        EXTERNAL_AGENT_PROTOCOL_V3_1,
+        EXTERNAL_AGENT_PROTOCOL_V3_2,
     }:
         candidates = _v3_candidate_drafts(payload["candidates"], batch)
         residue = _v3_residue_drafts(payload["residue"], batch)
@@ -1676,13 +1776,21 @@ def _parse_external_agent_result(
     if expected_protocol_version in {
         EXTERNAL_AGENT_PROTOCOL_V2,
         EXTERNAL_AGENT_PROTOCOL_V3,
-        EXTERNAL_AGENT_PROTOCOL_VERSION,
+        EXTERNAL_AGENT_PROTOCOL_V3_1,
+        EXTERNAL_AGENT_PROTOCOL_V3_2,
     }:
         try:
-            accounting = tuple(
-                _anchor_accounting(item)
-                for item in _items(payload["anchor_accounting"], "anchor_accounting")
-            )
+            if expected_protocol_version == EXTERNAL_AGENT_PROTOCOL_V3_2:
+                accounting = _v32_anchor_accounting(
+                    payload["anchor_accounting"]
+                )
+            else:
+                accounting = tuple(
+                    _anchor_accounting(item)
+                    for item in _items(
+                        payload["anchor_accounting"], "anchor_accounting"
+                    )
+                )
         except RepresentationInformationError as exc:
             raise _ExternalAgentContractFailure("anchor_accounting") from exc
     try:
@@ -1697,6 +1805,26 @@ def _parse_external_agent_result(
     except RepresentationInformationError as exc:
         raise _ExternalAgentContractFailure("unknown") from exc
     return RepresentationAnalysisResult(candidates, residue)
+
+
+def _v32_anchor_accounting(value: object) -> tuple[_AnchorAccounting, ...]:
+    if not isinstance(value, dict):
+        raise RepresentationInformationError(
+            "anchor accounting map does not match the execution contract"
+        )
+    accounting: list[_AnchorAccounting] = []
+    for anchor_unit_id, accounted_as in value.items():
+        if accounted_as not in {"candidate", "residue"}:
+            raise RepresentationInformationError(
+                "anchor accounting outcome is not supported"
+            )
+        accounting.append(
+            _AnchorAccounting(
+                anchor_unit_id=anchor_unit_id,
+                accounted_as=accounted_as,
+            )
+        )
+    return tuple(accounting)
 
 
 def _v3_candidate_drafts(
