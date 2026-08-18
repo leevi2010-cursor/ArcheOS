@@ -5239,6 +5239,15 @@ class SemanticHandoffTest(unittest.TestCase):
                     "contract_failure_stage": "record_grouping",
                 },
             ),
+            (
+                "coverage-without-signal",
+                "candidate_shape",
+                1,
+                {
+                    "contract_failure_detail": "anchor_coverage",
+                    "contract_failure_stage": "coverage",
+                },
+            ),
             ("binding-empty-result", "wrong_binding", 1, {"result_size_bytes": 0}),
             ("contract-empty-result", "candidate_shape", 1, {"result_size_bytes": 0}),
         )
@@ -5434,6 +5443,165 @@ class SemanticHandoffTest(unittest.TestCase):
         self.assertEqual(audit["grouping_collision_count"], 0)
         grant = self.install_historical_inventory_authority(handoff, provider)
         self.assertEqual(grant["legacy_attempt_inventory_count"], 1)
+
+    def test_global_authority_inventory_accepts_versioned_anchor_coverage_signals(
+        self,
+    ) -> None:
+        def counts(
+            covered: int,
+            accounting: int,
+            missing: int,
+            *,
+            candidates: int | None = None,
+            unknown: int = 0,
+            duplicate_accounting: int = 0,
+        ) -> dict[str, int]:
+            candidate_count = covered if candidates is None else candidates
+            return {
+                "covered_units": covered,
+                "unaccounted_units": 2 - covered,
+                "candidate_item_count": candidate_count,
+                "residue_item_count": 0,
+                "accounting_item_count": accounting,
+                "candidate_anchor_ref_count": candidate_count,
+                "residue_anchor_ref_count": 0,
+                "duplicate_anchor_ref_count": 0,
+                "duplicate_accounting_count": duplicate_accounting,
+                "dual_assignment_count": 0,
+                "missing_anchor_count": missing,
+                "unknown_anchor_ref_count": unknown,
+                "raw_record_count": candidate_count,
+                "projected_record_count": candidate_count,
+                "duplicate_exact_body_count": 0,
+                "grouping_collision_count": 0,
+            }
+
+        cases = (
+            ("v31-missing", EXTERNAL_AGENT_PROTOCOL_V3_1, counts(1, 2, 1)),
+            ("v31-short", EXTERNAL_AGENT_PROTOCOL_V3_1, counts(2, 1, 0)),
+            ("v31-duplicate", EXTERNAL_AGENT_PROTOCOL_V3_1, counts(2, 2, 0, duplicate_accounting=1)),
+            ("v31-unknown", EXTERNAL_AGENT_PROTOCOL_V3_1, counts(2, 2, 0, unknown=1)),
+            ("v32-missing", EXTERNAL_AGENT_PROTOCOL_V3_2, counts(1, 2, 1)),
+            ("v32-short", EXTERNAL_AGENT_PROTOCOL_V3_2, counts(2, 1, 0)),
+            ("v32-extra", EXTERNAL_AGENT_PROTOCOL_V3_2, counts(2, 3, 0, unknown=1)),
+            ("v32-swap", EXTERNAL_AGENT_PROTOCOL_V3_2, counts(1, 2, 1, unknown=1)),
+            ("v33-missing", EXTERNAL_AGENT_PROTOCOL_V3_3, counts(1, 1, 1)),
+            ("v33-extra", EXTERNAL_AGENT_PROTOCOL_V3_3, counts(2, 3, 0, unknown=1)),
+            ("v33-swap", EXTERNAL_AGENT_PROTOCOL_V3_3, counts(1, 2, 1, unknown=1)),
+            ("v33-empty", EXTERNAL_AGENT_PROTOCOL_V3_3, counts(1, 2, 1)),
+            ("v33-nonobject", EXTERNAL_AGENT_PROTOCOL_V3_3, counts(0, 0, 2, candidates=0)),
+            ("v34-missing", EXTERNAL_AGENT_PROTOCOL_V3_4, counts(1, 1, 1)),
+            ("v34-extra", EXTERNAL_AGENT_PROTOCOL_V3_4, counts(2, 3, 0, unknown=1)),
+            ("v34-swap", EXTERNAL_AGENT_PROTOCOL_V3_4, counts(1, 2, 1, unknown=1)),
+            ("v34-empty", EXTERNAL_AGENT_PROTOCOL_V3_4, counts(1, 2, 1)),
+            ("v34-nonobject", EXTERNAL_AGENT_PROTOCOL_V3_4, counts(0, 0, 2, candidates=0)),
+        )
+        for name, protocol, projection in cases:
+            with self.subTest(name=name):
+                root = self.root / f"inventory-anchor-coverage-{name}"
+                (
+                    _representation,
+                    _service,
+                    handoff,
+                    provider,
+                    batch,
+                    audit_path,
+                ) = self.build_historical_inventory_audit(
+                    root,
+                    runner_mode="candidate_shape",
+                    blocks=2,
+                )
+                audit = json.loads(audit_path.read_text(encoding="utf-8"))
+                audit["protocol_version"] = protocol
+                audit["input_fingerprint"] = _external_agent_request(
+                    batch,
+                    protocol_version=protocol,
+                )[1]
+                audit["contract_failure_detail"] = "anchor_coverage"
+                audit["contract_failure_stage"] = "coverage"
+                audit.update(projection)
+                if protocol != EXTERNAL_AGENT_PROTOCOL_V3_4:
+                    for field in _GROUPING_DIAGNOSTIC_FIELDS:
+                        audit.pop(field)
+                    audit["diagnostic_schema_version"] = (
+                        "external-agent-diagnostics/2.0"
+                    )
+                audit_path.write_text(json.dumps(audit), encoding="utf-8")
+                grant = self.install_historical_inventory_authority(
+                    handoff,
+                    provider,
+                )
+                self.assertEqual(grant["legacy_attempt_inventory_count"], 1)
+
+    def test_global_authority_inventory_rejects_anchor_coverage_signal_drift(
+        self,
+    ) -> None:
+        cases = (
+            ("v31-no-signal", EXTERNAL_AGENT_PROTOCOL_V3_1, {}),
+            ("v32-no-signal", EXTERNAL_AGENT_PROTOCOL_V3_2, {}),
+            ("v33-no-signal", EXTERNAL_AGENT_PROTOCOL_V3_3, {}),
+            ("v34-no-signal", EXTERNAL_AGENT_PROTOCOL_V3_4, {}),
+            ("v32-duplicate", EXTERNAL_AGENT_PROTOCOL_V3_2, {"duplicate_accounting_count": 1}),
+            ("v33-duplicate", EXTERNAL_AGENT_PROTOCOL_V3_3, {"duplicate_accounting_count": 1}),
+            ("v34-duplicate", EXTERNAL_AGENT_PROTOCOL_V3_4, {"duplicate_accounting_count": 1}),
+            ("v33-short-accounting", EXTERNAL_AGENT_PROTOCOL_V3_3, {"accounting_item_count": 1}),
+            ("v33-long-accounting", EXTERNAL_AGENT_PROTOCOL_V3_3, {"accounting_item_count": 3}),
+            ("v34-short-accounting", EXTERNAL_AGENT_PROTOCOL_V3_4, {"accounting_item_count": 1}),
+            ("v34-long-accounting", EXTERNAL_AGENT_PROTOCOL_V3_4, {"accounting_item_count": 3}),
+        )
+        for name, protocol, mutation in cases:
+            with self.subTest(name=name):
+                root = self.root / f"inventory-anchor-coverage-invalid-{name}"
+                (
+                    _representation,
+                    _service,
+                    handoff,
+                    provider,
+                    batch,
+                    audit_path,
+                ) = self.build_historical_inventory_audit(
+                    root,
+                    runner_mode="candidate_shape",
+                    blocks=2,
+                )
+                audit = json.loads(audit_path.read_text(encoding="utf-8"))
+                audit["protocol_version"] = protocol
+                audit["input_fingerprint"] = _external_agent_request(
+                    batch,
+                    protocol_version=protocol,
+                )[1]
+                audit["contract_failure_detail"] = "anchor_coverage"
+                audit["contract_failure_stage"] = "coverage"
+                audit.update(
+                    covered_units=2,
+                    unaccounted_units=0,
+                    candidate_item_count=2,
+                    residue_item_count=0,
+                    accounting_item_count=2,
+                    candidate_anchor_ref_count=2,
+                    residue_anchor_ref_count=0,
+                    duplicate_anchor_ref_count=0,
+                    duplicate_accounting_count=0,
+                    dual_assignment_count=0,
+                    missing_anchor_count=0,
+                    unknown_anchor_ref_count=0,
+                    raw_record_count=2,
+                    projected_record_count=2,
+                    duplicate_exact_body_count=0,
+                    grouping_collision_count=0,
+                )
+                audit.update(mutation)
+                if protocol != EXTERNAL_AGENT_PROTOCOL_V3_4:
+                    for field in _GROUPING_DIAGNOSTIC_FIELDS:
+                        audit.pop(field)
+                    audit["diagnostic_schema_version"] = (
+                        "external-agent-diagnostics/2.0"
+                    )
+                audit_path.write_text(json.dumps(audit), encoding="utf-8")
+                before = self.tree_snapshot(root)
+                with self.assertRaises(SemanticHandoffError):
+                    self.install_historical_inventory_authority(handoff, provider)
+                self.assertEqual(self.tree_snapshot(root), before)
 
     def test_global_authority_inventory_rejects_impossible_audit_states_zero_write(
         self,

@@ -4272,6 +4272,7 @@ def _validate_processing_audit_count_projection(
         invalid = (
             unknown > accounting_items
             or covered + unknown > accounting_items
+            or accounting_items > eligible + unknown
             or covered > candidate_items + residue_items
             or candidate_items != candidate_refs
             or residue_items != residue_refs
@@ -4282,6 +4283,40 @@ def _validate_processing_audit_count_projection(
         raise SemanticHandoffError(
             "Processing Run audit contract accounting projection 损坏。"
         )
+
+    if contract_detail == "anchor_coverage":
+        if family == "legacy_array":
+            coverage_signal_invalid = (
+                missing == 0
+                and accounting_items == eligible
+                and duplicate_accounting == 0
+                and unknown == 0
+                or candidate_refs < candidate_items
+                or residue_refs < residue_items
+                or unknown > accounting_items
+                or duplicate_accounting
+                > max(accounting_items - unknown - 1, 0)
+            )
+        elif family == "legacy_map":
+            coverage_signal_invalid = (
+                duplicate_accounting != 0
+                or missing == 0
+                and accounting_items == eligible
+                and unknown == 0
+                or candidate_refs < candidate_items
+                or residue_refs < residue_items
+                or unknown > accounting_items
+            )
+        else:
+            coverage_signal_invalid = (
+                duplicate_accounting != 0
+                or missing == 0
+                and unknown == 0
+            )
+        if coverage_signal_invalid:
+            raise SemanticHandoffError(
+                "Processing Run audit anchor coverage signal 损坏。"
+            )
 
     if family == "anchor_map_grouped":
         raw = int(audit["raw_record_count"])
