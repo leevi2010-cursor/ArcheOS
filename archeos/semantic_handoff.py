@@ -4293,6 +4293,9 @@ def _validate_processing_audit_count_projection(
             or projected > raw
             or duplicate_exact + projected > raw
             or collision > (projected - 1 if projected else 0)
+            or contract_detail == "record_grouping"
+            and duplicate_exact == 0
+            and collision == 0
         ):
             raise SemanticHandoffError(
                 "Processing Run audit contract grouping projection 损坏。"

@@ -5230,6 +5230,15 @@ class SemanticHandoffTest(unittest.TestCase):
             ("duplicate-anchor", "candidate_shape", 1, {"duplicate_anchor_ref_count": 1}),
             ("duplicate-exact", "candidate_shape", 1, {"duplicate_exact_body_count": 1}),
             ("collision", "candidate_shape", 1, {"grouping_collision_count": 1}),
+            (
+                "grouping-without-signal",
+                "candidate_shape",
+                1,
+                {
+                    "contract_failure_detail": "record_grouping",
+                    "contract_failure_stage": "record_grouping",
+                },
+            ),
             ("binding-empty-result", "wrong_binding", 1, {"result_size_bytes": 0}),
             ("contract-empty-result", "candidate_shape", 1, {"result_size_bytes": 0}),
         )
@@ -5415,12 +5424,14 @@ class SemanticHandoffTest(unittest.TestCase):
             audit_path,
         ) = self.build_historical_inventory_audit(
             root,
-            runner_mode="candidate_shape",
+            runner_mode="candidate_duplicate_anchor",
         )
         audit = json.loads(audit_path.read_text(encoding="utf-8"))
-        audit["contract_failure_detail"] = "record_grouping"
-        audit["contract_failure_stage"] = "record_grouping"
-        audit_path.write_text(json.dumps(audit), encoding="utf-8")
+        self.assertEqual(audit["contract_failure_detail"], "record_grouping")
+        self.assertEqual(audit["raw_record_count"], 2)
+        self.assertEqual(audit["projected_record_count"], 1)
+        self.assertEqual(audit["duplicate_exact_body_count"], 1)
+        self.assertEqual(audit["grouping_collision_count"], 0)
         grant = self.install_historical_inventory_authority(handoff, provider)
         self.assertEqual(grant["legacy_attempt_inventory_count"], 1)
 
