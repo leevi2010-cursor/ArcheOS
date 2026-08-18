@@ -924,6 +924,7 @@ class _SemanticRecoveryRun:
         if not os.path.lexists(legacy_run):
             return 0
         _validate_shared_recovery_root(self.audit_root, create=False)
+        self._validate_historical_v31_inventory(legacy_run)
         if not _payloads_exactly_equal(
             _private_json_exact(legacy_run / "run-receipt.json"),
             self.expected_historical_v31_run_receipt,
@@ -963,6 +964,93 @@ class _SemanticRecoveryRun:
                 raise SemanticHandoffError("历史 v3.1 recovery attempt 损坏。")
             count += 1
         return count
+
+    def _validate_historical_v31_inventory(self, legacy_run: Path) -> None:
+        _require_private_directory(legacy_run)
+        try:
+            children = {path.name: path for path in legacy_run.iterdir()}
+        except OSError as exc:
+            raise SemanticHandoffError(
+                "历史 v3.1 recovery inventory 不可读。"
+            ) from exc
+        if "run-receipt.json" not in children or not set(children) <= {
+            "run-receipt.json",
+            "attempts",
+            "results",
+        }:
+            raise SemanticHandoffError("历史 v3.1 recovery inventory 损坏。")
+        _require_private_file(children["run-receipt.json"])
+        attempt_ordinals: set[int] = set()
+        attempts = children.get("attempts")
+        if attempts is not None:
+            _require_private_directory(attempts)
+            for path in attempts.iterdir():
+                match = re.fullmatch(r"batch_(\d{4})\.json", path.name)
+                ordinal = int(match.group(1)) if match else 0
+                if (
+                    ordinal < 1
+                    or ordinal > len(self.historical_v31_batch_contracts)
+                    or ordinal in attempt_ordinals
+                ):
+                    raise SemanticHandoffError(
+                        "历史 v3.1 recovery attempt inventory 损坏。"
+                    )
+                _require_private_file(path)
+                attempt_ordinals.add(ordinal)
+        if attempt_ordinals and attempt_ordinals != set(
+            range(1, max(attempt_ordinals) + 1)
+        ):
+            raise SemanticHandoffError(
+                "历史 v3.1 recovery attempt inventory 顺序损坏。"
+            )
+        result_ordinals: set[int] = set()
+        results = children.get("results")
+        if results is not None:
+            _require_private_directory(results)
+            for path in results.iterdir():
+                match = re.fullmatch(r"batch_(\d{4})", path.name)
+                ordinal = int(match.group(1)) if match else 0
+                if (
+                    ordinal < 1
+                    or ordinal > len(self.historical_v31_batch_contracts)
+                    or ordinal in result_ordinals
+                    or ordinal not in attempt_ordinals
+                ):
+                    raise SemanticHandoffError(
+                        "历史 v3.1 recovery result inventory 损坏。"
+                    )
+                self._validate_historical_v31_result_inventory(path)
+                result_ordinals.add(ordinal)
+        if result_ordinals and result_ordinals != set(
+            range(1, max(result_ordinals) + 1)
+        ):
+            raise SemanticHandoffError(
+                "历史 v3.1 recovery result inventory 顺序损坏。"
+            )
+
+    @staticmethod
+    def _validate_historical_v31_result_inventory(path: Path) -> None:
+        _require_private_directory(path)
+        try:
+            children = {child.name: child for child in path.iterdir()}
+        except OSError as exc:
+            raise SemanticHandoffError(
+                "历史 v3.1 recovery result inventory 不可读。"
+            ) from exc
+        pending = {
+            "result.json",
+            "result-receipt.json",
+            "phase-post-strict-pending.json",
+        }
+        if frozenset(children) not in {
+            frozenset(pending),
+            frozenset(pending | {"phase-committed.json"}),
+        }:
+            raise SemanticHandoffError(
+                "历史 v3.1 recovery result inventory 损坏。"
+            )
+        for child in children.values():
+            _require_private_file(child)
 
     def _converge_result(
         self,

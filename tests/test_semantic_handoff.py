@@ -2091,6 +2091,149 @@ class SemanticHandoffTest(unittest.TestCase):
                 self.assertEqual(self.tree_snapshot(audit_root), before)
                 self.assertFalse((root / "atomic.jsonl").exists())
 
+    def test_v31_version_specific_inventory_rejects_impossible_entries(
+        self,
+    ) -> None:
+        import archeos.semantic_handoff as handoff_module
+
+        attacks = (
+            "run-commit.json",
+            "run-commit-unknown.json",
+            "extra_file",
+            "extra_directory",
+            "commit_symlink",
+            "result-commit.json",
+            "result-commit-unknown.json",
+        )
+        for attack in attacks:
+            with self.subTest(attack=attack):
+                root = self.root / attack
+                representation, service = self.build_service(root=root)
+                audit_root = root / "audits"
+                audit_root.mkdir(mode=0o700)
+                os.chmod(audit_root, 0o700)
+                runner = FakeRunner()
+                provider = CodexCliRepresentationAnalysisProvider(
+                    provider_version="0.147.0",
+                    timeout_seconds=300,
+                    runner=runner,
+                )
+                recovery = handoff_module._SemanticRecoveryRun(
+                    service,
+                    audit_root,
+                    representation.representation_id,
+                    provider,
+                    self.privacy_binding(),
+                )
+                receipt = json.loads(
+                    json.dumps(recovery.expected_historical_v31_run_receipt)
+                )
+                legacy_run = self.write_v31_attempt_fixture(recovery, receipt)
+                if attack in {"run-commit.json", "run-commit-unknown.json"}:
+                    unexpected = legacy_run / attack
+                    unexpected.write_text('{"state":"looks-valid"}', encoding="utf-8")
+                    os.chmod(unexpected, 0o600)
+                elif attack == "extra_file":
+                    unexpected = legacy_run / "unexpected.json"
+                    unexpected.write_text("{}", encoding="utf-8")
+                    os.chmod(unexpected, 0o600)
+                elif attack == "extra_directory":
+                    unexpected = legacy_run / "unexpected"
+                    unexpected.mkdir(mode=0o700)
+                    os.chmod(unexpected, 0o700)
+                elif attack == "commit_symlink":
+                    (legacy_run / "run-commit.json").symlink_to(
+                        "run-receipt.json"
+                    )
+                else:
+                    result = legacy_run / "results" / "batch_0001"
+                    result.mkdir(parents=True, mode=0o700)
+                    os.chmod(result.parent, 0o700)
+                    os.chmod(result, 0o700)
+                    for name in (
+                        "result.json",
+                        "result-receipt.json",
+                        "phase-post-strict-pending.json",
+                        attack,
+                    ):
+                        path = result / name
+                        path.write_text("{}", encoding="utf-8")
+                        os.chmod(path, 0o600)
+                before = self.tree_snapshot(audit_root)
+
+                with self.assertRaises(SemanticHandoffError):
+                    ExternalAgentSemanticHandoffService(
+                        service,
+                        JsonlAtomicInformationStore(root / "atomic.jsonl"),
+                        audit_root,
+                    ).recovery_preflight(
+                        representation.representation_id,
+                        provider,
+                        self.privacy_binding(),
+                    )
+                self.assertEqual(runner.calls, [])
+                self.assertEqual(self.tree_snapshot(audit_root), before)
+                self.assertFalse((root / "atomic.jsonl").exists())
+
+    def test_v31_version_specific_pending_and_committed_inventory_is_counted(
+        self,
+    ) -> None:
+        import archeos.semantic_handoff as handoff_module
+
+        for committed in (False, True):
+            with self.subTest(committed=committed):
+                root = self.root / str(committed)
+                representation, service = self.build_service(root=root)
+                audit_root = root / "audits"
+                audit_root.mkdir(mode=0o700)
+                os.chmod(audit_root, 0o700)
+                runner = FakeRunner()
+                provider = CodexCliRepresentationAnalysisProvider(
+                    provider_version="0.147.0",
+                    timeout_seconds=300,
+                    runner=runner,
+                )
+                recovery = handoff_module._SemanticRecoveryRun(
+                    service,
+                    audit_root,
+                    representation.representation_id,
+                    provider,
+                    self.privacy_binding(),
+                )
+                receipt = json.loads(
+                    json.dumps(recovery.expected_historical_v31_run_receipt)
+                )
+                legacy_run = self.write_v31_attempt_fixture(recovery, receipt)
+                result = legacy_run / "results" / "batch_0001"
+                result.mkdir(parents=True, mode=0o700)
+                os.chmod(result.parent, 0o700)
+                os.chmod(result, 0o700)
+                names = [
+                    "result.json",
+                    "result-receipt.json",
+                    "phase-post-strict-pending.json",
+                ]
+                if committed:
+                    names.append("phase-committed.json")
+                for name in names:
+                    path = result / name
+                    path.write_text("{}", encoding="utf-8")
+                    os.chmod(path, 0o600)
+                before = self.tree_snapshot(audit_root)
+
+                preflight = ExternalAgentSemanticHandoffService(
+                    service,
+                    JsonlAtomicInformationStore(root / "atomic.jsonl"),
+                    audit_root,
+                ).recovery_preflight(
+                    representation.representation_id,
+                    provider,
+                    self.privacy_binding(),
+                )
+                self.assertEqual(preflight.historical_counted_attempts, 1)
+                self.assertEqual(runner.calls, [])
+                self.assertEqual(self.tree_snapshot(audit_root), before)
+
     def test_v32_recovery_identity_is_stable_and_binds_execution_contract(
         self,
     ) -> None:
