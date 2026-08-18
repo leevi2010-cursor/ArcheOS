@@ -918,6 +918,17 @@ class ExternalAgentExecutionRecord:
 
 
 @dataclass(frozen=True)
+class ExternalAgentTechnicalObservation:
+    """Content-free, in-memory execution details for the synthetic Gate only."""
+
+    processing_run_id: str
+    stdout_sha256: str
+    stderr_sha256: str
+    result_readback_status: str
+    diagnostic_persistence_status: str
+
+
+@dataclass(frozen=True)
 class _ExternalAgentSuccessfulResult:
     """Private in-memory handoff for a strict result before temp cleanup."""
 
@@ -1251,8 +1262,10 @@ class CodexCliRepresentationAnalysisProvider:
             else Path(diagnostic_root).expanduser()
         )
         self.execution_records: list[ExternalAgentExecutionRecord] = []
+        self.technical_observations: list[ExternalAgentTechnicalObservation] = []
         self._successful_results: list[_ExternalAgentSuccessfulResult] = []
         self._capture_successful_raw = False
+        self.provider_start_count = 0
 
     def cleanup_failure_diagnostics(self) -> bool:
         """Explicitly remove local-only failure diagnostics after review."""
@@ -1288,30 +1301,38 @@ class CodexCliRepresentationAnalysisProvider:
             "started_at": _utc_timestamp(),
         }
         if not diagnostic_root_ready:
-            self.execution_records.append(
-                ExternalAgentExecutionRecord(
-                    **record_base,
-                    finished_at=_utc_timestamp(),
-                    execution_status="failed",
-                    failure_category="runtime_execution_failure",
-                    contract_failure_detail=None,
-                    strict_validation_status="failed",
-                    result_fingerprint=None,
-                    eligible_units=len(batch.anchor_units),
-                    covered_units=0,
-                    **_empty_contract_failure_diagnostics(),
-                    diagnostic_schema_version=DIAGNOSTIC_SCHEMA_VERSION,
-                    elapsed_ms=_elapsed_ms(started_monotonic),
-                    deadline_ms=round(self.timeout_seconds * 1000),
-                    exit_code=None,
-                    termination_signal=None,
-                    timeout_phase=None,
-                    provider_error_category=None,
-                    result_file_present=False,
-                    result_size_bytes=0,
-                    stdout_bytes=0,
-                    stderr_bytes=0,
-                    process_cleanup_status="not_started",
+            record = ExternalAgentExecutionRecord(
+                **record_base,
+                finished_at=_utc_timestamp(),
+                execution_status="failed",
+                failure_category="runtime_execution_failure",
+                contract_failure_detail=None,
+                strict_validation_status="failed",
+                result_fingerprint=None,
+                eligible_units=len(batch.anchor_units),
+                covered_units=0,
+                **_empty_contract_failure_diagnostics(),
+                diagnostic_schema_version=DIAGNOSTIC_SCHEMA_VERSION,
+                elapsed_ms=_elapsed_ms(started_monotonic),
+                deadline_ms=round(self.timeout_seconds * 1000),
+                exit_code=None,
+                termination_signal=None,
+                timeout_phase=None,
+                provider_error_category=None,
+                result_file_present=False,
+                result_size_bytes=0,
+                stdout_bytes=0,
+                stderr_bytes=0,
+                process_cleanup_status="not_started",
+            )
+            self.execution_records.append(record)
+            self.technical_observations.append(
+                ExternalAgentTechnicalObservation(
+                    processing_run_id=record.processing_run_id,
+                    stdout_sha256=_stream_fingerprint(""),
+                    stderr_sha256=_stream_fingerprint(""),
+                    result_readback_status="not_applicable",
+                    diagnostic_persistence_status="preflight_failed",
                 )
             )
             raise RepresentationInformationError(
@@ -1359,7 +1380,7 @@ class CodexCliRepresentationAnalysisProvider:
                     command,
                     _external_agent_prompt(request),
                     self.timeout_seconds,
-                    self.runner,
+                    self._start_provider,
                 )
                 result_file_present, result_size_bytes = _result_file_metadata(
                     result_path
@@ -1437,13 +1458,29 @@ class CodexCliRepresentationAnalysisProvider:
                     stderr_bytes=_stream_bytes(outcome.stderr),
                     process_cleanup_status=outcome.process_cleanup_status,
                 )
-                if not _write_failure_diagnostic_bundle(
+                diagnostic_written = _write_failure_diagnostic_bundle(
                     self.diagnostic_root, record, outcome
-                ):
+                )
+                if not diagnostic_written:
                     # Keep this local-only: the durable run audit is intentionally
                     # limited to its approved allowlist.
                     _LOGGER.warning("External Agent 本机失败诊断材料写入失败")
                 self.execution_records.append(record)
+                self.technical_observations.append(
+                    ExternalAgentTechnicalObservation(
+                        processing_run_id=record.processing_run_id,
+                        stdout_sha256=_stream_fingerprint(outcome.stdout),
+                        stderr_sha256=_stream_fingerprint(outcome.stderr),
+                        result_readback_status=(
+                            "verified"
+                            if result_file_present and result_fingerprint is not None
+                            else "not_applicable"
+                        ),
+                        diagnostic_persistence_status=(
+                            "verified" if diagnostic_written else "failed"
+                        ),
+                    )
+                )
                 raise RepresentationInformationError(
                     "External Agent 未产生可验证的结构化结果；未发布信息包。"
                 ) from exc
@@ -1478,6 +1515,15 @@ class CodexCliRepresentationAnalysisProvider:
             process_cleanup_status=outcome.process_cleanup_status,
         )
         self.execution_records.append(success_record)
+        self.technical_observations.append(
+            ExternalAgentTechnicalObservation(
+                processing_run_id=success_record.processing_run_id,
+                stdout_sha256=_stream_fingerprint(outcome.stdout),
+                stderr_sha256=_stream_fingerprint(outcome.stderr),
+                result_readback_status="verified",
+                diagnostic_persistence_status="not_applicable",
+            )
+        )
         if self._capture_successful_raw:
             self._successful_results.append(
                 _ExternalAgentSuccessfulResult(
@@ -1487,6 +1533,12 @@ class CodexCliRepresentationAnalysisProvider:
                 )
             )
         return result
+
+    def _start_provider(self, *args: object, **kwargs: object) -> Any:
+        """Count only a process that the configured production runner started."""
+        process = self.runner(*args, **kwargs)
+        self.provider_start_count += 1
+        return process
 
 
 @dataclass(frozen=True)
@@ -1898,6 +1950,8 @@ def _write_failure_diagnostic_bundle(
         ).replace("+00:00", "Z")
         metadata = {
             "diagnostic_schema_version": DIAGNOSTIC_SCHEMA_VERSION,
+            "execution_status": record.execution_status,
+            "strict_validation_status": record.strict_validation_status,
             "provider_route": record.provider_route,
             "provider_version": record.provider_version,
             "model": record.model,
@@ -1907,6 +1961,7 @@ def _write_failure_diagnostic_bundle(
             "eligible_units": record.eligible_units,
             "covered_units": record.covered_units,
             "contract_failure_stage": record.contract_failure_stage,
+            "contract_failure_detail": record.contract_failure_detail,
             "candidate_item_count": record.candidate_item_count,
             "residue_item_count": record.residue_item_count,
             "accounting_item_count": record.accounting_item_count,
@@ -1945,8 +2000,13 @@ def _write_failure_diagnostic_bundle(
             json.dumps(metadata, ensure_ascii=False, sort_keys=True) + "\n",
         )
         os.rename(staging, bundle)
-        return True
-    except OSError:
+        metadata_path = bundle / "metadata.json"
+        return not (
+            stat.S_IMODE(bundle.stat().st_mode) != 0o700
+            or stat.S_IMODE(metadata_path.stat().st_mode) != 0o600
+            or json.loads(metadata_path.read_text(encoding="utf-8")) != metadata
+        )
+    except (OSError, ValueError, TypeError):
         if "staging" in locals() and staging.exists():
             shutil.rmtree(staging, ignore_errors=True)
         return False

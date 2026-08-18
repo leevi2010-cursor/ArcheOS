@@ -25,6 +25,7 @@ _DIAGNOSTIC_V3_METADATA_FIELDS = {
     "accounting_item_count",
     "candidate_anchor_ref_count",
     "candidate_item_count",
+    "contract_failure_detail",
     "contract_failure_stage",
     "covered_units",
     "created_at",
@@ -37,6 +38,7 @@ _DIAGNOSTIC_V3_METADATA_FIELDS = {
     "eligible_units",
     "exit_code",
     "expires_at",
+    "execution_status",
     "failure_category",
     "fallback_policy",
     "finished_at",
@@ -59,6 +61,7 @@ _DIAGNOSTIC_V3_METADATA_FIELDS = {
     "started_at",
     "stderr_bytes",
     "stderr_sha256",
+    "strict_validation_status",
     "stdout_bytes",
     "stdout_sha256",
     "termination_signal",
@@ -341,7 +344,10 @@ class ExternalAgentFailureDiagnosticsTest(unittest.TestCase):
         self.assertEqual(record.failure_category, "result_contract_failure")
         self.assertEqual(record.contract_failure_stage, "top_level")
         bundle = provider.diagnostic_root / record.processing_run_id
-        self.assert_content_free_bundle(bundle)
+        metadata = self.assert_content_free_bundle(bundle)
+        self.assertEqual(metadata["execution_status"], "failed")
+        self.assertEqual(metadata["strict_validation_status"], "failed")
+        self.assertEqual(metadata["contract_failure_detail"], "top_level_schema")
 
     def test_symlink_diagnostic_root_fails_closed_without_touching_target(self) -> None:
         target = self.root / "external-target"
