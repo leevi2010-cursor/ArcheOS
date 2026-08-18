@@ -21,7 +21,7 @@ from archeos.representation_information import (
 
 _SYNTHETIC_BODY = "Synthetic only."
 _SYNTHETIC_UNIT_ID = "unit_" + "a" * 64
-_DIAGNOSTIC_V2_METADATA_FIELDS = {
+_DIAGNOSTIC_V3_METADATA_FIELDS = {
     "accounting_item_count",
     "candidate_anchor_ref_count",
     "candidate_item_count",
@@ -40,7 +40,10 @@ _DIAGNOSTIC_V2_METADATA_FIELDS = {
     "failure_category",
     "fallback_policy",
     "finished_at",
-    "input_fingerprint",
+    "raw_record_count",
+    "projected_record_count",
+    "duplicate_exact_body_count",
+    "grouping_collision_count",
     "missing_anchor_count",
     "model",
     "process_cleanup_status",
@@ -52,7 +55,6 @@ _DIAGNOSTIC_V2_METADATA_FIELDS = {
     "residue_anchor_ref_count",
     "residue_item_count",
     "result_file_present",
-    "result_fingerprint",
     "result_size_bytes",
     "started_at",
     "stderr_bytes",
@@ -189,7 +191,7 @@ class ExternalAgentFailureDiagnosticsTest(unittest.TestCase):
         metadata_path = bundle / "metadata.json"
         metadata_text = metadata_path.read_text(encoding="utf-8")
         metadata = json.loads(metadata_text)
-        self.assertEqual(set(metadata), _DIAGNOSTIC_V2_METADATA_FIELDS)
+        self.assertEqual(set(metadata), _DIAGNOSTIC_V3_METADATA_FIELDS)
         self.assertRegex(metadata["stdout_sha256"], r"^sha256:[0-9a-f]{64}$")
         self.assertRegex(metadata["stderr_sha256"], r"^sha256:[0-9a-f]{64}$")
         self.assertNotIn(_SYNTHETIC_BODY, metadata_text)
@@ -247,7 +249,7 @@ class ExternalAgentFailureDiagnosticsTest(unittest.TestCase):
         metadata = self.assert_content_free_bundle(bundle)
         self.assertEqual(
             metadata["diagnostic_schema_version"],
-            "external-agent-diagnostics/2.0",
+            "external-agent-diagnostics/3.0",
         )
         self.assertEqual(metadata["model"], "gpt-5.6-terra")
         self.assertEqual(metadata["reasoning_effort"], "medium")

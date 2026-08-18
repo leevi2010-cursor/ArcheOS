@@ -23,6 +23,7 @@ from archeos.representation_information import (
     EXTERNAL_AGENT_PROTOCOL_V3_1,
     EXTERNAL_AGENT_PROTOCOL_V3_2,
     EXTERNAL_AGENT_PROTOCOL_V3_3,
+    EXTERNAL_AGENT_PROTOCOL_V3_4,
     RepresentationAnalysisResult,
     RepresentationCandidateDraft,
     RepresentationInformationService,
@@ -339,6 +340,7 @@ class SyntheticSemanticHandoff:
                         EXTERNAL_AGENT_PROTOCOL_V3_1,
                         EXTERNAL_AGENT_PROTOCOL_V3_2,
                         EXTERNAL_AGENT_PROTOCOL_V3_3,
+                        EXTERNAL_AGENT_PROTOCOL_V3_4,
                     }
                     else "external-agent-diagnostics/1.0"
                 ),
@@ -376,6 +378,7 @@ class SyntheticSemanticHandoff:
                 EXTERNAL_AGENT_PROTOCOL_V3_1,
                 EXTERNAL_AGENT_PROTOCOL_V3_2,
                 EXTERNAL_AGENT_PROTOCOL_V3_3,
+                EXTERNAL_AGENT_PROTOCOL_V3_4,
             }:
                 audit.update(
                     {
@@ -392,6 +395,18 @@ class SyntheticSemanticHandoff:
                         "unknown_anchor_ref_count": 0,
                     }
                 )
+                if self.protocol_version == EXTERNAL_AGENT_PROTOCOL_V3_4:
+                    audit.update(
+                        {
+                            "raw_record_count": len(anchor_unit_ids),
+                            "projected_record_count": 1,
+                            "duplicate_exact_body_count": 0,
+                            "grouping_collision_count": 0,
+                            "diagnostic_schema_version": (
+                                "external-agent-diagnostics/3.0"
+                            ),
+                        }
+                    )
             audit_path.write_text(json.dumps(audit), encoding="utf-8")
 
 
@@ -1230,6 +1245,7 @@ class WechatDigestTests(unittest.TestCase):
             (EXTERNAL_AGENT_PROTOCOL_V3_1, False),
             (EXTERNAL_AGENT_PROTOCOL_V3_2, False),
             (EXTERNAL_AGENT_PROTOCOL_V3_3, False),
+            (EXTERNAL_AGENT_PROTOCOL_V3_4, False),
         )
         for index, (protocol_version, profiled_v1) in enumerate(protocols):
             with self.subTest(protocol=protocol_version):

@@ -21,6 +21,7 @@ from .filesystem import publish_directory_no_replace, publish_file_no_replace
 from .representation_information import (
     CONTRACT_FAILURE_DETAILS,
     DIAGNOSTIC_SCHEMA_V1,
+    DIAGNOSTIC_SCHEMA_V2,
     DIAGNOSTIC_SCHEMA_VERSION,
     EXTERNAL_AGENT_PROTOCOL_V1,
     EXTERNAL_AGENT_PROTOCOL_V2,
@@ -28,6 +29,7 @@ from .representation_information import (
     EXTERNAL_AGENT_PROTOCOL_V3_1,
     EXTERNAL_AGENT_PROTOCOL_V3_2,
     EXTERNAL_AGENT_PROTOCOL_V3_3,
+    EXTERNAL_AGENT_PROTOCOL_V3_4,
     EXTERNAL_AGENT_PROTOCOL_VERSION,
     EXTERNAL_AGENT_ROUTE,
     SUPPORTED_EXTERNAL_AGENT_PROTOCOL_VERSIONS,
@@ -88,9 +90,18 @@ _RECOVERY_RESULT_SCHEMA = "semantic-handoff-batch-result-receipt/2.0"
 _RECOVERY_RESULT_PHASE_SCHEMA = "semantic-handoff-batch-result-phase/1.0"
 _V31_LOCAL_VALIDATOR_CONTRACT_VERSION = "external-agent-local-validator/3.1"
 _V32_LOCAL_VALIDATOR_CONTRACT_VERSION = "external-agent-local-validator/3.2"
-_LOCAL_VALIDATOR_CONTRACT_VERSION = "external-agent-local-validator/3.3"
+_V33_LOCAL_VALIDATOR_CONTRACT_VERSION = "external-agent-local-validator/3.3"
+_LOCAL_VALIDATOR_CONTRACT_VERSION = "external-agent-local-validator/3.4"
 _EXECUTION_RECORD_FIELDS = frozenset(
     ExternalAgentExecutionRecord.__dataclass_fields__
+)
+_V2_GROUPING_DIAGNOSTIC_FIELDS = frozenset(
+    {
+        "raw_record_count",
+        "projected_record_count",
+        "duplicate_exact_body_count",
+        "grouping_collision_count",
+    }
 )
 
 
@@ -391,7 +402,23 @@ def _record_payload(record: ExternalAgentExecutionRecord) -> dict[str, object]:
 
 
 def _record_from_payload(value: object) -> ExternalAgentExecutionRecord:
-    if not isinstance(value, dict) or set(value) != _EXECUTION_RECORD_FIELDS:
+    if not isinstance(value, dict):
+        raise SemanticHandoffError("Semantic recovery execution receipt 损坏。")
+    fields = set(value)
+    current_v3 = (
+        value.get("protocol_version") == EXTERNAL_AGENT_PROTOCOL_V3_4
+        and fields == _EXECUTION_RECORD_FIELDS
+    )
+    historical_v2 = (
+        value.get("protocol_version")
+        in {
+            EXTERNAL_AGENT_PROTOCOL_V3_1,
+            EXTERNAL_AGENT_PROTOCOL_V3_2,
+            EXTERNAL_AGENT_PROTOCOL_V3_3,
+        }
+        and fields == _EXECUTION_RECORD_FIELDS - _V2_GROUPING_DIAGNOSTIC_FIELDS
+    )
+    if not current_v3 and not historical_v2:
         raise SemanticHandoffError("Semantic recovery execution receipt 损坏。")
     anchor_unit_ids = value.get("anchor_unit_ids")
     if not isinstance(anchor_unit_ids, list) or any(
@@ -400,6 +427,8 @@ def _record_from_payload(value: object) -> ExternalAgentExecutionRecord:
         raise SemanticHandoffError("Semantic recovery execution receipt 损坏。")
     payload = dict(value)
     payload["anchor_unit_ids"] = tuple(anchor_unit_ids)
+    if historical_v2:
+        payload.update({field: 0 for field in _V2_GROUPING_DIAGNOSTIC_FIELDS})
     try:
         return ExternalAgentExecutionRecord(**payload)  # type: ignore[arg-type]
     except TypeError as exc:
@@ -461,12 +490,12 @@ class _SemanticRecoveryRun:
             self._batch_contract(
                 batch,
                 ordinal,
-                protocol_version=EXTERNAL_AGENT_PROTOCOL_V3_3,
+                protocol_version=EXTERNAL_AGENT_PROTOCOL_V3_4,
             )
             for ordinal, batch in enumerate(self.batches, start=1)
         )
         execution_identity = self._execution_identity(
-            protocol_version=EXTERNAL_AGENT_PROTOCOL_V3_3,
+            protocol_version=EXTERNAL_AGENT_PROTOCOL_V3_4,
             validator_version=_LOCAL_VALIDATOR_CONTRACT_VERSION,
             batch_contracts=self.batch_contracts,
         )
@@ -540,6 +569,38 @@ class _SemanticRecoveryRun:
             historical_v32_identity,
             execution_identity_fingerprint=(
                 self.historical_v32_execution_identity_fingerprint
+            ),
+        )
+        self.historical_v33_batch_contracts = tuple(
+            self._batch_contract(
+                batch,
+                ordinal,
+                protocol_version=EXTERNAL_AGENT_PROTOCOL_V3_3,
+            )
+            for ordinal, batch in enumerate(self.batches, start=1)
+        )
+        historical_v33_identity = self._execution_identity(
+            protocol_version=EXTERNAL_AGENT_PROTOCOL_V3_3,
+            validator_version=_V33_LOCAL_VALIDATOR_CONTRACT_VERSION,
+            batch_contracts=self.historical_v33_batch_contracts,
+        )
+        self.historical_v33_execution_identity_fingerprint = _fingerprint(
+            historical_v33_identity
+        )
+        self.historical_v33_run_id = (
+            "semantic_run_"
+            + self.historical_v33_execution_identity_fingerprint.removeprefix(
+                "sha256:"
+            )[:32]
+        )
+        (
+            self.historical_v33_contract_fingerprint,
+            self.expected_historical_v33_run_receipt,
+        ) = self._expected_run_receipt(
+            self.historical_v33_run_id,
+            historical_v33_identity,
+            execution_identity_fingerprint=(
+                self.historical_v33_execution_identity_fingerprint
             ),
         )
 
@@ -939,13 +1000,24 @@ class _SemanticRecoveryRun:
             representation = receipt.get("representation")
             if (
                 receipt.get("protocol_version")
-                == EXTERNAL_AGENT_PROTOCOL_V3_3
+                == EXTERNAL_AGENT_PROTOCOL_V3_4
                 and isinstance(representation, dict)
                 and representation.get("representation_id")
                 == self.representation.representation_id
             ):
                 raise SemanticHandoffError(
                     "Semantic recovery execution identity 已漂移。"
+                )
+            if (
+                receipt.get("protocol_version")
+                == EXTERNAL_AGENT_PROTOCOL_V3_3
+                and isinstance(representation, dict)
+                and representation.get("representation_id")
+                == self.representation.representation_id
+                and path.name != self.historical_v33_run_id
+            ):
+                raise SemanticHandoffError(
+                    "历史 v3.3 recovery path binding 已漂移。"
                 )
             if (
                 receipt.get("protocol_version")
@@ -981,6 +1053,7 @@ class _SemanticRecoveryRun:
             historical_counted_attempts=(
                 self._historical_v31_attempt_count()
                 + self._historical_v32_attempt_count()
+                + self._historical_v33_attempt_count()
             ),
         )
 
@@ -1000,6 +1073,15 @@ class _SemanticRecoveryRun:
             expected_run_receipt=self.expected_historical_v32_run_receipt,
             batch_contracts=self.historical_v32_batch_contracts,
             protocol_version=EXTERNAL_AGENT_PROTOCOL_V3_2,
+        )
+
+    def _historical_v33_attempt_count(self) -> int:
+        return self._historical_attempt_count(
+            run_id=self.historical_v33_run_id,
+            contract_fingerprint=self.historical_v33_contract_fingerprint,
+            expected_run_receipt=self.expected_historical_v33_run_receipt,
+            batch_contracts=self.historical_v33_batch_contracts,
+            protocol_version=EXTERNAL_AGENT_PROTOCOL_V3_3,
         )
 
     def _historical_attempt_count(
@@ -1503,6 +1585,45 @@ class _SemanticRecoveryRun:
             record.missing_anchor_count,
             record.unknown_anchor_ref_count,
         )
+        expected_diagnostic_version = (
+            DIAGNOSTIC_SCHEMA_VERSION
+            if protocol_version == EXTERNAL_AGENT_PROTOCOL_V3_4
+            else DIAGNOSTIC_SCHEMA_V2
+        )
+        expected_grouping_counts = (0, 0, 0, 0)
+        if protocol_version == EXTERNAL_AGENT_PROTOCOL_V3_4:
+            try:
+                payload = json.loads(raw.decode("utf-8"))
+                parsed = _parse_external_agent_result(
+                    raw.decode("utf-8"),
+                    batch,
+                    str(receipt["input_fingerprint"]),
+                    protocol_version,
+                )
+                anchor_results = payload["anchor_results"]
+                assert isinstance(anchor_results, dict)
+                raw_count = sum(
+                    len(records)
+                    for value in anchor_results.values()
+                    if isinstance(value, dict)
+                    and isinstance((records := value.get("records")), list)
+                )
+            except (
+                AssertionError,
+                KeyError,
+                UnicodeDecodeError,
+                json.JSONDecodeError,
+                RepresentationInformationError,
+            ) as exc:
+                raise SemanticHandoffError(
+                    "Semantic recovery success diagnostics 不可重建。"
+                ) from exc
+            expected_grouping_counts = (
+                raw_count,
+                len(parsed.candidates) + len(parsed.residue),
+                0,
+                0,
+            )
         if (
             not _processing_run_id(record.processing_run_id)
             or record.protocol_version != protocol_version
@@ -1533,7 +1654,14 @@ class _SemanticRecoveryRun:
                 or value != 0
                 for value in zero_counts
             )
-            or record.diagnostic_schema_version != DIAGNOSTIC_SCHEMA_VERSION
+            or (
+                record.raw_record_count,
+                record.projected_record_count,
+                record.duplicate_exact_body_count,
+                record.grouping_collision_count,
+            )
+            != expected_grouping_counts
+            or record.diagnostic_schema_version != expected_diagnostic_version
             or not _timestamp(record.started_at)
             or not _timestamp(record.finished_at)
             or isinstance(record.elapsed_ms, bool)
@@ -1885,6 +2013,12 @@ _COMPLETED_AUDIT_CONTRACT_DIAGNOSTIC_FIELDS = {
     "missing_anchor_count",
     "unknown_anchor_ref_count",
 }
+_COMPLETED_AUDIT_GROUPING_DIAGNOSTIC_FIELDS = {
+    "raw_record_count",
+    "projected_record_count",
+    "duplicate_exact_body_count",
+    "grouping_collision_count",
+}
 _AUDIT_DIAGNOSTIC_FIELDS = {
     "diagnostic_schema_version",
     "elapsed_ms",
@@ -1974,6 +2108,7 @@ def _versioned_audit_contract(
             EXTERNAL_AGENT_PROTOCOL_V3_1,
             EXTERNAL_AGENT_PROTOCOL_V3_2,
             EXTERNAL_AGENT_PROTOCOL_V3_3,
+            EXTERNAL_AGENT_PROTOCOL_V3_4,
         }
         and package_provider != _provider_manifest(provider)
     ):
@@ -2016,6 +2151,17 @@ def _versioned_audit_contract(
                 frozenset(
                     _COMPLETED_AUDIT_BASE_FIELDS
                     | _COMPLETED_AUDIT_CONTRACT_DIAGNOSTIC_FIELDS
+                )
+            }
+        )
+        diagnostic_version = DIAGNOSTIC_SCHEMA_V2
+    elif protocol_version == EXTERNAL_AGENT_PROTOCOL_V3_4:
+        shapes = frozenset(
+            {
+                frozenset(
+                    _COMPLETED_AUDIT_BASE_FIELDS
+                    | _COMPLETED_AUDIT_CONTRACT_DIAGNOSTIC_FIELDS
+                    | _COMPLETED_AUDIT_GROUPING_DIAGNOSTIC_FIELDS
                 )
             }
         )
@@ -2131,11 +2277,7 @@ def _validate_versioned_published_audits(
             or has_diagnostics
             and (
                 audit.get("diagnostic_schema_version")
-                != (
-                    DIAGNOSTIC_SCHEMA_VERSION
-                    if has_contract_diagnostics
-                    else expected_diagnostic_version
-                )
+                != expected_diagnostic_version
                 or isinstance(audit.get("elapsed_ms"), bool)
                 or not isinstance(audit.get("elapsed_ms"), int)
                 or int(audit["elapsed_ms"]) < 0
@@ -2176,6 +2318,20 @@ def _validate_versioned_published_audits(
         ):
             raise SemanticHandoffError(
                 "已发布的信息包 contract diagnostics 不收敛。"
+            )
+        if protocol_version == EXTERNAL_AGENT_PROTOCOL_V3_4 and (
+            isinstance(audit.get("raw_record_count"), bool)
+            or not isinstance(audit.get("raw_record_count"), int)
+            or isinstance(audit.get("projected_record_count"), bool)
+            or not isinstance(audit.get("projected_record_count"), int)
+            or int(audit["raw_record_count"])
+            < int(audit["projected_record_count"])
+            or int(audit["projected_record_count"]) < 1
+            or audit.get("duplicate_exact_body_count") != 0
+            or audit.get("grouping_collision_count") != 0
+        ):
+            raise SemanticHandoffError(
+                "已发布的信息包 record grouping diagnostics 不收敛。"
             )
     if observed != set(expected):
         raise SemanticHandoffError("已发布的信息包审计批次集合不完整。")
@@ -2569,6 +2725,12 @@ class ExternalAgentSemanticHandoffService:
                 record.missing_anchor_count,
                 record.unknown_anchor_ref_count,
             )
+            grouping_counts = (
+                record.raw_record_count,
+                record.projected_record_count,
+                record.duplicate_exact_body_count,
+                record.grouping_collision_count,
+            )
             if (
                 record.failure_category == "result_contract_failure"
                 and (
@@ -2582,9 +2744,15 @@ class ExternalAgentSemanticHandoffService:
                     record.contract_failure_detail is not None
                     or record.contract_failure_stage is not None
                     or any(contract_counts)
+                    or record.execution_status != "succeeded"
+                    and any(grouping_counts)
                 )
             ) or (
                 any(isinstance(value, bool) or value < 0 for value in contract_counts)
+                or any(
+                    isinstance(value, bool) or value < 0
+                    for value in grouping_counts
+                )
                 or record.covered_units < 0
                 or record.covered_units > record.eligible_units
             ):
@@ -2622,6 +2790,10 @@ class ExternalAgentSemanticHandoffService:
                 "dual_assignment_count": record.dual_assignment_count,
                 "missing_anchor_count": record.missing_anchor_count,
                 "unknown_anchor_ref_count": record.unknown_anchor_ref_count,
+                "raw_record_count": record.raw_record_count,
+                "projected_record_count": record.projected_record_count,
+                "duplicate_exact_body_count": record.duplicate_exact_body_count,
+                "grouping_collision_count": record.grouping_collision_count,
                 "diagnostic_schema_version": record.diagnostic_schema_version,
                 "elapsed_ms": record.elapsed_ms,
                 "deadline_ms": record.deadline_ms,
@@ -2803,6 +2975,10 @@ class ExternalAgentSemanticHandoffService:
                 or record.eligible_units != len(anchor_unit_ids)
                 or record.covered_units != len(anchor_unit_ids)
                 or record.diagnostic_schema_version != DIAGNOSTIC_SCHEMA_VERSION
+                or record.raw_record_count < record.projected_record_count
+                or record.projected_record_count < 1
+                or record.duplicate_exact_body_count != 0
+                or record.grouping_collision_count != 0
                 or record.contract_failure_stage is not None
                 or any(
                     (
