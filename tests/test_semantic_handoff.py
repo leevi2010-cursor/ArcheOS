@@ -31,6 +31,7 @@ from archeos.representation_information import (
     EXTERNAL_AGENT_PROTOCOL_V3_2,
     EXTERNAL_AGENT_PROTOCOL_VERSION,
     CodexCliRepresentationAnalysisProvider,
+    ExternalAgentExecutionRecord,
     RepresentationAnalysisBatch,
     RepresentationAnalysisResult,
     RepresentationAnalysisUnit,
@@ -1891,6 +1892,18 @@ class SemanticHandoffTest(unittest.TestCase):
         *,
         nonce: str = "f" * 64,
     ) -> Path:
+        return self.write_v31_attempts_fixture(
+            recovery, receipt, (1,), nonces={1: nonce}
+        )
+
+    def write_v31_attempts_fixture(
+        self,
+        recovery,
+        receipt: dict[str, object],
+        ordinals: tuple[int, ...],
+        *,
+        nonces: dict[int, str] | None = None,
+    ) -> Path:
         for batch in receipt["batches"]:
             batch.pop("batch_contract_fingerprint", None)
             batch["batch_contract_fingerprint"] = _canonical_fingerprint(batch)
@@ -1898,14 +1911,6 @@ class SemanticHandoffTest(unittest.TestCase):
         receipt.pop("run_receipt_fingerprint", None)
         receipt["contract_fingerprint"] = _canonical_fingerprint(receipt)
         receipt["run_receipt_fingerprint"] = _canonical_fingerprint(receipt)
-        batch_receipt = receipt["batches"][0]
-        attempt = recovery._expected_attempt_payload(
-            semantic_run_id=receipt["semantic_run_id"],
-            contract_fingerprint=receipt["contract_fingerprint"],
-            batch_receipt=batch_receipt,
-            ordinal=1,
-            attempt_nonce=nonce,
-        )
         legacy_run = recovery.audit_root / receipt["semantic_run_id"]
         legacy_attempts = legacy_run / "attempts"
         legacy_attempts.mkdir(parents=True, mode=0o700)
@@ -1914,12 +1919,180 @@ class SemanticHandoffTest(unittest.TestCase):
         (legacy_run / "run-receipt.json").write_text(
             json.dumps(receipt), encoding="utf-8"
         )
-        (legacy_attempts / "batch_0001.json").write_text(
-            json.dumps(attempt), encoding="utf-8"
-        )
+        for ordinal in ordinals:
+            attempt = recovery._expected_attempt_payload(
+                semantic_run_id=receipt["semantic_run_id"],
+                contract_fingerprint=receipt["contract_fingerprint"],
+                batch_receipt=receipt["batches"][ordinal - 1],
+                ordinal=ordinal,
+                attempt_nonce=(
+                    nonces[ordinal]
+                    if nonces is not None
+                    else f"{ordinal:064x}"
+                ),
+            )
+            (legacy_attempts / f"batch_{ordinal:04d}.json").write_text(
+                json.dumps(attempt), encoding="utf-8"
+            )
         for path in legacy_run.rglob("*.json"):
             os.chmod(path, 0o600)
         return legacy_run
+
+    def write_v31_result_fixture(
+        self,
+        recovery,
+        legacy_run: Path,
+        ordinal: int,
+        *,
+        committed: bool = False,
+    ) -> None:
+        import archeos.semantic_handoff as handoff_module
+
+        contract = recovery.historical_v31_batch_contracts[ordinal - 1]
+        batch = contract["batch"]
+        batch_receipt = contract["receipt"]
+        attempt = json.loads(
+            (
+                legacy_run / "attempts" / f"batch_{ordinal:04d}.json"
+            ).read_text(encoding="utf-8")
+        )
+        anchor_ids = [unit.unit_id for unit in batch.anchor_units]
+        raw = json.dumps(
+            {
+                "protocol_version": EXTERNAL_AGENT_PROTOCOL_V3_1,
+                "input_fingerprint": batch_receipt["input_fingerprint"],
+                "anchor_accounting": [
+                    {"anchor_unit_id": unit_id, "accounted_as": "candidate"}
+                    for unit_id in anchor_ids
+                ],
+                "candidates": [
+                    {
+                        "statement": "Synthetic statement.",
+                        "semantic_type": "observation",
+                        "concerns": ["Synthetic"],
+                        "anchor_unit_ids": [unit_id],
+                        "supporting_evidence_unit_ids": [],
+                        "context": "Synthetic context.",
+                        "confidence": 0.9,
+                    }
+                    for unit_id in anchor_ids
+                ],
+                "residue": [],
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        processing_run_id = f"run_{ordinal:032x}"
+        record = ExternalAgentExecutionRecord(
+            processing_run_id=processing_run_id,
+            protocol_version=EXTERNAL_AGENT_PROTOCOL_V3_1,
+            input_fingerprint=batch_receipt["input_fingerprint"],
+            anchor_unit_ids=tuple(anchor_ids),
+            provider_route="codex-cli",
+            provider_version="0.147.0",
+            model="gpt-5.6-terra",
+            reasoning_effort="medium",
+            fallback_policy="none",
+            started_at="2026-08-18T00:00:00.000Z",
+            finished_at="2026-08-18T00:00:01.000Z",
+            execution_status="succeeded",
+            failure_category=None,
+            contract_failure_detail=None,
+            strict_validation_status="passed",
+            result_fingerprint=handoff_module._bytes_fingerprint(raw),
+            eligible_units=len(anchor_ids),
+            covered_units=len(anchor_ids),
+            contract_failure_stage=None,
+            candidate_item_count=0,
+            residue_item_count=0,
+            accounting_item_count=0,
+            candidate_anchor_ref_count=0,
+            residue_anchor_ref_count=0,
+            duplicate_anchor_ref_count=0,
+            duplicate_accounting_count=0,
+            dual_assignment_count=0,
+            missing_anchor_count=0,
+            unknown_anchor_ref_count=0,
+            diagnostic_schema_version="external-agent-diagnostics/2.0",
+            elapsed_ms=1000,
+            deadline_ms=300000,
+            exit_code=0,
+            termination_signal=None,
+            timeout_phase=None,
+            provider_error_category=None,
+            result_file_present=True,
+            result_size_bytes=len(raw),
+            stdout_bytes=0,
+            stderr_bytes=0,
+            process_cleanup_status="verified",
+        )
+        without_fingerprint = {
+            "schema_version": "semantic-handoff-batch-result-receipt/2.0",
+            "artifact_kind": "semantic_handoff_batch_result",
+            "semantic_run_id": recovery.historical_v31_run_id,
+            "run_contract_fingerprint": (
+                recovery.historical_v31_contract_fingerprint
+            ),
+            "batch_ordinal": ordinal,
+            "batch_contract_fingerprint": batch_receipt[
+                "batch_contract_fingerprint"
+            ],
+            "attempt_id": attempt["attempt_id"],
+            "attempt_nonce": attempt["attempt_nonce"],
+            "attempt_receipt_fingerprint": attempt[
+                "attempt_receipt_fingerprint"
+            ],
+            "processing_run_id": processing_run_id,
+            "result_sha256": handoff_module._bytes_fingerprint(raw),
+            "result_size_bytes": len(raw),
+            "strict_validation_status": "passed",
+            "result_readback_status": "verified",
+            "process_cleanup_status": "verified",
+            "execution_record": handoff_module._record_payload(record),
+        }
+        result_receipt = {
+            **without_fingerprint,
+            "result_receipt_fingerprint": handoff_module._fingerprint(
+                without_fingerprint
+            ),
+        }
+        result = legacy_run / "results" / f"batch_{ordinal:04d}"
+        result.mkdir(parents=True, mode=0o700)
+        os.chmod(result.parent, 0o700)
+        os.chmod(result, 0o700)
+        payloads = {
+            "result-receipt.json": result_receipt,
+            "phase-post-strict-pending.json": (
+                recovery._expected_result_phase_payload(
+                    semantic_run_id=recovery.historical_v31_run_id,
+                    contract_fingerprint=(
+                        recovery.historical_v31_contract_fingerprint
+                    ),
+                    batch_receipt=batch_receipt,
+                    ordinal=ordinal,
+                    result_receipt=result_receipt,
+                    phase="post_strict_pending",
+                )
+            ),
+        }
+        if committed:
+            payloads["phase-committed.json"] = (
+                recovery._expected_result_phase_payload(
+                    semantic_run_id=recovery.historical_v31_run_id,
+                    contract_fingerprint=(
+                        recovery.historical_v31_contract_fingerprint
+                    ),
+                    batch_receipt=batch_receipt,
+                    ordinal=ordinal,
+                    result_receipt=result_receipt,
+                    phase="committed",
+                )
+            )
+        (result / "result.json").write_bytes(raw)
+        for name, payload in payloads.items():
+            (result / name).write_text(json.dumps(payload), encoding="utf-8")
+        for path in result.iterdir():
+            os.chmod(path, 0o600)
 
     def test_v31_attempt_is_counted_preserved_and_isolated_from_v32_run(
         self,
@@ -2204,21 +2377,9 @@ class SemanticHandoffTest(unittest.TestCase):
                     json.dumps(recovery.expected_historical_v31_run_receipt)
                 )
                 legacy_run = self.write_v31_attempt_fixture(recovery, receipt)
-                result = legacy_run / "results" / "batch_0001"
-                result.mkdir(parents=True, mode=0o700)
-                os.chmod(result.parent, 0o700)
-                os.chmod(result, 0o700)
-                names = [
-                    "result.json",
-                    "result-receipt.json",
-                    "phase-post-strict-pending.json",
-                ]
-                if committed:
-                    names.append("phase-committed.json")
-                for name in names:
-                    path = result / name
-                    path.write_text("{}", encoding="utf-8")
-                    os.chmod(path, 0o600)
+                self.write_v31_result_fixture(
+                    recovery, legacy_run, 1, committed=committed
+                )
                 before = self.tree_snapshot(audit_root)
 
                 preflight = ExternalAgentSemanticHandoffService(
@@ -2233,6 +2394,83 @@ class SemanticHandoffTest(unittest.TestCase):
                 self.assertEqual(preflight.historical_counted_attempts, 1)
                 self.assertEqual(runner.calls, [])
                 self.assertEqual(self.tree_snapshot(audit_root), before)
+
+    def test_v31_version_specific_sequence_causality_matrix(self) -> None:
+        import archeos.semantic_handoff as handoff_module
+
+        cases = (
+            ("no_attempts", 41, (), (), True, 0),
+            ("attempt_1", 41, (1,), (), True, 1),
+            ("attempt_1_result_1", 41, (1,), (1,), True, 1),
+            ("attempt_2_result_1", 41, (1, 2), (1,), True, 2),
+            ("attempt_2_result_2", 41, (1, 2), (1, 2), True, 2),
+            ("attempt_2_no_results", 41, (1, 2), (), False, 0),
+            ("attempt_3_only_result_1", 81, (1, 2, 3), (1,), False, 0),
+            ("attempt_gap", 81, (1, 3), (1,), False, 0),
+            ("result_without_attempt", 41, (1,), (1,), False, 0),
+        )
+        for name, blocks, attempts, results, accepted, expected_count in cases:
+            with self.subTest(case=name):
+                root = self.root / name
+                representation, service = self.build_service(
+                    blocks=blocks, root=root
+                )
+                audit_root = root / "audits"
+                audit_root.mkdir(mode=0o700)
+                os.chmod(audit_root, 0o700)
+                runner = FakeRunner()
+                provider = CodexCliRepresentationAnalysisProvider(
+                    provider_version="0.147.0",
+                    timeout_seconds=300,
+                    runner=runner,
+                )
+                recovery = handoff_module._SemanticRecoveryRun(
+                    service,
+                    audit_root,
+                    representation.representation_id,
+                    provider,
+                    self.privacy_binding(),
+                )
+                receipt = json.loads(
+                    json.dumps(recovery.expected_historical_v31_run_receipt)
+                )
+                legacy_run = self.write_v31_attempts_fixture(
+                    recovery, receipt, attempts
+                )
+                for ordinal in results:
+                    self.write_v31_result_fixture(
+                        recovery, legacy_run, ordinal, committed=True
+                    )
+                if name == "result_without_attempt":
+                    (
+                        legacy_run / "attempts" / "batch_0001.json"
+                    ).unlink()
+                before = self.tree_snapshot(audit_root)
+                handoff = ExternalAgentSemanticHandoffService(
+                    service,
+                    JsonlAtomicInformationStore(root / "atomic.jsonl"),
+                    audit_root,
+                )
+                if accepted:
+                    preflight = handoff.recovery_preflight(
+                        representation.representation_id,
+                        provider,
+                        self.privacy_binding(),
+                    )
+                    self.assertEqual(
+                        preflight.historical_counted_attempts,
+                        expected_count,
+                    )
+                else:
+                    with self.assertRaises(SemanticHandoffError):
+                        handoff.recovery_preflight(
+                            representation.representation_id,
+                            provider,
+                            self.privacy_binding(),
+                        )
+                self.assertEqual(runner.calls, [])
+                self.assertEqual(self.tree_snapshot(audit_root), before)
+                self.assertFalse((root / "atomic.jsonl").exists())
 
     def test_v32_recovery_identity_is_stable_and_binds_execution_contract(
         self,

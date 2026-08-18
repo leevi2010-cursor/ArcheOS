@@ -696,11 +696,32 @@ class _SemanticRecoveryRun:
             raise SemanticHandoffError("Semantic recovery phase 无效。")
         batch_receipt = self.batch_contracts[ordinal - 1]["receipt"]
         assert isinstance(batch_receipt, dict)
+        return self._expected_result_phase_payload(
+            semantic_run_id=self.semantic_run_id,
+            contract_fingerprint=self.contract_fingerprint,
+            batch_receipt=batch_receipt,
+            ordinal=ordinal,
+            result_receipt=result_receipt,
+            phase=phase,
+        )
+
+    @staticmethod
+    def _expected_result_phase_payload(
+        *,
+        semantic_run_id: str,
+        contract_fingerprint: str,
+        batch_receipt: Mapping[str, object],
+        ordinal: int,
+        result_receipt: Mapping[str, object],
+        phase: str,
+    ) -> dict[str, object]:
+        if phase not in {"post_strict_pending", "committed"}:
+            raise SemanticHandoffError("Semantic recovery phase 无效。")
         return {
             "schema_version": _RECOVERY_RESULT_PHASE_SCHEMA,
             "artifact_kind": "semantic_handoff_batch_result_phase",
-            "semantic_run_id": self.semantic_run_id,
-            "run_contract_fingerprint": self.contract_fingerprint,
+            "semantic_run_id": semantic_run_id,
+            "run_contract_fingerprint": contract_fingerprint,
             "batch_ordinal": ordinal,
             "batch_contract_fingerprint": batch_receipt[
                 "batch_contract_fingerprint"
@@ -1019,7 +1040,12 @@ class _SemanticRecoveryRun:
                     raise SemanticHandoffError(
                         "历史 v3.1 recovery result inventory 损坏。"
                     )
-                self._validate_historical_v31_result_inventory(path)
+                attempt = _private_json_exact(
+                    attempts / f"batch_{ordinal:04d}.json"
+                )
+                self._validate_historical_v31_result_inventory(
+                    path, ordinal, attempt
+                )
                 result_ordinals.add(ordinal)
         if result_ordinals and result_ordinals != set(
             range(1, max(result_ordinals) + 1)
@@ -1027,9 +1053,21 @@ class _SemanticRecoveryRun:
             raise SemanticHandoffError(
                 "历史 v3.1 recovery result inventory 顺序损坏。"
             )
+        if attempt_ordinals:
+            last_attempt = max(attempt_ordinals)
+            completed = set(range(1, last_attempt + 1))
+            final_attempt_unknown = set(range(1, last_attempt))
+            if result_ordinals not in (completed, final_attempt_unknown):
+                raise SemanticHandoffError(
+                    "历史 v3.1 recovery batch 顺序因果损坏。"
+                )
 
-    @staticmethod
-    def _validate_historical_v31_result_inventory(path: Path) -> None:
+    def _validate_historical_v31_result_inventory(
+        self,
+        path: Path,
+        ordinal: int,
+        attempt: Mapping[str, object],
+    ) -> None:
         _require_private_directory(path)
         try:
             children = {child.name: child for child in path.iterdir()}
@@ -1051,6 +1089,116 @@ class _SemanticRecoveryRun:
             )
         for child in children.values():
             _require_private_file(child)
+        raw = _private_bytes_read(path / "result.json")
+        receipt = _private_json_exact(path / "result-receipt.json")
+        batch_contract = self.historical_v31_batch_contracts[ordinal - 1]
+        batch_receipt = batch_contract["receipt"]
+        batch = batch_contract["batch"]
+        assert isinstance(batch_receipt, dict)
+        assert isinstance(batch, RepresentationAnalysisBatch)
+        expected_keys = {
+            "schema_version",
+            "artifact_kind",
+            "semantic_run_id",
+            "run_contract_fingerprint",
+            "batch_ordinal",
+            "batch_contract_fingerprint",
+            "attempt_id",
+            "attempt_nonce",
+            "attempt_receipt_fingerprint",
+            "processing_run_id",
+            "result_sha256",
+            "result_size_bytes",
+            "strict_validation_status",
+            "result_readback_status",
+            "process_cleanup_status",
+            "execution_record",
+            "result_receipt_fingerprint",
+        }
+        receipt_without_fingerprint = dict(receipt)
+        receipt_fingerprint = receipt_without_fingerprint.pop(
+            "result_receipt_fingerprint", None
+        )
+        if (
+            set(receipt) != expected_keys
+            or receipt.get("schema_version") != _RECOVERY_RESULT_SCHEMA
+            or receipt.get("artifact_kind")
+            != "semantic_handoff_batch_result"
+            or receipt.get("semantic_run_id") != self.historical_v31_run_id
+            or receipt.get("run_contract_fingerprint")
+            != self.historical_v31_contract_fingerprint
+            or isinstance(receipt.get("batch_ordinal"), bool)
+            or receipt.get("batch_ordinal") != ordinal
+            or receipt.get("batch_contract_fingerprint")
+            != batch_receipt.get("batch_contract_fingerprint")
+            or receipt.get("attempt_id") != attempt.get("attempt_id")
+            or receipt.get("attempt_nonce") != attempt.get("attempt_nonce")
+            or receipt.get("attempt_receipt_fingerprint")
+            != attempt.get("attempt_receipt_fingerprint")
+            or receipt.get("result_sha256") != _bytes_fingerprint(raw)
+            or isinstance(receipt.get("result_size_bytes"), bool)
+            or receipt.get("result_size_bytes") != len(raw)
+            or receipt.get("strict_validation_status") != "passed"
+            or receipt.get("result_readback_status") != "verified"
+            or receipt.get("process_cleanup_status") != "verified"
+            or receipt_fingerprint != _fingerprint(receipt_without_fingerprint)
+        ):
+            raise SemanticHandoffError(
+                "历史 v3.1 recovery result binding 损坏。"
+            )
+        pending = self._expected_result_phase_payload(
+            semantic_run_id=self.historical_v31_run_id,
+            contract_fingerprint=self.historical_v31_contract_fingerprint,
+            batch_receipt=batch_receipt,
+            ordinal=ordinal,
+            result_receipt=receipt,
+            phase="post_strict_pending",
+        )
+        if not _payloads_exactly_equal(
+            _private_json_exact(path / "phase-post-strict-pending.json"),
+            pending,
+        ):
+            raise SemanticHandoffError(
+                "历史 v3.1 recovery pending phase 损坏。"
+            )
+        if "phase-committed.json" in children and not _payloads_exactly_equal(
+            _private_json_exact(path / "phase-committed.json"),
+            self._expected_result_phase_payload(
+                semantic_run_id=self.historical_v31_run_id,
+                contract_fingerprint=self.historical_v31_contract_fingerprint,
+                batch_receipt=batch_receipt,
+                ordinal=ordinal,
+                result_receipt=receipt,
+                phase="committed",
+            ),
+        ):
+            raise SemanticHandoffError(
+                "历史 v3.1 recovery committed phase 损坏。"
+            )
+        record = _record_from_payload(receipt.get("execution_record"))
+        if receipt.get("processing_run_id") != record.processing_run_id:
+            raise SemanticHandoffError(
+                "历史 v3.1 recovery Processing Run binding 损坏。"
+            )
+        self._reject_conflicting_failure_audit(record)
+        self._validate_success_record_for_contract(
+            record,
+            ordinal,
+            raw,
+            protocol_version=EXTERNAL_AGENT_PROTOCOL_V3_1,
+            batch_contracts=self.historical_v31_batch_contracts,
+        )
+        try:
+            _parse_external_agent_result(
+                raw.decode("utf-8"),
+                batch,
+                str(batch_receipt["input_fingerprint"]),
+                EXTERNAL_AGENT_PROTOCOL_V3_1,
+            )
+        except (UnicodeDecodeError, RepresentationInformationError) as exc:
+            raise SemanticHandoffError(
+                "历史 v3.1 recovery result strict readback 失败。"
+            ) from exc
 
     def _converge_result(
         self,
@@ -1229,8 +1377,25 @@ class _SemanticRecoveryRun:
     def _validate_success_record(
         self, record: ExternalAgentExecutionRecord, ordinal: int, raw: bytes
     ) -> None:
-        receipt = self.batch_contracts[ordinal - 1]["receipt"]
-        batch = self.batch_contracts[ordinal - 1]["batch"]
+        self._validate_success_record_for_contract(
+            record,
+            ordinal,
+            raw,
+            protocol_version=EXTERNAL_AGENT_PROTOCOL_VERSION,
+            batch_contracts=self.batch_contracts,
+        )
+
+    def _validate_success_record_for_contract(
+        self,
+        record: ExternalAgentExecutionRecord,
+        ordinal: int,
+        raw: bytes,
+        *,
+        protocol_version: str,
+        batch_contracts: tuple[dict[str, object], ...],
+    ) -> None:
+        receipt = batch_contracts[ordinal - 1]["receipt"]
+        batch = batch_contracts[ordinal - 1]["batch"]
         assert isinstance(receipt, dict)
         assert isinstance(batch, RepresentationAnalysisBatch)
         zero_counts = (
@@ -1247,7 +1412,7 @@ class _SemanticRecoveryRun:
         )
         if (
             not _processing_run_id(record.processing_run_id)
-            or record.protocol_version != EXTERNAL_AGENT_PROTOCOL_VERSION
+            or record.protocol_version != protocol_version
             or record.input_fingerprint != receipt["input_fingerprint"]
             or record.anchor_unit_ids
             != tuple(unit.unit_id for unit in batch.anchor_units)
