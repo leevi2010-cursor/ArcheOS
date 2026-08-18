@@ -1794,8 +1794,12 @@ class SemanticHandoffTest(unittest.TestCase):
         root: Path,
         *,
         runner_mode: str = "success",
+        blocks: int = 1,
     ):
-        representation, service = self.build_service(root=root / "source")
+        representation, service = self.build_service(
+            root=root / "source",
+            blocks=blocks,
+        )
         audit_root = root / "audits"
         handoff = ExternalAgentSemanticHandoffService(
             service,
@@ -5198,6 +5202,227 @@ class SemanticHandoffTest(unittest.TestCase):
                 self.assertFalse(
                     (handoff.audit_root / "semantic_global_authority").exists()
                 )
+
+    def test_global_authority_inventory_rejects_producer_count_drift_zero_write(
+        self,
+    ) -> None:
+        zero_contract = {field: 0 for field in _CONTRACT_DIAGNOSTIC_FIELDS[1:]}
+        zero_grouping = {field: 0 for field in _GROUPING_DIAGNOSTIC_FIELDS}
+        attacks = (
+            ("candidate-item-only", "candidate_shape", 1, {"candidate_item_count": 8}),
+            (
+                "covered-without-records",
+                "candidate_shape",
+                1,
+                {**zero_contract, **zero_grouping},
+            ),
+            ("success-raw-below-eligible", "success", 40, {"raw_record_count": 1, "projected_record_count": 1}),
+            ("success-contract-count", "success", 1, {"candidate_item_count": 1}),
+            (
+                "raw-item-drift",
+                "candidate_shape",
+                1,
+                {"candidate_item_count": 5, "candidate_anchor_ref_count": 5, "raw_record_count": 10, "projected_record_count": 5},
+            ),
+            ("covered-without-raw", "candidate_shape", 1, {"raw_record_count": 0, "projected_record_count": 0}),
+            ("missing", "candidate_shape", 1, {"missing_anchor_count": 1}),
+            ("accounting", "candidate_shape", 1, {"accounting_item_count": 0}),
+            ("duplicate-anchor", "candidate_shape", 1, {"duplicate_anchor_ref_count": 1}),
+            ("duplicate-exact", "candidate_shape", 1, {"duplicate_exact_body_count": 1}),
+            ("collision", "candidate_shape", 1, {"grouping_collision_count": 1}),
+            ("binding-empty-result", "wrong_binding", 1, {"result_size_bytes": 0}),
+            ("contract-empty-result", "candidate_shape", 1, {"result_size_bytes": 0}),
+        )
+        for name, mode, blocks, mutation in attacks:
+            with self.subTest(name=name):
+                root = self.root / f"inventory-producer-count-{name}"
+                (
+                    _representation,
+                    _service,
+                    handoff,
+                    provider,
+                    _batch,
+                    audit_path,
+                ) = self.build_historical_inventory_audit(
+                    root,
+                    runner_mode=mode,
+                    blocks=blocks,
+                )
+                audit = json.loads(audit_path.read_text(encoding="utf-8"))
+                audit.update(mutation)
+                audit_path.write_text(json.dumps(audit), encoding="utf-8")
+                before = self.tree_snapshot(root)
+                with self.assertRaises(SemanticHandoffError):
+                    self.install_historical_inventory_authority(handoff, provider)
+                self.assertEqual(self.tree_snapshot(root), before)
+                self.assertFalse(
+                    (handoff.audit_root / "semantic_global_authority").exists()
+                )
+
+    def test_global_authority_inventory_accepts_top_level_projection_union(
+        self,
+    ) -> None:
+        for name, missing in (("non-object", 0), ("object", 1)):
+            with self.subTest(name=name):
+                root = self.root / f"inventory-top-level-{name}"
+                (
+                    _representation,
+                    _service,
+                    handoff,
+                    provider,
+                    _batch,
+                    audit_path,
+                ) = self.build_historical_inventory_audit(
+                    root,
+                    runner_mode="candidate_shape",
+                )
+                audit = json.loads(audit_path.read_text(encoding="utf-8"))
+                audit.update(
+                    failure_category="result_contract_failure",
+                    contract_failure_detail="top_level_schema",
+                    contract_failure_stage="top_level",
+                    covered_units=0,
+                    unaccounted_units=audit["eligible_units"],
+                    **{
+                        field: 0
+                        for field in (
+                            *_CONTRACT_DIAGNOSTIC_FIELDS[1:],
+                            *_GROUPING_DIAGNOSTIC_FIELDS,
+                        )
+                    },
+                )
+                audit["missing_anchor_count"] = missing
+                audit_path.write_text(json.dumps(audit), encoding="utf-8")
+                grant = self.install_historical_inventory_authority(
+                    handoff,
+                    provider,
+                )
+                self.assertEqual(grant["legacy_attempt_inventory_count"], 1)
+
+    def test_processing_audit_writer_uses_same_producer_contract_before_write(
+        self,
+    ) -> None:
+        root = self.root / "audit-writer-producer-contract"
+        representation, service = self.build_service(root=root / "source")
+        audit_root = root / "audits"
+        handoff = ExternalAgentSemanticHandoffService(
+            service,
+            JsonlAtomicInformationStore(root / "atomic.jsonl"),
+            audit_root,
+        )
+        provider = CodexCliRepresentationAnalysisProvider(
+            provider_version="0.147.0",
+            timeout_seconds=300,
+            runner=FakeRunner("candidate_shape"),
+        )
+        batch = _analysis_batches(
+            _units_from_representation(
+                representation,
+                service.representation_repository,
+            ),
+            service.batch_size,
+        )[0]
+        with self.assertRaises(RepresentationInformationError):
+            provider.analyze(batch)
+        invalid = replace(
+            provider.execution_records[0],
+            candidate_item_count=8,
+        )
+        with self.assertRaises(SemanticHandoffError):
+            handoff._persist_audits(
+                [invalid],
+                package_published=False,
+                information_ingested=False,
+                durable_ingestion_status="ingestion_not_completed",
+                package_fingerprint=None,
+                handoff_status="failed",
+            )
+        self.assertFalse(audit_root.exists())
+
+    def test_global_authority_inventory_rejects_unreachable_versioned_detail(
+        self,
+    ) -> None:
+        cases = (
+            (
+                EXTERNAL_AGENT_PROTOCOL_V1,
+                "anchor_accounting",
+                None,
+            ),
+            (
+                EXTERNAL_AGENT_PROTOCOL_V3_3,
+                "record_grouping",
+                "record_grouping",
+            ),
+        )
+        for protocol, detail, stage in cases:
+            with self.subTest(protocol=protocol, detail=detail):
+                root = self.root / (
+                    "inventory-detail-" + protocol.replace("/", "_")
+                )
+                (
+                    _representation,
+                    _service,
+                    handoff,
+                    provider,
+                    batch,
+                    audit_path,
+                ) = self.build_historical_inventory_audit(
+                    root,
+                    runner_mode="candidate_shape",
+                )
+                audit = json.loads(audit_path.read_text(encoding="utf-8"))
+                audit["protocol_version"] = protocol
+                audit["input_fingerprint"] = _external_agent_request(
+                    batch,
+                    protocol_version=protocol,
+                )[1]
+                audit["contract_failure_detail"] = detail
+                if protocol == EXTERNAL_AGENT_PROTOCOL_V1:
+                    audit["covered_units"] = 0
+                    audit["unaccounted_units"] = audit["eligible_units"]
+                    audit["result_fingerprint"] = None
+                    for field in (
+                        *_CONTRACT_DIAGNOSTIC_FIELDS,
+                        *_GROUPING_DIAGNOSTIC_FIELDS,
+                    ):
+                        audit.pop(field)
+                    audit["diagnostic_schema_version"] = (
+                        "external-agent-diagnostics/1.0"
+                    )
+                else:
+                    audit["contract_failure_stage"] = stage
+                    for field in _GROUPING_DIAGNOSTIC_FIELDS:
+                        audit.pop(field)
+                    audit["diagnostic_schema_version"] = (
+                        "external-agent-diagnostics/2.0"
+                    )
+                audit_path.write_text(json.dumps(audit), encoding="utf-8")
+                before = self.tree_snapshot(root)
+                with self.assertRaises(SemanticHandoffError):
+                    self.install_historical_inventory_authority(handoff, provider)
+                self.assertEqual(self.tree_snapshot(root), before)
+
+    def test_global_authority_inventory_accepts_v34_record_grouping_detail(
+        self,
+    ) -> None:
+        root = self.root / "inventory-v34-record-grouping"
+        (
+            _representation,
+            _service,
+            handoff,
+            provider,
+            _batch,
+            audit_path,
+        ) = self.build_historical_inventory_audit(
+            root,
+            runner_mode="candidate_shape",
+        )
+        audit = json.loads(audit_path.read_text(encoding="utf-8"))
+        audit["contract_failure_detail"] = "record_grouping"
+        audit["contract_failure_stage"] = "record_grouping"
+        audit_path.write_text(json.dumps(audit), encoding="utf-8")
+        grant = self.install_historical_inventory_authority(handoff, provider)
+        self.assertEqual(grant["legacy_attempt_inventory_count"], 1)
 
     def test_global_authority_inventory_rejects_impossible_audit_states_zero_write(
         self,

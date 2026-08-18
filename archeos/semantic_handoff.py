@@ -3822,6 +3822,12 @@ _PROCESSING_AUDIT_CONTRACT_STAGES = {
     "record_grouping": "record_grouping",
     "unknown": "validation",
 }
+_PROCESSING_AUDIT_CONTRACT_COUNT_FIELDS = (
+    _COMPLETED_AUDIT_CONTRACT_DIAGNOSTIC_FIELDS - {"contract_failure_stage"}
+)
+_PROCESSING_AUDIT_GROUPING_COUNT_FIELDS = (
+    _COMPLETED_AUDIT_GROUPING_DIAGNOSTIC_FIELDS
+)
 _PROCESSING_AUDIT_DURABLE_STATES = frozenset(
     {
         (False, False, "ingestion_not_completed", "failed"),
@@ -3916,6 +3922,29 @@ def _versioned_processing_audit_failure_states(
             ),
         ),
     }
+
+
+def _versioned_processing_audit_contract_details(
+    protocol_version: str,
+) -> frozenset[str]:
+    details = set(CONTRACT_FAILURE_DETAILS) - {"record_grouping"}
+    if protocol_version == EXTERNAL_AGENT_PROTOCOL_V1:
+        details.remove("anchor_accounting")
+    elif protocol_version == EXTERNAL_AGENT_PROTOCOL_V3_4:
+        details.add("record_grouping")
+    return frozenset(details)
+
+
+def _processing_audit_protocol_family(protocol_version: str) -> str:
+    return {
+        EXTERNAL_AGENT_PROTOCOL_V1: "diag1",
+        EXTERNAL_AGENT_PROTOCOL_V2: "diag1",
+        EXTERNAL_AGENT_PROTOCOL_V3: "diag1",
+        EXTERNAL_AGENT_PROTOCOL_V3_1: "legacy_array",
+        EXTERNAL_AGENT_PROTOCOL_V3_2: "legacy_map",
+        EXTERNAL_AGENT_PROTOCOL_V3_3: "anchor_map",
+        EXTERNAL_AGENT_PROTOCOL_V3_4: "anchor_map_grouped",
+    }[protocol_version]
 
 
 def _versioned_processing_audit_shapes(
@@ -4060,8 +4089,6 @@ def _processing_audit_failure_state_matches(
     *,
     protocol_version: str,
     has_diagnostics: bool,
-    has_contract_diagnostics: bool,
-    has_grouping_diagnostics: bool,
 ) -> bool:
     eligible = int(audit["eligible_units"])
     covered = int(audit["covered_units"])
@@ -4108,32 +4135,168 @@ def _processing_audit_failure_state_matches(
     elif audit.get("result_fingerprint") is not None:
         return False
 
-    count_fields = (
-        _COMPLETED_AUDIT_CONTRACT_DIAGNOSTIC_FIELDS - {"contract_failure_stage"}
+    return True
+
+
+def _processing_audit_counts_are_zero(
+    audit: Mapping[str, object], fields: frozenset[str]
+) -> bool:
+    return all(audit.get(field) == 0 for field in fields)
+
+
+def _validate_processing_audit_count_projection(
+    audit: Mapping[str, object],
+    *,
+    protocol_version: str,
+    execution_succeeded: bool,
+    failure_category: object,
+    contract_detail: object,
+    has_contract_diagnostics: bool,
+    has_grouping_diagnostics: bool,
+) -> None:
+    """Validate the immutable count projection emitted by each producer family."""
+
+    eligible = int(audit["eligible_units"])
+    covered = int(audit["covered_units"])
+    family = _processing_audit_protocol_family(protocol_version)
+    if has_contract_diagnostics and any(
+        not _audit_integer(audit, field)
+        for field in _PROCESSING_AUDIT_CONTRACT_COUNT_FIELDS
+    ):
+        raise SemanticHandoffError("Processing Run audit contract counts 损坏。")
+    if has_grouping_diagnostics and any(
+        not _audit_integer(audit, field)
+        for field in _PROCESSING_AUDIT_GROUPING_COUNT_FIELDS
+    ):
+        raise SemanticHandoffError("Processing Run audit grouping counts 损坏。")
+
+    if execution_succeeded:
+        if (
+            has_contract_diagnostics
+            and (
+                audit.get("contract_failure_stage") is not None
+                or not _processing_audit_counts_are_zero(
+                    audit, _PROCESSING_AUDIT_CONTRACT_COUNT_FIELDS
+                )
+            )
+            or has_grouping_diagnostics
+            and (
+                int(audit["raw_record_count"]) < eligible
+                or not 1
+                <= int(audit["projected_record_count"])
+                <= int(audit["raw_record_count"])
+                or audit.get("duplicate_exact_body_count") != 0
+                or audit.get("grouping_collision_count") != 0
+            )
+        ):
+            raise SemanticHandoffError(
+                "Processing Run audit success count projection 损坏。"
+            )
+        return
+
+    if failure_category != "result_contract_failure":
+        if (
+            covered != 0
+            or audit.get("unaccounted_units") != eligible
+            or has_contract_diagnostics
+            and (
+                audit.get("contract_failure_stage") is not None
+                or not _processing_audit_counts_are_zero(
+                    audit, _PROCESSING_AUDIT_CONTRACT_COUNT_FIELDS
+                )
+            )
+            or has_grouping_diagnostics
+            and not _processing_audit_counts_are_zero(
+                audit, _PROCESSING_AUDIT_GROUPING_COUNT_FIELDS
+            )
+        ):
+            raise SemanticHandoffError(
+                "Processing Run audit failure count projection 损坏。"
+            )
+        return
+
+    if family == "diag1":
+        if covered != 0 or audit.get("unaccounted_units") != eligible:
+            raise SemanticHandoffError(
+                "Processing Run audit historical contract projection 损坏。"
+            )
+        return
+
+    if contract_detail not in _versioned_processing_audit_contract_details(
+        protocol_version
+    ) or audit.get("contract_failure_stage") != _PROCESSING_AUDIT_CONTRACT_STAGES[
+        contract_detail
+    ]:
+        raise SemanticHandoffError(
+            "Processing Run audit contract detail projection 损坏。"
+        )
+    all_count_fields = _PROCESSING_AUDIT_CONTRACT_COUNT_FIELDS | (
+        _PROCESSING_AUDIT_GROUPING_COUNT_FIELDS
+        if has_grouping_diagnostics
+        else frozenset()
     )
     if (
-        has_contract_diagnostics
-        and not state.contract_coverage
-        and any(audit.get(field) != 0 for field in count_fields)
+        contract_detail == "top_level_schema"
+        and covered == 0
+        and _processing_audit_counts_are_zero(audit, all_count_fields)
     ):
-        return False
-    if has_grouping_diagnostics:
-        if state.contract_coverage:
-            if (
-                int(audit["raw_record_count"])
-                < int(audit["projected_record_count"])
-                or int(audit["duplicate_exact_body_count"])
-                > int(audit["raw_record_count"])
-                or int(audit["grouping_collision_count"])
-                > int(audit["projected_record_count"])
-            ):
-                return False
-        elif any(
-            audit.get(field) != 0
-            for field in _COMPLETED_AUDIT_GROUPING_DIAGNOSTIC_FIELDS
+        return
+
+    candidate_items = int(audit["candidate_item_count"])
+    residue_items = int(audit["residue_item_count"])
+    accounting_items = int(audit["accounting_item_count"])
+    candidate_refs = int(audit["candidate_anchor_ref_count"])
+    residue_refs = int(audit["residue_anchor_ref_count"])
+    duplicate_refs = int(audit["duplicate_anchor_ref_count"])
+    duplicate_accounting = int(audit["duplicate_accounting_count"])
+    dual = int(audit["dual_assignment_count"])
+    missing = int(audit["missing_anchor_count"])
+    unknown = int(audit["unknown_anchor_ref_count"])
+    if covered + missing != eligible:
+        raise SemanticHandoffError(
+            "Processing Run audit contract coverage projection 损坏。"
+        )
+
+    if family in {"legacy_array", "legacy_map"}:
+        invalid = (
+            covered + dual + duplicate_refs > candidate_refs + residue_refs
+            or dual > covered
+            or candidate_items == 0
+            and candidate_refs != 0
+            or residue_items == 0
+            and residue_refs != 0
+            or family == "legacy_array"
+            and duplicate_accounting > max(accounting_items - 1, 0)
+        )
+    else:
+        invalid = (
+            unknown > accounting_items
+            or covered + unknown > accounting_items
+            or covered > candidate_items + residue_items
+            or candidate_items != candidate_refs
+            or residue_items != residue_refs
+            or duplicate_refs > candidate_items + residue_items - covered
+            or dual > min(candidate_items, residue_items)
+        )
+    if invalid:
+        raise SemanticHandoffError(
+            "Processing Run audit contract accounting projection 损坏。"
+        )
+
+    if family == "anchor_map_grouped":
+        raw = int(audit["raw_record_count"])
+        projected = int(audit["projected_record_count"])
+        duplicate_exact = int(audit["duplicate_exact_body_count"])
+        collision = int(audit["grouping_collision_count"])
+        if (
+            raw != candidate_items + residue_items
+            or projected > raw
+            or duplicate_exact + projected > raw
+            or collision > (projected - 1 if projected else 0)
         ):
-            return False
-    return True
+            raise SemanticHandoffError(
+                "Processing Run audit contract grouping projection 损坏。"
+            )
 
 
 def _validate_versioned_processing_run_audit(
@@ -4141,10 +4304,15 @@ def _validate_versioned_processing_run_audit(
     *,
     expected_provider: CodexCliRepresentationAnalysisProvider | None = None,
     require_verified_readback: bool = True,
+    audit_payload: Mapping[str, object] | None = None,
 ) -> dict[str, object]:
     """Validate one producer-reachable, content-free Processing Run audit."""
 
-    audit = _private_json_exact(path)
+    audit = (
+        _private_json_exact(path)
+        if audit_payload is None
+        else dict(audit_payload)
+    )
     protocol = audit.get("protocol_version")
     if not isinstance(protocol, str):
         raise SemanticHandoffError("Processing Run audit protocol 无法解释。")
@@ -4263,7 +4431,11 @@ def _validate_versioned_processing_run_audit(
             raise SemanticHandoffError("Processing Run audit failure 状态损坏。")
         detail = audit.get("contract_failure_detail")
         if category == "result_contract_failure":
-            if "contract_failure_detail" in audit and detail not in CONTRACT_FAILURE_DETAILS:
+            if (
+                "contract_failure_detail" in audit
+                and detail
+                not in _versioned_processing_audit_contract_details(protocol)
+            ):
                 raise SemanticHandoffError(
                     "Processing Run audit contract failure 状态损坏。"
                 )
@@ -4291,40 +4463,30 @@ def _validate_versioned_processing_run_audit(
                 state,
                 protocol_version=protocol,
                 has_diagnostics=has_diagnostics,
-                has_contract_diagnostics=has_contract_diagnostics,
-                has_grouping_diagnostics=has_grouping_diagnostics,
             )
             for state in states
         ):
             raise SemanticHandoffError(
                 "Processing Run audit failure projection 损坏。"
             )
-
-    if has_contract_diagnostics:
-        count_fields = (
-            _COMPLETED_AUDIT_CONTRACT_DIAGNOSTIC_FIELDS
-            - {"contract_failure_stage"}
-        )
-        if any(not _audit_integer(audit, field) for field in count_fields):
-            raise SemanticHandoffError(
-                "Processing Run audit contract counts 损坏。"
-            )
-    if has_grouping_diagnostics:
-        if any(
-            not _audit_integer(audit, field)
-            for field in _COMPLETED_AUDIT_GROUPING_DIAGNOSTIC_FIELDS
-        ) or int(audit["raw_record_count"]) < int(audit["projected_record_count"]):
-            raise SemanticHandoffError(
-                "Processing Run audit grouping counts 损坏。"
-            )
-        if execution_succeeded and (
-            int(audit["projected_record_count"]) < 1
-            or audit.get("duplicate_exact_body_count") != 0
-            or audit.get("grouping_collision_count") != 0
+        if (
+            has_diagnostics
+            and category in {"result_binding_failure", "result_contract_failure"}
+            and not _audit_integer(audit, "result_size_bytes", positive=True)
         ):
             raise SemanticHandoffError(
-                "Processing Run audit success grouping 状态损坏。"
+                "Processing Run audit structured result size 损坏。"
             )
+
+    _validate_processing_audit_count_projection(
+        audit,
+        protocol_version=protocol,
+        execution_succeeded=execution_succeeded,
+        failure_category=audit.get("failure_category"),
+        contract_detail=audit.get("contract_failure_detail"),
+        has_contract_diagnostics=has_contract_diagnostics,
+        has_grouping_diagnostics=has_grouping_diagnostics,
+    )
     return audit
 
 
@@ -5024,54 +5186,8 @@ class ExternalAgentSemanticHandoffService:
         handoff_status: str,
         no_replace: bool = False,
     ) -> tuple[Path, ...]:
-        if not os.path.lexists(self.audit_root):
-            _validate_shared_recovery_root(self.audit_root, create=True)
-        paths: list[Path] = []
+        prepared: list[tuple[Path, dict[str, object]]] = []
         for record in records:
-            contract_counts = (
-                record.candidate_item_count,
-                record.residue_item_count,
-                record.accounting_item_count,
-                record.candidate_anchor_ref_count,
-                record.residue_anchor_ref_count,
-                record.duplicate_anchor_ref_count,
-                record.duplicate_accounting_count,
-                record.dual_assignment_count,
-                record.missing_anchor_count,
-                record.unknown_anchor_ref_count,
-            )
-            grouping_counts = (
-                record.raw_record_count,
-                record.projected_record_count,
-                record.duplicate_exact_body_count,
-                record.grouping_collision_count,
-            )
-            if (
-                record.failure_category == "result_contract_failure"
-                and (
-                    record.contract_failure_detail not in CONTRACT_FAILURE_DETAILS
-                    or record.contract_failure_stage is None
-                    or not _sha256_fingerprint(record.result_fingerprint)
-                )
-            ) or (
-                record.failure_category != "result_contract_failure"
-                and (
-                    record.contract_failure_detail is not None
-                    or record.contract_failure_stage is not None
-                    or any(contract_counts)
-                    or record.execution_status != "succeeded"
-                    and any(grouping_counts)
-                )
-            ) or (
-                any(isinstance(value, bool) or value < 0 for value in contract_counts)
-                or any(
-                    isinstance(value, bool) or value < 0
-                    for value in grouping_counts
-                )
-                or record.covered_units < 0
-                or record.covered_units > record.eligible_units
-            ):
-                raise SemanticHandoffError("Processing Run 合同失败诊断字段无效。")
             payload = {
                 "schema_version": "processing-run-audit/1.0",
                 "artifact_kind": "processing_run_audit",
@@ -5136,6 +5252,17 @@ class ExternalAgentSemanticHandoffService:
             path = (
                 self.audit_root / record.processing_run_id / "processing-run-audit.json"
             )
+            _validate_versioned_processing_run_audit(
+                path,
+                require_verified_readback=False,
+                audit_payload=payload,
+            )
+            prepared.append((path, payload))
+
+        if prepared and not os.path.lexists(self.audit_root):
+            _validate_shared_recovery_root(self.audit_root, create=True)
+        paths: list[Path] = []
+        for path, payload in prepared:
             if no_replace:
                 _private_json_write_no_replace(path, payload)
             else:
@@ -5147,6 +5274,7 @@ class ExternalAgentSemanticHandoffService:
             _private_json_write(path, payload)
             if _private_json_read(path) != payload:
                 raise SemanticHandoffError("Processing Run 审计最终读回失败。")
+            _validate_versioned_processing_run_audit(path)
             paths.append(path)
         return tuple(paths)
 
