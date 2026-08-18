@@ -6,6 +6,7 @@ import os
 import stat
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
 
@@ -16,6 +17,7 @@ from archeos.representation_information import (
 )
 from archeos.synthetic_semantic_gate import (
     SyntheticSemanticGateError,
+    _receipt_fingerprint,
     execute_synthetic_semantic_gate,
     read_synthetic_semantic_gate_receipt,
 )
@@ -91,6 +93,19 @@ class SyntheticSemanticGateTest(unittest.TestCase):
         self.assertNotIn("result_fingerprint", text)
         self.assertEqual(stat.S_IMODE(run.receipt_path.parent.stat().st_mode), 0o700)
         self.assertEqual(stat.S_IMODE(run.receipt_path.stat().st_mode), 0o600)
+
+    def assert_rehashed_attack_rejected(
+        self,
+        run,
+        changes: dict[str, object],
+    ) -> None:
+        payload = dict(run.receipt)
+        payload.update(changes)
+        payload["receipt_fingerprint"] = _receipt_fingerprint(payload)
+        run.receipt_path.write_text(json.dumps(payload), encoding="utf-8")
+        os.chmod(run.receipt_path, 0o600)
+        with self.assertRaises(SyntheticSemanticGateError):
+            read_synthetic_semantic_gate_receipt(run.receipt_path)
 
     def test_strict_success_with_grouping_is_pass_and_private(self) -> None:
         provider, run = self.execute("shared_candidate")
@@ -169,6 +184,53 @@ class SyntheticSemanticGateTest(unittest.TestCase):
         self.assertEqual(receipt["eligible_units"], 2)
         self.assertLess(receipt["covered_units"], receipt["eligible_units"])
         self.assertEqual(receipt["result_readback_status"], "verified")
+
+    def test_provider_and_strict_failure_projection_matrix_is_legal(self) -> None:
+        expected = {
+            "no_result": ("no_result", "not_applicable"),
+            "invalid_json": ("invalid_json", "not_applicable"),
+            "wrong_binding": ("result_binding_failure", "failed"),
+            "candidate_shape": ("result_contract_failure", "verified"),
+        }
+        for mode, (failure, input_binding) in expected.items():
+            with self.subTest(mode=mode):
+                _provider, run = self.execute(mode)
+                self.assertEqual(run.receipt["provider_failure_category"], failure)
+                self.assertEqual(
+                    run.receipt["input_binding_status"], input_binding
+                )
+                self.assertEqual(run.receipt["technical_gate_status"], "failed")
+                self.assertEqual(
+                    read_synthetic_semantic_gate_receipt(run.receipt_path),
+                    run.receipt,
+                )
+
+    def test_runtime_execution_failure_is_a_legal_started_state(self) -> None:
+        class RuntimeFailureProcess:
+            pid = 987655
+            returncode = None
+
+            def communicate(self, *, input=None, timeout=None):
+                del input, timeout
+                raise RuntimeError(_BODY)
+
+        provider = self.provider("valid")
+        provider.runner = lambda *_args, **_kwargs: RuntimeFailureProcess()
+        run = execute_synthetic_semantic_gate(
+            self.batch(),
+            provider,
+            receipt_root=self.root / "receipt-runtime-failure",
+        )
+
+        self.assertEqual(
+            run.receipt["provider_failure_category"],
+            "runtime_execution_failure",
+        )
+        self.assertEqual(run.receipt["provider_call_counted"], 1)
+        self.assertEqual(run.receipt["technical_gate_status"], "failed")
+        self.assertEqual(
+            read_synthetic_semantic_gate_receipt(run.receipt_path), run.receipt
+        )
 
     def test_post_success_assertion_failure_is_recorded_after_strict_pass(self) -> None:
         def fail_assertion(_result) -> None:
@@ -263,7 +325,120 @@ class SyntheticSemanticGateTest(unittest.TestCase):
         self.assertFalse(run.receipt["provider_call_started"])
         self.assertEqual(run.receipt["provider_call_counted"], 0)
         self.assertFalse(run.receipt["provider_outcome_unknown"])
+        self.assertEqual(run.receipt["provider_execution_status"], "not_started")
+        self.assertEqual(run.receipt["harness_status"], "failed")
+        self.assertEqual(
+            run.receipt["harness_failure_category"], "pre_provider_failure"
+        )
         self.assertEqual(run.receipt["process_cleanup_status"], "not_started")
+
+    def test_rehashed_semantic_attacks_cannot_bypass_exact_state_machine(self) -> None:
+        _provider, grouped = self.execute("shared_candidate")
+        attacks = (
+            {
+                "provider_call_started": False,
+                "provider_call_counted": 0,
+            },
+            {
+                "result_file_present": False,
+                "result_size_bytes": 0,
+                "result_readback_status": "not_applicable",
+            },
+            {"result_size_bytes": 0},
+            {"eligible_units": 3},
+            {"covered_units": 0, "missing_anchor_count": 0},
+            {"missing_anchor_count": 1},
+            {"accounting_item_count": 1},
+            {"raw_record_count": 1, "grouping_observed": False},
+            {"projected_record_count": 3, "grouping_observed": False},
+            {"protocol_version": None},
+            {"provider_route": None},
+            {"provider_version": None},
+            {"input_binding_status": "not_applicable"},
+            {"model": None},
+            {"fallback_policy": "retry"},
+            {"grouping_observed": False},
+            {"technical_gate_status": "failed"},
+            {
+                "provider_failure_category": "runtime_nonzero_exit",
+                "strict_validation_status": "failed",
+            },
+            {"diagnostic_persistence_status": "failed"},
+        )
+        for changes in attacks:
+            with self.subTest(changes=changes):
+                self.assert_rehashed_attack_rejected(grouped, changes)
+
+        _provider, ungrouped = self.execute("record_body_drift")
+        self.assert_rehashed_attack_rejected(
+            ungrouped,
+            {"grouping_observed": True},
+        )
+
+    def test_rehashed_failure_state_attacks_are_rejected(self) -> None:
+        _provider, failed = self.execute("nonzero")
+        attacks = (
+            {"technical_gate_status": "passed"},
+            {"strict_validation_status": "passed"},
+            {"provider_failure_category": None},
+            {"process_cleanup_status": "failed"},
+            {
+                "harness_status": "failed",
+                "harness_failure_category": "post_success_assertion_failure",
+            },
+        )
+        for changes in attacks:
+            with self.subTest(changes=changes):
+                self.assert_rehashed_attack_rejected(failed, changes)
+
+        _provider, contract = self.execute("accounting_missing_anchor")
+        self.assert_rehashed_attack_rejected(
+            contract,
+            {"contract_failure_stage": "candidate"},
+        )
+        contract_count_attacks = (
+            {"raw_record_count": 2, "grouping_observed": True},
+            {"accounting_item_count": 0},
+            {"projected_record_count": 2},
+            {"grouping_collision_count": 2},
+        )
+        for changes in contract_count_attacks:
+            with self.subTest(changes=changes):
+                self.assert_rehashed_attack_rejected(contract, changes)
+
+    def test_execution_record_binding_drift_becomes_outcome_unknown(self) -> None:
+        for field, value in (
+            ("input_fingerprint", "sha256:" + "0" * 64),
+            ("deadline_ms", 1),
+        ):
+            with self.subTest(field=field):
+                provider = self.provider("shared_candidate")
+                analyze = provider.analyze
+
+                def drift_record(
+                    batch,
+                    *,
+                    _field=field,
+                    _value=value,
+                    _analyze=analyze,
+                    _provider=provider,
+                ):
+                    result = _analyze(batch)
+                    _provider.execution_records[-1] = replace(
+                        _provider.execution_records[-1], **{_field: _value}
+                    )
+                    return result
+
+                provider.analyze = drift_record  # type: ignore[method-assign]
+                run = execute_synthetic_semantic_gate(
+                    self.batch(),
+                    provider,
+                    receipt_root=self.root / f"receipt-binding-{field}",
+                )
+
+                self.assertEqual(run.receipt["provider_call_counted"], 1)
+                self.assertTrue(run.receipt["provider_outcome_unknown"])
+                self.assertEqual(run.receipt["technical_gate_status"], "unknown")
 
     def test_unsafe_receipt_root_fails_before_provider(self) -> None:
         receipt_root = self.root / "unsafe-receipt"
