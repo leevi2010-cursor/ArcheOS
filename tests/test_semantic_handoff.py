@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import hashlib
 import inspect
 import json
 import os
@@ -1885,116 +1884,29 @@ class SemanticHandoffTest(unittest.TestCase):
         self.assertEqual(provider.execution_records, [])
         self.assertFalse(any(audit_root.glob("semantic_run_*")))
 
-    def test_v31_attempt_is_counted_preserved_and_isolated_from_v32_run(
+    def write_v31_attempt_fixture(
         self,
-    ) -> None:
-        representation, service = self.build_service(blocks=1)
-        audit_root = self.root / "audits"
-        audit_root.mkdir(mode=0o700)
-        os.chmod(audit_root, 0o700)
-        provider = CodexCliRepresentationAnalysisProvider(
-            provider_version="0.147.0", runner=FakeRunner()
-        )
-        units = _units_from_representation(
-            representation, service.representation_repository
-        )
-        batch = _analysis_batches(units, service.batch_size)[0]
-        schema = external_agent_representation_analysis_schema(
-            EXTERNAL_AGENT_PROTOCOL_V3_1,
-            batch=batch,
-        )
-        _, input_fingerprint = _external_agent_request(
-            batch,
-            protocol_version=EXTERNAL_AGENT_PROTOCOL_V3_1,
-            result_schema=schema,
-        )
-        batch_receipt = {
-            "ordinal": 1,
-            "total": 1,
-            "anchor_unit_ids": [unit.unit_id for unit in batch.anchor_units],
-            "context_support_unit_ids": [
-                unit.unit_id for unit in batch.context_support_units
-            ],
-            "input_fingerprint": input_fingerprint,
-            "result_schema_fingerprint": _canonical_fingerprint(schema),
-        }
-        batch_receipt["batch_contract_fingerprint"] = _canonical_fingerprint(
-            batch_receipt
-        )
-        legacy_run_id = "semantic_run_" + hashlib.sha256(
-            representation.representation_id.encode("utf-8")
-        ).hexdigest()[:32]
-        receipt = {
-            "schema_version": "semantic-handoff-run-receipt/2.0",
-            "artifact_kind": "semantic_handoff_recovery_run",
-            "semantic_run_id": legacy_run_id,
-            "source": {
-                "source_id": representation.source_id,
-                "content_hash": representation.source_content_hash,
-            },
-            "representation": {
-                "representation_id": representation.representation_id,
-                "manifest_fingerprint": _canonical_fingerprint(
-                    representation.to_manifest_dict()
-                ),
-                "artifacts": [
-                    {
-                        "artifact_id": artifact.artifact_id,
-                        "content_hash": artifact.content_hash,
-                    }
-                    for artifact in representation.artifacts
-                ],
-            },
-            "privacy": {
-                "policy": self.privacy_binding().policy,
-                "policy_version": self.privacy_binding().policy_version,
-                "route": self.privacy_binding().route,
-                "receipt_fingerprint": (
-                    self.privacy_binding().receipt_fingerprint
-                ),
-            },
-            "protocol_version": EXTERNAL_AGENT_PROTOCOL_V3_1,
-            "provider_route": "external-agent-codex-cli",
-            "provider": {
-                "name": provider.name,
-                "provider_version": provider.provider_version,
-                "model": provider.model,
-                "reasoning_effort": provider.reasoning_effort,
-                "fallback_policy": provider.fallback_policy,
-            },
-            "execution_deadline_ms": round(provider.timeout_seconds * 1000),
-            "semantic_batch_size": service.batch_size,
-            "ordered_eligible_unit_ids": [
-                unit.unit_id for unit in units if unit.analysis_eligible
-            ],
-            "prompt_template_fingerprint": "sha256:" + "e" * 64,
-            "local_validator_contract_version": (
-                "external-agent-local-validator/3.1"
-            ),
-            "batches": [batch_receipt],
-        }
+        recovery,
+        receipt: dict[str, object],
+        *,
+        nonce: str = "f" * 64,
+    ) -> Path:
+        for batch in receipt["batches"]:
+            batch.pop("batch_contract_fingerprint", None)
+            batch["batch_contract_fingerprint"] = _canonical_fingerprint(batch)
+        receipt.pop("contract_fingerprint", None)
+        receipt.pop("run_receipt_fingerprint", None)
         receipt["contract_fingerprint"] = _canonical_fingerprint(receipt)
         receipt["run_receipt_fingerprint"] = _canonical_fingerprint(receipt)
-        nonce = "f" * 64
-        attempt = {
-            "schema_version": "semantic-handoff-attempt-receipt/2.0",
-            "artifact_kind": "semantic_handoff_attempt",
-            "attempt_id": "attempt_"
-            + hashlib.sha256(
-                f"{legacy_run_id}:1:{nonce}".encode()
-            ).hexdigest()[:32],
-            "attempt_nonce": nonce,
-            "semantic_run_id": legacy_run_id,
-            "run_contract_fingerprint": receipt["contract_fingerprint"],
-            "batch_ordinal": 1,
-            "batch_contract_fingerprint": batch_receipt[
-                "batch_contract_fingerprint"
-            ],
-            "input_fingerprint": batch_receipt["input_fingerprint"],
-            "state": "started",
-        }
-        attempt["attempt_receipt_fingerprint"] = _canonical_fingerprint(attempt)
-        legacy_run = audit_root / legacy_run_id
+        batch_receipt = receipt["batches"][0]
+        attempt = recovery._expected_attempt_payload(
+            semantic_run_id=receipt["semantic_run_id"],
+            contract_fingerprint=receipt["contract_fingerprint"],
+            batch_receipt=batch_receipt,
+            ordinal=1,
+            attempt_nonce=nonce,
+        )
+        legacy_run = recovery.audit_root / receipt["semantic_run_id"]
         legacy_attempts = legacy_run / "attempts"
         legacy_attempts.mkdir(parents=True, mode=0o700)
         os.chmod(legacy_run, 0o700)
@@ -2007,6 +1919,62 @@ class SemanticHandoffTest(unittest.TestCase):
         )
         for path in legacy_run.rglob("*.json"):
             os.chmod(path, 0o600)
+        return legacy_run
+
+    def test_v31_attempt_is_counted_preserved_and_isolated_from_v32_run(
+        self,
+    ) -> None:
+        import archeos.semantic_handoff as handoff_module
+
+        representation, service = self.build_service(blocks=1)
+        audit_root = self.root / "audits"
+        audit_root.mkdir(mode=0o700)
+        os.chmod(audit_root, 0o700)
+        runner = FakeRunner()
+        provider = CodexCliRepresentationAnalysisProvider(
+            provider_version="0.147.0", timeout_seconds=300, runner=runner
+        )
+        recovery = handoff_module._SemanticRecoveryRun(
+            service,
+            audit_root,
+            representation.representation_id,
+            provider,
+            self.privacy_binding(),
+        )
+        receipt = json.loads(
+            json.dumps(recovery.expected_historical_v31_run_receipt)
+        )
+        self.assertEqual(receipt["protocol_version"], EXTERNAL_AGENT_PROTOCOL_V3_1)
+        self.assertEqual(receipt["provider_route"], "codex-cli")
+        self.assertEqual(
+            receipt["provider"],
+            {
+                "name": "external-agent-codex-cli",
+                "provider_version": "0.147.0",
+                "model": "gpt-5.6-terra",
+                "reasoning_effort": "medium",
+                "fallback_policy": "none",
+            },
+        )
+        self.assertEqual(receipt["execution_deadline_ms"], 300000)
+        self.assertEqual(receipt["semantic_batch_size"], 40)
+        self.assertEqual(
+            receipt["local_validator_contract_version"],
+            "external-agent-local-validator/3.1",
+        )
+        self.assertEqual(
+            receipt["prompt_template_fingerprint"],
+            "sha256:31d354c57fbbe5a4eee17dd8995a2a15e02a5e243b3d9d4d7218455cd55282dd",
+        )
+        self.assertEqual(
+            receipt["batches"][0]["input_fingerprint"],
+            "sha256:ec25ae7e9eacbcd2c9eefdb2451b82c319433219ceaed717a7cb9b2b38fc12a4",
+        )
+        self.assertEqual(
+            receipt["batches"][0]["result_schema_fingerprint"],
+            "sha256:6235b2a2c192196db4bc856c973649c5a9f8ff2d2777e3b06d4d643fa587d6ab",
+        )
+        legacy_run = self.write_v31_attempt_fixture(recovery, receipt)
         before = self.tree_snapshot(legacy_run)
 
         handoff = ExternalAgentSemanticHandoffService(
@@ -2022,7 +1990,7 @@ class SemanticHandoffTest(unittest.TestCase):
         self.assertEqual(preflight.historical_counted_attempts, 1)
         self.assertEqual(preflight.conservatively_counted_attempts, 0)
         self.assertEqual(preflight.required_new_calls, 1)
-        self.assertEqual(provider.execution_records, [])
+        self.assertEqual(runner.calls, [])
         self.assertEqual(self.tree_snapshot(legacy_run), before)
 
         result = handoff.execute(
@@ -2037,6 +2005,91 @@ class SemanticHandoffTest(unittest.TestCase):
         self.assertEqual(len(current_runs), 1)
         self.assertEqual(self.tree_snapshot(legacy_run), before)
         self.assertEqual(result.ingestion.created, 1)
+
+    def test_self_consistent_v31_authority_drift_is_never_counted(self) -> None:
+        import archeos.semantic_handoff as handoff_module
+
+        attacks = {
+            "source": lambda receipt: receipt["source"].update(
+                {"content_hash": "sha256:" + "0" * 64}
+            ),
+            "representation": lambda receipt: receipt[
+                "representation"
+            ].update({"manifest_fingerprint": "sha256:" + "0" * 64}),
+            "privacy": lambda receipt: receipt["privacy"].update(
+                {"receipt_fingerprint": "sha256:" + "0" * 64}
+            ),
+            "route": lambda receipt: receipt.update(
+                {"provider_route": "external-agent-codex-cli"}
+            ),
+            "provider": lambda receipt: receipt["provider"].update(
+                {"provider_version": "0.148.0"}
+            ),
+            "deadline": lambda receipt: receipt.update(
+                {"execution_deadline_ms": 301000}
+            ),
+            "batch_size": lambda receipt: receipt.update(
+                {"semantic_batch_size": 20}
+            ),
+            "anchors": lambda receipt: receipt[
+                "ordered_eligible_unit_ids"
+            ].reverse(),
+            "context": lambda receipt: receipt["batches"][0][
+                "context_support_unit_ids"
+            ].append("unit_" + "0" * 64),
+            "prompt": lambda receipt: receipt.update(
+                {"prompt_template_fingerprint": "sha256:" + "0" * 64}
+            ),
+            "schema": lambda receipt: receipt["batches"][0].update(
+                {"result_schema_fingerprint": "sha256:" + "0" * 64}
+            ),
+            "input": lambda receipt: receipt["batches"][0].update(
+                {"input_fingerprint": "sha256:" + "0" * 64}
+            ),
+            "path": lambda receipt: receipt.update(
+                {"semantic_run_id": "semantic_run_" + "0" * 32}
+            ),
+        }
+        for attack, mutate in attacks.items():
+            with self.subTest(attack=attack):
+                root = self.root / attack
+                representation, service = self.build_service(blocks=2, root=root)
+                audit_root = root / "audits"
+                audit_root.mkdir(mode=0o700)
+                os.chmod(audit_root, 0o700)
+                runner = FakeRunner()
+                provider = CodexCliRepresentationAnalysisProvider(
+                    provider_version="0.147.0",
+                    timeout_seconds=300,
+                    runner=runner,
+                )
+                recovery = handoff_module._SemanticRecoveryRun(
+                    service,
+                    audit_root,
+                    representation.representation_id,
+                    provider,
+                    self.privacy_binding(),
+                )
+                receipt = json.loads(
+                    json.dumps(recovery.expected_historical_v31_run_receipt)
+                )
+                mutate(receipt)
+                self.write_v31_attempt_fixture(recovery, receipt)
+                before = self.tree_snapshot(audit_root)
+
+                with self.assertRaises(SemanticHandoffError):
+                    ExternalAgentSemanticHandoffService(
+                        service,
+                        JsonlAtomicInformationStore(root / "atomic.jsonl"),
+                        audit_root,
+                    ).recovery_preflight(
+                        representation.representation_id,
+                        provider,
+                        self.privacy_binding(),
+                    )
+                self.assertEqual(runner.calls, [])
+                self.assertEqual(self.tree_snapshot(audit_root), before)
+                self.assertFalse((root / "atomic.jsonl").exists())
 
     def test_v32_recovery_identity_is_stable_and_binds_execution_contract(
         self,
