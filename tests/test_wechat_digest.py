@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -353,7 +354,8 @@ class SyntheticSemanticHandoff:
             audit_path = (
                 audit_root / processing_run_id / "processing-run-audit.json"
             )
-            audit_path.parent.mkdir(parents=True, exist_ok=True)
+            audit_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            os.chmod(audit_path.parent, 0o700)
             audit = {
                 "schema_version": "processing-run-audit/1.0",
                 "artifact_kind": "processing_run_audit",
@@ -448,6 +450,7 @@ class SyntheticSemanticHandoff:
                         }
                     )
             audit_path.write_text(json.dumps(audit), encoding="utf-8")
+            os.chmod(audit_path, 0o600)
 
 
 class NoStructuralChangeProvider:

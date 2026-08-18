@@ -2373,128 +2373,14 @@ class _SemanticGlobalAuthority:
                 os.close(descriptor)
 
     @staticmethod
-    def _validated_inventory_audit(path: Path) -> dict[str, object]:
-        audit = _private_json_exact(path)
-        protocol = audit.get("protocol_version")
-        if protocol == EXTERNAL_AGENT_PROTOCOL_V1:
-            allowed_shapes = _unprofiled_v1_audit_shapes() | frozenset(
-                {frozenset(_COMPLETED_AUDIT_BASE_FIELDS)}
-            )
-            expected_diagnostics = DIAGNOSTIC_SCHEMA_V1
-        elif protocol in {EXTERNAL_AGENT_PROTOCOL_V2, EXTERNAL_AGENT_PROTOCOL_V3}:
-            allowed_shapes = frozenset(
-                {frozenset(_COMPLETED_AUDIT_BASE_FIELDS)}
-            )
-            expected_diagnostics = DIAGNOSTIC_SCHEMA_V1
-        elif protocol in {
-            EXTERNAL_AGENT_PROTOCOL_V3_1,
-            EXTERNAL_AGENT_PROTOCOL_V3_2,
-            EXTERNAL_AGENT_PROTOCOL_V3_3,
-        }:
-            allowed_shapes = frozenset(
-                {
-                    frozenset(
-                        _COMPLETED_AUDIT_BASE_FIELDS
-                        | _COMPLETED_AUDIT_CONTRACT_DIAGNOSTIC_FIELDS
-                    )
-                }
-            )
-            expected_diagnostics = DIAGNOSTIC_SCHEMA_V2
-        elif protocol == EXTERNAL_AGENT_PROTOCOL_V3_4:
-            allowed_shapes = frozenset(
-                {
-                    frozenset(
-                        _COMPLETED_AUDIT_BASE_FIELDS
-                        | _COMPLETED_AUDIT_CONTRACT_DIAGNOSTIC_FIELDS
-                        | _COMPLETED_AUDIT_GROUPING_DIAGNOSTIC_FIELDS
-                    )
-                }
-            )
-            expected_diagnostics = DIAGNOSTIC_SCHEMA_VERSION
-        else:
-            raise SemanticHandoffError(
-                "Semantic global authority historical audit protocol 无法解释。"
-            )
-        anchors = audit.get("anchor_unit_ids")
-        has_diagnostics = _AUDIT_DIAGNOSTIC_FIELDS.issubset(audit)
-        has_profile = _AUDIT_PROFILE_FIELDS.issubset(audit)
-        if (
-            frozenset(audit) not in allowed_shapes
-            or audit.get("schema_version") != "processing-run-audit/1.0"
-            or audit.get("artifact_kind") != "processing_run_audit"
-            or not _processing_run_id(audit.get("processing_run_id"))
-            or path.parent.name != audit.get("processing_run_id")
-            or not _sha256_fingerprint(audit.get("input_fingerprint"))
-            or not isinstance(anchors, list)
-            or not anchors
-            or any(not isinstance(item, str) for item in anchors)
-            or len(anchors) != len(set(anchors))
-            or audit.get("provider_route") != EXTERNAL_AGENT_ROUTE
-            or not isinstance(audit.get("provider_version"), str)
-            or has_profile
-            and (
-                not isinstance(audit.get("model"), str)
-                or audit.get("reasoning_effort")
-                not in {"low", "medium", "high", "xhigh"}
-                or audit.get("fallback_policy") != "none"
-            )
-            or not _timestamp(audit.get("started_at"))
-            or not _timestamp(audit.get("finished_at"))
-            or audit.get("execution_status") not in {"succeeded", "failed"}
-            or isinstance(audit.get("eligible_units"), bool)
-            or audit.get("eligible_units") != len(anchors)
-            or isinstance(audit.get("covered_units"), bool)
-            or not isinstance(audit.get("covered_units"), int)
-            or not 0 <= int(audit["covered_units"]) <= len(anchors)
-            or audit.get("unaccounted_units")
-            != len(anchors) - int(audit["covered_units"])
-            or audit.get("audit_readback_status") != "verified"
-            or audit.get("package_published") is True
-            and not _sha256_fingerprint(audit.get("package_fingerprint"))
-            or audit.get("package_published") is False
-            and audit.get("package_fingerprint") is not None
-            or audit.get("information_ingested") is True
-            and audit.get("package_published") is not True
-            or has_diagnostics
-            and (
-                audit.get("diagnostic_schema_version") != expected_diagnostics
-                or any(
-                    isinstance(audit.get(field), bool)
-                    or not isinstance(audit.get(field), int)
-                    or int(audit[field]) < 0
-                    for field in (
-                        "elapsed_ms",
-                        "deadline_ms",
-                        "result_size_bytes",
-                        "stdout_bytes",
-                        "stderr_bytes",
-                    )
-                )
-            )
-        ):
-            raise SemanticHandoffError(
-                "Semantic global authority historical audit 无法解释。"
-            )
-        if audit.get("execution_status") == "succeeded":
-            if (
-                audit.get("failure_category") is not None
-                or audit.get("strict_validation_status") != "passed"
-                or not _sha256_fingerprint(audit.get("result_fingerprint"))
-                or audit.get("covered_units") != len(anchors)
-                or has_diagnostics
-                and (
-                    audit.get("result_file_present") is not True
-                    or audit.get("process_cleanup_status") != "verified"
-                )
-            ):
-                raise SemanticHandoffError(
-                    "Semantic global authority historical success audit 损坏。"
-                )
-        elif not isinstance(audit.get("failure_category"), str):
-            raise SemanticHandoffError(
-                "Semantic global authority historical failure audit 损坏。"
-            )
-        return audit
+    def _validated_inventory_audit(
+        path: Path,
+        provider: CodexCliRepresentationAnalysisProvider,
+    ) -> dict[str, object]:
+        return _validate_versioned_processing_run_audit(
+            path,
+            expected_provider=provider,
+        )
 
     @staticmethod
     def _audit_matches_record(
@@ -2799,14 +2685,16 @@ class _SemanticGlobalAuthority:
             )
         return batches  # type: ignore[return-value]
 
-    def _legacy_inventory(self) -> tuple[int, str]:
+    def _legacy_inventory(
+        self, provider: CodexCliRepresentationAnalysisProvider
+    ) -> tuple[int, str]:
         if not _validate_shared_recovery_root(self.audit_root, create=False):
             return 0, _fingerprint([])
         audits: dict[str, tuple[Path, dict[str, object]]] = {}
         for path in sorted(
             self.audit_root.glob("run_*/processing-run-audit.json")
         ):
-            audit = self._validated_inventory_audit(path)
+            audit = self._validated_inventory_audit(path, provider)
             run_id = str(audit["processing_run_id"])
             if run_id in audits:
                 raise SemanticHandoffError(
@@ -3061,7 +2949,7 @@ class _SemanticGlobalAuthority:
         ):
             raise SemanticHandoffError("Semantic global authority 安装参数无效。")
         window_payload = _authority_window_payload(window)
-        legacy_count, legacy_fingerprint = self._legacy_inventory()
+        legacy_count, legacy_fingerprint = self._legacy_inventory(provider)
         if legacy_count > expected_total:
             raise SemanticHandoffError(
                 "Semantic global authority legacy attempt 超过 baseline。"
@@ -3172,7 +3060,7 @@ class _SemanticGlobalAuthority:
         without_fingerprint.pop("global_authority_fingerprint", None)
         window_payload = _authority_window_payload(window)
         campaign = grant.get("campaign")
-        legacy_count, legacy_fingerprint = self._legacy_inventory()
+        legacy_count, legacy_fingerprint = self._legacy_inventory(provider)
         if (
             set(grant)
             != {
@@ -3896,6 +3784,430 @@ def _unprofiled_v1_audit_shapes() -> frozenset[frozenset[str]]:
     )
 
 
+_PROCESSING_AUDIT_FAILURE_CATEGORIES = frozenset(
+    {
+        "runtime_start_failure",
+        "timeout",
+        "runtime_nonzero_exit",
+        "runtime_execution_failure",
+        "process_cleanup_failure",
+        "no_result",
+        "invalid_json",
+        "result_binding_failure",
+        "result_contract_failure",
+    }
+)
+_PROCESSING_AUDIT_PROVIDER_ERROR_CATEGORIES = frozenset(
+    {
+        "auth_or_permission",
+        "rate_limited",
+        "network_or_transport",
+        "service_unavailable",
+        "structured_output_rejected",
+        "provider_internal_error",
+        "cancelled",
+        "unknown",
+    }
+)
+_PROCESSING_AUDIT_TIMEOUT_PHASES = frozenset(
+    {"initial_communicate", "term_drain", "kill_drain"}
+)
+_PROCESSING_AUDIT_CONTRACT_STAGES = {
+    "top_level_schema": "top_level",
+    "candidate_schema": "candidate",
+    "residue_schema": "residue",
+    "evidence_reference": "evidence_reference",
+    "anchor_coverage": "coverage",
+    "anchor_accounting": "accounting_cross_check",
+    "record_grouping": "record_grouping",
+    "unknown": "validation",
+}
+_PROCESSING_AUDIT_DURABLE_STATES = frozenset(
+    {
+        (False, False, "ingestion_not_completed", "failed"),
+        (True, False, "ingestion_not_completed", "failed"),
+        (True, False, "pending", "pending"),
+        (True, False, "write_attempt_started", "pending_durable_write"),
+        (True, True, "written_readback_pending", "pending_readback"),
+        (True, True, "completed", "completed"),
+    }
+)
+
+
+def _versioned_processing_audit_shapes(
+    protocol_version: str,
+    *,
+    profiled: bool | None,
+) -> tuple[frozenset[frozenset[str]], str]:
+    full = frozenset(_COMPLETED_AUDIT_BASE_FIELDS)
+    if protocol_version == EXTERNAL_AGENT_PROTOCOL_V1:
+        if profiled is True:
+            shapes = frozenset({full})
+        elif profiled is False:
+            shapes = _unprofiled_v1_audit_shapes()
+        else:
+            shapes = _unprofiled_v1_audit_shapes() | frozenset({full})
+        return shapes, DIAGNOSTIC_SCHEMA_V1
+    if protocol_version in {EXTERNAL_AGENT_PROTOCOL_V2, EXTERNAL_AGENT_PROTOCOL_V3}:
+        return frozenset({full}), DIAGNOSTIC_SCHEMA_V1
+    if protocol_version in {
+        EXTERNAL_AGENT_PROTOCOL_V3_1,
+        EXTERNAL_AGENT_PROTOCOL_V3_2,
+        EXTERNAL_AGENT_PROTOCOL_V3_3,
+    }:
+        return (
+            frozenset(
+                {
+                    frozenset(
+                        _COMPLETED_AUDIT_BASE_FIELDS
+                        | _COMPLETED_AUDIT_CONTRACT_DIAGNOSTIC_FIELDS
+                    )
+                }
+            ),
+            DIAGNOSTIC_SCHEMA_V2,
+        )
+    if protocol_version == EXTERNAL_AGENT_PROTOCOL_V3_4:
+        return (
+            frozenset(
+                {
+                    frozenset(
+                        _COMPLETED_AUDIT_BASE_FIELDS
+                        | _COMPLETED_AUDIT_CONTRACT_DIAGNOSTIC_FIELDS
+                        | _COMPLETED_AUDIT_GROUPING_DIAGNOSTIC_FIELDS
+                    )
+                }
+            ),
+            DIAGNOSTIC_SCHEMA_VERSION,
+        )
+    raise SemanticHandoffError(
+        "Processing Run audit protocol 无法解释。"
+    )
+
+
+def _safe_execution_label(value: object) -> bool:
+    return (
+        isinstance(value, str)
+        and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", value)
+        is not None
+    )
+
+
+def _audit_integer(audit: Mapping[str, object], field: str, *, positive: bool = False) -> bool:
+    value = audit.get(field)
+    return (
+        not isinstance(value, bool)
+        and isinstance(value, int)
+        and (value > 0 if positive else value >= 0)
+    )
+
+
+def _validate_processing_audit_diagnostics(
+    audit: Mapping[str, object],
+    *,
+    expected_schema: str,
+    execution_succeeded: bool,
+) -> None:
+    if (
+        audit.get("diagnostic_schema_version") != expected_schema
+        or not _audit_integer(audit, "elapsed_ms")
+        or not _audit_integer(audit, "deadline_ms", positive=True)
+        or not _audit_integer(audit, "result_size_bytes")
+        or not _audit_integer(audit, "stdout_bytes")
+        or not _audit_integer(audit, "stderr_bytes")
+        or not isinstance(audit.get("result_file_present"), bool)
+        or audit.get("exit_code") is not None
+        and (
+            isinstance(audit.get("exit_code"), bool)
+            or not isinstance(audit.get("exit_code"), int)
+        )
+        or audit.get("termination_signal") is not None
+        and (
+            isinstance(audit.get("termination_signal"), bool)
+            or not isinstance(audit.get("termination_signal"), int)
+            or int(audit["termination_signal"]) <= 0
+        )
+        or audit.get("timeout_phase")
+        not in _PROCESSING_AUDIT_TIMEOUT_PHASES | {None}
+        or audit.get("provider_error_category")
+        not in _PROCESSING_AUDIT_PROVIDER_ERROR_CATEGORIES | {None}
+        or audit.get("process_cleanup_status")
+        not in {"not_started", "verified", "failed"}
+        or audit.get("result_file_present") is False
+        and audit.get("result_size_bytes") != 0
+        or audit.get("result_file_present") is False
+        and audit.get("result_fingerprint") is not None
+        or audit.get("result_file_present") is True
+        and not _sha256_fingerprint(audit.get("result_fingerprint"))
+        or isinstance(audit.get("exit_code"), int)
+        and int(audit["exit_code"]) < 0
+        and audit.get("termination_signal") != -int(audit["exit_code"])
+    ):
+        raise SemanticHandoffError("Processing Run audit diagnostics 损坏。")
+
+    if execution_succeeded:
+        if (
+            audit.get("exit_code") != 0
+            or audit.get("termination_signal") is not None
+            or audit.get("timeout_phase") is not None
+            or audit.get("provider_error_category") is not None
+            or audit.get("result_file_present") is not True
+            or not _audit_integer(audit, "result_size_bytes", positive=True)
+            or audit.get("process_cleanup_status") != "verified"
+        ):
+            raise SemanticHandoffError(
+                "Processing Run audit success diagnostics 损坏。"
+            )
+        return
+
+    category = audit.get("failure_category")
+    if category == "runtime_start_failure":
+        valid = (
+            audit.get("exit_code") is None
+            and audit.get("termination_signal") is None
+            and audit.get("timeout_phase") is None
+            and audit.get("provider_error_category") is None
+            and audit.get("result_file_present") is False
+            and audit.get("process_cleanup_status") == "not_started"
+        )
+    elif category == "timeout":
+        valid = (
+            audit.get("timeout_phase") is not None
+            and audit.get("process_cleanup_status") == "verified"
+        )
+    elif category == "runtime_nonzero_exit":
+        valid = (
+            isinstance(audit.get("exit_code"), int)
+            and not isinstance(audit.get("exit_code"), bool)
+            and audit.get("exit_code") != 0
+            and audit.get("process_cleanup_status") == "verified"
+        )
+    elif category == "process_cleanup_failure":
+        valid = audit.get("process_cleanup_status") == "failed"
+    elif category in {
+        "no_result",
+        "invalid_json",
+        "result_binding_failure",
+        "result_contract_failure",
+    }:
+        valid = (
+            audit.get("exit_code") == 0
+            and audit.get("termination_signal") is None
+            and audit.get("timeout_phase") is None
+            and audit.get("provider_error_category") is None
+            and audit.get("process_cleanup_status") == "verified"
+            and (
+                audit.get("result_file_present") is False
+                if category == "no_result"
+                else audit.get("result_file_present") is True
+            )
+        )
+    else:
+        valid = category == "runtime_execution_failure" and (
+            audit.get("process_cleanup_status") in {"not_started", "verified"}
+        )
+        if valid and audit.get("process_cleanup_status") == "not_started":
+            valid = (
+                audit.get("exit_code") is None
+                and audit.get("termination_signal") is None
+                and audit.get("timeout_phase") is None
+                and audit.get("provider_error_category") is None
+                and audit.get("result_file_present") is False
+            )
+    if not valid:
+        raise SemanticHandoffError(
+            "Processing Run audit failure diagnostics 损坏。"
+        )
+
+
+def _validate_versioned_processing_run_audit(
+    path: Path,
+    *,
+    expected_provider: CodexCliRepresentationAnalysisProvider | None = None,
+    require_verified_readback: bool = True,
+) -> dict[str, object]:
+    """Validate one producer-reachable, content-free Processing Run audit."""
+
+    audit = _private_json_exact(path)
+    protocol = audit.get("protocol_version")
+    if not isinstance(protocol, str):
+        raise SemanticHandoffError("Processing Run audit protocol 无法解释。")
+    allowed_shapes, expected_diagnostics = _versioned_processing_audit_shapes(
+        protocol,
+        profiled=None,
+    )
+    anchors = audit.get("anchor_unit_ids")
+    has_profile = _AUDIT_PROFILE_FIELDS.issubset(audit)
+    has_diagnostics = _AUDIT_DIAGNOSTIC_FIELDS.issubset(audit)
+    has_contract_diagnostics = (
+        _COMPLETED_AUDIT_CONTRACT_DIAGNOSTIC_FIELDS.issubset(audit)
+    )
+    has_grouping_diagnostics = (
+        _COMPLETED_AUDIT_GROUPING_DIAGNOSTIC_FIELDS.issubset(audit)
+    )
+    started = _timestamp(audit.get("started_at"))
+    finished = _timestamp(audit.get("finished_at"))
+    if (
+        frozenset(audit) not in allowed_shapes
+        or audit.get("schema_version") != "processing-run-audit/1.0"
+        or audit.get("artifact_kind") != "processing_run_audit"
+        or not _processing_run_id(audit.get("processing_run_id"))
+        or path.parent.name != audit.get("processing_run_id")
+        or not _sha256_fingerprint(audit.get("input_fingerprint"))
+        or not isinstance(anchors, list)
+        or not anchors
+        or any(not isinstance(item, str) for item in anchors)
+        or len(anchors) != len(set(anchors))
+        or audit.get("provider_route") != EXTERNAL_AGENT_ROUTE
+        or not _safe_execution_label(audit.get("provider_version"))
+        or has_profile
+        and (
+            not _safe_execution_label(audit.get("model"))
+            or audit.get("reasoning_effort")
+            not in {"low", "medium", "high", "xhigh"}
+            or audit.get("fallback_policy") != "none"
+        )
+        or started is None
+        or finished is None
+        or started > finished
+        or not _audit_integer(audit, "eligible_units", positive=True)
+        or audit.get("eligible_units") != len(anchors)
+        or not _audit_integer(audit, "covered_units")
+        or int(audit["covered_units"]) > len(anchors)
+        or audit.get("unaccounted_units")
+        != len(anchors) - int(audit["covered_units"])
+        or not isinstance(audit.get("package_published"), bool)
+        or not isinstance(audit.get("information_ingested"), bool)
+        or audit.get("audit_readback_status")
+        not in ({"verified"} if require_verified_readback else {"pending", "verified"})
+        or audit.get("package_published") is True
+        and not _sha256_fingerprint(audit.get("package_fingerprint"))
+        or audit.get("package_published") is False
+        and audit.get("package_fingerprint") is not None
+        or (
+            audit.get("package_published"),
+            audit.get("information_ingested"),
+            audit.get("durable_ingestion_status"),
+            audit.get("handoff_status"),
+        )
+        not in _PROCESSING_AUDIT_DURABLE_STATES
+        or expected_provider is not None
+        and (
+            audit.get("provider_version") != expected_provider.provider_version
+            or has_profile
+            and (
+                audit.get("model") != expected_provider.model
+                or audit.get("reasoning_effort")
+                != expected_provider.reasoning_effort
+                or audit.get("fallback_policy")
+                != expected_provider.fallback_policy
+            )
+            or has_diagnostics
+            and audit.get("deadline_ms")
+            != round(expected_provider.timeout_seconds * 1000)
+        )
+    ):
+        raise SemanticHandoffError("Processing Run audit binding 损坏。")
+
+    execution_succeeded = audit.get("execution_status") == "succeeded"
+    execution_failed = audit.get("execution_status") == "failed"
+    if not execution_succeeded and not execution_failed:
+        raise SemanticHandoffError("Processing Run audit execution 状态损坏。")
+    if has_diagnostics:
+        _validate_processing_audit_diagnostics(
+            audit,
+            expected_schema=expected_diagnostics,
+            execution_succeeded=execution_succeeded,
+        )
+    if execution_succeeded:
+        if (
+            audit.get("failure_category") is not None
+            or audit.get("contract_failure_detail") is not None
+            and "contract_failure_detail" in audit
+            or audit.get("strict_validation_status") != "passed"
+            or not _sha256_fingerprint(audit.get("result_fingerprint"))
+            or audit.get("covered_units") != len(anchors)
+            or audit.get("result_readback_status") != "verified"
+        ):
+            raise SemanticHandoffError("Processing Run audit success 状态损坏。")
+    else:
+        category = audit.get("failure_category")
+        if (
+            category not in _PROCESSING_AUDIT_FAILURE_CATEGORIES
+            or audit.get("strict_validation_status") != "failed"
+            or audit.get("result_readback_status") != "not_applicable"
+            or audit.get("package_published") is not False
+        ):
+            raise SemanticHandoffError("Processing Run audit failure 状态损坏。")
+        detail = audit.get("contract_failure_detail")
+        if category == "result_contract_failure":
+            if "contract_failure_detail" in audit and detail not in CONTRACT_FAILURE_DETAILS:
+                raise SemanticHandoffError(
+                    "Processing Run audit contract failure 状态损坏。"
+                )
+            if has_contract_diagnostics and (
+                detail not in CONTRACT_FAILURE_DETAILS
+                or audit.get("contract_failure_stage")
+                != _PROCESSING_AUDIT_CONTRACT_STAGES[detail]
+            ):
+                raise SemanticHandoffError(
+                    "Processing Run audit contract diagnostics 损坏。"
+                )
+        elif (
+            "contract_failure_detail" in audit
+            and detail is not None
+            or has_contract_diagnostics
+            and audit.get("contract_failure_stage") is not None
+        ):
+            raise SemanticHandoffError(
+                "Processing Run audit failure detail 损坏。"
+            )
+
+    if has_contract_diagnostics:
+        count_fields = (
+            _COMPLETED_AUDIT_CONTRACT_DIAGNOSTIC_FIELDS
+            - {"contract_failure_stage"}
+        )
+        if any(not _audit_integer(audit, field) for field in count_fields):
+            raise SemanticHandoffError(
+                "Processing Run audit contract counts 损坏。"
+            )
+        if audit.get("failure_category") != "result_contract_failure" and any(
+            audit.get(field) != 0 for field in count_fields
+        ):
+            raise SemanticHandoffError(
+                "Processing Run audit contract counts 状态损坏。"
+            )
+    if has_grouping_diagnostics:
+        if any(
+            not _audit_integer(audit, field)
+            for field in _COMPLETED_AUDIT_GROUPING_DIAGNOSTIC_FIELDS
+        ) or int(audit["raw_record_count"]) < int(audit["projected_record_count"]):
+            raise SemanticHandoffError(
+                "Processing Run audit grouping counts 损坏。"
+            )
+        if execution_succeeded and (
+            int(audit["projected_record_count"]) < 1
+            or audit.get("duplicate_exact_body_count") != 0
+            or audit.get("grouping_collision_count") != 0
+        ):
+            raise SemanticHandoffError(
+                "Processing Run audit success grouping 状态损坏。"
+            )
+        if (
+            not execution_succeeded
+            and
+            audit.get("failure_category") != "result_contract_failure"
+            and any(
+                audit.get(field) != 0
+                for field in _COMPLETED_AUDIT_GROUPING_DIAGNOSTIC_FIELDS
+            )
+        ):
+            raise SemanticHandoffError(
+                "Processing Run audit failure grouping 状态损坏。"
+            )
+    return audit
+
+
 def _versioned_audit_contract(
     protocol_version: str,
     package_provider: object,
@@ -3968,42 +4280,10 @@ def _versioned_audit_contract(
         )
     package_provider_version = package_provider["provider_version"]
     assert isinstance(package_provider_version, str)
-    if protocol_version in {
-        EXTERNAL_AGENT_PROTOCOL_V1,
-        EXTERNAL_AGENT_PROTOCOL_V2,
-        EXTERNAL_AGENT_PROTOCOL_V3,
-    }:
-        shapes = frozenset({frozenset(_COMPLETED_AUDIT_BASE_FIELDS)})
-        diagnostic_version = DIAGNOSTIC_SCHEMA_V1
-    elif protocol_version in {
-        EXTERNAL_AGENT_PROTOCOL_V3_1,
-        EXTERNAL_AGENT_PROTOCOL_V3_2,
-        EXTERNAL_AGENT_PROTOCOL_V3_3,
-    }:
-        shapes = frozenset(
-            {
-                frozenset(
-                    _COMPLETED_AUDIT_BASE_FIELDS
-                    | _COMPLETED_AUDIT_CONTRACT_DIAGNOSTIC_FIELDS
-                )
-            }
-        )
-        diagnostic_version = DIAGNOSTIC_SCHEMA_V2
-    elif protocol_version == EXTERNAL_AGENT_PROTOCOL_V3_4:
-        shapes = frozenset(
-            {
-                frozenset(
-                    _COMPLETED_AUDIT_BASE_FIELDS
-                    | _COMPLETED_AUDIT_CONTRACT_DIAGNOSTIC_FIELDS
-                    | _COMPLETED_AUDIT_GROUPING_DIAGNOSTIC_FIELDS
-                )
-            }
-        )
-        diagnostic_version = DIAGNOSTIC_SCHEMA_VERSION
-    else:
-        raise SemanticHandoffError(
-            "已发布的信息包使用不受支持的 External Agent protocol。"
-        )
+    shapes, diagnostic_version = _versioned_processing_audit_shapes(
+        protocol_version,
+        profiled=True,
+    )
     return shapes, diagnostic_version, True, package_provider_version
 
 
@@ -4033,7 +4313,10 @@ def _validate_versioned_published_audits(
         raise SemanticHandoffError("已发布的信息包审计集合不完整。")
     observed: set[tuple[str, ...]] = set()
     for path in paths:
-        audit = _private_json_read(path)
+        audit = _validate_versioned_processing_run_audit(
+            path,
+            require_verified_readback=False,
+        )
         if frozenset(audit) not in expected_shapes:
             raise SemanticHandoffError("已发布的信息包审计字段不精确。")
         has_diagnostics = _AUDIT_DIAGNOSTIC_FIELDS.issubset(audit)
