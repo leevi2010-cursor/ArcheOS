@@ -33,7 +33,11 @@ from archeos.representation_information import (
     CodexCliRepresentationAnalysisProvider,
     RepresentationInformationService,
 )
-from archeos.semantic_handoff import ExternalAgentSemanticHandoffService
+from archeos.semantic_handoff import (
+    ExternalAgentSemanticHandoffService,
+    SemanticPrivacyBinding,
+    SemanticWindowAuthorityBinding,
+)
 from archeos.source import LocalManagedSourceRepository
 from archeos.workspace import (
     MANAGED_CONFIG_COMMENT,
@@ -101,11 +105,48 @@ class WorkspaceAndMcpTest(unittest.TestCase):
                 representation = RepresentationService(sources, representations).build(source.source_id, JsonAdapter()).representation
                 service = RepresentationInformationService(sources, representations, args.output_root)
                 first_runner = FakeRunner()
-                first = ExternalAgentSemanticHandoffService(
+                handoff = ExternalAgentSemanticHandoffService(
                     service, JsonlAtomicInformationStore(args.store), args.audit_root,
-                ).execute(representation.representation_id, CodexCliRepresentationAnalysisProvider(
-                    provider_version="synthetic", runner=first_runner,
-                ))
+                )
+                provider = CodexCliRepresentationAnalysisProvider(
+                    provider_version="synthetic",
+                    timeout_seconds=300,
+                    runner=first_runner,
+                )
+                binding = SemanticWindowAuthorityBinding(
+                    campaign_created_at="2026-08-18T00:00:00.000Z",
+                    campaign_lower_cursor=(0, "", ""),
+                    frozen_global_upper_cursor=(1, "upper", "upper"),
+                    capture_provider_version="synthetic-capture-1.0",
+                    semantic_batch_size=40,
+                    window_run_id="run_" + "7" * 32,
+                    window_plan_fingerprint="sha256:" + "8" * 64,
+                    window_plan_receipt_fingerprint="sha256:" + "7" * 64,
+                    window_after_cursor=(0, "", ""),
+                    window_upper_cursor=(1, "upper", "upper"),
+                    previous_checkpoint_fingerprint=None,
+                    completed_window_chain=(),
+                    reviewed_git_head="6" * 40,
+                )
+                handoff.install_global_authority(
+                    provider,
+                    authority_ref="sha256:" + "5" * 64,
+                    expected_total=80,
+                    max_new=20,
+                    absolute_cap=100,
+                    window_binding=binding,
+                )
+                first = handoff.execute(
+                    representation.representation_id,
+                    provider,
+                    privacy_binding=SemanticPrivacyBinding(
+                        policy="synthetic-local",
+                        policy_version="1.0",
+                        route="approved",
+                        receipt_fingerprint="sha256:" + "9" * 64,
+                    ),
+                    authority_binding=binding,
+                )
                 self.assertEqual((first.ingestion.created, len(first_runner.calls)), (1, 1))
 
             (code_b / "02_processing").mkdir(); (code_b / "03_information").mkdir()
@@ -279,9 +320,19 @@ class WorkspaceAndMcpTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             _, _ = initialize_workspace(root, config_path=root / "archeos.toml")
-            with mock.patch.object(workspace_module, "_optional_audio_status", return_value="unavailable"):
-                with mock.patch.object(workspace_module.importlib.util, "find_spec", return_value=None):
-                    report = workspace_module.doctor(root / "archeos.toml")
+            with (
+                mock.patch.object(
+                    workspace_module,
+                    "_optional_audio_status",
+                    return_value="unavailable",
+                ),
+                mock.patch.object(
+                    workspace_module.importlib.util,
+                    "find_spec",
+                    return_value=None,
+                ),
+            ):
+                report = workspace_module.doctor(root / "archeos.toml")
             self.assertEqual(report["optional_audio_runtime"], "unavailable")
             self.assertEqual(report["optional_document_runtime"], "unavailable")
 
@@ -342,9 +393,15 @@ class WorkspaceAndMcpTest(unittest.TestCase):
                 codex_config.write_text(changed, encoding="utf-8")
                 original_write(path, content, expected_snapshot=expected_snapshot)  # type: ignore[arg-type]
 
-            with mock.patch.object(workspace_module, "_write_private_config", side_effect=write_after_user_change):
-                with self.assertRaisesRegex(ValueError, "changed during integration"):
-                    install_codex_integration(config, codex_config)
+            with (
+                mock.patch.object(
+                    workspace_module,
+                    "_write_private_config",
+                    side_effect=write_after_user_change,
+                ),
+                self.assertRaisesRegex(ValueError, "changed during integration"),
+            ):
+                install_codex_integration(config, codex_config)
             self.assertEqual(codex_config.read_text(encoding="utf-8"), changed)
             self.assertFalse((root / ".codex.toml.archeos.lock").exists())
 
@@ -444,13 +501,15 @@ class WorkspaceAndMcpTest(unittest.TestCase):
                     args=["-m", "archeos", "mcp", "serve", "--workspace", str(root)],
                     cwd=Path(__file__).resolve().parents[1],
                 )
-                async with stdio_client(parameters) as (reader, writer):
-                    async with ClientSession(reader, writer) as session:
-                        await session.initialize()
-                        tools = await session.list_tools()
-                        context = await session.call_tool("archeos_context_build", {"object_id": record.object_id})
-                        unknown = await session.call_tool("archeos_object_resolve", {"object_id": "obj_missing"})
-                        return {tool.name for tool in tools.tools}, context, unknown
+                async with (
+                    stdio_client(parameters) as (reader, writer),
+                    ClientSession(reader, writer) as session,
+                ):
+                    await session.initialize()
+                    tools = await session.list_tools()
+                    context = await session.call_tool("archeos_context_build", {"object_id": record.object_id})
+                    unknown = await session.call_tool("archeos_object_resolve", {"object_id": "obj_missing"})
+                    return {tool.name for tool in tools.tools}, context, unknown
 
             names, context, unknown = asyncio.run(smoke())
             self.assertEqual(names, {"archeos_object_resolve", "archeos_context_build", "archeos_source_show", "archeos_source_verify"})

@@ -85,6 +85,18 @@ class SemanticRecoveryPreflight:
 
 
 @dataclass(frozen=True)
+class SemanticCompletedWindowBinding:
+    """Caller-proved completed digest window in the frozen campaign chain."""
+
+    window_run_id: str
+    window_plan_fingerprint: str
+    window_plan_receipt_fingerprint: str
+    window_status_fingerprint: str
+    window_after_cursor: tuple[int, str, str]
+    window_upper_cursor: tuple[int, str, str]
+
+
+@dataclass(frozen=True)
 class SemanticWindowAuthorityBinding:
     """Caller-proved digest campaign/window binding for one Semantic attempt."""
 
@@ -99,6 +111,7 @@ class SemanticWindowAuthorityBinding:
     window_after_cursor: tuple[int, str, str]
     window_upper_cursor: tuple[int, str, str]
     previous_checkpoint_fingerprint: str | None
+    completed_window_chain: tuple[SemanticCompletedWindowBinding, ...]
     reviewed_git_head: str
 
 
@@ -463,6 +476,77 @@ def _cursor_payload(value: tuple[int, str, str]) -> list[object]:
     return [value[0], value[1], value[2]]
 
 
+def _completed_window_payload(
+    binding: SemanticCompletedWindowBinding,
+) -> dict[str, object]:
+    if (
+        not isinstance(binding, SemanticCompletedWindowBinding)
+        or re.fullmatch(r"run_[0-9a-f]{32}", binding.window_run_id) is None
+        or not _sha256_fingerprint(binding.window_plan_fingerprint)
+        or not _sha256_fingerprint(binding.window_plan_receipt_fingerprint)
+        or not _sha256_fingerprint(binding.window_status_fingerprint)
+    ):
+        raise SemanticHandoffError(
+            "Semantic global authority completed window binding 无效。"
+        )
+    after = _cursor_payload(binding.window_after_cursor)
+    upper = _cursor_payload(binding.window_upper_cursor)
+    if tuple(after) >= tuple(upper):
+        raise SemanticHandoffError(
+            "Semantic global authority completed window range 无效。"
+        )
+    return {
+        "window_run_id": binding.window_run_id,
+        "window_plan_fingerprint": binding.window_plan_fingerprint,
+        "window_plan_receipt_fingerprint": (
+            binding.window_plan_receipt_fingerprint
+        ),
+        "window_status_fingerprint": binding.window_status_fingerprint,
+        "window_after_cursor": after,
+        "window_upper_cursor": upper,
+    }
+
+
+def _completed_window_from_payload(
+    value: object,
+) -> SemanticCompletedWindowBinding:
+    if not isinstance(value, dict) or set(value) != {
+        "window_run_id",
+        "window_plan_fingerprint",
+        "window_plan_receipt_fingerprint",
+        "window_status_fingerprint",
+        "window_after_cursor",
+        "window_upper_cursor",
+    }:
+        raise SemanticHandoffError(
+            "Semantic global authority completed window receipt 损坏。"
+        )
+    try:
+        binding = SemanticCompletedWindowBinding(
+            window_run_id=value["window_run_id"],  # type: ignore[arg-type]
+            window_plan_fingerprint=value[  # type: ignore[arg-type]
+                "window_plan_fingerprint"
+            ],
+            window_plan_receipt_fingerprint=value[  # type: ignore[arg-type]
+                "window_plan_receipt_fingerprint"
+            ],
+            window_status_fingerprint=value[  # type: ignore[arg-type]
+                "window_status_fingerprint"
+            ],
+            window_after_cursor=tuple(value["window_after_cursor"]),  # type: ignore[arg-type]
+            window_upper_cursor=tuple(value["window_upper_cursor"]),  # type: ignore[arg-type]
+        )
+    except TypeError as exc:
+        raise SemanticHandoffError(
+            "Semantic global authority completed window receipt 损坏。"
+        ) from exc
+    if not _payloads_exactly_equal(_completed_window_payload(binding), value):
+        raise SemanticHandoffError(
+            "Semantic global authority completed window receipt 损坏。"
+        )
+    return binding
+
+
 def _authority_window_payload(
     binding: SemanticWindowAuthorityBinding,
 ) -> dict[str, object]:
@@ -491,6 +575,35 @@ def _authority_window_payload(
     upper = _cursor_payload(binding.window_upper_cursor)
     if not (tuple(lower) <= tuple(after) < tuple(upper) <= tuple(global_upper)):
         raise SemanticHandoffError("Semantic global authority window range 无效。")
+    chain = [
+        _completed_window_payload(item)
+        for item in binding.completed_window_chain
+    ]
+    expected_after = tuple(lower)
+    seen_run_ids: set[str] = set()
+    for item in chain:
+        if (
+            item["window_run_id"] in seen_run_ids
+            or tuple(item["window_after_cursor"]) != expected_after
+            or tuple(item["window_upper_cursor"]) > tuple(after)
+        ):
+            raise SemanticHandoffError(
+                "Semantic global authority completed window chain 不连续。"
+            )
+        seen_run_ids.add(str(item["window_run_id"]))
+        expected_after = tuple(item["window_upper_cursor"])
+    if expected_after != tuple(after):
+        raise SemanticHandoffError(
+            "Semantic global authority completed window chain 不完整。"
+        )
+    if binding.window_run_id in seen_run_ids:
+        raise SemanticHandoffError(
+            "Semantic global authority current window 重复。"
+        )
+    if chain and binding.previous_checkpoint_fingerprint is None:
+        raise SemanticHandoffError(
+            "Semantic global authority checkpoint chain binding 无效。"
+        )
     return {
         "campaign_created_at": binding.campaign_created_at,
         "campaign_lower_cursor": lower,
@@ -505,6 +618,7 @@ def _authority_window_payload(
         "previous_checkpoint_fingerprint": (
             binding.previous_checkpoint_fingerprint
         ),
+        "completed_window_chain": chain,
         "reviewed_git_head": binding.reviewed_git_head,
     }
 
@@ -522,6 +636,7 @@ def _authority_window_from_payload(value: object) -> SemanticWindowAuthorityBind
         "window_after_cursor",
         "window_upper_cursor",
         "previous_checkpoint_fingerprint",
+        "completed_window_chain",
         "reviewed_git_head",
     }:
         raise SemanticHandoffError("Semantic global authority window receipt 损坏。")
@@ -544,6 +659,10 @@ def _authority_window_from_payload(value: object) -> SemanticWindowAuthorityBind
             previous_checkpoint_fingerprint=value[
                 "previous_checkpoint_fingerprint"
             ],  # type: ignore[arg-type]
+            completed_window_chain=tuple(
+                _completed_window_from_payload(item)
+                for item in value["completed_window_chain"]  # type: ignore[union-attr]
+            ),
             reviewed_git_head=value["reviewed_git_head"],  # type: ignore[arg-type]
         )
     except TypeError as exc:
@@ -553,6 +672,41 @@ def _authority_window_from_payload(value: object) -> SemanticWindowAuthorityBind
     if not _payloads_exactly_equal(_authority_window_payload(binding), value):
         raise SemanticHandoffError("Semantic global authority window receipt 损坏。")
     return binding
+
+
+def _window_history_extends(
+    previous: Mapping[str, object], current: Mapping[str, object]
+) -> bool:
+    """Require every skipped zero-call window to remain in the durable chain."""
+
+    previous_chain = previous.get("completed_window_chain")
+    current_chain = current.get("completed_window_chain")
+    if not isinstance(previous_chain, list) or not isinstance(current_chain, list):
+        return False
+    if len(current_chain) <= len(previous_chain):
+        return False
+    if not _payloads_exactly_equal(
+        current_chain[: len(previous_chain)], previous_chain
+    ):
+        return False
+    completed_previous = current_chain[len(previous_chain)]
+    if not isinstance(completed_previous, dict):
+        return False
+    return (
+        completed_previous.get("window_run_id")
+        == previous.get("window_run_id")
+        and completed_previous.get("window_plan_fingerprint")
+        == previous.get("window_plan_fingerprint")
+        and completed_previous.get("window_plan_receipt_fingerprint")
+        == previous.get("window_plan_receipt_fingerprint")
+        and completed_previous.get("window_after_cursor")
+        == previous.get("window_after_cursor")
+        and completed_previous.get("window_upper_cursor")
+        == previous.get("window_upper_cursor")
+        and current.get("window_after_cursor")
+        == current_chain[-1].get("window_upper_cursor")
+        and _sha256_fingerprint(current.get("previous_checkpoint_fingerprint"))
+    )
 
 
 def _record_payload(record: ExternalAgentExecutionRecord) -> dict[str, object]:
@@ -2187,52 +2341,570 @@ class _SemanticGlobalAuthority:
             finally:
                 os.close(descriptor)
 
+    @contextmanager
+    def _install_locked(self):
+        """Serialize zero-write validation before the authority root exists."""
+
+        parent = self.audit_root.parent
+        _require_safe_ancestor_traversal(parent)
+        if not os.path.lexists(parent):
+            raise SemanticHandoffError(
+                "Semantic global authority install parent 不存在。"
+            )
+        descriptor = os.open(parent, os.O_RDONLY)
+        try:
+            opened = os.fstat(descriptor)
+            observed = parent.lstat()
+            if (
+                opened.st_dev != observed.st_dev
+                or opened.st_ino != observed.st_ino
+                or not stat.S_ISDIR(opened.st_mode)
+                or opened.st_uid != os.getuid()
+            ):
+                raise SemanticHandoffError(
+                    "Semantic global authority install lock binding 损坏。"
+                )
+            fcntl.flock(descriptor, fcntl.LOCK_EX)
+            yield
+        finally:
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
+            finally:
+                os.close(descriptor)
+
+    @staticmethod
+    def _validated_inventory_audit(path: Path) -> dict[str, object]:
+        audit = _private_json_exact(path)
+        protocol = audit.get("protocol_version")
+        if protocol == EXTERNAL_AGENT_PROTOCOL_V1:
+            allowed_shapes = _unprofiled_v1_audit_shapes() | frozenset(
+                {frozenset(_COMPLETED_AUDIT_BASE_FIELDS)}
+            )
+            expected_diagnostics = DIAGNOSTIC_SCHEMA_V1
+        elif protocol in {EXTERNAL_AGENT_PROTOCOL_V2, EXTERNAL_AGENT_PROTOCOL_V3}:
+            allowed_shapes = frozenset(
+                {frozenset(_COMPLETED_AUDIT_BASE_FIELDS)}
+            )
+            expected_diagnostics = DIAGNOSTIC_SCHEMA_V1
+        elif protocol in {
+            EXTERNAL_AGENT_PROTOCOL_V3_1,
+            EXTERNAL_AGENT_PROTOCOL_V3_2,
+            EXTERNAL_AGENT_PROTOCOL_V3_3,
+        }:
+            allowed_shapes = frozenset(
+                {
+                    frozenset(
+                        _COMPLETED_AUDIT_BASE_FIELDS
+                        | _COMPLETED_AUDIT_CONTRACT_DIAGNOSTIC_FIELDS
+                    )
+                }
+            )
+            expected_diagnostics = DIAGNOSTIC_SCHEMA_V2
+        elif protocol == EXTERNAL_AGENT_PROTOCOL_V3_4:
+            allowed_shapes = frozenset(
+                {
+                    frozenset(
+                        _COMPLETED_AUDIT_BASE_FIELDS
+                        | _COMPLETED_AUDIT_CONTRACT_DIAGNOSTIC_FIELDS
+                        | _COMPLETED_AUDIT_GROUPING_DIAGNOSTIC_FIELDS
+                    )
+                }
+            )
+            expected_diagnostics = DIAGNOSTIC_SCHEMA_VERSION
+        else:
+            raise SemanticHandoffError(
+                "Semantic global authority historical audit protocol 无法解释。"
+            )
+        anchors = audit.get("anchor_unit_ids")
+        has_diagnostics = _AUDIT_DIAGNOSTIC_FIELDS.issubset(audit)
+        has_profile = _AUDIT_PROFILE_FIELDS.issubset(audit)
+        if (
+            frozenset(audit) not in allowed_shapes
+            or audit.get("schema_version") != "processing-run-audit/1.0"
+            or audit.get("artifact_kind") != "processing_run_audit"
+            or not _processing_run_id(audit.get("processing_run_id"))
+            or path.parent.name != audit.get("processing_run_id")
+            or not _sha256_fingerprint(audit.get("input_fingerprint"))
+            or not isinstance(anchors, list)
+            or not anchors
+            or any(not isinstance(item, str) for item in anchors)
+            or len(anchors) != len(set(anchors))
+            or audit.get("provider_route") != EXTERNAL_AGENT_ROUTE
+            or not isinstance(audit.get("provider_version"), str)
+            or has_profile
+            and (
+                not isinstance(audit.get("model"), str)
+                or audit.get("reasoning_effort")
+                not in {"low", "medium", "high", "xhigh"}
+                or audit.get("fallback_policy") != "none"
+            )
+            or not _timestamp(audit.get("started_at"))
+            or not _timestamp(audit.get("finished_at"))
+            or audit.get("execution_status") not in {"succeeded", "failed"}
+            or isinstance(audit.get("eligible_units"), bool)
+            or audit.get("eligible_units") != len(anchors)
+            or isinstance(audit.get("covered_units"), bool)
+            or not isinstance(audit.get("covered_units"), int)
+            or not 0 <= int(audit["covered_units"]) <= len(anchors)
+            or audit.get("unaccounted_units")
+            != len(anchors) - int(audit["covered_units"])
+            or audit.get("audit_readback_status") != "verified"
+            or audit.get("package_published") is True
+            and not _sha256_fingerprint(audit.get("package_fingerprint"))
+            or audit.get("package_published") is False
+            and audit.get("package_fingerprint") is not None
+            or audit.get("information_ingested") is True
+            and audit.get("package_published") is not True
+            or has_diagnostics
+            and (
+                audit.get("diagnostic_schema_version") != expected_diagnostics
+                or any(
+                    isinstance(audit.get(field), bool)
+                    or not isinstance(audit.get(field), int)
+                    or int(audit[field]) < 0
+                    for field in (
+                        "elapsed_ms",
+                        "deadline_ms",
+                        "result_size_bytes",
+                        "stdout_bytes",
+                        "stderr_bytes",
+                    )
+                )
+            )
+        ):
+            raise SemanticHandoffError(
+                "Semantic global authority historical audit 无法解释。"
+            )
+        if audit.get("execution_status") == "succeeded":
+            if (
+                audit.get("failure_category") is not None
+                or audit.get("strict_validation_status") != "passed"
+                or not _sha256_fingerprint(audit.get("result_fingerprint"))
+                or audit.get("covered_units") != len(anchors)
+                or has_diagnostics
+                and (
+                    audit.get("result_file_present") is not True
+                    or audit.get("process_cleanup_status") != "verified"
+                )
+            ):
+                raise SemanticHandoffError(
+                    "Semantic global authority historical success audit 损坏。"
+                )
+        elif not isinstance(audit.get("failure_category"), str):
+            raise SemanticHandoffError(
+                "Semantic global authority historical failure audit 损坏。"
+            )
+        return audit
+
+    @staticmethod
+    def _audit_matches_record(
+        audit: Mapping[str, object], record: ExternalAgentExecutionRecord
+    ) -> bool:
+        expected = _record_payload(record)
+        return all(
+            field not in audit or audit.get(field) == value
+            for field, value in expected.items()
+        )
+
+    @staticmethod
+    def _audit_matches_attempt_contract(
+        audit: Mapping[str, object],
+        run_payload: Mapping[str, object],
+        batch_receipt: Mapping[str, object],
+    ) -> bool:
+        provider = run_payload.get("provider")
+        anchors = batch_receipt.get("anchor_unit_ids")
+        return (
+            isinstance(provider, dict)
+            and isinstance(anchors, list)
+            and audit.get("execution_status") == "failed"
+            and audit.get("protocol_version")
+            == run_payload.get("protocol_version")
+            and audit.get("input_fingerprint")
+            == batch_receipt.get("input_fingerprint")
+            and audit.get("anchor_unit_ids") == anchors
+            and audit.get("provider_route")
+            == run_payload.get("provider_route")
+            and audit.get("provider_version")
+            == provider.get("provider_version")
+            and audit.get("model") == provider.get("model")
+            and audit.get("reasoning_effort")
+            == provider.get("reasoning_effort")
+            and audit.get("fallback_policy")
+            == provider.get("fallback_policy")
+            and audit.get("deadline_ms")
+            == run_payload.get("execution_deadline_ms")
+        )
+
+    @staticmethod
+    def _result_record_for_inventory(
+        result: Path,
+        *,
+        run_payload: Mapping[str, object],
+        attempt: Mapping[str, object],
+        batch_receipt: Mapping[str, object],
+        ordinal: int,
+    ) -> ExternalAgentExecutionRecord:
+        _require_private_directory(result)
+        children = {child.name: child for child in result.iterdir()}
+        pending = {
+            "result.json",
+            "result-receipt.json",
+            "phase-post-strict-pending.json",
+        }
+        if frozenset(children) not in {
+            frozenset(pending),
+            frozenset(pending | {"phase-committed.json"}),
+        }:
+            raise SemanticHandoffError(
+                "Semantic global authority historical result inventory 损坏。"
+            )
+        for child in children.values():
+            _require_private_file(child)
+        raw = _private_bytes_read(result / "result.json")
+        receipt = _private_json_exact(result / "result-receipt.json")
+        projected = dict(receipt)
+        fingerprint = projected.pop("result_receipt_fingerprint", None)
+        if (
+            receipt.get("schema_version") != _RECOVERY_RESULT_SCHEMA
+            or receipt.get("artifact_kind")
+            != "semantic_handoff_batch_result"
+            or receipt.get("semantic_run_id")
+            != run_payload.get("semantic_run_id")
+            or receipt.get("run_contract_fingerprint")
+            != run_payload.get("contract_fingerprint")
+            or receipt.get("batch_ordinal") != ordinal
+            or receipt.get("batch_contract_fingerprint")
+            != batch_receipt.get("batch_contract_fingerprint")
+            or receipt.get("attempt_id") != attempt.get("attempt_id")
+            or receipt.get("attempt_nonce") != attempt.get("attempt_nonce")
+            or receipt.get("attempt_receipt_fingerprint")
+            != attempt.get("attempt_receipt_fingerprint")
+            or receipt.get("result_sha256") != _bytes_fingerprint(raw)
+            or receipt.get("result_size_bytes") != len(raw)
+            or receipt.get("strict_validation_status") != "passed"
+            or receipt.get("result_readback_status") != "verified"
+            or receipt.get("process_cleanup_status") != "verified"
+            or fingerprint != _fingerprint(projected)
+        ):
+            raise SemanticHandoffError(
+                "Semantic global authority historical result binding 损坏。"
+            )
+        record = _record_from_payload(receipt.get("execution_record"))
+        if receipt.get("processing_run_id") != record.processing_run_id:
+            raise SemanticHandoffError(
+                "Semantic global authority historical result audit binding 损坏。"
+            )
+        return record
+
+    @staticmethod
+    def _validate_inventory_run_contract(
+        run_payload: Mapping[str, object], run_name: str
+    ) -> list[dict[str, object]]:
+        protocol = run_payload.get("protocol_version")
+        validators = {
+            EXTERNAL_AGENT_PROTOCOL_V3_1: _V31_LOCAL_VALIDATOR_CONTRACT_VERSION,
+            EXTERNAL_AGENT_PROTOCOL_V3_2: _V32_LOCAL_VALIDATOR_CONTRACT_VERSION,
+            EXTERNAL_AGENT_PROTOCOL_V3_3: _V33_LOCAL_VALIDATOR_CONTRACT_VERSION,
+            EXTERNAL_AGENT_PROTOCOL_V3_4: _LOCAL_VALIDATOR_CONTRACT_VERSION,
+        }
+        validator = validators.get(protocol)
+        source = run_payload.get("source")
+        representation = run_payload.get("representation")
+        privacy = run_payload.get("privacy")
+        provider = run_payload.get("provider")
+        batches = run_payload.get("batches")
+        ordered = run_payload.get("ordered_eligible_unit_ids")
+        expected_keys = {
+            "schema_version",
+            "artifact_kind",
+            "semantic_run_id",
+            "source",
+            "representation",
+            "privacy",
+            "protocol_version",
+            "provider_route",
+            "provider",
+            "execution_deadline_ms",
+            "semantic_batch_size",
+            "ordered_eligible_unit_ids",
+            "prompt_template_fingerprint",
+            "local_validator_contract_version",
+            "batches",
+            "contract_fingerprint",
+            "run_receipt_fingerprint",
+        }
+        if protocol != EXTERNAL_AGENT_PROTOCOL_V3_1:
+            expected_keys.add("execution_identity_fingerprint")
+        if (
+            set(run_payload) != expected_keys
+            or validator is None
+            or run_payload.get("schema_version") != _RECOVERY_RUN_SCHEMA
+            or run_payload.get("artifact_kind")
+            != "semantic_handoff_recovery_run"
+            or run_payload.get("semantic_run_id") != run_name
+            or not isinstance(source, dict)
+            or set(source) != {"source_id", "content_hash"}
+            or not isinstance(source.get("source_id"), str)
+            or not _sha256_fingerprint(source.get("content_hash"))
+            or not isinstance(representation, dict)
+            or set(representation)
+            != {"representation_id", "manifest_fingerprint", "artifacts"}
+            or not isinstance(representation.get("representation_id"), str)
+            or not _sha256_fingerprint(
+                representation.get("manifest_fingerprint")
+            )
+            or not isinstance(representation.get("artifacts"), list)
+            or any(
+                not isinstance(item, dict)
+                or set(item) != {"artifact_id", "content_hash"}
+                or not isinstance(item.get("artifact_id"), str)
+                or not _sha256_fingerprint(item.get("content_hash"))
+                for item in representation.get("artifacts", [])
+            )
+            or not isinstance(privacy, dict)
+            or set(privacy)
+            != {"policy", "policy_version", "route", "receipt_fingerprint"}
+            or privacy.get("route") != "approved"
+            or not isinstance(privacy.get("policy"), str)
+            or not isinstance(privacy.get("policy_version"), str)
+            or not _sha256_fingerprint(privacy.get("receipt_fingerprint"))
+            or run_payload.get("provider_route") != EXTERNAL_AGENT_ROUTE
+            or not isinstance(provider, dict)
+            or set(provider)
+            != {
+                "name",
+                "provider_version",
+                "model",
+                "reasoning_effort",
+                "fallback_policy",
+            }
+            or provider.get("name") != "external-agent-codex-cli"
+            or not isinstance(provider.get("provider_version"), str)
+            or provider.get("model") != "gpt-5.6-terra"
+            or provider.get("reasoning_effort") != "medium"
+            or provider.get("fallback_policy") != "none"
+            or run_payload.get("execution_deadline_ms") != 300000
+            or isinstance(run_payload.get("semantic_batch_size"), bool)
+            or not isinstance(run_payload.get("semantic_batch_size"), int)
+            or int(run_payload["semantic_batch_size"]) < 1
+            or not isinstance(ordered, list)
+            or not ordered
+            or any(not isinstance(item, str) for item in ordered)
+            or len(ordered) != len(set(ordered))
+            or run_payload.get("prompt_template_fingerprint")
+            != _fingerprint(
+                _external_agent_prompt(
+                    {"protocol_version": protocol, "template_probe": True}
+                )
+            )
+            or run_payload.get("local_validator_contract_version") != validator
+            or not isinstance(batches, list)
+            or not batches
+        ):
+            raise SemanticHandoffError(
+                "Semantic global authority historical run contract 无法解释。"
+            )
+        flattened: list[str] = []
+        for ordinal, batch in enumerate(batches, start=1):
+            if not isinstance(batch, dict):
+                raise SemanticHandoffError(
+                    "Semantic global authority historical batch contract 损坏。"
+                )
+            projected = dict(batch)
+            fingerprint = projected.pop("batch_contract_fingerprint", None)
+            anchors = batch.get("anchor_unit_ids")
+            context = batch.get("context_support_unit_ids")
+            if (
+                set(batch)
+                != {
+                    "ordinal",
+                    "total",
+                    "anchor_unit_ids",
+                    "context_support_unit_ids",
+                    "input_fingerprint",
+                    "result_schema_fingerprint",
+                    "batch_contract_fingerprint",
+                }
+                or batch.get("ordinal") != ordinal
+                or batch.get("total") != len(batches)
+                or not isinstance(anchors, list)
+                or not anchors
+                or any(not isinstance(item, str) for item in anchors)
+                or len(anchors) != len(set(anchors))
+                or not isinstance(context, list)
+                or any(not isinstance(item, str) for item in context)
+                or len(context) != len(set(context))
+                or set(anchors) & set(context)
+                or not _sha256_fingerprint(batch.get("input_fingerprint"))
+                or not _sha256_fingerprint(
+                    batch.get("result_schema_fingerprint")
+                )
+                or fingerprint != _fingerprint(projected)
+            ):
+                raise SemanticHandoffError(
+                    "Semantic global authority historical batch contract 损坏。"
+                )
+            flattened.extend(anchors)
+        if flattened != ordered:
+            raise SemanticHandoffError(
+                "Semantic global authority historical partition 损坏。"
+            )
+        identity = {
+            key: run_payload[key]
+            for key in (
+                "source",
+                "representation",
+                "privacy",
+                "protocol_version",
+                "provider_route",
+                "provider",
+                "execution_deadline_ms",
+                "semantic_batch_size",
+                "ordered_eligible_unit_ids",
+                "prompt_template_fingerprint",
+                "local_validator_contract_version",
+                "batches",
+            )
+        }
+        identity_fingerprint = _fingerprint(identity)
+        representation_id = str(representation["representation_id"])
+        expected_run_id = (
+            "semantic_run_"
+            + (
+                hashlib.sha256(representation_id.encode("utf-8")).hexdigest()
+                if protocol == EXTERNAL_AGENT_PROTOCOL_V3_1
+                else identity_fingerprint.removeprefix("sha256:")
+            )[:32]
+        )
+        without_run_fingerprint = dict(run_payload)
+        observed_run_fingerprint = without_run_fingerprint.pop(
+            "run_receipt_fingerprint", None
+        )
+        without_contract_fingerprint = dict(without_run_fingerprint)
+        observed_contract_fingerprint = without_contract_fingerprint.pop(
+            "contract_fingerprint", None
+        )
+        if (
+            run_name != expected_run_id
+            or protocol != EXTERNAL_AGENT_PROTOCOL_V3_1
+            and run_payload.get("execution_identity_fingerprint")
+            != identity_fingerprint
+            or observed_contract_fingerprint
+            != _fingerprint(without_contract_fingerprint)
+            or observed_run_fingerprint != _fingerprint(without_run_fingerprint)
+        ):
+            raise SemanticHandoffError(
+                "Semantic global authority historical execution identity 漂移。"
+            )
+        return batches  # type: ignore[return-value]
+
     def _legacy_inventory(self) -> tuple[int, str]:
-        _validate_shared_recovery_root(self.audit_root, create=False)
+        if not _validate_shared_recovery_root(self.audit_root, create=False):
+            return 0, _fingerprint([])
+        audits: dict[str, tuple[Path, dict[str, object]]] = {}
+        for path in sorted(
+            self.audit_root.glob("run_*/processing-run-audit.json")
+        ):
+            audit = self._validated_inventory_audit(path)
+            run_id = str(audit["processing_run_id"])
+            if run_id in audits:
+                raise SemanticHandoffError(
+                    "Semantic global authority historical audit identity 冲突。"
+                )
+            audits[run_id] = (path, audit)
+
         entries: list[dict[str, object]] = []
+        linked_audits: set[str] = set()
         for run in sorted(self.audit_root.glob("semantic_run_*")):
-            attempts = run / "attempts"
-            if not os.path.lexists(attempts):
-                continue
-            _require_private_directory(attempts)
+            _require_private_directory(run)
+            children = {child.name: child for child in run.iterdir()}
+            if (
+                "run-receipt.json" not in children
+                or not set(children)
+                <= {"run-receipt.json", "attempts", "results"}
+            ):
+                raise SemanticHandoffError(
+                    "Semantic global authority historical run inventory 损坏。"
+                )
             run_receipt_path = run / "run-receipt.json"
             run_receipt = _private_bytes_read(run_receipt_path)
             run_payload = _private_json_exact(run_receipt_path)
-            batches = run_payload.get("batches")
+            batches = self._validate_inventory_run_contract(
+                run_payload, run.name
+            )
+            attempts = children.get("attempts")
+            results = children.get("results")
+            if attempts is None:
+                if results is not None:
+                    raise SemanticHandoffError(
+                        "Semantic global authority historical result 缺少 attempt。"
+                    )
+                continue
+            _require_private_directory(attempts)
+            attempt_paths = sorted(attempts.iterdir())
+            attempt_ordinals = [
+                int(match.group(1))
+                for path in attempt_paths
+                if (
+                    match := re.fullmatch(r"batch_(\d{4})\.json", path.name)
+                )
+                is not None
+            ]
             if (
-                run_payload.get("schema_version") != _RECOVERY_RUN_SCHEMA
-                or run_payload.get("semantic_run_id") != run.name
-                or not _sha256_fingerprint(run_payload.get("contract_fingerprint"))
-                or not isinstance(batches, list)
-                or not batches
+                len(attempt_ordinals) != len(attempt_paths)
+                or attempt_ordinals != list(range(1, len(attempt_paths) + 1))
             ):
                 raise SemanticHandoffError(
-                    "Semantic global authority legacy run 无法解释。"
+                    "Semantic global authority historical attempt 顺序损坏。"
                 )
-            for path in sorted(attempts.iterdir()):
+            result_ordinals: list[int] = []
+            if results is not None:
+                _require_private_directory(results)
+                result_paths = sorted(results.iterdir())
+                result_ordinals = [
+                    int(match.group(1))
+                    for path in result_paths
+                    if (
+                        match := re.fullmatch(r"batch_(\d{4})", path.name)
+                    )
+                    is not None
+                ]
+                if len(result_ordinals) != len(result_paths):
+                    raise SemanticHandoffError(
+                        "Semantic global authority historical result 路径损坏。"
+                    )
+            if tuple(result_ordinals) not in {
+                tuple(attempt_ordinals),
+                tuple(attempt_ordinals[:-1]),
+            }:
+                raise SemanticHandoffError(
+                    "Semantic global authority historical attempt/result 顺序损坏。"
+                )
+            for path in attempt_paths:
                 payload = _private_json_exact(path)
-                if payload.get("schema_version") == _GLOBAL_ATTEMPT_SCHEMA:
-                    continue
-                if payload.get("schema_version") != _RECOVERY_ATTEMPT_SCHEMA:
+                attempt_schema = payload.get("schema_version")
+                if attempt_schema not in {
+                    _RECOVERY_ATTEMPT_SCHEMA,
+                    _GLOBAL_ATTEMPT_SCHEMA,
+                }:
                     raise SemanticHandoffError(
                         "Semantic global authority legacy attempt 无法解释。"
                     )
                 match = re.fullmatch(r"batch_(\d{4})\.json", path.name)
-                if match is None:
-                    raise SemanticHandoffError(
-                        "Semantic global authority legacy attempt 路径损坏。"
-                    )
-                ordinal = int(match.group(1))
-                if ordinal < 1 or ordinal > len(batches):
-                    raise SemanticHandoffError(
-                        "Semantic global authority legacy attempt ordinal 损坏。"
-                    )
-                batch_receipt = batches[ordinal - 1]
+                ordinal = int(match.group(1)) if match is not None else 0
+                batch_receipt = (
+                    batches[ordinal - 1]
+                    if 1 <= ordinal <= len(batches)
+                    else None
+                )
                 nonce = payload.get("attempt_nonce")
                 if (
-                    not isinstance(batch_receipt, dict)
+                    match is None
+                    or not isinstance(batch_receipt, dict)
                     or not isinstance(nonce, str)
-                    or not _payloads_exactly_equal(
+                    or attempt_schema == _RECOVERY_ATTEMPT_SCHEMA
+                    and not _payloads_exactly_equal(
                         payload,
                         _SemanticRecoveryRun._expected_attempt_payload(
                             semantic_run_id=run.name,
@@ -2248,10 +2920,18 @@ class _SemanticGlobalAuthority:
                     raise SemanticHandoffError(
                         "Semantic global authority legacy attempt binding 损坏。"
                     )
-                result = run / "results" / f"batch_{match.group(1)}"
+                result = run / "results" / f"batch_{ordinal:04d}"
+                record: ExternalAgentExecutionRecord | None = None
+                linked_run_id: str | None = None
                 result_entries: list[dict[str, object]] = []
                 if os.path.lexists(result):
-                    _validate_recovery_result_directory(result)
+                    record = self._result_record_for_inventory(
+                        result,
+                        run_payload=run_payload,
+                        attempt=payload,
+                        batch_receipt=batch_receipt,
+                        ordinal=ordinal,
+                    )
                     result_entries = [
                         {
                             "path": child.relative_to(self.audit_root).as_posix(),
@@ -2261,16 +2941,69 @@ class _SemanticGlobalAuthority:
                         }
                         for child in sorted(result.iterdir())
                     ]
+                    linked = audits.get(record.processing_run_id)
+                    if linked is not None:
+                        if (
+                            record.processing_run_id in linked_audits
+                            or not self._audit_matches_record(linked[1], record)
+                        ):
+                            raise SemanticHandoffError(
+                                "Semantic global authority audit/attempt binding 冲突。"
+                            )
+                        linked_audits.add(record.processing_run_id)
+                        linked_run_id = record.processing_run_id
+                else:
+                    candidates = [
+                        run_id
+                        for run_id, (_, audit) in audits.items()
+                        if run_id not in linked_audits
+                        and self._audit_matches_attempt_contract(
+                            audit, run_payload, batch_receipt
+                        )
+                    ]
+                    if len(candidates) > 1:
+                        raise SemanticHandoffError(
+                            "Semantic global authority audit/attempt identity 无法唯一解释。"
+                        )
+                    if candidates:
+                        linked_audits.add(candidates[0])
+                        linked_run_id = candidates[0]
+                if attempt_schema == _GLOBAL_ATTEMPT_SCHEMA:
+                    continue
                 entries.append(
                     {
+                        "kind": "recovery_attempt",
                         "path": path.relative_to(self.audit_root).as_posix(),
                         "attempt_sha256": _bytes_fingerprint(
                             _private_bytes_read(path)
                         ),
                         "run_receipt_sha256": _bytes_fingerprint(run_receipt),
                         "result_entries": result_entries,
+                        "processing_audit_sha256": (
+                            _bytes_fingerprint(
+                                _private_bytes_read(
+                                    audits[linked_run_id][0]
+                                )
+                            )
+                            if linked_run_id is not None
+                            else None
+                        ),
                     }
                 )
+
+        for run_id, (path, audit) in sorted(audits.items()):
+            if run_id in linked_audits:
+                continue
+            entries.append(
+                {
+                    "kind": "processing_run_audit",
+                    "path": path.relative_to(self.audit_root).as_posix(),
+                    "audit_sha256": _bytes_fingerprint(_private_bytes_read(path)),
+                    "protocol_version": audit["protocol_version"],
+                    "input_fingerprint": audit["input_fingerprint"],
+                }
+            )
+        entries.sort(key=_canonical_bytes)
         return len(entries), _fingerprint(entries)
 
     @staticmethod
@@ -2373,7 +3106,15 @@ class _SemanticGlobalAuthority:
         window: SemanticWindowAuthorityBinding,
         provider: CodexCliRepresentationAnalysisProvider,
     ) -> dict[str, object]:
-        with self._locked():
+        preflight = self._expected_grant(
+            authority_ref=authority_ref,
+            expected_total=expected_total,
+            max_new=max_new,
+            absolute_cap=absolute_cap,
+            window=window,
+            provider=provider,
+        )
+        with self._install_locked():
             expected = self._expected_grant(
                 authority_ref=authority_ref,
                 expected_total=expected_total,
@@ -2382,31 +3123,39 @@ class _SemanticGlobalAuthority:
                 window=window,
                 provider=provider,
             )
-            if os.path.lexists(self.grant_path):
-                observed = _private_json_exact(self.grant_path)
-                if not _payloads_exactly_equal(observed, expected):
-                    raise SemanticHandoffError(
-                        "Semantic global authority 已存在且不匹配；不得重置。"
+            if not _payloads_exactly_equal(preflight, expected):
+                raise SemanticHandoffError(
+                    "Semantic global authority install preflight 发生漂移。"
+                )
+            self._ensure_root()
+            with self._locked():
+                if os.path.lexists(self.grant_path):
+                    observed = _private_json_exact(self.grant_path)
+                    if not _payloads_exactly_equal(observed, expected):
+                        raise SemanticHandoffError(
+                            "Semantic global authority 已存在且不匹配；不得重置。"
+                        )
+                    _refsync_and_readback(
+                        files=(self.grant_path, self.lock_path),
+                        directories=(self.root, self.audit_root),
                     )
+                    converged = _private_json_exact(self.grant_path)
+                    if not _payloads_exactly_equal(converged, expected):
+                        raise SemanticHandoffError(
+                            "Semantic global authority 安装读回失败。"
+                        )
+                    return converged
+                _publish_private_json_marker(self.grant_path, expected)
                 _refsync_and_readback(
                     files=(self.grant_path, self.lock_path),
                     directories=(self.root, self.audit_root),
                 )
-                converged = _private_json_exact(self.grant_path)
-                if not _payloads_exactly_equal(converged, expected):
+                observed = _private_json_exact(self.grant_path)
+                if not _payloads_exactly_equal(observed, expected):
                     raise SemanticHandoffError(
                         "Semantic global authority 安装读回失败。"
                     )
-                return converged
-            _publish_private_json_marker(self.grant_path, expected)
-            _refsync_and_readback(
-                files=(self.grant_path, self.lock_path),
-                directories=(self.root, self.audit_root),
-            )
-            observed = _private_json_exact(self.grant_path)
-            if not _payloads_exactly_equal(observed, expected):
-                raise SemanticHandoffError("Semantic global authority 安装读回失败。")
-            return observed
+                return observed
 
     def _load_grant(
         self,
@@ -2615,7 +3364,11 @@ class _SemanticGlobalAuthority:
                 )
             _authority_window_from_payload(window)
             if previous_window is None:
-                if not _payloads_exactly_equal(window, grant.get("initial_window")):
+                initial_window = grant.get("initial_window")
+                if not isinstance(initial_window, dict) or not (
+                    _payloads_exactly_equal(window, initial_window)
+                    or _window_history_extends(initial_window, window)
+                ):
                     raise SemanticHandoffError(
                         "Semantic global authority initial window 漂移。"
                     )
@@ -2626,13 +3379,7 @@ class _SemanticGlobalAuthority:
                     raise SemanticHandoffError(
                         "Semantic global authority current window 漂移。"
                     )
-            elif (
-                window.get("window_after_cursor")
-                != previous_window.get("window_upper_cursor")
-                or not _sha256_fingerprint(
-                    window.get("previous_checkpoint_fingerprint")
-                )
-            ):
+            elif not _window_history_extends(previous_window, window):
                 raise SemanticHandoffError(
                     "Semantic global authority window checkpoint 不连续。"
                 )
@@ -2796,16 +3543,14 @@ class _SemanticGlobalAuthority:
                         current_window, last_window
                     )
                 else:
-                    valid_window = (
-                        current_window["window_after_cursor"]
-                        == last_window.get("window_upper_cursor")
-                        and _sha256_fingerprint(
-                            current_window["previous_checkpoint_fingerprint"]
-                        )
+                    valid_window = _window_history_extends(
+                        last_window, current_window
                     )
             else:
-                valid_window = _payloads_exactly_equal(
-                    current_window, grant.get("initial_window")
+                initial_window = grant.get("initial_window")
+                valid_window = isinstance(initial_window, dict) and (
+                    _payloads_exactly_equal(current_window, initial_window)
+                    or _window_history_extends(initial_window, current_window)
                 )
             if not valid_window:
                 raise SemanticHandoffError(
@@ -3600,9 +4345,9 @@ class ExternalAgentSemanticHandoffService:
         recovery: _SemanticRecoveryRun | None = None
         analysis_provider: object = provider
         installed_global_authority = _SemanticGlobalAuthority(self.audit_root)
-        if privacy_binding is None and installed_global_authority.exists:
+        if privacy_binding is None:
             raise SemanticHandoffError(
-                "Semantic global authority 已安装；direct/unbound execute 不得启动新调用。"
+                "Semantic global authority 未绑定；direct/unbound execute 不得启动新调用。"
             )
         if privacy_binding is not None:
             if new_call_authority is not None:

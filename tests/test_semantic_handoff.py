@@ -51,6 +51,7 @@ from archeos.representation_information import (
 )
 from archeos.semantic_handoff import (
     ExternalAgentSemanticHandoffService,
+    SemanticCompletedWindowBinding,
     SemanticHandoffError,
     SemanticPrivacyBinding,
     SemanticWindowAuthorityBinding,
@@ -1269,17 +1270,21 @@ class SemanticHandoffTest(unittest.TestCase):
                 root = self.root / mode
                 representation, service = self.build_service(root=root)
                 atomic_path = root / "atomic.jsonl"
+                handoff = ExternalAgentSemanticHandoffService(
+                    service,
+                    JsonlAtomicInformationStore(atomic_path),
+                    root / "audits",
+                )
                 with self.assertRaisesRegex(Exception, "未确认新增 Durable"):
-                    ExternalAgentSemanticHandoffService(
-                        service,
-                        JsonlAtomicInformationStore(atomic_path),
-                        root / "audits",
-                    ).execute(
+                    self.execute_with_global_authority(
+                        handoff,
                         representation.representation_id,
                         CodexCliRepresentationAnalysisProvider(
                             provider_version="0.147.0",
                             runner=FakeRunner(mode),
                         ),
+                        privacy_binding=self.privacy_binding(),
+                        new_call_authority=1,
                     )
                 self.assertFalse(
                     (root / "information" / representation.representation_id).exists()
@@ -1518,11 +1523,18 @@ class SemanticHandoffTest(unittest.TestCase):
             provider_version="0.147.0", runner=FakeRunner()
         )
         audit_root = self.root / "audits"
-        result = ExternalAgentSemanticHandoffService(
+        handoff = ExternalAgentSemanticHandoffService(
             service,
             JsonlAtomicInformationStore(self.root / "atomic.jsonl"),
             audit_root,
-        ).execute(representation.representation_id, provider)
+        )
+        result = self.execute_with_global_authority(
+            handoff,
+            representation.representation_id,
+            provider,
+            privacy_binding=self.privacy_binding(),
+            new_call_authority=1,
+        )
         manifest, _ = validate_representation_information_package(
             result.package
         )
@@ -1716,6 +1728,7 @@ class SemanticHandoffTest(unittest.TestCase):
             window_after_cursor=(0, "", ""),
             window_upper_cursor=(1, "window", "window"),
             previous_checkpoint_fingerprint=None,
+            completed_window_chain=(),
             reviewed_git_head="6" * 40,
         )
 
@@ -1827,7 +1840,13 @@ class SemanticHandoffTest(unittest.TestCase):
             JsonlAtomicInformationStore(self.root / "atomic.jsonl"),
             self.root / "audits",
         )
-        first = handoff.execute(representation.representation_id, provider)
+        first = self.execute_with_global_authority(
+            handoff,
+            representation.representation_id,
+            provider,
+            privacy_binding=self.privacy_binding(),
+            new_call_authority=1,
+        )
         self.assertEqual(first.ingestion.created, 1)
         self.assertFalse(first.replayed_existing_package)
         audit = json.loads(first.audit_paths[0].read_text())
@@ -1886,11 +1905,14 @@ class SemanticHandoffTest(unittest.TestCase):
             JsonlAtomicInformationStore(self.root / "atomic.jsonl"),
             audit_root,
         )
-        first = handoff.execute(
+        first = self.execute_with_global_authority(
+            handoff,
             representation.representation_id,
             CodexCliRepresentationAnalysisProvider(
                 provider_version="0.147.0", runner=FakeRunner()
             ),
+            privacy_binding=self.privacy_binding(),
+            new_call_authority=1,
         )
         units = _units_from_representation(
             representation, service.representation_repository
@@ -1929,11 +1951,14 @@ class SemanticHandoffTest(unittest.TestCase):
             JsonlAtomicInformationStore(self.root / "atomic.jsonl"),
             audit_root,
         )
-        first = handoff.execute(
+        first = self.execute_with_global_authority(
+            handoff,
             representation.representation_id,
             CodexCliRepresentationAnalysisProvider(
                 provider_version="0.147.0", runner=FakeRunner()
             ),
+            privacy_binding=self.privacy_binding(),
+            new_call_authority=1,
         )
         units = _units_from_representation(
             representation, service.representation_repository
@@ -1972,11 +1997,14 @@ class SemanticHandoffTest(unittest.TestCase):
             JsonlAtomicInformationStore(self.root / "atomic.jsonl"),
             audit_root,
         )
-        handoff.execute(
+        self.execute_with_global_authority(
+            handoff,
             representation.representation_id,
             CodexCliRepresentationAnalysisProvider(
                 provider_version="0.147.0", runner=FakeRunner()
             ),
+            privacy_binding=self.privacy_binding(),
+            new_call_authority=1,
         )
         units = _units_from_representation(
             representation, service.representation_repository
@@ -2014,12 +2042,15 @@ class SemanticHandoffTest(unittest.TestCase):
             JsonlAtomicInformationStore(self.root / "atomic.jsonl"),
             audit_root,
         )
-        first = handoff.execute(
+        first = self.execute_with_global_authority(
+            handoff,
             representation.representation_id,
             CodexCliRepresentationAnalysisProvider(
                 provider_version="0.147.0",
                 runner=FakeRunner(),
             ),
+            privacy_binding=self.privacy_binding(),
+            new_call_authority=1,
         )
         units = _units_from_representation(
             representation,
@@ -2059,12 +2090,15 @@ class SemanticHandoffTest(unittest.TestCase):
             JsonlAtomicInformationStore(self.root / "atomic.jsonl"),
             audit_root,
         )
-        first = handoff.execute(
+        first = self.execute_with_global_authority(
+            handoff,
             representation.representation_id,
             CodexCliRepresentationAnalysisProvider(
                 provider_version="0.147.0",
                 runner=FakeRunner(),
             ),
+            privacy_binding=self.privacy_binding(),
+            new_call_authority=1,
         )
         units = _units_from_representation(
             representation,
@@ -2104,11 +2138,14 @@ class SemanticHandoffTest(unittest.TestCase):
             JsonlAtomicInformationStore(self.root / "atomic.jsonl"),
             audit_root,
         )
-        handoff.execute(
+        self.execute_with_global_authority(
+            handoff,
             representation.representation_id,
             CodexCliRepresentationAnalysisProvider(
                 provider_version="0.147.0", runner=FakeRunner()
             ),
+            privacy_binding=self.privacy_binding(),
+            new_call_authority=1,
         )
         package = service.output_root / representation.representation_id
         manifest_path = package / "manifest.json"
@@ -2182,7 +2219,13 @@ class SemanticHandoffTest(unittest.TestCase):
             service, JsonlAtomicInformationStore(store_path), audit_root
         )
 
-        first = handoff.execute(representation.representation_id, provider)
+        first = self.execute_with_global_authority(
+            handoff,
+            representation.representation_id,
+            provider,
+            privacy_binding=self.privacy_binding(),
+            new_call_authority=1,
+        )
         self.assertEqual(first.ingestion.created, 1)
         self.assertFalse(first.replayed_existing_package)
         self.assertEqual(len(first.audit_paths), 1)
@@ -2216,7 +2259,13 @@ class SemanticHandoffTest(unittest.TestCase):
             self.root / "audits",
         )
         with self.assertRaisesRegex(Exception, "未确认新增 Durable"):
-            handoff.execute(representation.representation_id, provider)
+            self.execute_with_global_authority(
+                handoff,
+                representation.representation_id,
+                provider,
+                privacy_binding=self.privacy_binding(),
+                new_call_authority=1,
+            )
         self.assertFalse(
             (self.root / "information" / representation.representation_id).exists()
         )
@@ -2249,11 +2298,14 @@ class SemanticHandoffTest(unittest.TestCase):
             self.root / "audits",
         )
         with self.assertRaisesRegex(Exception, "未确认新增 Durable"):
-            handoff.execute(
+            self.execute_with_global_authority(
+                handoff,
                 representation.representation_id,
                 CodexCliRepresentationAnalysisProvider(
                     provider_version="0.147.0", runner=FakeRunner("candidate_shape")
                 ),
+                privacy_binding=self.privacy_binding(),
+                new_call_authority=1,
             )
         audit_path = next((self.root / "audits").glob("*/processing-run-audit.json"))
         audit_text = audit_path.read_text(encoding="utf-8")
@@ -2267,18 +2319,22 @@ class SemanticHandoffTest(unittest.TestCase):
     def test_partial_coverage_audit_preserves_only_content_free_counts(self) -> None:
         representation, service = self.build_service(blocks=40)
         audit_root = self.root / "audits"
+        handoff = ExternalAgentSemanticHandoffService(
+            service,
+            JsonlAtomicInformationStore(self.root / "atomic.jsonl"),
+            audit_root,
+        )
         with self.assertRaisesRegex(Exception, "未确认新增 Durable"):
-            ExternalAgentSemanticHandoffService(
-                service,
-                JsonlAtomicInformationStore(self.root / "atomic.jsonl"),
-                audit_root,
-            ).execute(
+            self.execute_with_global_authority(
+                handoff,
                 representation.representation_id,
                 CodexCliRepresentationAnalysisProvider(
                     provider_version="0.147.0",
                     runner=FakeRunner("coverage_summary"),
                     diagnostic_root=self.root.resolve() / "diagnostics",
                 ),
+                privacy_binding=self.privacy_binding(),
+                new_call_authority=1,
             )
         audit_path = next(audit_root.glob("*/processing-run-audit.json"))
         audit_text = audit_path.read_text(encoding="utf-8")
@@ -2300,11 +2356,14 @@ class SemanticHandoffTest(unittest.TestCase):
         handoff = ExternalAgentSemanticHandoffService(
             service, JsonlAtomicInformationStore(store_path), self.root / "audits"
         )
-        handoff.execute(
+        self.execute_with_global_authority(
+            handoff,
             representation.representation_id,
             CodexCliRepresentationAnalysisProvider(
                 provider_version="0.147.0", runner=FakeRunner()
             ),
+            privacy_binding=self.privacy_binding(),
+            new_call_authority=1,
         )
         original = store_path.read_text(encoding="utf-8")
         managed = (
@@ -2353,11 +2412,14 @@ class SemanticHandoffTest(unittest.TestCase):
             patch.object(handoff_module, "_private_json_write", fail_final_write),
             self.assertRaisesRegex(Exception, "审计仍为待完成"),
         ):
-            handoff.execute(
+            self.execute_with_global_authority(
+                handoff,
                 representation.representation_id,
                 CodexCliRepresentationAnalysisProvider(
                     provider_version="0.147.0", runner=FakeRunner()
                 ),
+                privacy_binding=self.privacy_binding(),
+                new_call_authority=1,
             )
         pending = json.loads(
             next(audit_root.glob("*/processing-run-audit.json")).read_text()
@@ -2387,17 +2449,26 @@ class SemanticHandoffTest(unittest.TestCase):
             provider_version="0.147.0", runner=SequenceRunner("valid", "nonzero")
         )
         with self.assertRaisesRegex(Exception, "未确认新增 Durable"):
-            handoff.execute(representation.representation_id, provider)
+            self.execute_with_global_authority(
+                handoff,
+                representation.representation_id,
+                provider,
+                privacy_binding=self.privacy_binding(),
+                new_call_authority=2,
+            )
         audits = sorted((self.root / "audits").glob("*/processing-run-audit.json"))
-        self.assertEqual(len(audits), 2)
+        self.assertEqual(len(provider.execution_records), 2)
+        self.assertEqual(len(audits), 1)
         payloads = [json.loads(path.read_text()) for path in audits]
-        successful = next(
-            item for item in payloads if item["execution_status"] == "succeeded"
-        )
         failed = next(item for item in payloads if item["execution_status"] == "failed")
-        self.assertIsNone(successful["failure_category"])
         self.assertEqual(failed["failure_category"], "runtime_nonzero_exit")
-        self.assertEqual(successful["handoff_status"], "failed")
+        self.assertEqual(failed["handoff_status"], "failed")
+        committed_results = tuple(
+            (self.root / "audits").glob(
+                "semantic_run_*/results/batch_0001/phase-committed.json"
+            )
+        )
+        self.assertEqual(len(committed_results), 1)
         self.assertFalse(
             (self.root / "information" / representation.representation_id).exists()
         )
@@ -2417,9 +2488,22 @@ class SemanticHandoffTest(unittest.TestCase):
             provider_version="0.147.0",
             runner=SequenceRunner("valid", "nonzero"),
         )
-        with self.assertRaisesRegex(Exception, "未确认新增 Durable"):
-            handoff.execute(representation.representation_id, historical)
+        units = _units_from_representation(
+            representation, service.representation_repository
+        )
+        batches = _analysis_batches(units, service.batch_size)
+        historical.analyze(batches[0])
+        with self.assertRaises(RepresentationInformationError):
+            historical.analyze(batches[1])
         self.assertEqual(len(historical.execution_records), 2)
+        handoff._persist_audits(
+            historical.execution_records,
+            package_published=False,
+            information_ingested=False,
+            durable_ingestion_status="ingestion_not_completed",
+            package_fingerprint=None,
+            handoff_status="failed",
+        )
 
         provider = CodexCliRepresentationAnalysisProvider(
             provider_version="0.147.0", runner=FakeRunner()
@@ -4771,6 +4855,337 @@ class SemanticHandoffTest(unittest.TestCase):
         self.assertEqual(runner.calls, [])
         self.assertFalse(audit_root.exists())
 
+    def test_direct_new_call_without_grant_is_zero_write(self) -> None:
+        representation, service = self.build_service(
+            root=self.root / "direct-no-grant"
+        )
+        audit_root = self.root / "direct-no-grant-audits"
+        runner = FakeRunner()
+        before = self.tree_snapshot(self.root)
+        with self.assertRaisesRegex(SemanticHandoffError, "direct/unbound"):
+            ExternalAgentSemanticHandoffService(
+                service,
+                JsonlAtomicInformationStore(self.root / "direct-no-grant.jsonl"),
+                audit_root,
+            ).execute(
+                representation.representation_id,
+                CodexCliRepresentationAnalysisProvider(
+                    provider_version="0.147.0",
+                    timeout_seconds=300,
+                    runner=runner,
+                ),
+            )
+        self.assertEqual(runner.calls, [])
+        self.assertEqual(self.tree_snapshot(self.root), before)
+        self.assertFalse(audit_root.exists())
+
+    def test_invalid_global_authority_install_is_zero_write(self) -> None:
+        cases = (
+            (79, 20, 100, 300, self.semantic_window_binding()),
+            (80, 21, 100, 300, self.semantic_window_binding()),
+            (80, 20, 101, 300, self.semantic_window_binding()),
+            (80, 20, 100, 299, self.semantic_window_binding()),
+            (
+                80,
+                20,
+                100,
+                300,
+                replace(self.semantic_window_binding(), reviewed_git_head="invalid"),
+            ),
+        )
+        for index, (expected, new, cap, timeout, binding) in enumerate(cases):
+            with self.subTest(index=index):
+                root = self.root / f"invalid-install-{index}"
+                representation, service = self.build_service(root=root)
+                audit_root = root / "audits"
+                handoff = ExternalAgentSemanticHandoffService(
+                    service,
+                    JsonlAtomicInformationStore(root / "atomic.jsonl"),
+                    audit_root,
+                )
+                provider = CodexCliRepresentationAnalysisProvider(
+                    provider_version="0.147.0",
+                    timeout_seconds=timeout,
+                    runner=FakeRunner(),
+                )
+                before = self.tree_snapshot(root)
+                with self.assertRaises(SemanticHandoffError):
+                    handoff.install_global_authority(
+                        provider,
+                        authority_ref="sha256:" + "5" * 64,
+                        expected_total=expected,
+                        max_new=new,
+                        absolute_cap=cap,
+                        window_binding=binding,
+                    )
+                self.assertEqual(self.tree_snapshot(root), before)
+                self.assertFalse(audit_root.exists())
+                self.assertFalse(
+                    (service.output_root / representation.representation_id).exists()
+                )
+
+    def test_global_authority_freezes_historical_audit_inventory(self) -> None:
+        root = self.root / "historical-inventory"
+        audit_root = root / "audits"
+        representation, service = self.build_service(root=root / "first")
+        handoff = ExternalAgentSemanticHandoffService(
+            service,
+            JsonlAtomicInformationStore(root / "first.jsonl"),
+            audit_root,
+        )
+        historical = CodexCliRepresentationAnalysisProvider(
+            provider_version="0.147.0",
+            timeout_seconds=300,
+            runner=FakeRunner(),
+        )
+        batch = _analysis_batches(
+            _units_from_representation(
+                representation, service.representation_repository
+            ),
+            service.batch_size,
+        )[0]
+        historical.analyze(batch)
+        handoff._persist_audits(
+            historical.execution_records,
+            package_published=False,
+            information_ingested=False,
+            durable_ingestion_status="ingestion_not_completed",
+            package_fingerprint=None,
+            handoff_status="failed",
+        )
+        provider = CodexCliRepresentationAnalysisProvider(
+            provider_version="0.147.0",
+            timeout_seconds=300,
+            runner=FakeRunner(),
+        )
+        grant = handoff.install_global_authority(
+            provider,
+            authority_ref="sha256:" + "5" * 64,
+            expected_total=80,
+            max_new=20,
+            absolute_cap=100,
+            window_binding=self.semantic_window_binding(),
+        )
+        self.assertEqual(grant["legacy_attempt_inventory_count"], 1)
+        self.assertEqual(grant["external_prior_count"], 79)
+
+        drift = CodexCliRepresentationAnalysisProvider(
+            provider_version="0.147.0",
+            timeout_seconds=300,
+            runner=FakeRunner(),
+        )
+        drift.analyze(batch)
+        handoff._persist_audits(
+            drift.execution_records,
+            package_published=False,
+            information_ingested=False,
+            durable_ingestion_status="ingestion_not_completed",
+            package_fingerprint=None,
+            handoff_status="failed",
+        )
+        next_representation, next_service = self.build_service(
+            root=root / "next", source_id="src_" + "2" * 32
+        )
+        next_runner = FakeRunner()
+        before_reject = self.tree_snapshot(audit_root)
+        with self.assertRaisesRegex(SemanticHandoffError, "binding"):
+            ExternalAgentSemanticHandoffService(
+                next_service,
+                JsonlAtomicInformationStore(root / "next.jsonl"),
+                audit_root,
+            ).execute(
+                next_representation.representation_id,
+                CodexCliRepresentationAnalysisProvider(
+                    provider_version="0.147.0",
+                    timeout_seconds=300,
+                    runner=next_runner,
+                ),
+                privacy_binding=self.privacy_binding(),
+                authority_binding=self.semantic_window_binding(),
+            )
+        self.assertEqual(next_runner.calls, [])
+        self.assertEqual(self.tree_snapshot(audit_root), before_reject)
+
+    def test_global_authority_rejects_eighty_one_historical_calls_zero_write(
+        self,
+    ) -> None:
+        root = self.root / "historical-overflow"
+        audit_root = root / "audits"
+        representation, service = self.build_service(root=root / "source")
+        handoff = ExternalAgentSemanticHandoffService(
+            service,
+            JsonlAtomicInformationStore(root / "atomic.jsonl"),
+            audit_root,
+        )
+        historical = CodexCliRepresentationAnalysisProvider(
+            provider_version="0.147.0",
+            timeout_seconds=300,
+            runner=FakeRunner(),
+        )
+        batch = _analysis_batches(
+            _units_from_representation(
+                representation, service.representation_repository
+            ),
+            service.batch_size,
+        )[0]
+        for _ in range(81):
+            historical.analyze(batch)
+        handoff._persist_audits(
+            historical.execution_records,
+            package_published=False,
+            information_ingested=False,
+            durable_ingestion_status="ingestion_not_completed",
+            package_fingerprint=None,
+            handoff_status="failed",
+        )
+        before = self.tree_snapshot(audit_root)
+        with self.assertRaisesRegex(SemanticHandoffError, "超过 baseline"):
+            handoff.install_global_authority(
+                CodexCliRepresentationAnalysisProvider(
+                    provider_version="0.147.0",
+                    timeout_seconds=300,
+                    runner=FakeRunner(),
+                ),
+                authority_ref="sha256:" + "5" * 64,
+                expected_total=80,
+                max_new=20,
+                absolute_cap=100,
+                window_binding=self.semantic_window_binding(),
+            )
+        self.assertEqual(self.tree_snapshot(audit_root), before)
+        self.assertFalse((audit_root / "semantic_global_authority").exists())
+
+    def test_global_authority_accepts_proven_zero_call_window_chains(self) -> None:
+        initial = self.semantic_window_binding()
+        completed_initial = SemanticCompletedWindowBinding(
+            window_run_id=initial.window_run_id,
+            window_plan_fingerprint=initial.window_plan_fingerprint,
+            window_plan_receipt_fingerprint=(
+                initial.window_plan_receipt_fingerprint
+            ),
+            window_status_fingerprint="sha256:" + "9" * 64,
+            window_after_cursor=initial.window_after_cursor,
+            window_upper_cursor=initial.window_upper_cursor,
+        )
+        zero_window = replace(
+            initial,
+            window_run_id="run_" + "8" * 32,
+            window_plan_fingerprint="sha256:" + "3" * 64,
+            window_plan_receipt_fingerprint="sha256:" + "2" * 64,
+            window_after_cursor=initial.window_upper_cursor,
+            window_upper_cursor=(2, "zero", "zero"),
+            previous_checkpoint_fingerprint="sha256:" + "1" * 64,
+            completed_window_chain=(completed_initial,),
+        )
+        completed_zero = SemanticCompletedWindowBinding(
+            window_run_id=zero_window.window_run_id,
+            window_plan_fingerprint=zero_window.window_plan_fingerprint,
+            window_plan_receipt_fingerprint=(
+                zero_window.window_plan_receipt_fingerprint
+            ),
+            window_status_fingerprint="sha256:" + "4" * 64,
+            window_after_cursor=zero_window.window_after_cursor,
+            window_upper_cursor=zero_window.window_upper_cursor,
+        )
+        third_window = replace(
+            initial,
+            window_run_id="run_" + "9" * 32,
+            window_plan_fingerprint="sha256:" + "a" * 64,
+            window_plan_receipt_fingerprint="sha256:" + "b" * 64,
+            window_after_cursor=zero_window.window_upper_cursor,
+            window_upper_cursor=(3, "third", "third"),
+            previous_checkpoint_fingerprint="sha256:" + "c" * 64,
+            completed_window_chain=(completed_initial, completed_zero),
+        )
+
+        for scenario, first_call, current in (
+            ("initial-zero", False, zero_window),
+            ("call-zero-call", True, third_window),
+        ):
+            with self.subTest(scenario=scenario):
+                root = self.root / scenario
+                audit_root = root / "audits"
+                first_representation, first_service = self.build_service(
+                    root=root / "first", source_id="src_" + "1" * 32
+                )
+                first_handoff = ExternalAgentSemanticHandoffService(
+                    first_service,
+                    JsonlAtomicInformationStore(root / "first.jsonl"),
+                    audit_root,
+                )
+                provider = CodexCliRepresentationAnalysisProvider(
+                    provider_version="0.147.0",
+                    timeout_seconds=300,
+                    runner=FakeRunner(),
+                )
+                first_handoff.install_global_authority(
+                    provider,
+                    authority_ref="sha256:" + "5" * 64,
+                    expected_total=80,
+                    max_new=20,
+                    absolute_cap=100,
+                    window_binding=initial,
+                )
+                if first_call:
+                    first_handoff.execute(
+                        first_representation.representation_id,
+                        provider,
+                        privacy_binding=self.privacy_binding(),
+                        authority_binding=initial,
+                    )
+                next_representation, next_service = self.build_service(
+                    root=root / "next", source_id="src_" + "2" * 32
+                )
+                next_runner = FakeRunner()
+                ExternalAgentSemanticHandoffService(
+                    next_service,
+                    JsonlAtomicInformationStore(root / "next.jsonl"),
+                    audit_root,
+                ).execute(
+                    next_representation.representation_id,
+                    CodexCliRepresentationAnalysisProvider(
+                        provider_version="0.147.0",
+                        timeout_seconds=300,
+                        runner=next_runner,
+                    ),
+                    privacy_binding=self.privacy_binding(),
+                    authority_binding=current,
+                )
+                self.assertEqual(len(next_runner.calls), 1)
+
+        tampered = replace(
+            third_window,
+            completed_window_chain=(
+                completed_initial,
+                replace(
+                    completed_zero,
+                    window_after_cursor=(1, "gap", "gap"),
+                ),
+            ),
+        )
+        tampered_representation, tampered_service = self.build_service(
+            root=root / "tampered", source_id="src_" + "3" * 32
+        )
+        tampered_runner = FakeRunner()
+        before_tamper = self.tree_snapshot(audit_root)
+        with self.assertRaisesRegex(SemanticHandoffError, "不连续"):
+            ExternalAgentSemanticHandoffService(
+                tampered_service,
+                JsonlAtomicInformationStore(root / "tampered.jsonl"),
+                audit_root,
+            ).execute(
+                tampered_representation.representation_id,
+                CodexCliRepresentationAnalysisProvider(
+                    provider_version="0.147.0",
+                    timeout_seconds=300,
+                    runner=tampered_runner,
+                ),
+                privacy_binding=self.privacy_binding(),
+                authority_binding=tampered,
+            )
+        self.assertEqual(tampered_runner.calls, [])
+        self.assertEqual(self.tree_snapshot(audit_root), before_tamper)
+
     def test_global_authority_caps_twenty_attempts_across_windows(self) -> None:
         shared_audits = self.root / "global-audits"
 
@@ -4855,6 +5270,20 @@ class SemanticHandoffTest(unittest.TestCase):
             window_after_cursor=first_window.window_upper_cursor,
             window_upper_cursor=(2, "next", "next"),
             previous_checkpoint_fingerprint="sha256:" + "1" * 64,
+            completed_window_chain=(
+                SemanticCompletedWindowBinding(
+                    window_run_id=first_window.window_run_id,
+                    window_plan_fingerprint=(
+                        first_window.window_plan_fingerprint
+                    ),
+                    window_plan_receipt_fingerprint=(
+                        first_window.window_plan_receipt_fingerprint
+                    ),
+                    window_status_fingerprint="sha256:" + "9" * 64,
+                    window_after_cursor=first_window.window_after_cursor,
+                    window_upper_cursor=first_window.window_upper_cursor,
+                ),
+            ),
         )
         multi_representation, multi_handoff = build_handoff(41, 41)
         multi_runner = FakeRunner()
@@ -5205,6 +5634,140 @@ class SemanticHandoffTest(unittest.TestCase):
         self.assertFalse(
             (service.output_root / representation.representation_id).exists()
         )
+
+    def test_concurrent_exact_global_authority_install_is_idempotent(self) -> None:
+        representation, service = self.build_service(
+            root=self.root / "concurrent-install-source"
+        )
+        audit_root = self.root / "concurrent-install-audits"
+        handoff = ExternalAgentSemanticHandoffService(
+            service,
+            JsonlAtomicInformationStore(self.root / "concurrent-install.jsonl"),
+            audit_root,
+        )
+        binding = self.semantic_window_binding()
+        ready_paths = [self.root / f"install-ready-{index}" for index in range(2)]
+        start_path = self.root / "install-start"
+        child_script = """
+import sys
+import time
+from pathlib import Path
+
+from archeos.atomic_information import JsonlAtomicInformationStore
+from archeos.representation import LocalRepresentationRepository
+from archeos.representation_information import (
+    CodexCliRepresentationAnalysisProvider,
+    RepresentationInformationService,
+)
+from archeos.semantic_handoff import (
+    ExternalAgentSemanticHandoffService,
+    SemanticWindowAuthorityBinding,
+)
+from archeos.source import LocalManagedSourceRepository
+from tests.test_semantic_handoff import FakeRunner
+
+managed_root, representation_root, information_root, audit_root, store_path = (
+    Path(value) for value in sys.argv[1:6]
+)
+ready_path, start_path = (Path(value) for value in sys.argv[6:8])
+ready_path.write_text("ready", encoding="utf-8")
+deadline = time.monotonic() + 10
+while not start_path.exists():
+    if time.monotonic() >= deadline:
+        raise RuntimeError("concurrent install start barrier timed out")
+    time.sleep(0.01)
+service = RepresentationInformationService(
+    LocalManagedSourceRepository(managed_root),
+    LocalRepresentationRepository(representation_root),
+    information_root,
+)
+handoff = ExternalAgentSemanticHandoffService(
+    service,
+    JsonlAtomicInformationStore(store_path),
+    audit_root,
+)
+handoff.install_global_authority(
+    CodexCliRepresentationAnalysisProvider(
+        provider_version="0.147.0",
+        timeout_seconds=300,
+        runner=FakeRunner(),
+    ),
+    authority_ref="sha256:" + "5" * 64,
+    expected_total=80,
+    max_new=20,
+    absolute_cap=100,
+    window_binding=SemanticWindowAuthorityBinding(
+        campaign_created_at="2026-08-18T00:00:00.000Z",
+        campaign_lower_cursor=(0, "", ""),
+        frozen_global_upper_cursor=(100, "upper", "upper"),
+        capture_provider_version="synthetic-capture-1.0",
+        semantic_batch_size=40,
+        window_run_id="run_" + "7" * 32,
+        window_plan_fingerprint="sha256:" + "8" * 64,
+        window_plan_receipt_fingerprint="sha256:" + "7" * 64,
+        window_after_cursor=(0, "", ""),
+        window_upper_cursor=(1, "window", "window"),
+        previous_checkpoint_fingerprint=None,
+        completed_window_chain=(),
+        reviewed_git_head="6" * 40,
+    ),
+)
+print("passed")
+"""
+        processes = [
+            subprocess.Popen(
+                [
+                    sys.executable,
+                    "-c",
+                    child_script,
+                    str(self.root / "concurrent-install-source" / "managed"),
+                    str(
+                        self.root
+                        / "concurrent-install-source"
+                        / "representations"
+                    ),
+                    str(self.root / "concurrent-install-source" / "information"),
+                    str(audit_root),
+                    str(self.root / "concurrent-install.jsonl"),
+                    str(ready_path),
+                    str(start_path),
+                ],
+                cwd=Path(__file__).resolve().parents[1],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            for ready_path in ready_paths
+        ]
+        deadline = time.monotonic() + 10
+        while not all(path.exists() for path in ready_paths):
+            if time.monotonic() >= deadline:
+                self.fail("concurrent install child readiness timed out")
+            time.sleep(0.01)
+        start_path.write_text("start", encoding="utf-8")
+        outcomes = [process.communicate(timeout=10) for process in processes]
+        self.assertEqual(
+            [(process.returncode, stdout.strip(), stderr) for process, (stdout, stderr) in zip(processes, outcomes, strict=True)],
+            [(0, "passed", ""), (0, "passed", "")],
+        )
+        grant = handoff.install_global_authority(
+            CodexCliRepresentationAnalysisProvider(
+                provider_version="0.147.0",
+                timeout_seconds=300,
+                runner=FakeRunner(),
+            ),
+            authority_ref="sha256:" + "5" * 64,
+            expected_total=80,
+            max_new=20,
+            absolute_cap=100,
+            window_binding=binding,
+        )
+        self.assertEqual(grant["baseline_total"], 80)
+        self.assertFalse(
+            (service.output_root / representation.representation_id).exists()
+        )
+
     def test_concurrent_recovery_runner_cannot_duplicate_a_batch_call(self) -> None:
         representation, service = self.build_service(blocks=40)
         audit_root = self.root / "audits"
@@ -5419,11 +5982,14 @@ class SemanticHandoffTest(unittest.TestCase):
             JsonlAtomicInformationStore(self.root / "atomic.jsonl"),
             audit_root,
         )
-        handoff.execute(
+        self.execute_with_global_authority(
+            handoff,
             representation.representation_id,
             CodexCliRepresentationAnalysisProvider(
                 provider_version="0.147.0", timeout_seconds=300, runner=FakeRunner()
             ),
+            privacy_binding=self.privacy_binding(),
+            new_call_authority=1,
         )
         replay_runner = FakeRunner()
         replay = self.execute_with_global_authority(handoff,
@@ -5478,7 +6044,13 @@ class SemanticHandoffTest(unittest.TestCase):
             JsonlAtomicInformationStore(self.root / "atomic.jsonl"),
             audit_root,
         )
-        first = handoff.execute(representation.representation_id, provider)
+        first = self.execute_with_global_authority(
+            handoff,
+            representation.representation_id,
+            provider,
+            privacy_binding=self.privacy_binding(),
+            new_call_authority=3,
+        )
         manifest = json.loads((first.package / "manifest.json").read_text())
         self.assertEqual(
             [len(batch["unit_ids"]) for batch in manifest["batches"]], [40, 40, 1]
@@ -5510,11 +6082,18 @@ class SemanticHandoffTest(unittest.TestCase):
         )
 
         with self.assertRaisesRegex(Exception, "未确认新增 Durable"):
-            handoff.execute(representation.representation_id, provider)
+            self.execute_with_global_authority(
+                handoff,
+                representation.representation_id,
+                provider,
+                privacy_binding=self.privacy_binding(),
+                new_call_authority=3,
+            )
 
         audits = sorted(audit_root.glob("*/processing-run-audit.json"))
         audit_payloads = [json.loads(path.read_text()) for path in audits]
-        self.assertEqual(len(audits), 2)
+        self.assertEqual(len(provider.execution_records), 2)
+        self.assertEqual(len(audits), 1)
         failed = next(
             payload
             for payload in audit_payloads
@@ -5552,7 +6131,13 @@ class SemanticHandoffTest(unittest.TestCase):
         handoff = ExternalAgentSemanticHandoffService(
             service, InspectingStore(self.root / "atomic.jsonl"), audit_root
         )
-        handoff.execute(representation.representation_id, provider)
+        self.execute_with_global_authority(
+            handoff,
+            representation.representation_id,
+            provider,
+            privacy_binding=self.privacy_binding(),
+            new_call_authority=1,
+        )
 
     def test_replay_requires_the_complete_batch_audit_set_before_store_write(
         self,
@@ -5565,11 +6150,14 @@ class SemanticHandoffTest(unittest.TestCase):
             JsonlAtomicInformationStore(self.root / "initial-atomic.jsonl"),
             audit_root,
         )
-        handoff.execute(
+        self.execute_with_global_authority(
+            handoff,
             representation.representation_id,
             CodexCliRepresentationAnalysisProvider(
                 provider_version="0.147.0", timeout_seconds=300, runner=SequenceRunner("valid", "valid")
             ),
+            privacy_binding=self.privacy_binding(),
+            new_call_authority=2,
         )
         next(audit_root.glob("*/processing-run-audit.json")).unlink()
         replay_store = self.root / "replay-atomic.jsonl"
@@ -5593,11 +6181,14 @@ class SemanticHandoffTest(unittest.TestCase):
             JsonlAtomicInformationStore(self.root / "initial-atomic.jsonl"),
             audit_root,
         )
-        handoff.execute(
+        self.execute_with_global_authority(
+            handoff,
             representation.representation_id,
             CodexCliRepresentationAnalysisProvider(
                 provider_version="0.147.0", timeout_seconds=300, runner=SequenceRunner("valid", "valid")
             ),
+            privacy_binding=self.privacy_binding(),
+            new_call_authority=2,
         )
         next(audit_root.glob("*/processing-run-audit.json")).write_text(
             "{synthetic corruption", encoding="utf-8"
@@ -5623,14 +6214,18 @@ class SemanticHandoffTest(unittest.TestCase):
             def get_current(self, _atomic_information_id):
                 raise OSError("synthetic store readback failure")
 
+        handoff = ExternalAgentSemanticHandoffService(
+            service, ReadbackFailingStore(store_path), audit_root
+        )
         with self.assertRaisesRegex(Exception, "已写入或正在读回"):
-            ExternalAgentSemanticHandoffService(
-                service, ReadbackFailingStore(store_path), audit_root
-            ).execute(
+            self.execute_with_global_authority(
+                handoff,
                 representation.representation_id,
                 CodexCliRepresentationAnalysisProvider(
                     provider_version="0.147.0", timeout_seconds=300, runner=FakeRunner()
                 ),
+                privacy_binding=self.privacy_binding(),
+                new_call_authority=1,
             )
         pending = json.loads(
             next(audit_root.glob("*/processing-run-audit.json")).read_text()
@@ -5659,11 +6254,18 @@ class SemanticHandoffTest(unittest.TestCase):
         provider = CodexCliRepresentationAnalysisProvider(
             provider_version="0.147.0", timeout_seconds=300, runner=FakeRunner()
         )
-        ExternalAgentSemanticHandoffService(
+        first_handoff = ExternalAgentSemanticHandoffService(
             service,
             JsonlAtomicInformationStore(self.root / "initial-atomic.jsonl"),
             audit_root,
-        ).execute(representation.representation_id, provider)
+        )
+        self.execute_with_global_authority(
+            first_handoff,
+            representation.representation_id,
+            provider,
+            privacy_binding=self.privacy_binding(),
+            new_call_authority=1,
+        )
         audit_path = next(audit_root.glob("*/processing-run-audit.json"))
         original = json.loads(audit_path.read_text())
         tampered_values = {
@@ -5702,16 +6304,30 @@ class SemanticHandoffTest(unittest.TestCase):
         provider = CodexCliRepresentationAnalysisProvider(
             provider_version="0.147.0", timeout_seconds=300, runner=SequenceRunner("valid", "valid")
         )
-        ExternalAgentSemanticHandoffService(
+        first_handoff = ExternalAgentSemanticHandoffService(
             first_service,
             JsonlAtomicInformationStore(self.root / "first-atomic.jsonl"),
             self.root / "first-audits",
-        ).execute(first_representation.representation_id, provider)
-        second = ExternalAgentSemanticHandoffService(
+        )
+        self.execute_with_global_authority(
+            first_handoff,
+            first_representation.representation_id,
+            provider,
+            privacy_binding=self.privacy_binding(),
+            new_call_authority=1,
+        )
+        second_handoff = ExternalAgentSemanticHandoffService(
             second_service,
             JsonlAtomicInformationStore(self.root / "second-atomic.jsonl"),
             self.root / "second-audits",
-        ).execute(second_representation.representation_id, provider)
+        )
+        second = self.execute_with_global_authority(
+            second_handoff,
+            second_representation.representation_id,
+            provider,
+            privacy_binding=self.privacy_binding(),
+            new_call_authority=1,
+        )
         self.assertEqual(len(provider.execution_records), 2)
         self.assertEqual(len(second.audit_paths), 1)
         self.assertEqual(
@@ -5744,15 +6360,19 @@ class SemanticHandoffTest(unittest.TestCase):
             ),
             self.assertRaisesRegex(Exception, "已写入或正在读回"),
         ):
-            ExternalAgentSemanticHandoffService(
+            handoff = ExternalAgentSemanticHandoffService(
                 service,
                 JsonlAtomicInformationStore(self.root / "atomic.jsonl"),
                 audit_root,
-            ).execute(
+            )
+            self.execute_with_global_authority(
+                handoff,
                 representation.representation_id,
                 CodexCliRepresentationAnalysisProvider(
                     provider_version="0.147.0", timeout_seconds=300, runner=FakeRunner()
                 ),
+                privacy_binding=self.privacy_binding(),
+                new_call_authority=1,
             )
         pending = json.loads(
             next(audit_root.glob("*/processing-run-audit.json")).read_text()

@@ -54,6 +54,7 @@ from .representation_information import (
 from .semantic_handoff import (
     ExternalAgentSemanticHandoffService,
     SemanticCampaignAuthorityBinding,
+    SemanticCompletedWindowBinding,
     SemanticHandoffError,
     SemanticPrivacyBinding,
     SemanticWindowAuthorityBinding,
@@ -1421,6 +1422,124 @@ class WechatDigestService:
                 raise WechatDigestError(
                     "微信运行计划与 frozen Semantic campaign 漂移。"
                 )
+        completed_windows: list[SemanticCompletedWindowBinding] = []
+        candidates: list[
+            tuple[
+                WechatCursor,
+                WechatCursor,
+                str,
+                dict[str, object],
+                dict[str, object],
+                dict[str, object],
+            ]
+        ] = []
+        if self.run_store.runs_root.exists():
+            for path in sorted(self.run_store.runs_root.iterdir()):
+                if path.name == run_id:
+                    continue
+                if not path.is_dir() or re.fullmatch(
+                    r"run_[0-9a-f]{32}", path.name
+                ) is None:
+                    raise WechatDigestError(
+                        "微信 Semantic completed window inventory 损坏。"
+                    )
+                candidate_plan = self.run_store.plan(path.name)
+                if candidate_plan.get("created_at") != campaign_created_at:
+                    continue
+                candidate_global_upper = self._plan_all_history_upper(
+                    candidate_plan
+                )
+                if (
+                    candidate_global_upper is None
+                    or self._cursor_tuple(candidate_global_upper)
+                    != campaign_upper
+                    or candidate_plan.get("provider_version")
+                    != campaign_provider_version
+                    or self._plan_batch_size(candidate_plan)
+                    != campaign_batch_size
+                ):
+                    if campaign is None:
+                        continue
+                    raise WechatDigestError(
+                        "微信 Semantic completed window campaign 漂移。"
+                    )
+                candidate_after = WechatCursor.from_dict(
+                    candidate_plan.get("after_cursor"),
+                    "plan.after_cursor",
+                )
+                candidate_upper = WechatCursor.from_dict(
+                    candidate_plan.get("upper_bound"),
+                    "plan.upper_bound",
+                )
+                if candidate_upper > after:
+                    continue
+                candidate_receipt = self.run_store.plan_receipt(path.name)
+                candidate_status = self.run_store.status(path.name)
+                candidate_capture = self.capture_provider.capture(
+                    candidate_after,
+                    upper_bound=candidate_upper,
+                )
+                self._verify_capture_against_plan(
+                    candidate_capture, candidate_plan
+                )
+                self._verify_plan_and_status(
+                    path.name,
+                    candidate_capture,
+                    candidate_plan,
+                    candidate_status,
+                )
+                if (
+                    candidate_status.get("state") != "completed"
+                    or candidate_status.get("checkpoint_published") is not True
+                ):
+                    raise WechatDigestError(
+                        "微信 Semantic completed window 未完成 checkpoint。"
+                    )
+                candidates.append(
+                    (
+                        candidate_after,
+                        candidate_upper,
+                        path.name,
+                        candidate_plan,
+                        candidate_receipt,
+                        candidate_status,
+                    )
+                )
+        candidates.sort(key=lambda item: item[0])
+        if campaign is None and candidates:
+            campaign_lower = self._cursor_tuple(candidates[0][0])
+        chain_cursor = WechatCursor(*campaign_lower)
+        for (
+            candidate_after,
+            candidate_upper,
+            candidate_run_id,
+            candidate_plan,
+            candidate_receipt,
+            candidate_status,
+        ) in candidates:
+            if candidate_after != chain_cursor:
+                raise WechatDigestError(
+                    "微信 Semantic completed window chain 不连续。"
+                )
+            completed_windows.append(
+                SemanticCompletedWindowBinding(
+                    window_run_id=candidate_run_id,
+                    window_plan_fingerprint=_plan_fingerprint(candidate_plan),
+                    window_plan_receipt_fingerprint=_sha256_bytes(
+                        _canonical_json(candidate_receipt).encode("utf-8")
+                    ),
+                    window_status_fingerprint=_sha256_bytes(
+                        _canonical_json(candidate_status).encode("utf-8")
+                    ),
+                    window_after_cursor=self._cursor_tuple(candidate_after),
+                    window_upper_cursor=self._cursor_tuple(candidate_upper),
+                )
+            )
+            chain_cursor = candidate_upper
+        if chain_cursor != after:
+            raise WechatDigestError(
+                "微信 Semantic completed window chain 不完整。"
+            )
         checkpoint_fingerprint = None
         checkpoint = self.run_store.checkpoint()
         if checkpoint is not None:
@@ -1431,6 +1550,15 @@ class WechatDigestService:
             checkpoint_payload = self.run_store._read_json(
                 self.run_store.checkpoint_path
             )
+            if (
+                completed_windows
+                and isinstance(checkpoint_payload, dict)
+                and checkpoint_payload.get("run_id")
+                != completed_windows[-1].window_run_id
+            ):
+                raise WechatDigestError(
+                    "微信 checkpoint 与 completed window chain 不一致。"
+                )
             checkpoint_fingerprint = _sha256_bytes(
                 _canonical_json(checkpoint_payload).encode("utf-8")
             )
@@ -1456,6 +1584,7 @@ class WechatDigestService:
             window_after_cursor=self._cursor_tuple(after),
             window_upper_cursor=self._cursor_tuple(upper),
             previous_checkpoint_fingerprint=checkpoint_fingerprint,
+            completed_window_chain=tuple(completed_windows),
             reviewed_git_head=campaign_reviewed_head,
         )
 

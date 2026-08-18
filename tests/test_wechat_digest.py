@@ -236,6 +236,7 @@ class SyntheticSemanticHandoff:
         self.reviewed_git_head = "6" * 40
         self.installed_grant = None
         self.campaign_binding = None
+        self.authority_bindings = []
 
     def execute(
         self,
@@ -247,6 +248,7 @@ class SyntheticSemanticHandoff:
         if privacy_binding is not None:
             assert privacy_binding.route == "approved"
             assert authority_binding is not None
+            self.authority_bindings.append(authority_binding)
         output_root = self.workspace / "02_processing" / "information"
         package = output_root / representation_id
         store = JsonlAtomicInformationStore(
@@ -1928,6 +1930,60 @@ class WechatDigestTests(unittest.TestCase):
                 absolute_cap=100,
             )
         self.assertEqual(self.semantic.provider.calls, provider_calls)
+
+    def test_global_authority_uses_durable_completed_window_chain(self) -> None:
+        day = 24 * 60 * 60
+        capture = SyntheticCaptureProvider(
+            [
+                message(1, timestamp=1_700_000_000),
+                message(2, timestamp=1_700_000_000 + 31 * day),
+            ],
+            window_seconds=30 * day,
+        )
+        self.semantic.failures_remaining = 1
+        service = self.service(capture)
+        with self.assertRaises(WechatDigestError):
+            service.run(all_history=True)
+        service.install_semantic_authority(
+            authority_ref="sha256:" + "a" * 64,
+            expected_total=80,
+            max_new=20,
+            absolute_cap=100,
+        )
+        result = service.run()
+        self.assertGreaterEqual(result.new_messages, 2)
+        plans = sorted(
+            (
+                WechatCursor.from_dict(plan["after_cursor"]),
+                str(plan["run_id"]),
+            )
+            for plan in (
+                service.run_store.plan(path.name)
+                for path in service.run_store.runs_root.iterdir()
+                if path.is_dir()
+            )
+        )
+        self.assertEqual(len(plans), 2)
+        first_run_id = plans[0][1]
+        first_status = service.run_store.status(first_run_id)
+        self.assertEqual(first_status["state"], "completed")
+        self.assertTrue(first_status["checkpoint_published"])
+        self.assertEqual(self.semantic.provider.calls, 2)
+        final_binding = self.semantic.authority_bindings[-1]
+        self.assertEqual(len(final_binding.completed_window_chain), 1)
+        completed = final_binding.completed_window_chain[0]
+        self.assertEqual(completed.window_run_id, first_run_id)
+        self.assertEqual(
+            completed.window_upper_cursor,
+            final_binding.window_after_cursor,
+        )
+        checkpoint = service.run_store._read_json(
+            service.run_store.checkpoint_path
+        )
+        self.assertEqual(
+            checkpoint["run_id"], plans[-1][1]
+        )
+        self.assertIsNone(service.run_store.active_run_id())
 
     def test_upgrade_rejects_tampered_legacy_binding_before_any_write(self) -> None:
         capture = SyntheticCaptureProvider([message(1)])
