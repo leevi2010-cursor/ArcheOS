@@ -22,6 +22,7 @@ from archeos.representation_information import (
     EXTERNAL_AGENT_PROTOCOL_V3,
     EXTERNAL_AGENT_PROTOCOL_V3_1,
     EXTERNAL_AGENT_PROTOCOL_V3_2,
+    EXTERNAL_AGENT_PROTOCOL_V3_3,
     RepresentationAnalysisResult,
     RepresentationCandidateDraft,
     RepresentationInformationService,
@@ -337,6 +338,7 @@ class SyntheticSemanticHandoff:
                     in {
                         EXTERNAL_AGENT_PROTOCOL_V3_1,
                         EXTERNAL_AGENT_PROTOCOL_V3_2,
+                        EXTERNAL_AGENT_PROTOCOL_V3_3,
                     }
                     else "external-agent-diagnostics/1.0"
                 ),
@@ -373,6 +375,7 @@ class SyntheticSemanticHandoff:
             if self.protocol_version in {
                 EXTERNAL_AGENT_PROTOCOL_V3_1,
                 EXTERNAL_AGENT_PROTOCOL_V3_2,
+                EXTERNAL_AGENT_PROTOCOL_V3_3,
             }:
                 audit.update(
                     {
@@ -1226,6 +1229,7 @@ class WechatDigestTests(unittest.TestCase):
             (EXTERNAL_AGENT_PROTOCOL_V3, False),
             (EXTERNAL_AGENT_PROTOCOL_V3_1, False),
             (EXTERNAL_AGENT_PROTOCOL_V3_2, False),
+            (EXTERNAL_AGENT_PROTOCOL_V3_3, False),
         )
         for index, (protocol_version, profiled_v1) in enumerate(protocols):
             with self.subTest(protocol=protocol_version):

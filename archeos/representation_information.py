@@ -44,7 +44,8 @@ EXTERNAL_AGENT_PROTOCOL_V2 = "external-agent-semantic-handoff/2.0"
 EXTERNAL_AGENT_PROTOCOL_V3 = "external-agent-semantic-handoff/3.0"
 EXTERNAL_AGENT_PROTOCOL_V3_1 = "external-agent-semantic-handoff/3.1"
 EXTERNAL_AGENT_PROTOCOL_V3_2 = "external-agent-semantic-handoff/3.2"
-EXTERNAL_AGENT_PROTOCOL_VERSION = EXTERNAL_AGENT_PROTOCOL_V3_2
+EXTERNAL_AGENT_PROTOCOL_V3_3 = "external-agent-semantic-handoff/3.3"
+EXTERNAL_AGENT_PROTOCOL_VERSION = EXTERNAL_AGENT_PROTOCOL_V3_3
 SUPPORTED_EXTERNAL_AGENT_PROTOCOL_VERSIONS = frozenset(
     {
         EXTERNAL_AGENT_PROTOCOL_V1,
@@ -52,6 +53,7 @@ SUPPORTED_EXTERNAL_AGENT_PROTOCOL_VERSIONS = frozenset(
         EXTERNAL_AGENT_PROTOCOL_V3,
         EXTERNAL_AGENT_PROTOCOL_V3_1,
         EXTERNAL_AGENT_PROTOCOL_V3_2,
+        EXTERNAL_AGENT_PROTOCOL_V3_3,
     }
 )
 EXTERNAL_AGENT_ROUTE = "codex-cli"
@@ -249,7 +251,12 @@ def external_agent_representation_analysis_schema(
     """The #31 result contract with the #80 Codex serialization binding."""
     if protocol_version not in SUPPORTED_EXTERNAL_AGENT_PROTOCOL_VERSIONS:
         raise ValueError("unsupported External Agent protocol version")
-    if protocol_version in {
+    if protocol_version == EXTERNAL_AGENT_PROTOCOL_V3_3:
+        if batch is None:
+            raise ValueError("v3.3 External Agent schema requires its bound batch")
+        _validate_exact_batch_identity(batch, "v3.3")
+        return _external_agent_v33_analysis_schema(batch)
+    elif protocol_version in {
         EXTERNAL_AGENT_PROTOCOL_V3,
         EXTERNAL_AGENT_PROTOCOL_V3_1,
         EXTERNAL_AGENT_PROTOCOL_V3_2,
@@ -285,7 +292,7 @@ def external_agent_representation_analysis_schema(
         required = ["anchor_accounting", *required]
         if protocol_version == EXTERNAL_AGENT_PROTOCOL_V3_2:
             assert batch is not None
-            _validate_v32_batch_identity(batch)
+            _validate_exact_batch_identity(batch, "v3.2")
             anchor_ids = [unit.unit_id for unit in batch.anchor_units]
             protocol_properties["anchor_accounting"] = {
                 "type": "object",
@@ -349,7 +356,10 @@ def external_agent_representation_analysis_schema(
     return schema
 
 
-def _validate_v32_batch_identity(batch: RepresentationAnalysisBatch) -> None:
+def _validate_exact_batch_identity(
+    batch: RepresentationAnalysisBatch,
+    protocol_label: str,
+) -> None:
     anchor_ids = [unit.unit_id for unit in batch.anchor_units]
     context_ids = [unit.unit_id for unit in batch.context_support_units]
     if (
@@ -358,7 +368,128 @@ def _validate_v32_batch_identity(batch: RepresentationAnalysisBatch) -> None:
         or len(set(context_ids)) != len(context_ids)
         or set(anchor_ids).intersection(context_ids)
     ):
-        raise ValueError("v3.2 External Agent batch identity is invalid")
+        raise ValueError(
+            f"{protocol_label} External Agent batch identity is invalid"
+        )
+
+
+def _external_agent_v33_analysis_schema(
+    batch: RepresentationAnalysisBatch,
+) -> dict[str, object]:
+    anchor_ids = [unit.unit_id for unit in batch.anchor_units]
+    context_ids = [
+        unit.unit_id
+        for unit in batch.context_support_units
+        if unit.analysis_eligible
+    ]
+    result_record_id = {"type": "string", "minLength": 1}
+    candidate_record = {
+        "type": "object",
+        "additionalProperties": False,
+        "required": [
+            "result_record_id",
+            "statement",
+            "semantic_type",
+            "concerns",
+            "supporting_evidence_unit_ids",
+            "context",
+            "confidence",
+        ],
+        "properties": {
+            "result_record_id": result_record_id,
+            "statement": {"type": "string", "minLength": 1},
+            "semantic_type": {
+                "type": "string",
+                "enum": sorted(SEMANTIC_TYPES),
+            },
+            "concerns": {
+                "type": "array",
+                "items": {"type": "string", "minLength": 1},
+                "minItems": 1,
+            },
+            "supporting_evidence_unit_ids": {
+                "type": "array",
+                "items": {"type": "string", "enum": context_ids},
+                "maxItems": len(context_ids),
+            },
+            "context": {"type": "string", "minLength": 1},
+            "confidence": {
+                "type": "number",
+                "minimum": 0,
+                "maximum": 1,
+            },
+        },
+    }
+    residue_record = {
+        "type": "object",
+        "additionalProperties": False,
+        "required": [
+            "result_record_id",
+            "reason_not_absorbed",
+            "future_value_or_uncertainty",
+        ],
+        "properties": {
+            "result_record_id": result_record_id,
+            "reason_not_absorbed": {"type": "string", "minLength": 1},
+            "future_value_or_uncertainty": {
+                "type": "string",
+                "minLength": 1,
+            },
+        },
+    }
+
+    def branch(classification: str, record: dict[str, object]) -> dict[str, object]:
+        return {
+            "type": "object",
+            "additionalProperties": False,
+            "required": ["classification", "records"],
+            "properties": {
+                "classification": {
+                    "type": "string",
+                    "const": classification,
+                },
+                "records": {
+                    "type": "array",
+                    "minItems": 1,
+                    "items": record,
+                },
+            },
+        }
+
+    return {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "additionalProperties": False,
+        "required": [
+            "protocol_version",
+            "input_fingerprint",
+            "anchor_results",
+        ],
+        "properties": {
+            "protocol_version": {
+                "type": "string",
+                "const": EXTERNAL_AGENT_PROTOCOL_V3_3,
+            },
+            "input_fingerprint": {
+                "type": "string",
+                "pattern": "^sha256:[0-9a-f]{64}$",
+            },
+            "anchor_results": {
+                "type": "object",
+                "properties": {
+                    unit_id: {
+                        "anyOf": [
+                            branch("candidate", candidate_record),
+                            branch("residue", residue_record),
+                        ]
+                    }
+                    for unit_id in anchor_ids
+                },
+                "required": anchor_ids,
+                "additionalProperties": False,
+            },
+        },
+    }
 
 
 def _external_agent_v3_analysis_schema(
@@ -759,6 +890,74 @@ def _contract_failure_diagnostics(
     except json.JSONDecodeError:
         return summary
     if not isinstance(payload, dict):
+        return summary
+
+    anchor_results = payload.get("anchor_results")
+    if isinstance(anchor_results, dict):
+        anchor_ids = {unit.unit_id for unit in batch.anchor_units}
+        covered: set[str] = set()
+        candidate_ids: list[str] = []
+        residue_ids: list[str] = []
+        candidate_items = 0
+        residue_items = 0
+        candidate_refs = 0
+        residue_refs = 0
+        duplicate_record_ids = 0
+        for anchor_id, anchor_result in anchor_results.items():
+            if not isinstance(anchor_result, dict):
+                continue
+            classification = anchor_result.get("classification")
+            records = anchor_result.get("records")
+            if (
+                anchor_id not in anchor_ids
+                or classification not in {"candidate", "residue"}
+                or not isinstance(records, list)
+                or not records
+            ):
+                continue
+            covered.add(anchor_id)
+            record_ids = [
+                record.get("result_record_id")
+                for record in records
+                if isinstance(record, dict)
+                and isinstance(record.get("result_record_id"), str)
+            ]
+            duplicate_record_ids += sum(
+                count - 1
+                for count in Counter(record_ids).values()
+                if count > 1
+            )
+            if classification == "candidate":
+                candidate_items += len(records)
+                candidate_refs += len(records)
+                candidate_ids.extend(record_ids)
+            else:
+                residue_items += len(records)
+                residue_refs += len(records)
+                residue_ids.extend(record_ids)
+        candidate_set = set(candidate_ids)
+        residue_set = set(residue_ids)
+        summary.update(
+            {
+                "candidate_item_count": candidate_items,
+                "residue_item_count": residue_items,
+                "accounting_item_count": len(anchor_results),
+                "candidate_anchor_ref_count": candidate_refs,
+                "residue_anchor_ref_count": residue_refs,
+                "duplicate_anchor_ref_count": duplicate_record_ids,
+                "duplicate_accounting_count": (
+                    anchor_results.duplicate_key_count
+                    if isinstance(anchor_results, _DuplicateKeyAwareDict)
+                    else 0
+                ),
+                "dual_assignment_count": len(candidate_set & residue_set),
+                "missing_anchor_count": len(anchor_ids - covered),
+                "unknown_anchor_ref_count": sum(
+                    anchor_id not in anchor_ids for anchor_id in anchor_results
+                ),
+                "covered_units": len(covered),
+            }
+        )
         return summary
 
     def items(field: str) -> list[object]:
@@ -1618,8 +1817,16 @@ def _external_agent_request(
 ) -> tuple[dict[str, object], str]:
     if protocol_version not in SUPPORTED_EXTERNAL_AGENT_PROTOCOL_VERSIONS:
         raise ValueError("unsupported External Agent protocol version")
-    if protocol_version == EXTERNAL_AGENT_PROTOCOL_V3_2:
-        _validate_v32_batch_identity(batch)
+    if protocol_version in {
+        EXTERNAL_AGENT_PROTOCOL_V3_2,
+        EXTERNAL_AGENT_PROTOCOL_V3_3,
+    }:
+        _validate_exact_batch_identity(
+            batch,
+            "v3.3"
+            if protocol_version == EXTERNAL_AGENT_PROTOCOL_V3_3
+            else "v3.2",
+        )
     rules = [
         "Return only the strict structured result.",
         "Account for every anchor with Candidate or Residue.",
@@ -1640,6 +1847,14 @@ def _external_agent_request(
             2,
             "Emit anchor_accounting as an object whose exact keys are every supplied anchor unit_id; each candidate|residue value must match that anchor's Candidate or Residue Evidence.",
         )
+    elif protocol_version == EXTERNAL_AGENT_PROTOCOL_V3_3:
+        rules = [
+            "Return only protocol_version, input_fingerprint, and anchor_results.",
+            "Emit exactly one anchor_results key for every supplied anchor unit_id; each value must choose Candidate or Residue and contain one or more records.",
+            "Use the same result_record_id and exactly identical business fields when one record is supported by multiple anchors; never repeat an ID within one anchor or reuse it across classifications.",
+            "Candidate supporting Evidence may cite only supplied evidence-capable context units; context cannot replace the anchor expressed by the map key.",
+            "Use Residue for unresolved or insufficient evidence; never invent identity, facts, or World Model state.",
+        ]
     if protocol_version in {
         EXTERNAL_AGENT_PROTOCOL_V3,
         EXTERNAL_AGENT_PROTOCOL_V3_1,
@@ -1661,6 +1876,7 @@ def _external_agent_request(
     if protocol_version in {
         EXTERNAL_AGENT_PROTOCOL_V3_1,
         EXTERNAL_AGENT_PROTOCOL_V3_2,
+        EXTERNAL_AGENT_PROTOCOL_V3_3,
     }:
         if result_schema is None:
             result_schema = external_agent_representation_analysis_schema(
@@ -1713,7 +1929,11 @@ def _parse_external_agent_result(
             raw,
             object_pairs_hook=(
                 _DuplicateKeyAwareDict
-                if expected_protocol_version == EXTERNAL_AGENT_PROTOCOL_V3_2
+                if expected_protocol_version
+                in {
+                    EXTERNAL_AGENT_PROTOCOL_V3_2,
+                    EXTERNAL_AGENT_PROTOCOL_V3_3,
+                }
                 else None
             ),
         )
@@ -1721,12 +1941,19 @@ def _parse_external_agent_result(
         raise RepresentationInformationError("invalid_json") from exc
     if expected_protocol_version not in SUPPORTED_EXTERNAL_AGENT_PROTOCOL_VERSIONS:
         raise ValueError("unsupported External Agent protocol version")
-    expected_fields = {
-        "protocol_version",
-        "input_fingerprint",
-        "candidates",
-        "residue",
-    }
+    if expected_protocol_version == EXTERNAL_AGENT_PROTOCOL_V3_3:
+        expected_fields = {
+            "protocol_version",
+            "input_fingerprint",
+            "anchor_results",
+        }
+    else:
+        expected_fields = {
+            "protocol_version",
+            "input_fingerprint",
+            "candidates",
+            "residue",
+        }
     if expected_protocol_version in {
         EXTERNAL_AGENT_PROTOCOL_V2,
         EXTERNAL_AGENT_PROTOCOL_V3,
@@ -1741,8 +1968,16 @@ def _parse_external_agent_result(
         or payload["input_fingerprint"] != expected_fingerprint
     ):
         raise RepresentationInformationError("result_binding_failure")
-    if expected_protocol_version == EXTERNAL_AGENT_PROTOCOL_V3_2:
-        accounting_value = payload["anchor_accounting"]
+    if expected_protocol_version in {
+        EXTERNAL_AGENT_PROTOCOL_V3_2,
+        EXTERNAL_AGENT_PROTOCOL_V3_3,
+    }:
+        accounting_field = (
+            "anchor_results"
+            if expected_protocol_version == EXTERNAL_AGENT_PROTOCOL_V3_3
+            else "anchor_accounting"
+        )
+        accounting_value = payload[accounting_field]
         if (
             isinstance(accounting_value, _DuplicateKeyAwareDict)
             and accounting_value.duplicate_key_count
@@ -1750,7 +1985,11 @@ def _parse_external_agent_result(
             raise _ExternalAgentContractFailure("anchor_accounting")
         if _contains_duplicate_json_key(payload):
             raise _ExternalAgentContractFailure("top_level_schema")
-    if expected_protocol_version in {
+    if expected_protocol_version == EXTERNAL_AGENT_PROTOCOL_V3_3:
+        candidates, residue, accounting = _v33_project_anchor_results(
+            payload["anchor_results"], batch
+        )
+    elif expected_protocol_version in {
         EXTERNAL_AGENT_PROTOCOL_V3,
         EXTERNAL_AGENT_PROTOCOL_V3_1,
         EXTERNAL_AGENT_PROTOCOL_V3_2,
@@ -1772,7 +2011,8 @@ def _parse_external_agent_result(
             )
         except RepresentationInformationError as exc:
             raise _ExternalAgentContractFailure("residue_schema") from exc
-    accounting: tuple[_AnchorAccounting, ...] | None = None
+    if expected_protocol_version != EXTERNAL_AGENT_PROTOCOL_V3_3:
+        accounting: tuple[_AnchorAccounting, ...] | None = None
     if expected_protocol_version in {
         EXTERNAL_AGENT_PROTOCOL_V2,
         EXTERNAL_AGENT_PROTOCOL_V3,
@@ -1805,6 +2045,186 @@ def _parse_external_agent_result(
     except RepresentationInformationError as exc:
         raise _ExternalAgentContractFailure("unknown") from exc
     return RepresentationAnalysisResult(candidates, residue)
+
+
+def _v33_project_anchor_results(
+    value: object,
+    batch: RepresentationAnalysisBatch,
+) -> tuple[
+    tuple[RepresentationCandidateDraft, ...],
+    tuple[RepresentationResidueDraft, ...],
+    tuple[_AnchorAccounting, ...],
+]:
+    anchor_ids = [unit.unit_id for unit in batch.anchor_units]
+    context_ids = {
+        unit.unit_id
+        for unit in batch.context_support_units
+        if unit.analysis_eligible
+    }
+    if not isinstance(value, dict) or set(value) != set(anchor_ids):
+        raise _ExternalAgentContractFailure("anchor_coverage")
+
+    candidate_bodies: dict[
+        str,
+        tuple[str, str, tuple[str, ...], tuple[str, ...], str, float],
+    ] = {}
+    candidate_anchors: dict[str, list[str]] = {}
+    residue_bodies: dict[str, tuple[str, str]] = {}
+    residue_anchors: dict[str, list[str]] = {}
+    classifications: dict[str, str] = {}
+    accounting: list[_AnchorAccounting] = []
+
+    for anchor_id in anchor_ids:
+        anchor_result = value[anchor_id]
+        if not isinstance(anchor_result, dict) or set(anchor_result) != {
+            "classification",
+            "records",
+        }:
+            raise _ExternalAgentContractFailure("anchor_accounting")
+        classification = anchor_result["classification"]
+        if classification not in {"candidate", "residue"}:
+            raise _ExternalAgentContractFailure("anchor_accounting")
+        try:
+            records = _items(anchor_result["records"], "anchor result records")
+        except RepresentationInformationError as exc:
+            raise _ExternalAgentContractFailure("anchor_accounting") from exc
+        if not records:
+            raise _ExternalAgentContractFailure("anchor_coverage")
+        seen_ids: set[str] = set()
+        for record in records:
+            expected = (
+                {
+                    "result_record_id",
+                    "statement",
+                    "semantic_type",
+                    "concerns",
+                    "supporting_evidence_unit_ids",
+                    "context",
+                    "confidence",
+                }
+                if classification == "candidate"
+                else {
+                    "result_record_id",
+                    "reason_not_absorbed",
+                    "future_value_or_uncertainty",
+                }
+            )
+            if not isinstance(record, dict) or set(record) != expected:
+                raise _ExternalAgentContractFailure(
+                    "candidate_schema"
+                    if classification == "candidate"
+                    else "residue_schema"
+                )
+            try:
+                record_id = _text(
+                    record["result_record_id"], "result_record_id"
+                )
+            except RepresentationInformationError as exc:
+                raise _ExternalAgentContractFailure(
+                    "candidate_schema"
+                    if classification == "candidate"
+                    else "residue_schema"
+                ) from exc
+            if record_id in seen_ids:
+                raise _ExternalAgentContractFailure("anchor_accounting")
+            seen_ids.add(record_id)
+            previous_classification = classifications.get(record_id)
+            if (
+                previous_classification is not None
+                and previous_classification != classification
+            ):
+                raise _ExternalAgentContractFailure("anchor_accounting")
+            classifications[record_id] = classification
+            if classification == "candidate":
+                try:
+                    supporting = _unique_strings(
+                        record["supporting_evidence_unit_ids"],
+                        "candidate supporting_evidence_unit_ids",
+                        required=False,
+                    )
+                    if any(unit_id not in context_ids for unit_id in supporting):
+                        raise _ExternalAgentContractFailure(
+                            "evidence_reference"
+                        )
+                    confidence = record["confidence"]
+                    if (
+                        isinstance(confidence, bool)
+                        or not isinstance(confidence, (int, float))
+                        or not 0 <= confidence <= 1
+                    ):
+                        raise RepresentationInformationError(
+                            "candidate confidence must be between 0 and 1"
+                        )
+                    semantic_type = _text(
+                        record["semantic_type"], "candidate semantic_type"
+                    )
+                    if semantic_type not in SEMANTIC_TYPES:
+                        raise RepresentationInformationError(
+                            "candidate semantic_type is not supported"
+                        )
+                    body = (
+                        _text(record["statement"], "candidate statement"),
+                        semantic_type,
+                        _strings(record["concerns"], "candidate concerns"),
+                        supporting,
+                        _text(record["context"], "candidate context"),
+                        float(confidence),
+                    )
+                except _ExternalAgentContractFailure:
+                    raise
+                except RepresentationInformationError as exc:
+                    raise _ExternalAgentContractFailure(
+                        "candidate_schema"
+                    ) from exc
+                if (
+                    record_id in candidate_bodies
+                    and candidate_bodies[record_id] != body
+                ):
+                    raise _ExternalAgentContractFailure("anchor_accounting")
+                candidate_bodies.setdefault(record_id, body)
+                candidate_anchors.setdefault(record_id, []).append(anchor_id)
+            else:
+                try:
+                    body = (
+                        _text(
+                            record["reason_not_absorbed"],
+                            "Residue reason_not_absorbed",
+                        ),
+                        _text(
+                            record["future_value_or_uncertainty"],
+                            "Residue future_value_or_uncertainty",
+                        ),
+                    )
+                except RepresentationInformationError as exc:
+                    raise _ExternalAgentContractFailure(
+                        "residue_schema"
+                    ) from exc
+                if record_id in residue_bodies and residue_bodies[record_id] != body:
+                    raise _ExternalAgentContractFailure("anchor_accounting")
+                residue_bodies.setdefault(record_id, body)
+                residue_anchors.setdefault(record_id, []).append(anchor_id)
+        accounting.append(_AnchorAccounting(anchor_id, classification))
+
+    candidates = tuple(
+        RepresentationCandidateDraft(
+            statement=body[0],
+            semantic_type=body[1],
+            concerns=body[2],
+            evidence_unit_ids=(*candidate_anchors[record_id], *body[3]),
+            context=body[4],
+            confidence=body[5],
+        )
+        for record_id, body in candidate_bodies.items()
+    )
+    residue = tuple(
+        RepresentationResidueDraft(
+            evidence_unit_ids=tuple(residue_anchors[record_id]),
+            reason_not_absorbed=body[0],
+            future_value_or_uncertainty=body[1],
+        )
+        for record_id, body in residue_bodies.items()
+    )
+    return candidates, residue, tuple(accounting)
 
 
 def _v32_anchor_accounting(value: object) -> tuple[_AnchorAccounting, ...]:

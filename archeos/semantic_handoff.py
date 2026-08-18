@@ -27,6 +27,7 @@ from .representation_information import (
     EXTERNAL_AGENT_PROTOCOL_V3,
     EXTERNAL_AGENT_PROTOCOL_V3_1,
     EXTERNAL_AGENT_PROTOCOL_V3_2,
+    EXTERNAL_AGENT_PROTOCOL_V3_3,
     EXTERNAL_AGENT_PROTOCOL_VERSION,
     EXTERNAL_AGENT_ROUTE,
     SUPPORTED_EXTERNAL_AGENT_PROTOCOL_VERSIONS,
@@ -86,7 +87,8 @@ _RECOVERY_ATTEMPT_SCHEMA = "semantic-handoff-attempt-receipt/2.0"
 _RECOVERY_RESULT_SCHEMA = "semantic-handoff-batch-result-receipt/2.0"
 _RECOVERY_RESULT_PHASE_SCHEMA = "semantic-handoff-batch-result-phase/1.0"
 _V31_LOCAL_VALIDATOR_CONTRACT_VERSION = "external-agent-local-validator/3.1"
-_LOCAL_VALIDATOR_CONTRACT_VERSION = "external-agent-local-validator/3.2"
+_V32_LOCAL_VALIDATOR_CONTRACT_VERSION = "external-agent-local-validator/3.2"
+_LOCAL_VALIDATOR_CONTRACT_VERSION = "external-agent-local-validator/3.3"
 _EXECUTION_RECORD_FIELDS = frozenset(
     ExternalAgentExecutionRecord.__dataclass_fields__
 )
@@ -459,12 +461,12 @@ class _SemanticRecoveryRun:
             self._batch_contract(
                 batch,
                 ordinal,
-                protocol_version=EXTERNAL_AGENT_PROTOCOL_V3_2,
+                protocol_version=EXTERNAL_AGENT_PROTOCOL_V3_3,
             )
             for ordinal, batch in enumerate(self.batches, start=1)
         )
         execution_identity = self._execution_identity(
-            protocol_version=EXTERNAL_AGENT_PROTOCOL_V3_2,
+            protocol_version=EXTERNAL_AGENT_PROTOCOL_V3_3,
             validator_version=_LOCAL_VALIDATOR_CONTRACT_VERSION,
             batch_contracts=self.batch_contracts,
         )
@@ -507,6 +509,38 @@ class _SemanticRecoveryRun:
         ) = self._expected_run_receipt(
             self.historical_v31_run_id,
             historical_identity,
+        )
+        self.historical_v32_batch_contracts = tuple(
+            self._batch_contract(
+                batch,
+                ordinal,
+                protocol_version=EXTERNAL_AGENT_PROTOCOL_V3_2,
+            )
+            for ordinal, batch in enumerate(self.batches, start=1)
+        )
+        historical_v32_identity = self._execution_identity(
+            protocol_version=EXTERNAL_AGENT_PROTOCOL_V3_2,
+            validator_version=_V32_LOCAL_VALIDATOR_CONTRACT_VERSION,
+            batch_contracts=self.historical_v32_batch_contracts,
+        )
+        self.historical_v32_execution_identity_fingerprint = _fingerprint(
+            historical_v32_identity
+        )
+        self.historical_v32_run_id = (
+            "semantic_run_"
+            + self.historical_v32_execution_identity_fingerprint.removeprefix(
+                "sha256:"
+            )[:32]
+        )
+        (
+            self.historical_v32_contract_fingerprint,
+            self.expected_historical_v32_run_receipt,
+        ) = self._expected_run_receipt(
+            self.historical_v32_run_id,
+            historical_v32_identity,
+            execution_identity_fingerprint=(
+                self.historical_v32_execution_identity_fingerprint
+            ),
         )
 
     def _execution_identity(
@@ -905,13 +939,24 @@ class _SemanticRecoveryRun:
             representation = receipt.get("representation")
             if (
                 receipt.get("protocol_version")
-                == EXTERNAL_AGENT_PROTOCOL_V3_2
+                == EXTERNAL_AGENT_PROTOCOL_V3_3
                 and isinstance(representation, dict)
                 and representation.get("representation_id")
                 == self.representation.representation_id
             ):
                 raise SemanticHandoffError(
                     "Semantic recovery execution identity 已漂移。"
+                )
+            if (
+                receipt.get("protocol_version")
+                == EXTERNAL_AGENT_PROTOCOL_V3_2
+                and isinstance(representation, dict)
+                and representation.get("representation_id")
+                == self.representation.representation_id
+                and path.name != self.historical_v32_run_id
+            ):
+                raise SemanticHandoffError(
+                    "历史 v3.2 recovery path binding 已漂移。"
                 )
             if (
                 receipt.get("protocol_version")
@@ -935,22 +980,55 @@ class _SemanticRecoveryRun:
             conservatively_counted_attempts=unknown,
             historical_counted_attempts=(
                 self._historical_v31_attempt_count()
+                + self._historical_v32_attempt_count()
             ),
         )
 
     def _historical_v31_attempt_count(self) -> int:
-        if self.historical_v31_run_id == self.semantic_run_id:
+        return self._historical_attempt_count(
+            run_id=self.historical_v31_run_id,
+            contract_fingerprint=self.historical_v31_contract_fingerprint,
+            expected_run_receipt=self.expected_historical_v31_run_receipt,
+            batch_contracts=self.historical_v31_batch_contracts,
+            protocol_version=EXTERNAL_AGENT_PROTOCOL_V3_1,
+        )
+
+    def _historical_v32_attempt_count(self) -> int:
+        return self._historical_attempt_count(
+            run_id=self.historical_v32_run_id,
+            contract_fingerprint=self.historical_v32_contract_fingerprint,
+            expected_run_receipt=self.expected_historical_v32_run_receipt,
+            batch_contracts=self.historical_v32_batch_contracts,
+            protocol_version=EXTERNAL_AGENT_PROTOCOL_V3_2,
+        )
+
+    def _historical_attempt_count(
+        self,
+        *,
+        run_id: str,
+        contract_fingerprint: str,
+        expected_run_receipt: Mapping[str, object],
+        batch_contracts: tuple[dict[str, object], ...],
+        protocol_version: str,
+    ) -> int:
+        if run_id == self.semantic_run_id:
             raise SemanticHandoffError("Semantic recovery protocol 路径未隔离。")
-        legacy_run = self.audit_root / self.historical_v31_run_id
+        legacy_run = self.audit_root / run_id
         if not os.path.lexists(legacy_run):
             return 0
         _validate_shared_recovery_root(self.audit_root, create=False)
-        self._validate_historical_v31_inventory(legacy_run)
+        self._validate_historical_inventory(
+            legacy_run,
+            run_id=run_id,
+            contract_fingerprint=contract_fingerprint,
+            batch_contracts=batch_contracts,
+            protocol_version=protocol_version,
+        )
         if not _payloads_exactly_equal(
             _private_json_exact(legacy_run / "run-receipt.json"),
-            self.expected_historical_v31_run_receipt,
+            expected_run_receipt,
         ):
-            raise SemanticHandoffError("历史 v3.1 recovery binding 损坏。")
+            raise SemanticHandoffError("历史 Semantic recovery binding 损坏。")
         attempts_dir = legacy_run / "attempts"
         if not os.path.lexists(attempts_dir):
             return 0
@@ -962,31 +1040,35 @@ class _SemanticRecoveryRun:
             nonce = attempt.get("attempt_nonce")
             if (
                 ordinal < 1
-                or ordinal > len(self.historical_v31_batch_contracts)
+                or ordinal > len(batch_contracts)
                 or not isinstance(nonce, str)
             ):
-                raise SemanticHandoffError("历史 v3.1 recovery attempt 损坏。")
-            batch_receipt = self.historical_v31_batch_contracts[ordinal - 1][
-                "receipt"
-            ]
+                raise SemanticHandoffError("历史 Semantic recovery attempt 损坏。")
+            batch_receipt = batch_contracts[ordinal - 1]["receipt"]
             assert isinstance(batch_receipt, dict)
             if not _payloads_exactly_equal(
                 attempt,
                 self._expected_attempt_payload(
-                    semantic_run_id=self.historical_v31_run_id,
-                    contract_fingerprint=(
-                        self.historical_v31_contract_fingerprint
-                    ),
+                    semantic_run_id=run_id,
+                    contract_fingerprint=contract_fingerprint,
                     batch_receipt=batch_receipt,
                     ordinal=ordinal,
                     attempt_nonce=nonce,
                 ),
             ):
-                raise SemanticHandoffError("历史 v3.1 recovery attempt 损坏。")
+                raise SemanticHandoffError("历史 Semantic recovery attempt 损坏。")
             count += 1
         return count
 
-    def _validate_historical_v31_inventory(self, legacy_run: Path) -> None:
+    def _validate_historical_inventory(
+        self,
+        legacy_run: Path,
+        *,
+        run_id: str,
+        contract_fingerprint: str,
+        batch_contracts: tuple[dict[str, object], ...],
+        protocol_version: str,
+    ) -> None:
         _require_private_directory(legacy_run)
         try:
             children = {path.name: path for path in legacy_run.iterdir()}
@@ -1010,7 +1092,7 @@ class _SemanticRecoveryRun:
                 ordinal = int(match.group(1)) if match else 0
                 if (
                     ordinal < 1
-                    or ordinal > len(self.historical_v31_batch_contracts)
+                    or ordinal > len(batch_contracts)
                     or ordinal in attempt_ordinals
                 ):
                     raise SemanticHandoffError(
@@ -1033,7 +1115,7 @@ class _SemanticRecoveryRun:
                 ordinal = int(match.group(1)) if match else 0
                 if (
                     ordinal < 1
-                    or ordinal > len(self.historical_v31_batch_contracts)
+                    or ordinal > len(batch_contracts)
                     or ordinal in result_ordinals
                     or ordinal not in attempt_ordinals
                 ):
@@ -1043,8 +1125,14 @@ class _SemanticRecoveryRun:
                 attempt = _private_json_exact(
                     attempts / f"batch_{ordinal:04d}.json"
                 )
-                self._validate_historical_v31_result_inventory(
-                    path, ordinal, attempt
+                self._validate_historical_result_inventory(
+                    path,
+                    ordinal,
+                    attempt,
+                    run_id=run_id,
+                    contract_fingerprint=contract_fingerprint,
+                    batch_contracts=batch_contracts,
+                    protocol_version=protocol_version,
                 )
                 result_ordinals.add(ordinal)
         if result_ordinals and result_ordinals != set(
@@ -1062,11 +1150,16 @@ class _SemanticRecoveryRun:
                     "历史 v3.1 recovery batch 顺序因果损坏。"
                 )
 
-    def _validate_historical_v31_result_inventory(
+    def _validate_historical_result_inventory(
         self,
         path: Path,
         ordinal: int,
         attempt: Mapping[str, object],
+        *,
+        run_id: str,
+        contract_fingerprint: str,
+        batch_contracts: tuple[dict[str, object], ...],
+        protocol_version: str,
     ) -> None:
         _require_private_directory(path)
         try:
@@ -1091,7 +1184,7 @@ class _SemanticRecoveryRun:
             _require_private_file(child)
         raw = _private_bytes_read(path / "result.json")
         receipt = _private_json_exact(path / "result-receipt.json")
-        batch_contract = self.historical_v31_batch_contracts[ordinal - 1]
+        batch_contract = batch_contracts[ordinal - 1]
         batch_receipt = batch_contract["receipt"]
         batch = batch_contract["batch"]
         assert isinstance(batch_receipt, dict)
@@ -1124,9 +1217,9 @@ class _SemanticRecoveryRun:
             or receipt.get("schema_version") != _RECOVERY_RESULT_SCHEMA
             or receipt.get("artifact_kind")
             != "semantic_handoff_batch_result"
-            or receipt.get("semantic_run_id") != self.historical_v31_run_id
+            or receipt.get("semantic_run_id") != run_id
             or receipt.get("run_contract_fingerprint")
-            != self.historical_v31_contract_fingerprint
+            != contract_fingerprint
             or isinstance(receipt.get("batch_ordinal"), bool)
             or receipt.get("batch_ordinal") != ordinal
             or receipt.get("batch_contract_fingerprint")
@@ -1147,8 +1240,8 @@ class _SemanticRecoveryRun:
                 "历史 v3.1 recovery result binding 损坏。"
             )
         pending = self._expected_result_phase_payload(
-            semantic_run_id=self.historical_v31_run_id,
-            contract_fingerprint=self.historical_v31_contract_fingerprint,
+            semantic_run_id=run_id,
+            contract_fingerprint=contract_fingerprint,
             batch_receipt=batch_receipt,
             ordinal=ordinal,
             result_receipt=receipt,
@@ -1164,8 +1257,8 @@ class _SemanticRecoveryRun:
         if "phase-committed.json" in children and not _payloads_exactly_equal(
             _private_json_exact(path / "phase-committed.json"),
             self._expected_result_phase_payload(
-                semantic_run_id=self.historical_v31_run_id,
-                contract_fingerprint=self.historical_v31_contract_fingerprint,
+                semantic_run_id=run_id,
+                contract_fingerprint=contract_fingerprint,
                 batch_receipt=batch_receipt,
                 ordinal=ordinal,
                 result_receipt=receipt,
@@ -1185,15 +1278,15 @@ class _SemanticRecoveryRun:
             record,
             ordinal,
             raw,
-            protocol_version=EXTERNAL_AGENT_PROTOCOL_V3_1,
-            batch_contracts=self.historical_v31_batch_contracts,
+            protocol_version=protocol_version,
+            batch_contracts=batch_contracts,
         )
         try:
             _parse_external_agent_result(
                 raw.decode("utf-8"),
                 batch,
                 str(batch_receipt["input_fingerprint"]),
-                EXTERNAL_AGENT_PROTOCOL_V3_1,
+                protocol_version,
             )
         except (UnicodeDecodeError, RepresentationInformationError) as exc:
             raise SemanticHandoffError(
@@ -1877,7 +1970,11 @@ def _versioned_audit_contract(
         )
     if (
         protocol_version
-        in {EXTERNAL_AGENT_PROTOCOL_V3_1, EXTERNAL_AGENT_PROTOCOL_V3_2}
+        in {
+            EXTERNAL_AGENT_PROTOCOL_V3_1,
+            EXTERNAL_AGENT_PROTOCOL_V3_2,
+            EXTERNAL_AGENT_PROTOCOL_V3_3,
+        }
         and package_provider != _provider_manifest(provider)
     ):
         raise SemanticHandoffError(
@@ -1912,6 +2009,7 @@ def _versioned_audit_contract(
     elif protocol_version in {
         EXTERNAL_AGENT_PROTOCOL_V3_1,
         EXTERNAL_AGENT_PROTOCOL_V3_2,
+        EXTERNAL_AGENT_PROTOCOL_V3_3,
     }:
         shapes = frozenset(
             {
