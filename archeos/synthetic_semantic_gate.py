@@ -6,10 +6,11 @@ import hashlib
 import json
 import os
 import re
+import secrets
 import stat
 import uuid
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from .filesystem import publish_file_no_replace
@@ -28,10 +29,12 @@ from .representation_information import (
     external_agent_representation_analysis_schema,
 )
 
-SYNTHETIC_GATE_RECEIPT_SCHEMA_VERSION = "synthetic-semantic-gate-receipt/1.0"
+SYNTHETIC_GATE_RECEIPT_SCHEMA_VERSION = "synthetic-semantic-gate-receipt/2.0"
 _RECEIPT_NAME = "technical-receipt.json"
 _EMPTY_SHA256 = "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
 _SHA256 = re.compile(r"sha256:[0-9a-f]{64}")
+_ENVELOPE_ID = re.compile(r"synthetic_gate_[0-9a-f]{32}")
+_CHALLENGE = re.compile(r"[0-9a-f]{64}")
 _FAILURE_CATEGORIES = frozenset(
     {
         "runtime_start_failure",
@@ -81,6 +84,8 @@ _RECEIPT_KEYS = frozenset(
     {
         "schema_version",
         "receipt_fingerprint",
+        "technical_envelope_id",
+        "authority_commitment",
         "provider_call_started",
         "provider_call_start_proven",
         "provider_call_counted",
@@ -98,6 +103,7 @@ _RECEIPT_KEYS = frozenset(
         "model",
         "reasoning_effort",
         "fallback_policy",
+        "deadline_ms",
         "eligible_units",
         "covered_units",
         "missing_anchor_count",
@@ -141,21 +147,76 @@ class SyntheticSemanticGateError(RuntimeError):
 
 
 @dataclass(frozen=True)
+class SyntheticSemanticGateExpectedAuthority:
+    """Caller-held, pre-call authority; sensitive bindings never enter receipt."""
+
+    technical_envelope_id: str
+    challenge: str = field(repr=False)
+    protocol_version: str = EXTERNAL_AGENT_PROTOCOL_VERSION
+    provider_route: str = EXTERNAL_AGENT_ROUTE
+    provider_version: str = ""
+    model: str = ""
+    reasoning_effort: str = ""
+    fallback_policy: str = "none"
+    deadline_ms: int = 0
+    eligible_units: int = 0
+    ordered_anchor_unit_ids: tuple[str, ...] = field(default=(), repr=False)
+    input_fingerprint: str = field(default="", repr=False)
+
+
+@dataclass(frozen=True)
 class SyntheticSemanticGateRun:
     receipt_path: Path
     receipt: dict[str, object]
     anonymous_projection: dict[str, object]
+    expected_authority: SyntheticSemanticGateExpectedAuthority = field(repr=False)
+    expected_receipt_fingerprint: str = field(repr=False)
+
+
+def build_synthetic_semantic_gate_expected_authority(
+    batch: RepresentationAnalysisBatch,
+    provider: CodexCliRepresentationAnalysisProvider,
+) -> SyntheticSemanticGateExpectedAuthority:
+    """Freeze the approved synthetic fixture/profile before any Provider start."""
+
+    if type(provider) is not CodexCliRepresentationAnalysisProvider:
+        raise SyntheticSemanticGateError(
+            "technical Gate 必须使用 production Provider adapter。"
+        )
+    try:
+        schema = external_agent_representation_analysis_schema(batch=batch)
+        _request, input_fingerprint = _external_agent_request(
+            batch,
+            result_schema=schema,
+        )
+    except (RepresentationInformationError, TypeError, ValueError) as exc:
+        raise SyntheticSemanticGateError("technical Gate expected authority 无法构建。") from exc
+    authority = SyntheticSemanticGateExpectedAuthority(
+        technical_envelope_id="synthetic_gate_" + uuid.uuid4().hex,
+        challenge=secrets.token_hex(32),
+        provider_version=provider.provider_version,
+        model=provider.model,
+        reasoning_effort=provider.reasoning_effort,
+        fallback_policy=provider.fallback_policy,
+        deadline_ms=round(provider.timeout_seconds * 1000),
+        eligible_units=len(batch.anchor_units),
+        ordered_anchor_unit_ids=tuple(unit.unit_id for unit in batch.anchor_units),
+        input_fingerprint=input_fingerprint,
+    )
+    _require_expected_authority(authority, batch=batch, provider=provider)
+    return authority
 
 
 def execute_synthetic_semantic_gate(
     batch: RepresentationAnalysisBatch,
     provider: CodexCliRepresentationAnalysisProvider,
     *,
+    expected_authority: SyntheticSemanticGateExpectedAuthority,
     receipt_root: Path,
     post_success_assertion: Callable[[Mapping[str, object]], None] | None = None,
     post_success_serializer: Callable[[Mapping[str, object]], object] | None = None,
 ) -> SyntheticSemanticGateRun:
-    """Run one synthetic batch through the production adapter and persist truth first.
+    """Run once and persist an externally bound technical observation first.
 
     Hooks exist only to verify harness failure boundaries. Their return values are
     discarded and can never enter the technical receipt.
@@ -163,6 +224,7 @@ def execute_synthetic_semantic_gate(
 
     if type(provider) is not CodexCliRepresentationAnalysisProvider:
         raise SyntheticSemanticGateError("technical Gate 必须使用 production Provider adapter。")
+    _require_expected_authority(expected_authority, batch=batch, provider=provider)
     root = Path(receipt_root)
     _prepare_receipt_root(root)
     before_records = len(provider.execution_records)
@@ -195,7 +257,7 @@ def execute_synthetic_semantic_gate(
         )
         or (
             record is not None
-            and not _record_matches_execution_authority(record, provider, batch)
+            and not _record_matches_expected_authority(record, expected_authority)
         )
     ):
         harness_failure = "execution_observation_invalid"
@@ -207,17 +269,23 @@ def execute_synthetic_semantic_gate(
         and record.execution_status == "succeeded"
         and result is not None
     ):
-        safe_observation = _safe_success_observation(record)
-        if post_success_assertion is not None:
-            try:
-                post_success_assertion(safe_observation)
-            except Exception:  # noqa: BLE001 - no exception content is persisted.
-                harness_failure = "post_success_assertion_failure"
-        if harness_failure is None and post_success_serializer is not None:
-            try:
-                post_success_serializer(safe_observation)
-            except Exception:  # noqa: BLE001 - no exception content is persisted.
-                harness_failure = "post_success_serialization_failure"
+        try:
+            safe_observation = _safe_success_observation(record)
+        except (AttributeError, TypeError, ValueError):
+            harness_failure = "execution_observation_invalid"
+            record = None
+            observation = None
+        else:
+            if post_success_assertion is not None:
+                try:
+                    post_success_assertion(safe_observation)
+                except Exception:  # noqa: BLE001 - no exception content is persisted.
+                    harness_failure = "post_success_assertion_failure"
+            if harness_failure is None and post_success_serializer is not None:
+                try:
+                    post_success_serializer(safe_observation)
+                except Exception:  # noqa: BLE001 - no exception content is persisted.
+                    harness_failure = "post_success_serialization_failure"
 
     if (
         observation is not None
@@ -226,28 +294,71 @@ def execute_synthetic_semantic_gate(
         harness_failure = "diagnostics_persistence_failure"
     if record is not None and (
         (record.execution_status == "succeeded") != (result is not None)
+        or (
+            result is not None
+            and not isinstance(result, RepresentationAnalysisResult)
+        )
     ):
         harness_failure = "execution_observation_invalid"
         record = None
         observation = None
 
-    receipt = _receipt_payload(
-        provider,
-        record,
-        observation,
-        eligible_units=len(batch.anchor_units),
-        result_present=result is not None,
-        provider_exception=provider_exception,
-        start_delta=start_delta,
-        harness_failure=harness_failure,
-    )
+    try:
+        receipt = _receipt_payload(
+            expected_authority,
+            record,
+            observation,
+            result_present=result is not None,
+            provider_exception=provider_exception,
+            start_delta=start_delta,
+            harness_failure=harness_failure,
+        )
+        _validate_receipt(
+            receipt,
+            expected_authority=expected_authority,
+            expected_receipt_fingerprint=receipt["receipt_fingerprint"],
+        )
+    except (AttributeError, SyntheticSemanticGateError, TypeError, ValueError):
+        if start_delta == 0:
+            raise
+        receipt = _receipt_payload(
+            expected_authority,
+            None,
+            None,
+            result_present=False,
+            provider_exception=True,
+            start_delta=start_delta,
+            harness_failure="execution_observation_invalid",
+        )
+        _validate_receipt(
+            receipt,
+            expected_authority=expected_authority,
+            expected_receipt_fingerprint=receipt["receipt_fingerprint"],
+        )
+    expected_receipt_fingerprint = receipt["receipt_fingerprint"]
+    assert isinstance(expected_receipt_fingerprint, str)
     path = root / _RECEIPT_NAME
-    _write_receipt_no_replace(path, receipt)
-    readback = read_synthetic_semantic_gate_receipt(path)
+    _write_receipt_no_replace(
+        path,
+        receipt,
+        expected_authority=expected_authority,
+        expected_receipt_fingerprint=expected_receipt_fingerprint,
+    )
+    readback = read_synthetic_semantic_gate_receipt(
+        path,
+        expected_authority=expected_authority,
+        expected_receipt_fingerprint=expected_receipt_fingerprint,
+    )
     if readback != receipt:
         raise SyntheticSemanticGateError("technical Gate receipt 读回不一致。")
     projection = dict(readback)
-    return SyntheticSemanticGateRun(path, readback, projection)
+    return SyntheticSemanticGateRun(
+        path,
+        readback,
+        projection,
+        expected_authority,
+        expected_receipt_fingerprint,
+    )
 
 
 def _safe_success_observation(
@@ -268,37 +379,101 @@ def _safe_success_observation(
     }
 
 
-def _record_matches_execution_authority(
-    record: ExternalAgentExecutionRecord,
-    provider: CodexCliRepresentationAnalysisProvider,
+def _require_expected_authority(
+    authority: SyntheticSemanticGateExpectedAuthority,
+    *,
     batch: RepresentationAnalysisBatch,
-) -> bool:
+    provider: CodexCliRepresentationAnalysisProvider,
+) -> None:
+    if type(authority) is not SyntheticSemanticGateExpectedAuthority:
+        raise SyntheticSemanticGateError("technical Gate expected authority 缺失。")
     try:
         schema = external_agent_representation_analysis_schema(batch=batch)
         _request, expected_input_fingerprint = _external_agent_request(
             batch,
             result_schema=schema,
         )
-    except (RepresentationInformationError, TypeError, ValueError):
-        return False
-    return (
-        record.protocol_version == EXTERNAL_AGENT_PROTOCOL_VERSION
-        and record.provider_route == EXTERNAL_AGENT_ROUTE
-        and record.provider_version == provider.provider_version
-        and record.model == provider.model
-        and record.reasoning_effort == provider.reasoning_effort
-        and record.fallback_policy == provider.fallback_policy
-        and record.eligible_units == len(batch.anchor_units)
-        and record.anchor_unit_ids
+    except (RepresentationInformationError, TypeError, ValueError) as exc:
+        raise SyntheticSemanticGateError("technical Gate expected authority 无法核验。") from exc
+    if not (
+        _ENVELOPE_ID.fullmatch(authority.technical_envelope_id)
+        and _CHALLENGE.fullmatch(authority.challenge)
+        and authority.protocol_version == EXTERNAL_AGENT_PROTOCOL_VERSION
+        and authority.provider_route == EXTERNAL_AGENT_ROUTE
+        and authority.provider_version == provider.provider_version
+        and authority.model == provider.model
+        and authority.reasoning_effort == provider.reasoning_effort
+        and authority.fallback_policy == provider.fallback_policy == "none"
+        and authority.deadline_ms == round(provider.timeout_seconds * 1000)
+        and authority.eligible_units == len(batch.anchor_units) > 0
+        and authority.ordered_anchor_unit_ids
         == tuple(unit.unit_id for unit in batch.anchor_units)
-        and record.input_fingerprint == expected_input_fingerprint
+        and authority.input_fingerprint == expected_input_fingerprint
+    ):
+        raise SyntheticSemanticGateError("technical Gate expected authority 不匹配。")
+
+
+def _authority_commitment(
+    authority: SyntheticSemanticGateExpectedAuthority,
+) -> str:
+    """Randomized technical commitment; not a stable business fingerprint."""
+
+    value = {
+        "technical_envelope_id": authority.technical_envelope_id,
+        "challenge": authority.challenge,
+        "protocol_version": authority.protocol_version,
+        "provider_route": authority.provider_route,
+        "provider_version": authority.provider_version,
+        "model": authority.model,
+        "reasoning_effort": authority.reasoning_effort,
+        "fallback_policy": authority.fallback_policy,
+        "deadline_ms": authority.deadline_ms,
+        "eligible_units": authority.eligible_units,
+        "ordered_anchor_unit_ids": list(authority.ordered_anchor_unit_ids),
+        "input_fingerprint": authority.input_fingerprint,
+    }
+    encoded = json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return "sha256:" + hashlib.sha256(encoded).hexdigest()
+
+
+def _record_matches_expected_authority(
+    record: ExternalAgentExecutionRecord,
+    authority: SyntheticSemanticGateExpectedAuthority,
+) -> bool:
+    return (
+        record.protocol_version == authority.protocol_version
+        and record.provider_route == authority.provider_route
+        and record.provider_version == authority.provider_version
+        and record.model == authority.model
+        and record.reasoning_effort == authority.reasoning_effort
+        and record.fallback_policy == authority.fallback_policy
+        and record.eligible_units == authority.eligible_units
+        and record.anchor_unit_ids == authority.ordered_anchor_unit_ids
+        and record.input_fingerprint == authority.input_fingerprint
         and record.diagnostic_schema_version == DIAGNOSTIC_SCHEMA_VERSION
-        and record.deadline_ms == round(provider.timeout_seconds * 1000)
+        and record.deadline_ms == authority.deadline_ms
     )
 
 
-def read_synthetic_semantic_gate_receipt(path: Path) -> dict[str, object]:
-    """Strictly read one private, content-free technical receipt."""
+def read_synthetic_semantic_gate_receipt(
+    path: Path,
+    *,
+    expected_authority: SyntheticSemanticGateExpectedAuthority | None = None,
+    expected_receipt_fingerprint: str | None = None,
+) -> dict[str, object]:
+    """Read against caller-held authority; the receipt is never standalone truth."""
+
+    if (
+        type(expected_authority) is not SyntheticSemanticGateExpectedAuthority
+        or not isinstance(expected_receipt_fingerprint, str)
+        or _SHA256.fullmatch(expected_receipt_fingerprint) is None
+    ):
+        raise SyntheticSemanticGateError("technical Gate external authority 缺失。")
 
     receipt_path = Path(path)
     if receipt_path.name != _RECEIPT_NAME:
@@ -319,7 +494,11 @@ def read_synthetic_semantic_gate_receipt(path: Path) -> dict[str, object]:
         )
     except (OSError, UnicodeError, json.JSONDecodeError) as exc:
         raise SyntheticSemanticGateError("technical Gate receipt 无法安全读回。") from exc
-    _validate_receipt(payload)
+    _validate_receipt(
+        payload,
+        expected_authority=expected_authority,
+        expected_receipt_fingerprint=expected_receipt_fingerprint,
+    )
     return payload
 
 
@@ -333,11 +512,10 @@ def _reject_duplicate_keys(pairs: list[tuple[str, object]]) -> dict[str, object]
 
 
 def _receipt_payload(
-    provider: CodexCliRepresentationAnalysisProvider,
+    expected_authority: SyntheticSemanticGateExpectedAuthority,
     record: ExternalAgentExecutionRecord | None,
     observation: ExternalAgentTechnicalObservation | None,
     *,
-    eligible_units: int,
     result_present: bool,
     provider_exception: bool,
     start_delta: int,
@@ -418,6 +596,8 @@ def _receipt_payload(
     payload: dict[str, object] = {
         "schema_version": SYNTHETIC_GATE_RECEIPT_SCHEMA_VERSION,
         "receipt_fingerprint": None,
+        "technical_envelope_id": expected_authority.technical_envelope_id,
+        "authority_commitment": _authority_commitment(expected_authority),
         "provider_call_started": started,
         "provider_call_start_proven": start_proven,
         "provider_call_counted": 1 if start_delta != 0 else 0,
@@ -429,13 +609,14 @@ def _receipt_payload(
         "contract_failure_stage": effective_record.contract_failure_stage if effective_record else None,
         "strict_validation_status": strict_status,
         "input_binding_status": input_binding_status,
-        "protocol_version": effective_record.protocol_version if effective_record else None,
-        "provider_route": effective_record.provider_route if effective_record else None,
-        "provider_version": effective_record.provider_version if effective_record else provider.provider_version,
-        "model": effective_record.model if effective_record else provider.model,
-        "reasoning_effort": effective_record.reasoning_effort if effective_record else provider.reasoning_effort,
-        "fallback_policy": effective_record.fallback_policy if effective_record else provider.fallback_policy,
-        "eligible_units": effective_record.eligible_units if effective_record else eligible_units,
+        "protocol_version": expected_authority.protocol_version,
+        "provider_route": expected_authority.provider_route,
+        "provider_version": expected_authority.provider_version,
+        "model": expected_authority.model,
+        "reasoning_effort": expected_authority.reasoning_effort,
+        "fallback_policy": expected_authority.fallback_policy,
+        "deadline_ms": expected_authority.deadline_ms,
+        "eligible_units": expected_authority.eligible_units,
         "covered_units": effective_record.covered_units if effective_record else 0,
         "missing_anchor_count": effective_record.missing_anchor_count if effective_record else 0,
         "accounting_item_count": effective_record.accounting_item_count if effective_record else 0,
@@ -491,8 +672,18 @@ def _prepare_receipt_root(root: Path) -> None:
     _require_private_root(root, exact_inventory=set())
 
 
-def _write_receipt_no_replace(path: Path, payload: Mapping[str, object]) -> None:
-    _validate_receipt(dict(payload))
+def _write_receipt_no_replace(
+    path: Path,
+    payload: Mapping[str, object],
+    *,
+    expected_authority: SyntheticSemanticGateExpectedAuthority,
+    expected_receipt_fingerprint: str,
+) -> None:
+    _validate_receipt(
+        dict(payload),
+        expected_authority=expected_authority,
+        expected_receipt_fingerprint=expected_receipt_fingerprint,
+    )
     root = path.parent
     _require_private_root(root, exact_inventory=set())
     temporary = root / f".{_RECEIPT_NAME}.{uuid.uuid4().hex}.tmp"
@@ -551,7 +742,12 @@ def _require_safe_ancestors(path: Path) -> None:
         current = current.parent
 
 
-def _validate_receipt(payload: object) -> None:
+def _validate_receipt(
+    payload: object,
+    *,
+    expected_authority: SyntheticSemanticGateExpectedAuthority,
+    expected_receipt_fingerprint: str,
+) -> None:
     if not isinstance(payload, dict) or set(payload) != _RECEIPT_KEYS:
         raise SyntheticSemanticGateError("technical Gate receipt schema 无效。")
     if payload["schema_version"] != SYNTHETIC_GATE_RECEIPT_SCHEMA_VERSION:
@@ -561,8 +757,27 @@ def _validate_receipt(payload: object) -> None:
         not isinstance(fingerprint, str)
         or _SHA256.fullmatch(fingerprint) is None
         or fingerprint != _receipt_fingerprint(payload)
+        or fingerprint != expected_receipt_fingerprint
     ):
         raise SyntheticSemanticGateError("technical Gate receipt fingerprint 无效。")
+    if not (
+        type(expected_authority) is SyntheticSemanticGateExpectedAuthority
+        and _ENVELOPE_ID.fullmatch(expected_authority.technical_envelope_id)
+        and _CHALLENGE.fullmatch(expected_authority.challenge)
+        and payload["technical_envelope_id"]
+        == expected_authority.technical_envelope_id
+        and payload["authority_commitment"]
+        == _authority_commitment(expected_authority)
+        and payload["protocol_version"] == expected_authority.protocol_version
+        and payload["provider_route"] == expected_authority.provider_route
+        and payload["provider_version"] == expected_authority.provider_version
+        and payload["model"] == expected_authority.model
+        and payload["reasoning_effort"] == expected_authority.reasoning_effort
+        and payload["fallback_policy"] == expected_authority.fallback_policy
+        and payload["deadline_ms"] == expected_authority.deadline_ms
+        and payload["eligible_units"] == expected_authority.eligible_units
+    ):
+        raise SyntheticSemanticGateError("technical Gate external authority 不匹配。")
     started = payload["provider_call_started"]
     proven = payload["provider_call_start_proven"]
     counted = payload["provider_call_counted"]
@@ -743,10 +958,21 @@ _CONTRACT_COUNT_FIELDS = (
 def _validate_receipt_state(payload: dict[str, object]) -> None:
     """Validate one and only one complete technical receipt state."""
 
-    if payload["eligible_units"] <= 0:
-        raise SyntheticSemanticGateError("technical Gate eligible count 无效。")
     if (
-        payload["provider_version"] is None
+        payload["eligible_units"] <= 0
+        or isinstance(payload["deadline_ms"], bool)
+        or not isinstance(payload["deadline_ms"], int)
+        or payload["deadline_ms"] <= 0
+        or not isinstance(payload["technical_envelope_id"], str)
+        or _ENVELOPE_ID.fullmatch(payload["technical_envelope_id"]) is None
+        or not isinstance(payload["authority_commitment"], str)
+        or _SHA256.fullmatch(payload["authority_commitment"]) is None
+    ):
+        raise SyntheticSemanticGateError("technical Gate authority fields 无效。")
+    if (
+        payload["protocol_version"] != EXTERNAL_AGENT_PROTOCOL_VERSION
+        or payload["provider_route"] != EXTERNAL_AGENT_ROUTE
+        or payload["provider_version"] is None
         or payload["model"] is None
         or payload["reasoning_effort"] not in {"low", "medium", "high", "xhigh"}
         or payload["fallback_policy"] != "none"
@@ -821,8 +1047,8 @@ def _validate_never_started_state(payload: dict[str, object]) -> None:
         and payload["contract_failure_stage"] is None
         and payload["strict_validation_status"] == "unknown"
         and payload["input_binding_status"] == "not_applicable"
-        and payload["protocol_version"] is None
-        and payload["provider_route"] is None
+        and payload["protocol_version"] == EXTERNAL_AGENT_PROTOCOL_VERSION
+        and payload["provider_route"] == EXTERNAL_AGENT_ROUTE
         and all(payload[name] == 0 for name in _COUNT_FIELDS)
         and payload["exit_code"] is None
         and payload["termination_signal"] is None
@@ -852,8 +1078,8 @@ def _validate_outcome_unknown_state(payload: dict[str, object]) -> None:
         and payload["contract_failure_stage"] is None
         and payload["strict_validation_status"] == "unknown"
         and payload["input_binding_status"] == "unknown"
-        and payload["protocol_version"] is None
-        and payload["provider_route"] is None
+        and payload["protocol_version"] == EXTERNAL_AGENT_PROTOCOL_VERSION
+        and payload["provider_route"] == EXTERNAL_AGENT_ROUTE
         and all(payload[name] == 0 for name in _COUNT_FIELDS)
         and payload["exit_code"] is None
         and payload["termination_signal"] is None

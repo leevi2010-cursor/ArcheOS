@@ -18,6 +18,7 @@ from archeos.representation_information import (
 from archeos.synthetic_semantic_gate import (
     SyntheticSemanticGateError,
     _receipt_fingerprint,
+    build_synthetic_semantic_gate_expected_authority,
     execute_synthetic_semantic_gate,
     read_synthetic_semantic_gate_receipt,
 )
@@ -71,13 +72,29 @@ class SyntheticSemanticGateTest(unittest.TestCase):
 
     def execute(self, mode: str, **kwargs):
         provider = self.provider(mode)
+        run = self.execute_provider(provider, f"receipt-{mode}", **kwargs)
+        return provider, run
+
+    def execute_provider(self, provider, receipt_name: str, **kwargs):
+        batch = self.batch()
+        expected_authority = build_synthetic_semantic_gate_expected_authority(
+            batch, provider
+        )
         run = execute_synthetic_semantic_gate(
-            self.batch(),
+            batch,
             provider,
-            receipt_root=self.root / f"receipt-{mode}",
+            expected_authority=expected_authority,
+            receipt_root=self.root / receipt_name,
             **kwargs,
         )
-        return provider, run
+        return run
+
+    def read_run(self, run, *, path: Path | None = None):
+        return read_synthetic_semantic_gate_receipt(
+            path or run.receipt_path,
+            expected_authority=run.expected_authority,
+            expected_receipt_fingerprint=run.expected_receipt_fingerprint,
+        )
 
     def assert_private_content_free(self, run) -> None:
         text = run.receipt_path.read_text(encoding="utf-8")
@@ -91,6 +108,8 @@ class SyntheticSemanticGateTest(unittest.TestCase):
         self.assertNotIn("artifact_", text)
         self.assertNotIn("input_fingerprint", text)
         self.assertNotIn("result_fingerprint", text)
+        self.assertNotIn(run.expected_authority.challenge, text)
+        self.assertNotIn(run.expected_authority.input_fingerprint, text)
         self.assertEqual(stat.S_IMODE(run.receipt_path.parent.stat().st_mode), 0o700)
         self.assertEqual(stat.S_IMODE(run.receipt_path.stat().st_mode), 0o600)
 
@@ -105,7 +124,7 @@ class SyntheticSemanticGateTest(unittest.TestCase):
         run.receipt_path.write_text(json.dumps(payload), encoding="utf-8")
         os.chmod(run.receipt_path, 0o600)
         with self.assertRaises(SyntheticSemanticGateError):
-            read_synthetic_semantic_gate_receipt(run.receipt_path)
+            self.read_run(run)
 
     def test_strict_success_with_grouping_is_pass_and_private(self) -> None:
         provider, run = self.execute("shared_candidate")
@@ -156,11 +175,7 @@ class SyntheticSemanticGateTest(unittest.TestCase):
 
         provider = self.provider("valid")
         provider.runner = lambda *_args, **_kwargs: TransportProcess()
-        run = execute_synthetic_semantic_gate(
-            self.batch(),
-            provider,
-            receipt_root=self.root / "receipt-transport",
-        )
+        run = self.execute_provider(provider, "receipt-transport")
 
         self.assertEqual(run.receipt["provider_failure_category"], "runtime_nonzero_exit")
         self.assertEqual(run.receipt["provider_error_category"], "network_or_transport")
@@ -200,10 +215,7 @@ class SyntheticSemanticGateTest(unittest.TestCase):
                     run.receipt["input_binding_status"], input_binding
                 )
                 self.assertEqual(run.receipt["technical_gate_status"], "failed")
-                self.assertEqual(
-                    read_synthetic_semantic_gate_receipt(run.receipt_path),
-                    run.receipt,
-                )
+                self.assertEqual(self.read_run(run), run.receipt)
 
     def test_runtime_execution_failure_is_a_legal_started_state(self) -> None:
         class RuntimeFailureProcess:
@@ -216,11 +228,7 @@ class SyntheticSemanticGateTest(unittest.TestCase):
 
         provider = self.provider("valid")
         provider.runner = lambda *_args, **_kwargs: RuntimeFailureProcess()
-        run = execute_synthetic_semantic_gate(
-            self.batch(),
-            provider,
-            receipt_root=self.root / "receipt-runtime-failure",
-        )
+        run = self.execute_provider(provider, "receipt-runtime-failure")
 
         self.assertEqual(
             run.receipt["provider_failure_category"],
@@ -228,9 +236,7 @@ class SyntheticSemanticGateTest(unittest.TestCase):
         )
         self.assertEqual(run.receipt["provider_call_counted"], 1)
         self.assertEqual(run.receipt["technical_gate_status"], "failed")
-        self.assertEqual(
-            read_synthetic_semantic_gate_receipt(run.receipt_path), run.receipt
-        )
+        self.assertEqual(self.read_run(run), run.receipt)
 
     def test_post_success_assertion_failure_is_recorded_after_strict_pass(self) -> None:
         def fail_assertion(_result) -> None:
@@ -297,11 +303,7 @@ class SyntheticSemanticGateTest(unittest.TestCase):
             raise RuntimeError(_BODY)
 
         provider.analyze = lose_execution_record  # type: ignore[method-assign]
-        run = execute_synthetic_semantic_gate(
-            self.batch(),
-            provider,
-            receipt_root=self.root / "receipt-unknown",
-        )
+        run = self.execute_provider(provider, "receipt-unknown")
 
         self.assertTrue(run.receipt["provider_call_started"])
         self.assertEqual(run.receipt["provider_call_counted"], 1)
@@ -316,11 +318,7 @@ class SyntheticSemanticGateTest(unittest.TestCase):
         unsafe.mkdir(mode=0o700)
         os.chmod(unsafe, 0o755)
         provider = self.provider("valid", diagnostic_root=unsafe)
-        run = execute_synthetic_semantic_gate(
-            self.batch(),
-            provider,
-            receipt_root=self.root / "receipt-pre-provider",
-        )
+        run = self.execute_provider(provider, "receipt-pre-provider")
 
         self.assertFalse(run.receipt["provider_call_started"])
         self.assertEqual(run.receipt["provider_call_counted"], 0)
@@ -407,10 +405,23 @@ class SyntheticSemanticGateTest(unittest.TestCase):
                 self.assert_rehashed_attack_rejected(contract, changes)
 
     def test_execution_record_binding_drift_becomes_outcome_unknown(self) -> None:
-        for field, value in (
+        for index, (field, value) in enumerate((
+            ("protocol_version", "external-agent-semantic-handoff/3.3"),
+            ("provider_route", "synthetic-route"),
+            ("provider_version", "synthetic-technical-v2"),
+            ("model", "gpt-5.6-sol"),
+            ("reasoning_effort", "high"),
+            ("fallback_policy", "retry"),
             ("input_fingerprint", "sha256:" + "0" * 64),
+            ("anchor_unit_ids", tuple(reversed(_UNIT_IDS))),
+            ("eligible_units", 1),
             ("deadline_ms", 1),
-        ):
+            ("diagnostic_schema_version", "external-agent-diagnostics/2.0"),
+            ("covered_units", 1),
+            ("missing_anchor_count", 1),
+            ("raw_record_count", 1),
+            ("raw_record_count", "invalid"),
+        )):
             with self.subTest(field=field):
                 provider = self.provider("shared_candidate")
                 analyze = provider.analyze
@@ -430,25 +441,179 @@ class SyntheticSemanticGateTest(unittest.TestCase):
                     return result
 
                 provider.analyze = drift_record  # type: ignore[method-assign]
-                run = execute_synthetic_semantic_gate(
-                    self.batch(),
-                    provider,
-                    receipt_root=self.root / f"receipt-binding-{field}",
+                run = self.execute_provider(
+                    provider, f"receipt-binding-{index}-{field}"
                 )
 
+                self.assertEqual(provider.provider_start_count, 1)
                 self.assertEqual(run.receipt["provider_call_counted"], 1)
                 self.assertTrue(run.receipt["provider_outcome_unknown"])
                 self.assertEqual(run.receipt["technical_gate_status"], "unknown")
+                self.assertTrue(run.receipt_path.is_file())
+                self.assertEqual(self.read_run(run), run.receipt)
+
+    def test_observation_drift_becomes_outcome_unknown(self) -> None:
+        for index, changes in enumerate(
+            (
+                {"result_readback_status": "not_applicable"},
+                {"stdout_sha256": "sha256:" + "1" * 64},
+            )
+        ):
+            with self.subTest(changes=changes):
+                provider = self.provider("shared_candidate")
+                analyze = provider.analyze
+
+                def drift_observation(
+                    batch,
+                    *,
+                    _analyze=analyze,
+                    _provider=provider,
+                    _changes=changes,
+                ):
+                    result = _analyze(batch)
+                    _provider.technical_observations[-1] = replace(
+                        _provider.technical_observations[-1], **_changes
+                    )
+                    return result
+
+                provider.analyze = drift_observation  # type: ignore[method-assign]
+                run = self.execute_provider(
+                    provider, f"receipt-observation-drift-{index}"
+                )
+
+                self.assertEqual(provider.provider_start_count, 1)
+                self.assertEqual(run.receipt["provider_call_counted"], 1)
+                self.assertTrue(run.receipt["provider_outcome_unknown"])
+                self.assertEqual(run.receipt["technical_gate_status"], "unknown")
+                self.assertTrue(run.receipt_path.is_file())
+                self.assertEqual(self.read_run(run), run.receipt)
+
+    def test_reader_requires_original_external_authority_and_fingerprint(self) -> None:
+        _provider, run = self.execute("shared_candidate")
+
+        with self.assertRaisesRegex(SyntheticSemanticGateError, "external authority"):
+            read_synthetic_semantic_gate_receipt(run.receipt_path)
+        with self.assertRaises(SyntheticSemanticGateError):
+            read_synthetic_semantic_gate_receipt(
+                run.receipt_path,
+                expected_authority=run.expected_authority,
+                expected_receipt_fingerprint="sha256:" + "0" * 64,
+            )
+        for changes in (
+            {"challenge": "0" * 64},
+            {"technical_envelope_id": "synthetic_gate_" + "0" * 32},
+            {"provider_version": "synthetic-technical-v2"},
+            {"eligible_units": 3},
+            {"ordered_anchor_unit_ids": tuple(reversed(_UNIT_IDS))},
+            {"input_fingerprint": "sha256:" + "0" * 64},
+        ):
+            with self.subTest(changes=changes), self.assertRaises(
+                SyntheticSemanticGateError
+            ):
+                read_synthetic_semantic_gate_receipt(
+                    run.receipt_path,
+                    expected_authority=replace(run.expected_authority, **changes),
+                    expected_receipt_fingerprint=run.expected_receipt_fingerprint,
+                )
+
+    def test_execute_rejects_drifted_preflight_authority_before_provider(self) -> None:
+        batch = self.batch()
+        for index, changes in enumerate(
+            (
+                {"model": "gpt-5.6-sol"},
+                {"deadline_ms": 1},
+                {"eligible_units": 3},
+                {"ordered_anchor_unit_ids": tuple(reversed(_UNIT_IDS))},
+                {"input_fingerprint": "sha256:" + "0" * 64},
+            )
+        ):
+            with self.subTest(changes=changes):
+                provider = self.provider("shared_candidate")
+                expected = build_synthetic_semantic_gate_expected_authority(
+                    batch, provider
+                )
+                receipt_root = self.root / f"receipt-wrong-authority-{index}"
+                with self.assertRaisesRegex(
+                    SyntheticSemanticGateError, "expected authority"
+                ):
+                    execute_synthetic_semantic_gate(
+                        batch,
+                        provider,
+                        expected_authority=replace(expected, **changes),
+                        receipt_root=receipt_root,
+                    )
+                self.assertEqual(provider.provider_start_count, 0)
+                self.assertFalse(receipt_root.exists())
+
+    def test_coherent_rehash_cannot_replace_external_receipt_authority(self) -> None:
+        _provider, run = self.execute("shared_candidate")
+        coherent_attacks = (
+            {"provider_version": "synthetic-technical-v2"},
+            {"model": "gpt-5.6-sol"},
+            {"reasoning_effort": "high"},
+            {
+                "stdout_bytes": 1,
+                "stdout_sha256": "sha256:" + hashlib.sha256(b"x").hexdigest(),
+            },
+            {"result_size_bytes": run.receipt["result_size_bytes"] + 1},
+            {
+                "eligible_units": 3,
+                "covered_units": 3,
+                "raw_record_count": 3,
+            },
+        )
+        for changes in coherent_attacks:
+            with self.subTest(changes=changes):
+                self.assert_rehashed_attack_rejected(run, changes)
+
+    @unittest.skipUnless(hasattr(os, "fork"), "requires fork")
+    def test_cross_process_coherent_rehash_uses_original_external_authority(self) -> None:
+        for index, changes in enumerate(
+            (
+                {"provider_version": "synthetic-technical-v2"},
+                {"result_size_bytes": 1},
+                {
+                    "eligible_units": 3,
+                    "covered_units": 3,
+                    "raw_record_count": 3,
+                },
+            )
+        ):
+            with self.subTest(changes=changes):
+                provider = self.provider("shared_candidate")
+                run = self.execute_provider(provider, f"receipt-cross-{index}")
+                payload = dict(run.receipt)
+                payload.update(changes)
+                payload["receipt_fingerprint"] = _receipt_fingerprint(payload)
+                run.receipt_path.write_text(json.dumps(payload), encoding="utf-8")
+                os.chmod(run.receipt_path, 0o600)
+                pid = os.fork()
+                if pid == 0:
+                    try:
+                        self.read_run(run)
+                    except SyntheticSemanticGateError:
+                        os._exit(0)
+                    os._exit(1)
+                _waited, status = os.waitpid(pid, 0)
+                self.assertTrue(os.WIFEXITED(status), index)
+                self.assertEqual(os.WEXITSTATUS(status), 0, index)
 
     def test_unsafe_receipt_root_fails_before_provider(self) -> None:
         receipt_root = self.root / "unsafe-receipt"
         receipt_root.mkdir(mode=0o700)
         os.chmod(receipt_root, 0o755)
         provider = self.provider("valid")
+        batch = self.batch()
+        expected_authority = build_synthetic_semantic_gate_expected_authority(
+            batch, provider
+        )
 
         with self.assertRaisesRegex(SyntheticSemanticGateError, "root 不安全"):
             execute_synthetic_semantic_gate(
-                self.batch(), provider, receipt_root=receipt_root
+                batch,
+                provider,
+                expected_authority=expected_authority,
+                receipt_root=receipt_root,
             )
         self.assertEqual(provider.provider_start_count, 0)
         self.assertEqual(provider.execution_records, [])
@@ -469,7 +634,7 @@ class SyntheticSemanticGateTest(unittest.TestCase):
                 run.receipt_path.write_text(json.dumps(payload), encoding="utf-8")
                 os.chmod(run.receipt_path, 0o600)
                 with self.assertRaises(SyntheticSemanticGateError):
-                    read_synthetic_semantic_gate_receipt(run.receipt_path)
+                    self.read_run(run)
         duplicate = original.decode().replace(
             '"covered_units": 2',
             '"covered_units": 2, "covered_units": 2',
@@ -478,33 +643,33 @@ class SyntheticSemanticGateTest(unittest.TestCase):
         run.receipt_path.write_text(duplicate, encoding="utf-8")
         os.chmod(run.receipt_path, 0o600)
         with self.assertRaises(SyntheticSemanticGateError):
-            read_synthetic_semantic_gate_receipt(run.receipt_path)
+            self.read_run(run)
         run.receipt_path.unlink()
         with self.assertRaises(SyntheticSemanticGateError):
-            read_synthetic_semantic_gate_receipt(run.receipt_path)
+            self.read_run(run)
 
     def test_receipt_mode_symlink_and_extra_inventory_fail_closed(self) -> None:
         _provider, run = self.execute("shared_candidate")
         os.chmod(run.receipt_path, 0o644)
         with self.assertRaises(SyntheticSemanticGateError):
-            read_synthetic_semantic_gate_receipt(run.receipt_path)
+            self.read_run(run)
         os.chmod(run.receipt_path, 0o600)
         extra = run.receipt_path.parent / "extra.json"
         extra.write_text("{}", encoding="utf-8")
         os.chmod(extra, 0o600)
         with self.assertRaises(SyntheticSemanticGateError):
-            read_synthetic_semantic_gate_receipt(run.receipt_path)
+            self.read_run(run)
         extra.unlink()
         linked_root = self.root / "linked-receipt-root"
         linked_root.symlink_to(run.receipt_path.parent, target_is_directory=True)
         with self.assertRaises(SyntheticSemanticGateError):
-            read_synthetic_semantic_gate_receipt(linked_root / run.receipt_path.name)
+            self.read_run(run, path=linked_root / run.receipt_path.name)
 
     def test_readback_drift_fails_closed_after_receipt_write(self) -> None:
         provider = self.provider("shared_candidate")
 
-        def drifted_reader(path: Path) -> dict[str, object]:
-            payload = read_synthetic_semantic_gate_receipt(path)
+        def drifted_reader(path: Path, **expected) -> dict[str, object]:
+            payload = read_synthetic_semantic_gate_receipt(path, **expected)
             payload["covered_units"] = 0
             return payload
 
@@ -516,11 +681,7 @@ class SyntheticSemanticGateTest(unittest.TestCase):
             ),
             self.assertRaisesRegex(SyntheticSemanticGateError, "读回不一致"),
         ):
-            execute_synthetic_semantic_gate(
-                self.batch(),
-                provider,
-                receipt_root=self.root / "receipt-readback-drift",
-            )
+            self.execute_provider(provider, "receipt-readback-drift")
         self.assertEqual(provider.provider_start_count, 1)
 
     def test_stream_hashes_match_bytes_but_never_store_stream_body(self) -> None:
@@ -534,11 +695,7 @@ class SyntheticSemanticGateTest(unittest.TestCase):
 
         provider = self.provider("valid")
         provider.runner = lambda *_args, **_kwargs: StreamProcess()
-        run = execute_synthetic_semantic_gate(
-            self.batch(),
-            provider,
-            receipt_root=self.root / "receipt-stream-hashes",
-        )
+        run = self.execute_provider(provider, "receipt-stream-hashes")
 
         self.assertEqual(run.receipt["stdout_bytes"], len(_BODY.encode()))
         self.assertEqual(
