@@ -2375,12 +2375,8 @@ class _SemanticGlobalAuthority:
     @staticmethod
     def _validated_inventory_audit(
         path: Path,
-        provider: CodexCliRepresentationAnalysisProvider,
     ) -> dict[str, object]:
-        return _validate_versioned_processing_run_audit(
-            path,
-            expected_provider=provider,
-        )
+        return _validate_versioned_processing_run_audit(path)
 
     @staticmethod
     def _audit_matches_record(
@@ -2389,6 +2385,18 @@ class _SemanticGlobalAuthority:
         expected = _record_payload(record)
         return all(
             field not in audit or audit.get(field) == value
+            for field, value in expected.items()
+        )
+
+    @staticmethod
+    def _audit_matches_record_except_run_id(
+        audit: Mapping[str, object], record: ExternalAgentExecutionRecord
+    ) -> bool:
+        expected = _record_payload(record)
+        return all(
+            field == "processing_run_id"
+            or field not in audit
+            or audit.get(field) == value
             for field, value in expected.items()
         )
 
@@ -2421,6 +2429,83 @@ class _SemanticGlobalAuthority:
             and audit.get("deadline_ms")
             == run_payload.get("execution_deadline_ms")
         )
+
+    @staticmethod
+    def _audit_is_related_to_attempt(
+        audit: Mapping[str, object],
+        run_payload: Mapping[str, object],
+        batch_receipt: Mapping[str, object],
+    ) -> bool:
+        anchors = batch_receipt.get("anchor_unit_ids")
+        return (
+            isinstance(anchors, list)
+            and audit.get("input_fingerprint")
+            == batch_receipt.get("input_fingerprint")
+            and audit.get("anchor_unit_ids") == anchors
+            and audit.get("protocol_version")
+            == run_payload.get("protocol_version")
+        )
+
+    @staticmethod
+    def _record_matches_run_contract(
+        record: ExternalAgentExecutionRecord,
+        run_payload: Mapping[str, object],
+        batch_receipt: Mapping[str, object],
+        raw: bytes,
+    ) -> bool:
+        provider = run_payload.get("provider")
+        anchors = batch_receipt.get("anchor_unit_ids")
+        matches = (
+            isinstance(provider, dict)
+            and isinstance(anchors, list)
+            and record.protocol_version == run_payload.get("protocol_version")
+            and record.input_fingerprint
+            == batch_receipt.get("input_fingerprint")
+            and list(record.anchor_unit_ids) == anchors
+            and record.provider_route == run_payload.get("provider_route")
+            and record.provider_version == provider.get("provider_version")
+            and record.model == provider.get("model")
+            and record.reasoning_effort == provider.get("reasoning_effort")
+            and record.fallback_policy == provider.get("fallback_policy")
+            and record.deadline_ms == run_payload.get("execution_deadline_ms")
+            and record.execution_status == "succeeded"
+            and record.failure_category is None
+            and record.contract_failure_detail is None
+            and record.strict_validation_status == "passed"
+            and record.result_fingerprint == _bytes_fingerprint(raw)
+            and record.eligible_units == len(anchors)
+            and record.covered_units == len(anchors)
+            and record.result_file_present is True
+            and record.result_size_bytes == len(raw)
+            and record.exit_code == 0
+            and record.termination_signal is None
+            and record.timeout_phase is None
+            and record.provider_error_category is None
+            and record.process_cleanup_status == "verified"
+        )
+        if not matches:
+            return False
+        try:
+            _, expected_diagnostics = _versioned_processing_audit_shapes(
+                record.protocol_version,
+                profiled=True,
+            )
+            if record.diagnostic_schema_version != expected_diagnostics:
+                return False
+            _validate_processing_audit_count_projection(
+                _record_payload(record),
+                protocol_version=record.protocol_version,
+                execution_succeeded=True,
+                failure_category=None,
+                contract_detail=None,
+                has_contract_diagnostics=True,
+                has_grouping_diagnostics=(
+                    record.protocol_version == EXTERNAL_AGENT_PROTOCOL_V3_4
+                ),
+            )
+        except SemanticHandoffError:
+            return False
+        return True
 
     @staticmethod
     def _result_record_for_inventory(
@@ -2477,7 +2562,43 @@ class _SemanticGlobalAuthority:
                 "Semantic global authority historical result binding 损坏。"
             )
         record = _record_from_payload(receipt.get("execution_record"))
-        if receipt.get("processing_run_id") != record.processing_run_id:
+        pending_phase = _SemanticRecoveryRun._expected_result_phase_payload(
+            semantic_run_id=str(run_payload["semantic_run_id"]),
+            contract_fingerprint=str(run_payload["contract_fingerprint"]),
+            batch_receipt=batch_receipt,
+            ordinal=ordinal,
+            result_receipt=receipt,
+            phase="post_strict_pending",
+        )
+        if (
+            receipt.get("processing_run_id") != record.processing_run_id
+            or not _SemanticGlobalAuthority._record_matches_run_contract(
+                record,
+                run_payload,
+                batch_receipt,
+                raw,
+            )
+            or not _payloads_exactly_equal(
+                _private_json_exact(
+                    result / "phase-post-strict-pending.json"
+                ),
+                pending_phase,
+            )
+            or "phase-committed.json" in children
+            and not _payloads_exactly_equal(
+                _private_json_exact(result / "phase-committed.json"),
+                _SemanticRecoveryRun._expected_result_phase_payload(
+                    semantic_run_id=str(run_payload["semantic_run_id"]),
+                    contract_fingerprint=str(
+                        run_payload["contract_fingerprint"]
+                    ),
+                    batch_receipt=batch_receipt,
+                    ordinal=ordinal,
+                    result_receipt=receipt,
+                    phase="committed",
+                ),
+            )
+        ):
             raise SemanticHandoffError(
                 "Semantic global authority historical result audit binding 损坏。"
             )
@@ -2566,7 +2687,7 @@ class _SemanticGlobalAuthority:
                 "fallback_policy",
             }
             or provider.get("name") != "external-agent-codex-cli"
-            or not isinstance(provider.get("provider_version"), str)
+            or not _safe_execution_label(provider.get("provider_version"))
             or provider.get("model") != "gpt-5.6-terra"
             or provider.get("reasoning_effort") != "medium"
             or provider.get("fallback_policy") != "none"
@@ -2685,16 +2806,14 @@ class _SemanticGlobalAuthority:
             )
         return batches  # type: ignore[return-value]
 
-    def _legacy_inventory(
-        self, provider: CodexCliRepresentationAnalysisProvider
-    ) -> tuple[int, str]:
+    def _legacy_inventory(self) -> tuple[int, str]:
         if not _validate_shared_recovery_root(self.audit_root, create=False):
             return 0, _fingerprint([])
         audits: dict[str, tuple[Path, dict[str, object]]] = {}
         for path in sorted(
             self.audit_root.glob("run_*/processing-run-audit.json")
         ):
-            audit = self._validated_inventory_audit(path, provider)
+            audit = self._validated_inventory_audit(path)
             run_id = str(audit["processing_run_id"])
             if run_id in audits:
                 raise SemanticHandoffError(
@@ -2840,6 +2959,13 @@ class _SemanticGlobalAuthority:
                             )
                         linked_audits.add(record.processing_run_id)
                         linked_run_id = record.processing_run_id
+                    elif any(
+                        self._audit_matches_record_except_run_id(audit, record)
+                        for _, audit in audits.values()
+                    ):
+                        raise SemanticHandoffError(
+                            "Semantic global authority result/audit identity 漂移。"
+                        )
                 else:
                     candidates = [
                         run_id
@@ -2856,6 +2982,17 @@ class _SemanticGlobalAuthority:
                     if candidates:
                         linked_audits.add(candidates[0])
                         linked_run_id = candidates[0]
+                    elif any(
+                        self._audit_is_related_to_attempt(
+                            audit,
+                            run_payload,
+                            batch_receipt,
+                        )
+                        for _, audit in audits.values()
+                    ):
+                        raise SemanticHandoffError(
+                            "Semantic global authority audit/attempt binding 漂移。"
+                        )
                 if attempt_schema == _GLOBAL_ATTEMPT_SCHEMA:
                     continue
                 entries.append(
@@ -2949,7 +3086,7 @@ class _SemanticGlobalAuthority:
         ):
             raise SemanticHandoffError("Semantic global authority 安装参数无效。")
         window_payload = _authority_window_payload(window)
-        legacy_count, legacy_fingerprint = self._legacy_inventory(provider)
+        legacy_count, legacy_fingerprint = self._legacy_inventory()
         if legacy_count > expected_total:
             raise SemanticHandoffError(
                 "Semantic global authority legacy attempt 超过 baseline。"
@@ -3060,7 +3197,7 @@ class _SemanticGlobalAuthority:
         without_fingerprint.pop("global_authority_fingerprint", None)
         window_payload = _authority_window_payload(window)
         campaign = grant.get("campaign")
-        legacy_count, legacy_fingerprint = self._legacy_inventory(provider)
+        legacy_count, legacy_fingerprint = self._legacy_inventory()
         if (
             set(grant)
             != {

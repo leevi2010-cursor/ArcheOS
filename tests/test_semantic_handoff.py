@@ -2657,6 +2657,7 @@ class SemanticHandoffTest(unittest.TestCase):
         *,
         committed: bool = False,
         protocol_version: str = EXTERNAL_AGENT_PROTOCOL_V3_1,
+        provider_version: str = "0.147.0",
     ) -> None:
         import archeos.semantic_handoff as handoff_module
 
@@ -2674,9 +2675,14 @@ class SemanticHandoffTest(unittest.TestCase):
             contract_fingerprint = recovery.historical_v33_contract_fingerprint
         else:
             raise AssertionError("unsupported historical result fixture")
+        disk_run_receipt = json.loads(
+            (legacy_run / "run-receipt.json").read_text(encoding="utf-8")
+        )
+        semantic_run_id = disk_run_receipt["semantic_run_id"]
+        contract_fingerprint = disk_run_receipt["contract_fingerprint"]
         contract = contracts[ordinal - 1]
         batch = contract["batch"]
-        batch_receipt = contract["receipt"]
+        batch_receipt = disk_run_receipt["batches"][ordinal - 1]
         attempt = json.loads(
             (
                 legacy_run / "attempts" / f"batch_{ordinal:04d}.json"
@@ -2747,7 +2753,7 @@ class SemanticHandoffTest(unittest.TestCase):
             input_fingerprint=batch_receipt["input_fingerprint"],
             anchor_unit_ids=tuple(anchor_ids),
             provider_route="codex-cli",
-            provider_version="0.147.0",
+            provider_version=provider_version,
             model="gpt-5.6-terra",
             reasoning_effort="medium",
             fallback_policy="none",
@@ -2852,6 +2858,93 @@ class SemanticHandoffTest(unittest.TestCase):
             (result / name).write_text(json.dumps(payload), encoding="utf-8")
         for path in result.iterdir():
             os.chmod(path, 0o600)
+
+    def build_linked_v31_inventory_fixture(
+        self,
+        root: Path,
+        *,
+        provider_version: str = "0.146.0",
+    ):
+        import archeos.semantic_handoff as handoff_module
+
+        representation, service = self.build_service(
+            root=root / "source",
+            blocks=1,
+        )
+        audit_root = root / "audits"
+        audit_root.mkdir(parents=True, mode=0o700)
+        os.chmod(audit_root, 0o700)
+        current_provider = CodexCliRepresentationAnalysisProvider(
+            provider_version="0.147.0",
+            timeout_seconds=300,
+            runner=FakeRunner(),
+        )
+        recovery = handoff_module._SemanticRecoveryRun(
+            service,
+            audit_root,
+            representation.representation_id,
+            current_provider,
+            self.privacy_binding(),
+        )
+        receipt = json.loads(
+            json.dumps(recovery.expected_historical_v31_run_receipt)
+        )
+        receipt["provider"]["provider_version"] = provider_version
+        legacy_run = self.write_v31_attempt_fixture(recovery, receipt)
+        self.write_v31_result_fixture(
+            recovery,
+            legacy_run,
+            1,
+            committed=True,
+            provider_version=provider_version,
+        )
+        result_receipt = json.loads(
+            (
+                legacy_run
+                / "results"
+                / "batch_0001"
+                / "result-receipt.json"
+            ).read_text(encoding="utf-8")
+        )
+        record = handoff_module._record_from_payload(
+            result_receipt["execution_record"]
+        )
+        handoff = ExternalAgentSemanticHandoffService(
+            service,
+            JsonlAtomicInformationStore(root / "atomic.jsonl"),
+            audit_root,
+        )
+        record_payload = handoff_module._record_payload(record)
+        for field in _GROUPING_DIAGNOSTIC_FIELDS:
+            record_payload.pop(field)
+        audit_payload = {
+            "schema_version": "processing-run-audit/1.0",
+            "artifact_kind": "processing_run_audit",
+            **record_payload,
+            "unaccounted_units": 0,
+            "result_readback_status": "verified",
+            "package_published": True,
+            "package_fingerprint": "sha256:" + "9" * 64,
+            "information_ingested": False,
+            "durable_ingestion_status": "pending",
+            "handoff_status": "pending",
+            "audit_readback_status": "verified",
+        }
+        audit_directory = audit_root / record.processing_run_id
+        audit_directory.mkdir(mode=0o700)
+        audit_path = audit_directory / "processing-run-audit.json"
+        audit_path.write_text(json.dumps(audit_payload), encoding="utf-8")
+        os.chmod(audit_path, 0o600)
+        handoff_module._validate_versioned_processing_run_audit(audit_path)
+        return (
+            representation,
+            service,
+            handoff,
+            current_provider,
+            recovery,
+            legacy_run,
+            audit_path,
+        )
 
     def test_v31_attempt_is_counted_preserved_and_isolated_from_v34_run(
         self,
@@ -5082,6 +5175,246 @@ class SemanticHandoffTest(unittest.TestCase):
         self.assertEqual(next_runner.calls, [])
         self.assertEqual(self.tree_snapshot(audit_root), before_reject)
 
+    def test_global_authority_accepts_mixed_historical_provider_provenance(
+        self,
+    ) -> None:
+        root = self.root / "mixed-historical-provider"
+        (
+            representation,
+            service,
+            handoff,
+            current_provider,
+            _recovery,
+            _legacy_run,
+            _linked_audit,
+        ) = self.build_linked_v31_inventory_fixture(root)
+        historical = CodexCliRepresentationAnalysisProvider(
+            provider_version="0.145.0",
+            timeout_seconds=300,
+            runner=FakeRunner("nonzero"),
+        )
+        batch = _analysis_batches(
+            _units_from_representation(
+                representation,
+                service.representation_repository,
+            ),
+            service.batch_size,
+        )[0]
+        with self.assertRaises(RepresentationInformationError):
+            historical.analyze(batch)
+        handoff._persist_audits(
+            historical.execution_records,
+            package_published=False,
+            information_ingested=False,
+            durable_ingestion_status="ingestion_not_completed",
+            package_fingerprint=None,
+            handoff_status="failed",
+        )
+
+        grant = self.install_historical_inventory_authority(
+            handoff,
+            current_provider,
+        )
+        self.assertEqual(grant["legacy_attempt_inventory_count"], 2)
+        self.assertEqual(grant["external_prior_count"], 78)
+        self.assertEqual(
+            grant["contract"]["provider"]["provider_version"],
+            "0.147.0",
+        )
+        replay = self.install_historical_inventory_authority(
+            handoff,
+            current_provider,
+        )
+        self.assertEqual(
+            replay["legacy_attempt_inventory_fingerprint"],
+            grant["legacy_attempt_inventory_fingerprint"],
+        )
+
+        before = self.tree_snapshot(root)
+        with self.assertRaises(SemanticHandoffError):
+            self.install_historical_inventory_authority(
+                handoff,
+                CodexCliRepresentationAnalysisProvider(
+                    provider_version="0.148.0",
+                    timeout_seconds=300,
+                    runner=FakeRunner(),
+                ),
+            )
+        self.assertEqual(self.tree_snapshot(root), before)
+
+    def test_global_authority_exactly_deduplicates_linked_failed_audit(
+        self,
+    ) -> None:
+        import archeos.semantic_handoff as handoff_module
+
+        root = self.root / "linked-failed-historical"
+        representation, service = self.build_service(
+            root=root / "source",
+            blocks=1,
+        )
+        audit_root = root / "audits"
+        audit_root.mkdir(parents=True, mode=0o700)
+        os.chmod(audit_root, 0o700)
+        current_provider = CodexCliRepresentationAnalysisProvider(
+            provider_version="0.147.0",
+            timeout_seconds=300,
+            runner=FakeRunner(),
+        )
+        recovery = handoff_module._SemanticRecoveryRun(
+            service,
+            audit_root,
+            representation.representation_id,
+            current_provider,
+            self.privacy_binding(),
+        )
+        receipt = json.loads(
+            json.dumps(recovery.expected_historical_v31_run_receipt)
+        )
+        receipt["provider"]["provider_version"] = "0.146.0"
+        self.write_v31_attempt_fixture(recovery, receipt)
+        batch = recovery.historical_v31_batch_contracts[0]["batch"]
+        historical = CodexCliRepresentationAnalysisProvider(
+            provider_version="0.146.0",
+            timeout_seconds=300,
+            runner=FakeRunner("nonzero"),
+        )
+        with self.assertRaises(RepresentationInformationError):
+            historical.analyze(batch)
+        handoff = ExternalAgentSemanticHandoffService(
+            service,
+            JsonlAtomicInformationStore(root / "atomic.jsonl"),
+            audit_root,
+        )
+        audit_path = handoff._persist_audits(
+            historical.execution_records,
+            package_published=False,
+            information_ingested=False,
+            durable_ingestion_status="ingestion_not_completed",
+            package_fingerprint=None,
+            handoff_status="failed",
+        )[0]
+        audit = json.loads(audit_path.read_text(encoding="utf-8"))
+        audit["protocol_version"] = EXTERNAL_AGENT_PROTOCOL_V3_1
+        audit["input_fingerprint"] = receipt["batches"][0][
+            "input_fingerprint"
+        ]
+        audit["diagnostic_schema_version"] = (
+            "external-agent-diagnostics/2.0"
+        )
+        for field in _GROUPING_DIAGNOSTIC_FIELDS:
+            audit.pop(field)
+        audit_path.write_text(json.dumps(audit), encoding="utf-8")
+
+        grant = self.install_historical_inventory_authority(
+            handoff,
+            current_provider,
+        )
+        self.assertEqual(grant["legacy_attempt_inventory_count"], 1)
+        self.assertEqual(grant["external_prior_count"], 79)
+
+    def test_global_authority_rejects_linked_historical_provenance_drift(
+        self,
+    ) -> None:
+        import archeos.semantic_handoff as handoff_module
+
+        for attack in (
+            "audit-provider",
+            "audit-profile",
+            "audit-protocol",
+            "audit-deadline",
+            "audit-input",
+            "result-provider",
+            "result-cleanup",
+            "result-phase",
+        ):
+            with self.subTest(attack=attack):
+                root = self.root / f"linked-historical-{attack}"
+                (
+                    _representation,
+                    _service,
+                    handoff,
+                    current_provider,
+                    recovery,
+                    legacy_run,
+                    audit_path,
+                ) = self.build_linked_v31_inventory_fixture(root)
+                if attack.startswith("audit-"):
+                    audit = json.loads(audit_path.read_text(encoding="utf-8"))
+                    field, value = {
+                        "audit-provider": ("provider_version", "0.145.0"),
+                        "audit-profile": ("model", "gpt-5.6-sol"),
+                        "audit-protocol": (
+                            "protocol_version",
+                            EXTERNAL_AGENT_PROTOCOL_V3_2,
+                        ),
+                        "audit-deadline": ("deadline_ms", 299000),
+                        "audit-input": (
+                            "input_fingerprint",
+                            "sha256:" + "0" * 64,
+                        ),
+                    }[attack]
+                    audit[field] = value
+                    audit_path.write_text(json.dumps(audit), encoding="utf-8")
+                elif attack in {"result-provider", "result-cleanup"}:
+                    result = legacy_run / "results" / "batch_0001"
+                    receipt_path = result / "result-receipt.json"
+                    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+                    record = receipt["execution_record"]
+                    if attack == "result-provider":
+                        record["provider_version"] = "0.145.0"
+                    else:
+                        record["process_cleanup_status"] = "failed"
+                    receipt.pop("result_receipt_fingerprint")
+                    receipt["result_receipt_fingerprint"] = (
+                        handoff_module._fingerprint(receipt)
+                    )
+                    receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
+                    run_receipt = json.loads(
+                        (legacy_run / "run-receipt.json").read_text(
+                            encoding="utf-8"
+                        )
+                    )
+                    batch_receipt = run_receipt["batches"][0]
+                    for phase in ("post_strict_pending", "committed"):
+                        phase_path = result / (
+                            "phase-post-strict-pending.json"
+                            if phase == "post_strict_pending"
+                            else "phase-committed.json"
+                        )
+                        phase_path.write_text(
+                            json.dumps(
+                                recovery._expected_result_phase_payload(
+                                    semantic_run_id=legacy_run.name,
+                                    contract_fingerprint=run_receipt[
+                                        "contract_fingerprint"
+                                    ],
+                                    batch_receipt=batch_receipt,
+                                    ordinal=1,
+                                    result_receipt=receipt,
+                                    phase=phase,
+                                )
+                            ),
+                            encoding="utf-8",
+                        )
+                else:
+                    phase_path = (
+                        legacy_run
+                        / "results"
+                        / "batch_0001"
+                        / "phase-committed.json"
+                    )
+                    phase = json.loads(phase_path.read_text(encoding="utf-8"))
+                    phase["result_sha256"] = "sha256:" + "0" * 64
+                    phase_path.write_text(json.dumps(phase), encoding="utf-8")
+
+                before = self.tree_snapshot(root)
+                with self.assertRaises(SemanticHandoffError):
+                    self.install_historical_inventory_authority(
+                        handoff,
+                        current_provider,
+                    )
+                self.assertEqual(self.tree_snapshot(root), before)
+
     def test_global_authority_inventory_accepts_producer_success_and_failure(
         self,
     ) -> None:
@@ -6043,9 +6376,8 @@ class SemanticHandoffTest(unittest.TestCase):
         self,
     ) -> None:
         attacks = {
-            "provider_version": ("provider_version", "0.146.0"),
-            "model": ("model", "gpt-5.6-sol"),
-            "reasoning": ("reasoning_effort", "high"),
+            "unsafe_provider_version": ("provider_version", "unsafe/version"),
+            "unknown_protocol": ("protocol_version", "unknown-protocol/9.9"),
             "diagnostics": (
                 "diagnostic_schema_version",
                 "external-agent-diagnostics/2.0",
