@@ -3,19 +3,26 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import signal
 import subprocess
 import sys
 import tempfile
 import unittest
+from contextlib import contextmanager
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from archeos.atomic_information import (
     JsonlAtomicInformationStore,
     ingest_processing_package,
 )
-from archeos.digestion import InterpretationResult, WorldModelOperation
+from archeos.digestion import (
+    CodexAtomicInformationInterpretationProvider,
+    InterpretationResult,
+    WorldModelOperation,
+)
 from archeos.representation import LocalRepresentationRepository
 from archeos.representation_information import (
     EXTERNAL_AGENT_PROTOCOL_V1,
@@ -546,6 +553,75 @@ class NoStructuralChangeProvider:
         )
 
 
+class SerialSessionProvider:
+    name = "synthetic-serial-session"
+
+    def __init__(self) -> None:
+        self.session_entries = 0
+        self.session_exits = 0
+        self.calls = 0
+        self.observed_roles: list[tuple[str, ...]] = []
+        self.invalidations: list[str] = []
+
+    @contextmanager
+    def session(self):
+        self.session_entries += 1
+        try:
+            yield self
+        finally:
+            self.session_exits += 1
+
+    def metrics_cursor(self):
+        return self.calls
+
+    def metrics_since(self, cursor):
+        calls = self.calls - cursor
+        return {
+            "app_server_start_count": int(cursor == 0 and calls > 0),
+            "thread_count": calls,
+            "turn_count": calls,
+            "startup_wall_ms": 1 if cursor == 0 and calls > 0 else 0,
+            "turn_wall_ms_sum": calls,
+            "turn_wall_ms_max": int(calls > 0),
+            "governance_wall_ms": 0,
+            "timeout_count": 0,
+            "failure_count": len(self.invalidations),
+            "failure_categories": {
+                category: self.invalidations.count(category)
+                for category in set(self.invalidations)
+            },
+        }
+
+    def invalidate(self, category):
+        self.invalidations.append(category)
+
+    def interpret(self, atomic_information, current_world_state):
+        del atomic_information
+        self.calls += 1
+        roles = tuple(
+            role
+            for resolved in current_world_state.resolved_objects
+            for role in resolved.roles
+        )
+        self.observed_roles.append(roles)
+        if self.calls == 1:
+            target = current_world_state.resolved_objects[0].object_id
+            operations = (
+                WorldModelOperation(
+                    kind="add_role", target_object_id=target, role="project"
+                ),
+            )
+        else:
+            operations = (WorldModelOperation(kind="no_structural_change"),)
+        return InterpretationResult(
+            operations=operations,
+            rationale="Synthetic serial governance.",
+            evidence_sufficient=True,
+            conflict=False,
+            ambiguous=False,
+        )
+
+
 class FailGovernanceOnceService(WechatDigestService):
     fail_governance = True
 
@@ -564,6 +640,17 @@ class FailAfterGovernanceOnceService(WechatDigestService):
             self.fail_after_governance = False
             raise RuntimeError("synthetic post-governance failure")
         return super()._update_item(run_id, status, item_id, **changes)
+
+
+class FailAfterProviderOnceService(WechatDigestService):
+    fail_after_provider = True
+
+    def _govern(self, atomic_ids):
+        result = super()._govern(atomic_ids)
+        if self.fail_after_provider:
+            self.fail_after_provider = False
+            raise RuntimeError("synthetic crash before governance receipt completion")
+        return result
 
 
 class FailSecondGovernanceOnceService(WechatDigestService):
@@ -636,6 +723,363 @@ class WechatDigestTests(unittest.TestCase):
         self.assertEqual(second.new_messages, 0)
         self.assertEqual(second.durable_information, 0)
         self.assertEqual(self.source_count(), 1)
+
+    def test_governance_session_is_serial_and_rebuilds_world_state_per_atomic(
+        self,
+    ) -> None:
+        self.create_object()
+        provider = SerialSessionProvider()
+        capture = SyntheticCaptureProvider([message(1), message(2)])
+        service = WechatDigestService(
+            workspace=self.workspace,
+            capture_provider=capture,
+            semantic_handoff_factory=lambda: self.semantic,
+            interpretation_provider=provider,
+        )
+
+        result = service.run(since="2023-01-01")
+
+        self.assertEqual(provider.session_entries, 1)
+        self.assertEqual(provider.session_exits, 1)
+        self.assertEqual(provider.calls, 2)
+        self.assertEqual(provider.observed_roles, [(), ("project",)])
+        self.assertEqual(result.governance_app_server_starts, 1)
+        self.assertEqual(result.governance_threads, 2)
+        self.assertEqual(result.governance_turns, 2)
+        self.assertEqual(result.governance_failures, 0)
+        metrics = next(
+            item["governance_metrics"]
+            for run_path in service.run_store.runs_root.iterdir()
+            for item in service.run_store.status(run_path.name)["items"].values()
+            if isinstance(item, dict) and "governance_metrics" in item
+        )
+        self.assertEqual(metrics["app_server_start_count"], 1)
+        self.assertEqual(metrics["thread_count"], 2)
+        self.assertEqual(metrics["turn_count"], 2)
+        self.assertEqual(
+            set(metrics),
+            {
+                "app_server_start_count",
+                "thread_count",
+                "turn_count",
+                "startup_wall_ms",
+                "turn_wall_ms_sum",
+                "turn_wall_ms_max",
+                "governance_wall_ms",
+                "timeout_count",
+                "failure_count",
+                "failure_categories",
+            },
+        )
+        self.assertNotIn("atomic_info_", json.dumps(metrics))
+        self.assertNotIn(str(self.workspace), json.dumps(metrics))
+
+    def test_zero_governance_path_does_not_start_lazy_app_server(self) -> None:
+        capture = SyntheticCaptureProvider([])
+
+        def forbidden_loader():
+            raise AssertionError("zero-governance path must not load the SDK")
+
+        provider = CodexAtomicInformationInterpretationProvider(
+            sdk_loader=forbidden_loader
+        )
+        service = WechatDigestService(
+            workspace=self.workspace,
+            capture_provider=capture,
+            semantic_handoff_factory=lambda: self.semantic,
+            interpretation_provider=provider,
+        )
+
+        result = service.run(from_now=True)
+
+        self.assertEqual(result.governance_app_server_starts, 0)
+        self.assertEqual(result.governance_threads, 0)
+        self.assertEqual(result.governance_turns, 0)
+
+    def test_schema_failure_destroys_session_and_stops_later_atomic(self) -> None:
+        self.create_object()
+
+        class Turn:
+            def run(self):
+                return SimpleNamespace(final_response="not-json")
+
+            def interrupt(self):
+                raise AssertionError("schema failure must not interrupt")
+
+        class Thread:
+            def turn(self, *_args, **_kwargs):
+                return Turn()
+
+        class Codex:
+            instance = None
+
+            def __init__(self):
+                self.closed = False
+                self.thread_starts = 0
+                self.__class__.instance = self
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                self.closed = True
+
+            def thread_start(self, **_kwargs):
+                self.thread_starts += 1
+                return Thread()
+
+        provider = CodexAtomicInformationInterpretationProvider(
+            sdk_loader=lambda: (Codex, "deny-all", "read-only")
+        )
+        service = WechatDigestService(
+            workspace=self.workspace,
+            capture_provider=SyntheticCaptureProvider([message(1), message(2)]),
+            semantic_handoff_factory=lambda: self.semantic,
+            interpretation_provider=provider,
+        )
+
+        with self.assertRaises(WechatDigestError):
+            service.run(since="2023-01-01")
+
+        assert Codex.instance is not None
+        self.assertTrue(Codex.instance.closed)
+        self.assertEqual(Codex.instance.thread_starts, 1)
+        metrics = provider.metrics_since(0)
+        self.assertEqual(metrics["turn_count"], 1)
+        self.assertEqual(metrics["failure_categories"], {"schema": 1})
+        active_run_id = service.run_store.active_run_id()
+        assert active_run_id is not None
+        status = service.run_store.status(active_run_id)
+        self.assertEqual(status["state"], "failed")
+        item_metrics = next(
+            item["governance_metrics"]
+            for item in status["items"].values()
+            if isinstance(item, dict) and "governance_metrics" in item
+        )
+        self.assertEqual(item_metrics["failure_categories"], {"schema": 1})
+
+    def test_completed_governance_receipt_recovery_makes_zero_provider_calls(
+        self,
+    ) -> None:
+        self.create_object()
+        provider = SerialSessionProvider()
+        capture = SyntheticCaptureProvider([message(1)])
+        service = FailAfterGovernanceOnceService(
+            workspace=self.workspace,
+            capture_provider=capture,
+            semantic_handoff_factory=lambda: self.semantic,
+            interpretation_provider=provider,
+        )
+
+        with self.assertRaises(WechatDigestError):
+            service.run(all_history=True)
+        self.assertEqual(provider.calls, 1)
+        run_id = service.run_store.active_run_id()
+        assert run_id is not None
+        receipt = next(
+            item["governance_receipt"]
+            for item in service.run_store.status(run_id)["items"].values()
+            if isinstance(item, dict) and "governance_receipt" in item
+        )
+        self.assertEqual(receipt["phase"], "completed")
+
+        result = service.run()
+
+        self.assertTrue(result.replayed)
+        self.assertTrue(result.checkpoint_published)
+        self.assertEqual(provider.calls, 1)
+
+    def test_unknown_governance_receipt_recovery_fails_closed_zero_calls(
+        self,
+    ) -> None:
+        self.create_object()
+        provider = SerialSessionProvider()
+        capture = SyntheticCaptureProvider([message(1)])
+        service = FailAfterProviderOnceService(
+            workspace=self.workspace,
+            capture_provider=capture,
+            semantic_handoff_factory=lambda: self.semantic,
+            interpretation_provider=provider,
+        )
+
+        with self.assertRaises(WechatDigestError):
+            service.run(all_history=True)
+        self.assertEqual(provider.calls, 1)
+        run_id = service.run_store.active_run_id()
+        assert run_id is not None
+        receipt = next(
+            item["governance_receipt"]
+            for item in service.run_store.status(run_id)["items"].values()
+            if isinstance(item, dict) and "governance_receipt" in item
+        )
+        self.assertEqual(receipt["phase"], "started")
+
+        with self.assertRaisesRegex(WechatDigestError, "completion 未知"):
+            service.run()
+
+        self.assertEqual(provider.calls, 1)
+        self.assertIsNone(service.run_store.checkpoint())
+        self.assertEqual(service.run_store.active_run_id(), run_id)
+
+    def test_session_cleanup_failure_prevents_checkpoint_and_next_run(self) -> None:
+        self.create_object()
+
+        class CleanupFailureProvider(SerialSessionProvider):
+            @contextmanager
+            def session(self):
+                self.session_entries += 1
+                try:
+                    yield self
+                finally:
+                    self.session_exits += 1
+                    raise RuntimeError("synthetic session cleanup failure")
+
+        provider = CleanupFailureProvider()
+        service = WechatDigestService(
+            workspace=self.workspace,
+            capture_provider=SyntheticCaptureProvider([message(1)]),
+            semantic_handoff_factory=lambda: self.semantic,
+            interpretation_provider=provider,
+        )
+
+        with self.assertRaises(WechatDigestError):
+            service.run(all_history=True)
+
+        run_id = service.run_store.active_run_id()
+        assert run_id is not None
+        status = service.run_store.status(run_id)
+        self.assertEqual(status["failure_category"], "governance_session_cleanup")
+        self.assertFalse(status["checkpoint_published"])
+        self.assertIsNone(service.run_store.checkpoint())
+        self.assertEqual(provider.calls, 1)
+        self.assertEqual(provider.session_entries, 1)
+        self.assertEqual(provider.session_exits, 1)
+
+        with self.assertRaisesRegex(WechatDigestError, "cleanup 失败"):
+            service.run()
+
+        self.assertEqual(provider.calls, 1)
+        self.assertEqual(provider.session_entries, 1)
+        self.assertEqual(service.run_store.active_run_id(), run_id)
+
+        semantic_calls = self.semantic.provider.calls
+        with self.assertRaisesRegex(WechatDigestError, "cleanup 失败"):
+            service.prepare_next_semantic()
+
+        self.assertEqual(provider.calls, 1)
+        self.assertEqual(provider.session_entries, 1)
+        self.assertEqual(self.semantic.provider.calls, semantic_calls)
+
+    def test_sigterm_during_sdk_exit_force_kills_and_blocks_recovery(self) -> None:
+        self.create_object()
+        operation = {
+            "kind": "no_structural_change",
+            "target_object_id": None,
+            "secondary_object_id": None,
+            "name": None,
+            "role": None,
+            "relation": None,
+            "relationship_id": None,
+            "lifecycle_state": None,
+            "start_at": None,
+            "actual_end_at": None,
+            "target_end_at": None,
+            "completion_condition": None,
+        }
+        response = json.dumps(
+            {
+                "operations": [operation],
+                "rationale": "Synthetic cleanup termination.",
+                "evidence_sufficient": True,
+                "conflict": False,
+                "ambiguous": False,
+                "claim": None,
+            }
+        )
+        handlers = {
+            signal.SIGTERM: signal.SIG_DFL,
+            signal.SIGALRM: signal.SIG_DFL,
+        }
+
+        def getsignal(signum):
+            return handlers[signum]
+
+        def install_signal(signum, handler):
+            previous = handlers[signum]
+            handlers[signum] = handler
+            return previous
+
+        class Process:
+            def __init__(self):
+                self.killed = False
+
+            def kill(self):
+                self.killed = True
+
+        class Turn:
+            def run(self):
+                return SimpleNamespace(final_response=response)
+
+            def interrupt(self):
+                raise AssertionError("successful turn must not interrupt")
+
+        class Thread:
+            def turn(self, *_args, **_kwargs):
+                return Turn()
+
+        class Codex:
+            instance = None
+
+            def __init__(self):
+                self._client = SimpleNamespace(_proc=Process())
+                self.__class__.instance = self
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                handler = handlers[signal.SIGTERM]
+                assert callable(handler)
+                handler(signal.SIGTERM, None)
+
+            def thread_start(self, **_kwargs):
+                return Thread()
+
+        provider = CodexAtomicInformationInterpretationProvider(
+            sdk_loader=lambda: (Codex, "deny-all", "read-only")
+        )
+        service = WechatDigestService(
+            workspace=self.workspace,
+            capture_provider=SyntheticCaptureProvider([message(1)]),
+            semantic_handoff_factory=lambda: self.semantic,
+            interpretation_provider=provider,
+        )
+
+        with (
+            patch(
+                "archeos.digestion.providers.signal.getsignal",
+                side_effect=getsignal,
+            ),
+            patch(
+                "archeos.digestion.providers.signal.signal",
+                side_effect=install_signal,
+            ),
+            self.assertRaises(SystemExit),
+        ):
+            service.run(all_history=True)
+
+        assert Codex.instance is not None
+        self.assertTrue(Codex.instance._client._proc.killed)
+        self.assertIs(handlers[signal.SIGTERM], signal.SIG_DFL)
+        self.assertEqual(
+            provider.metrics_since(0)["failure_categories"], {"cleanup": 1}
+        )
+        run_id = service.run_store.active_run_id()
+        assert run_id is not None
+        status = service.run_store.status(run_id)
+        self.assertEqual(status["failure_category"], "governance_session_cleanup")
+        self.assertFalse(status["checkpoint_published"])
+        self.assertIsNone(service.run_store.checkpoint())
 
     def test_from_now_bootstrap_does_not_read_existing_message_bodies(self) -> None:
         capture = SyntheticCaptureProvider([message(1)])
