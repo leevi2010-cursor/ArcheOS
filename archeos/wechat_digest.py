@@ -256,6 +256,8 @@ class SemanticHandoffPort(Protocol):
         self,
     ) -> SemanticCampaignAuthorityBinding | None: ...
 
+    def global_attempt_summary(self, representation_id: str) -> dict[str, int]: ...
+
 
 def _canonical_json(value: object) -> str:
     return json.dumps(
@@ -1107,6 +1109,9 @@ class ExistingSemanticHandoff:
     ) -> SemanticCampaignAuthorityBinding | None:
         return self.service.global_campaign_binding()
 
+    def global_attempt_summary(self, representation_id: str) -> dict[str, int]:
+        return self.service.global_attempt_summary(representation_id)
+
 
 @dataclass(frozen=True)
 class WechatDigestResult:
@@ -1131,6 +1136,8 @@ class WechatDigestResult:
     governance_timeouts: int = 0
     governance_failures: int = 0
     failed_closed: int = 0
+    semantic_preserved_but_unabsorbed: int = 0
+    governance_preserved_but_incomplete: int = 0
 
 
 def _empty_governance_metrics() -> dict[str, object]:
@@ -1245,6 +1252,36 @@ def _validated_governance_receipt(value: object) -> dict[str, object]:
         ):
             raise WechatDigestError("微信 Governance receipt 损坏。")
     return dict(value)
+
+
+def _validated_global_attempt_summary(value: object) -> dict[str, int]:
+    expected = {
+        "global_attempt_total",
+        "global_unknown",
+        "next_global_ordinal",
+        "absolute_cap",
+    }
+    if not isinstance(value, dict) or set(value) != expected:
+        raise WechatDigestError("Semantic global attempt summary 损坏。")
+    if any(
+        isinstance(value[field], bool)
+        or not isinstance(value[field], int)
+        or value[field] < 0
+        for field in expected
+    ):
+        raise WechatDigestError("Semantic global attempt summary 损坏。")
+    summary = {field: int(value[field]) for field in expected}
+    if (
+        summary["global_attempt_total"] < 1
+        or summary["global_unknown"] != 0
+        or summary["next_global_ordinal"]
+        != summary["global_attempt_total"] + 1
+        or summary["global_attempt_total"] >= summary["absolute_cap"]
+    ):
+        raise WechatDigestError(
+            "Semantic global attempt ledger 尚未满足治理超时封存条件。"
+        )
+    return summary
 
 
 def _capture_fingerprint(capture: WechatCapture) -> str:
@@ -2106,6 +2143,189 @@ class WechatDigestService:
             )
             return resolution
 
+    def seal_governance_timeout(self) -> dict[str, object]:
+        """Seal one timed-out Governance item without any Provider retry."""
+
+        with self.run_store.lock():
+            run_id = self.run_store.active_run_id()
+            if run_id is None:
+                raise WechatDigestError(
+                    "不存在可封存 Governance timeout 的 active run。"
+                )
+            plan = self.run_store.plan(run_id)
+            if self._plan_all_history_upper(plan) is None:
+                raise WechatDigestError(
+                    "Governance timeout 封存只能绑定 frozen campaign。"
+                )
+            after = WechatCursor.from_dict(
+                plan.get("after_cursor"), "plan.after_cursor"
+            )
+            upper = WechatCursor.from_dict(
+                plan.get("upper_bound"), "plan.upper_bound"
+            )
+            checkpoint = self.run_store.checkpoint()
+            if checkpoint is not None and checkpoint != after:
+                raise WechatDigestError(
+                    "Governance timeout 封存的 checkpoint binding 不一致。"
+                )
+            capture = self.capture_provider.capture(after, upper_bound=upper)
+            self._verify_capture_against_plan(capture, plan)
+            status = self.run_store.status(run_id)
+            self._verify_plan_and_status(run_id, capture, plan, status)
+            if status.get("checkpoint_published") is not False:
+                raise WechatDigestError(
+                    "Governance timeout 封存不得发生在 checkpoint 推进后。"
+                )
+            items = status.get("items")
+            if not isinstance(items, dict):
+                raise WechatDigestError("微信运行状态 items 损坏。")
+            candidates: list[tuple[str, dict[str, object]]] = []
+            for item_id, value in items.items():
+                if not isinstance(item_id, str) or not isinstance(value, dict):
+                    raise WechatDigestError("微信运行状态 items 损坏。")
+                receipt_value = value.get("governance_receipt")
+                if receipt_value is not None and (
+                    _validated_governance_receipt(receipt_value).get("phase")
+                    == "started"
+                ):
+                    candidates.append((item_id, value))
+                elif value.get("state") not in TERMINAL_ITEM_STATES | {"planned"}:
+                    raise WechatDigestError(
+                        "Governance timeout 封存存在另一个未收敛 item。"
+                    )
+            if len(candidates) != 1:
+                raise WechatDigestError(
+                    "Governance timeout 封存必须唯一绑定一个 started item。"
+                )
+            item_id, item = candidates[0]
+            already_sealed = item.get("state") == "failed_closed"
+            if already_sealed:
+                if (
+                    status.get("state") != "processing"
+                    or status.get("failure_category") is not None
+                ):
+                    raise WechatDigestError(
+                        "Governance timeout 封存状态未安全收敛。"
+                    )
+                self._verify_governance_failed_closed_item(item)
+            elif (
+                item.get("state") != "represented"
+                or status.get("state") != "failed"
+                or status.get("failure_category")
+                != "CodexInterpretationTimeout"
+            ):
+                raise WechatDigestError(
+                    "当前运行不是可封存的 Governance turn timeout。"
+                )
+            if (
+                item.get("semantic_failure") is not None
+                or item.get("privacy_route") not in {None, "approved"}
+                or item.get("privacy_categories") not in (None, [])
+                or item.get("pending_human") is not False
+                or item.get("context_object_ids") != []
+            ):
+                raise WechatDigestError(
+                    "Governance timeout item preservation binding 损坏。"
+                )
+            representation_id = item.get("representation_id")
+            if not isinstance(representation_id, str):
+                raise WechatDigestError(
+                    "Governance timeout Representation binding 损坏。"
+                )
+            representation = self.representation_repository.get(
+                representation_id
+            )
+            privacy = self.privacy_gate.evaluate(
+                self._representation_texts(representation_id),
+                semantic_completeness_known=(
+                    representation.status == "complete"
+                    and representation.completeness == 1.0
+                    and not representation.warnings
+                ),
+            )
+            if privacy.route != "approved" or privacy.categories:
+                raise WechatDigestError(
+                    "Governance timeout privacy binding 不允许封存。"
+                )
+            atomic_ids = self._verify_semantic_receipts(
+                representation_id,
+                item,
+                recover_missing_item_receipt=True,
+            )
+            if not atomic_ids:
+                raise WechatDigestError(
+                    "Governance timeout item 缺少完整 Atomic Information。"
+                )
+            receipt = _validated_governance_receipt(
+                item.get("governance_receipt")
+            )
+            metrics = _validated_governance_metrics(
+                item.get("governance_metrics")
+            )
+            if (
+                receipt.get("phase") != "started"
+                or receipt.get("atomic_information_fingerprint")
+                != _governance_atomic_fingerprint(atomic_ids)
+                or int(metrics["timeout_count"]) < 1
+                or int(dict(metrics["failure_categories"]).get("timeout", 0))
+                < 1
+            ):
+                raise WechatDigestError(
+                    "Governance timeout evidence 不完整。"
+                )
+            try:
+                global_summary = _validated_global_attempt_summary(
+                    self._semantic_port().global_attempt_summary(
+                        representation_id
+                    )
+                )
+            except SemanticHandoffError as exc:
+                raise WechatDigestError(
+                    "Semantic global attempt ledger 未能安全读回。"
+                ) from exc
+            governance_failure = {
+                "failure_category": "turn_timeout",
+                "preserved_but_partially_governed": True,
+                "provider_retry_permitted": False,
+            }
+            if already_sealed:
+                if item.get("governance_failure") != governance_failure:
+                    raise WechatDigestError(
+                        "Governance timeout 封存记录不一致。"
+                    )
+            else:
+                updated_item = {
+                    **item,
+                    "state": "failed_closed",
+                    "privacy_route": "approved",
+                    "privacy_categories": [],
+                    "atomic_information_ids": list(atomic_ids),
+                    "governance_failure": governance_failure,
+                }
+                updated_items = dict(items)
+                updated_items[item_id] = updated_item
+                updated_status = {
+                    **status,
+                    "items": updated_items,
+                    "state": "processing",
+                    "failure_category": None,
+                    "updated_at": self.clock(),
+                }
+                self.run_store.update_status(run_id, updated_status)
+            final_status = self.run_store.status(run_id)
+            final_items = final_status.get("items")
+            if not isinstance(final_items, dict):
+                raise WechatDigestError("微信运行状态 items 损坏。")
+            final_item = self._item(final_items, item_id)
+            self._verify_governance_failed_closed_item(final_item)
+            return {
+                **global_summary,
+                "semantic_provider_calls": 0,
+                "governance_provider_calls": 0,
+                "governance_preserved_but_incomplete": 1,
+                "provider_retry_permitted": False,
+            }
+
     def run(
         self,
         *,
@@ -2795,7 +3015,16 @@ class WechatDigestService:
         item_id: str,
         item: Mapping[str, object],
     ) -> None:
-        failure = item.get("semantic_failure")
+        semantic_failure = item.get("semantic_failure")
+        governance_failure = item.get("governance_failure")
+        if (semantic_failure is None) == (governance_failure is None):
+            raise WechatDigestError(
+                "微信 failed_closed item failure variant 损坏。"
+            )
+        if governance_failure is not None:
+            self._verify_governance_failed_closed_item(item)
+            return
+        failure = semantic_failure
         if (
             not isinstance(failure, dict)
             or set(failure)
@@ -2861,9 +3090,61 @@ class WechatDigestService:
                 "微信 failed_closed item authority receipt 损坏。"
             ) from exc
 
-    def _verify_semantic_receipts(
-        self, representation_id: str, item: Mapping[str, object]
+    def _verify_governance_failed_closed_item(
+        self, item: Mapping[str, object]
     ) -> None:
+        failure = item.get("governance_failure")
+        receipt = _validated_governance_receipt(
+            item.get("governance_receipt")
+        )
+        metrics = _validated_governance_metrics(
+            item.get("governance_metrics")
+        )
+        atomic_ids = item.get("atomic_information_ids")
+        if (
+            not isinstance(failure, dict)
+            or set(failure)
+            != {
+                "failure_category",
+                "preserved_but_partially_governed",
+                "provider_retry_permitted",
+            }
+            or failure.get("failure_category") != "turn_timeout"
+            or failure.get("preserved_but_partially_governed") is not True
+            or failure.get("provider_retry_permitted") is not False
+            or item.get("semantic_failure") is not None
+            or item.get("state") != "failed_closed"
+            or item.get("privacy_route") != "approved"
+            or item.get("privacy_categories") != []
+            or not isinstance(atomic_ids, list)
+            or not atomic_ids
+            or any(not isinstance(value, str) for value in atomic_ids)
+            or len(atomic_ids) != len(set(atomic_ids))
+            or receipt.get("phase") != "started"
+            or receipt.get("atomic_information_fingerprint")
+            != _governance_atomic_fingerprint(atomic_ids)
+            or int(metrics["timeout_count"]) < 1
+            or int(dict(metrics["failure_categories"]).get("timeout", 0)) < 1
+            or item.get("pending_human") is not False
+            or item.get("context_object_ids") != []
+        ):
+            raise WechatDigestError(
+                "微信 failed_closed Governance receipt 损坏。"
+            )
+        representation_id = item.get("representation_id")
+        if not isinstance(representation_id, str):
+            raise WechatDigestError(
+                "微信 failed_closed Governance Representation 损坏。"
+            )
+        self._verify_semantic_receipts(representation_id, item)
+
+    def _verify_semantic_receipts(
+        self,
+        representation_id: str,
+        item: Mapping[str, object],
+        *,
+        recover_missing_item_receipt: bool = False,
+    ) -> tuple[str, ...]:
         package = (
             self.workspace
             / "02_processing"
@@ -2929,6 +3210,8 @@ class WechatDigestService:
                 package_fingerprint=_package_fingerprint(package),
             )
             observed = item.get("atomic_information_ids")
+            if recover_missing_item_receipt and observed == []:
+                observed = list(expected)
             if (
                 not isinstance(observed, list)
                 or any(not isinstance(value, str) for value in observed)
@@ -2956,6 +3239,7 @@ class WechatDigestService:
                     raise WechatDigestError(
                         "微信运行状态 Atomic Information receipt 不收敛。"
                     )
+            return tuple(expected)
         except WechatDigestError:
             raise
         except (
@@ -3214,6 +3498,17 @@ class WechatDigestService:
     def _terminal_item_valid(self, item: Mapping[str, object]) -> bool:
         if item.get("state") not in TERMINAL_ITEM_STATES:
             return False
+        governance_failed_closed = False
+        if item.get("state") == "failed_closed":
+            semantic_failure = item.get("semantic_failure")
+            governance_failure = item.get("governance_failure")
+            if (semantic_failure is None) == (governance_failure is None):
+                raise WechatDigestError(
+                    "微信 terminal failed_closed failure variant 损坏。"
+                )
+            if governance_failure is not None:
+                self._verify_governance_failed_closed_item(item)
+                governance_failed_closed = True
         source_id = item.get("source_id")
         if source_id is not None:
             if not isinstance(source_id, str):
@@ -3234,7 +3529,10 @@ class WechatDigestService:
             _validated_governance_metrics(item["governance_metrics"])
         if item.get("governance_receipt") is not None:
             receipt = _validated_governance_receipt(item["governance_receipt"])
-            if receipt["phase"] != "completed":
+            if (
+                receipt["phase"] != "completed"
+                and not governance_failed_closed
+            ):
                 raise WechatDigestError("微信 terminal item Governance receipt 未完成。")
             if atomic_ids and receipt["atomic_information_fingerprint"] != (
                 _governance_atomic_fingerprint(atomic_ids)
@@ -3833,6 +4131,12 @@ class WechatDigestService:
             governance_wall_ms=sum(result.governance_wall_ms for result in results),
             governance_timeouts=sum(result.governance_timeouts for result in results),
             governance_failures=sum(result.governance_failures for result in results),
+            semantic_preserved_but_unabsorbed=sum(
+                result.semantic_preserved_but_unabsorbed for result in results
+            ),
+            governance_preserved_but_incomplete=sum(
+                result.governance_preserved_but_incomplete for result in results
+            ),
         )
 
     @staticmethod
@@ -3895,4 +4199,14 @@ class WechatDigestService:
             governance_wall_ms=sum(int(item["governance_wall_ms"]) for item in metrics),
             governance_timeouts=sum(int(item["timeout_count"]) for item in metrics),
             governance_failures=sum(int(item["failure_count"]) for item in metrics),
+            semantic_preserved_but_unabsorbed=sum(
+                item.get("state") == "failed_closed"
+                and item.get("semantic_failure") is not None
+                for item in values
+            ),
+            governance_preserved_but_incomplete=sum(
+                item.get("state") == "failed_closed"
+                and item.get("governance_failure") is not None
+                for item in values
+            ),
         )

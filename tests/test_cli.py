@@ -59,6 +59,8 @@ class CliTest(unittest.TestCase):
         self.assertEqual(result, 0)
         self.assertIn("新增消息：3", output.getvalue())
         self.assertIn("待你判断：1", output.getvalue())
+        self.assertIn("已保留但未形成长期信息：0", output.getvalue())
+        self.assertIn("已形成长期信息但治理未完整确认：0", output.getvalue())
         self.assertIn("checkpoint：已推进", output.getvalue())
         digest_service.return_value.run.assert_called_once_with(
             since=None, from_now=True, all_history=False
@@ -104,6 +106,44 @@ class CliTest(unittest.TestCase):
         digest_service.return_value.resolve_semantic_unknown.assert_called_once_with(
             authority_manifest_file=authority
         )
+        capture_provider.assert_called_once()
+
+    @patch("archeos.cli.WechatDigestService")
+    @patch("archeos.cli.WechatCliCaptureProvider")
+    @patch("archeos.cli.require_workspace")
+    def test_wechat_digest_seals_governance_timeout_with_zero_call_summary(
+        self,
+        require_workspace: Mock,
+        capture_provider: Mock,
+        digest_service: Mock,
+    ) -> None:
+        require_workspace.return_value = WorkspaceConfig(
+            Path("/workspace"), Path("/config")
+        )
+        digest_service.return_value.seal_governance_timeout.return_value = {
+            "semantic_provider_calls": 0,
+            "governance_provider_calls": 0,
+            "global_attempt_total": 176,
+            "global_unknown": 0,
+            "next_global_ordinal": 177,
+            "absolute_cap": 1000,
+            "governance_preserved_but_incomplete": 1,
+            "provider_retry_permitted": False,
+        }
+        output = StringIO()
+        with redirect_stdout(output):
+            result = main(
+                ["wechat", "digest", "--seal-governance-timeout"]
+            )
+        self.assertEqual(result, 0)
+        payload = json.loads(output.getvalue())
+        self.assertEqual(payload["semantic_provider_calls"], 0)
+        self.assertEqual(payload["governance_provider_calls"], 0)
+        self.assertEqual(payload["next_global_ordinal"], 177)
+        self.assertEqual(payload["governance_preserved_but_incomplete"], 1)
+        self.assertFalse(payload["provider_retry_permitted"])
+        digest_service.return_value.seal_governance_timeout.assert_called_once_with()
+        digest_service.return_value.run.assert_not_called()
         capture_provider.assert_called_once()
 
     @patch("archeos.cli.WechatDigestService")

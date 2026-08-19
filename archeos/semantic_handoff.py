@@ -2374,7 +2374,7 @@ class _SemanticGlobalAuthority:
         _validate_global_authority_directory(self.root)
 
     @contextmanager
-    def _locked(self):
+    def _locked(self, *, blocking: bool = True):
         self._ensure_root()
         descriptor = os.open(self.lock_path, os.O_RDWR)
         try:
@@ -2389,7 +2389,15 @@ class _SemanticGlobalAuthority:
                 or opened.st_nlink != 1
             ):
                 raise SemanticHandoffError("Semantic global authority lock 损坏。")
-            fcntl.flock(descriptor, fcntl.LOCK_EX)
+            try:
+                fcntl.flock(
+                    descriptor,
+                    fcntl.LOCK_EX | (0 if blocking else fcntl.LOCK_NB),
+                )
+            except BlockingIOError as exc:
+                raise SemanticHandoffError(
+                    "Semantic global authority 正在被另一个任务使用。"
+                ) from exc
             _validate_shared_recovery_root(self.audit_root, create=False)
             yield
         finally:
@@ -6849,6 +6857,53 @@ class ExternalAgentSemanticHandoffService:
         self,
     ) -> SemanticCampaignAuthorityBinding | None:
         return _SemanticGlobalAuthority(self.audit_root).campaign_binding()
+
+    def global_attempt_summary(self, representation_id: str) -> dict[str, int]:
+        """Read the validated global attempt ledger without starting a Provider."""
+
+        if re.fullmatch(r"repr_[0-9a-f]{32}", representation_id) is None:
+            raise SemanticHandoffError(
+                "Semantic global attempt Representation identity 无效。"
+            )
+        authority = _SemanticGlobalAuthority(self.audit_root)
+        if not authority.exists:
+            raise SemanticHandoffError("Semantic global authority 未安装。")
+        with authority._locked(blocking=False):
+            base = authority._read_base_grant()
+            effective = authority._effective_authority(
+                base,
+                authority._read_extension(base),
+                authority._read_unknown_resolution(),
+            )
+            attempts, unknown = authority._global_attempts(effective)
+            if not attempts:
+                raise SemanticHandoffError(
+                    "Semantic global attempt ledger 为空。"
+                )
+            latest = attempts[-1]
+            semantic_run_id = latest.get("semantic_run_id")
+            if not isinstance(semantic_run_id, str):
+                raise SemanticHandoffError(
+                    "Semantic global attempt latest binding 损坏。"
+                )
+            run_receipt = _private_json_exact(
+                authority.audit_root / semantic_run_id / "run-receipt.json"
+            )
+            representation = run_receipt.get("representation")
+            if (
+                not isinstance(representation, dict)
+                or representation.get("representation_id") != representation_id
+            ):
+                raise SemanticHandoffError(
+                    "Semantic global attempt latest Representation 不匹配。"
+                )
+            total = int(base["baseline_total"]) + len(attempts)
+            return {
+                "global_attempt_total": total,
+                "global_unknown": int(unknown),
+                "next_global_ordinal": total + 1,
+                "absolute_cap": int(effective["absolute_cap"]),
+            }
 
     def recovery_preflight(
         self,

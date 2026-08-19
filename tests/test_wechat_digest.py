@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import shutil
 import signal
 import subprocess
 import sys
@@ -23,6 +24,7 @@ from archeos.digestion import (
     InterpretationResult,
     WorldModelOperation,
 )
+from archeos.digestion.providers import CodexInterpretationTimeout
 from archeos.representation import LocalRepresentationRepository
 from archeos.representation_information import (
     EXTERNAL_AGENT_PROTOCOL_V1,
@@ -248,6 +250,10 @@ class SyntheticSemanticHandoff:
         self.before_unknown_commit = None
         self.campaign_binding = None
         self.authority_bindings = []
+        self.global_attempt_total = 176
+        self.global_unknown = 0
+        self.absolute_cap = 1000
+        self.latest_representation_id = None
 
     def execute(
         self,
@@ -256,6 +262,7 @@ class SyntheticSemanticHandoff:
         privacy_binding=None,
         authority_binding=None,
     ):
+        self.latest_representation_id = representation_id
         if privacy_binding is not None:
             assert privacy_binding.route == "approved"
             assert authority_binding is not None
@@ -361,6 +368,16 @@ class SyntheticSemanticHandoff:
 
     def global_campaign_binding(self):
         return self.campaign_binding
+
+    def global_attempt_summary(self, representation_id):
+        if representation_id != self.latest_representation_id:
+            raise RuntimeError("synthetic latest Representation mismatch")
+        return {
+            "global_attempt_total": self.global_attempt_total,
+            "global_unknown": self.global_unknown,
+            "next_global_ordinal": self.global_attempt_total + 1,
+            "absolute_cap": self.absolute_cap,
+        }
 
     def resolve_unknown(
         self,
@@ -622,6 +639,20 @@ class SerialSessionProvider:
         )
 
 
+class TimeoutOnFourthTurnProvider(SerialSessionProvider):
+    def metrics_since(self, cursor):
+        metrics = super().metrics_since(cursor)
+        metrics["timeout_count"] = self.invalidations.count("timeout")
+        return metrics
+
+    def interpret(self, atomic_information, current_world_state):
+        if self.calls == 3:
+            self.calls += 1
+            self.invalidations.append("timeout")
+            raise CodexInterpretationTimeout("synthetic governance timeout")
+        return super().interpret(atomic_information, current_world_state)
+
+
 class FailGovernanceOnceService(WechatDigestService):
     fail_governance = True
 
@@ -703,6 +734,56 @@ class WechatDigestTests(unittest.TestCase):
                 self.workspace / "01_inbox"
             ).list_sources()
         )
+
+    def governance_timeout_fixture(self, *, include_next: bool = True):
+        self.create_object()
+        messages = [
+            message(index, conversation="failed")
+            for index in range(1, 11)
+        ]
+        if include_next:
+            messages.append(message(11, conversation="next"))
+        capture = SyntheticCaptureProvider(messages)
+        provider = TimeoutOnFourthTurnProvider()
+        service = WechatDigestService(
+            workspace=self.workspace,
+            capture_provider=capture,
+            semantic_handoff_factory=lambda: self.semantic,
+            interpretation_provider=provider,
+        )
+        with self.assertRaises(WechatDigestError):
+            service.run(all_history=True)
+        run_id = service.run_store.active_run_id()
+        assert run_id is not None
+        status = service.run_store.status(run_id)
+        item_id = next(
+            key
+            for key, item in status["items"].items()
+            if isinstance(item, dict)
+            and isinstance(item.get("governance_receipt"), dict)
+            and item["governance_receipt"].get("phase") == "started"
+        )
+        self.assertEqual(status["failure_category"], "CodexInterpretationTimeout")
+        self.assertEqual(status["items"][item_id]["atomic_information_ids"], [])
+        self.assertEqual(
+            len(service.information_store.list_atomic_information()), 10
+        )
+        return service, capture, provider, run_id, item_id
+
+    def assert_governance_timeout_seal_rejected(self, mutate) -> None:
+        service, _capture, provider, run_id, item_id = (
+            self.governance_timeout_fixture(include_next=False)
+        )
+        mutate(service, run_id, item_id)
+        status_path = service.run_store.runs_root / run_id / "status.json"
+        status_before = status_path.read_bytes()
+        semantic_calls = self.semantic.provider.calls
+        governance_calls = provider.calls
+        with self.assertRaises((OSError, RuntimeError, WechatDigestError)):
+            service.seal_governance_timeout()
+        self.assertEqual(status_path.read_bytes(), status_before)
+        self.assertEqual(self.semantic.provider.calls, semantic_calls)
+        self.assertEqual(provider.calls, governance_calls)
 
     def test_no_checkpoint_plain_digest_fails_closed(self) -> None:
         capture = SyntheticCaptureProvider([message(1)])
@@ -920,6 +1001,195 @@ class WechatDigestTests(unittest.TestCase):
         self.assertEqual(provider.calls, 1)
         self.assertIsNone(service.run_store.checkpoint())
         self.assertEqual(service.run_store.active_run_id(), run_id)
+
+    def test_governance_timeout_seal_preserves_data_and_continues_next_item(
+        self,
+    ) -> None:
+        service, _capture, provider, run_id, item_id = (
+            self.governance_timeout_fixture()
+        )
+
+        def protected_snapshot():
+            return {
+                str(path.relative_to(self.workspace)): path.read_bytes()
+                for path in self.workspace.rglob("*")
+                if path.is_file()
+                and "wechat_digest" not in path.relative_to(self.workspace).parts
+            }
+
+        before = protected_snapshot()
+        semantic_calls = self.semantic.provider.calls
+        governance_calls = provider.calls
+
+        resolution = service.seal_governance_timeout()
+
+        self.assertEqual(resolution["semantic_provider_calls"], 0)
+        self.assertEqual(resolution["governance_provider_calls"], 0)
+        self.assertEqual(resolution["global_attempt_total"], 176)
+        self.assertEqual(resolution["global_unknown"], 0)
+        self.assertEqual(resolution["next_global_ordinal"], 177)
+        self.assertFalse(resolution["provider_retry_permitted"])
+        self.assertEqual(self.semantic.provider.calls, semantic_calls)
+        self.assertEqual(provider.calls, governance_calls)
+        self.assertEqual(protected_snapshot(), before)
+
+        sealed_status = service.run_store.status(run_id)
+        sealed_item = sealed_status["items"][item_id]
+        self.assertEqual(sealed_item["state"], "failed_closed")
+        self.assertNotIn("semantic_failure", sealed_item)
+        self.assertEqual(sealed_item["governance_receipt"]["phase"], "started")
+        self.assertEqual(
+            set(sealed_item["atomic_information_ids"]),
+            {
+                revision.atomic_information_id
+                for revision in service.information_store.list_atomic_information()
+                if revision.origin_source_id == sealed_item["source_id"]
+            },
+        )
+        self.assertEqual(
+            sealed_item["governance_failure"],
+            {
+                "failure_category": "turn_timeout",
+                "preserved_but_partially_governed": True,
+                "provider_retry_permitted": False,
+            },
+        )
+
+        status_bytes = (
+            service.run_store.runs_root / run_id / "status.json"
+        ).read_bytes()
+        self.assertEqual(service.seal_governance_timeout(), resolution)
+        self.assertEqual(
+            (service.run_store.runs_root / run_id / "status.json").read_bytes(),
+            status_bytes,
+        )
+        self.assertEqual(self.semantic.provider.calls, semantic_calls)
+        self.assertEqual(provider.calls, governance_calls)
+
+        result = service.run()
+
+        self.assertTrue(result.checkpoint_published)
+        self.assertEqual(result.failed_closed, 1)
+        self.assertEqual(result.semantic_preserved_but_unabsorbed, 0)
+        self.assertEqual(result.governance_preserved_but_incomplete, 1)
+        self.assertEqual(self.semantic.provider.calls, semantic_calls + 1)
+        self.assertEqual(provider.calls, governance_calls + 1)
+        final_item = service.run_store.status(run_id)["items"][item_id]
+        self.assertEqual(final_item, sealed_item)
+        self.assertIsNone(service.run_store.active_run_id())
+
+    def test_governance_timeout_seal_recovers_after_status_write_interruption(
+        self,
+    ) -> None:
+        service, capture, provider, run_id, item_id = (
+            self.governance_timeout_fixture(include_next=False)
+        )
+
+        class InterruptAfterWriteStore(WechatDigestRunStore):
+            interrupt_once = True
+
+            def update_status(self, target_run_id, status):
+                super().update_status(target_run_id, status)
+                item = status.get("items", {}).get(item_id, {})
+                if self.interrupt_once and item.get("governance_failure"):
+                    self.interrupt_once = False
+                    raise OSError("synthetic post-write interruption")
+
+        interrupted_store = InterruptAfterWriteStore(service.run_store.root)
+        recovering = WechatDigestService(
+            workspace=self.workspace,
+            capture_provider=capture,
+            semantic_handoff_factory=lambda: self.semantic,
+            interpretation_provider=provider,
+            run_store=interrupted_store,
+        )
+        semantic_calls = self.semantic.provider.calls
+        governance_calls = provider.calls
+
+        with self.assertRaisesRegex(OSError, "post-write interruption"):
+            recovering.seal_governance_timeout()
+
+        written = interrupted_store.status(run_id)["items"][item_id]
+        self.assertEqual(written["state"], "failed_closed")
+        resolution = recovering.seal_governance_timeout()
+        self.assertEqual(resolution["governance_preserved_but_incomplete"], 1)
+        self.assertEqual(self.semantic.provider.calls, semantic_calls)
+        self.assertEqual(provider.calls, governance_calls)
+
+    def test_governance_timeout_seal_rejects_missing_semantic_package(self) -> None:
+        def mutate(service, run_id, item_id):
+            item = service.run_store.status(run_id)["items"][item_id]
+            shutil.rmtree(
+                self.workspace
+                / "02_processing"
+                / "information"
+                / item["representation_id"]
+            )
+
+        self.assert_governance_timeout_seal_rejected(mutate)
+
+    def test_governance_timeout_seal_rejects_atomic_receipt_drift(self) -> None:
+        def mutate(service, run_id, item_id):
+            status = service.run_store.status(run_id)
+            status["items"][item_id]["atomic_information_ids"] = [
+                "atomic_" + "f" * 32
+            ]
+            service.run_store.update_status(run_id, status)
+
+        self.assert_governance_timeout_seal_rejected(mutate)
+
+    def test_governance_timeout_seal_rejects_completed_receipt(self) -> None:
+        def mutate(service, run_id, item_id):
+            status = service.run_store.status(run_id)
+            receipt = status["items"][item_id]["governance_receipt"]
+            status["items"][item_id]["governance_receipt"] = {
+                **receipt,
+                "phase": "completed",
+                "pending_human": False,
+                "context_object_ids": [],
+            }
+            service.run_store.update_status(run_id, status)
+
+        self.assert_governance_timeout_seal_rejected(mutate)
+
+    def test_governance_timeout_seal_rejects_missing_timeout_evidence(self) -> None:
+        def mutate(service, run_id, item_id):
+            status = service.run_store.status(run_id)
+            metrics = status["items"][item_id]["governance_metrics"]
+            metrics["timeout_count"] = 0
+            metrics["failure_count"] = 0
+            metrics["failure_categories"] = {}
+            service.run_store.update_status(run_id, status)
+
+        self.assert_governance_timeout_seal_rejected(mutate)
+
+    def test_governance_timeout_seal_rejects_global_unknown(self) -> None:
+        def mutate(_service, _run_id, _item_id):
+            self.semantic.global_unknown = 1
+
+        self.assert_governance_timeout_seal_rejected(mutate)
+
+    def test_governance_timeout_seal_rejects_later_semantic_attempt(self) -> None:
+        def mutate(_service, _run_id, _item_id):
+            self.semantic.global_attempt_total += 1
+            self.semantic.latest_representation_id = "repr_" + "f" * 32
+
+        self.assert_governance_timeout_seal_rejected(mutate)
+
+    def test_governance_timeout_seal_rejects_competing_digest_lock(self) -> None:
+        service, _capture, provider, run_id, _item_id = (
+            self.governance_timeout_fixture(include_next=False)
+        )
+        status_path = service.run_store.runs_root / run_id / "status.json"
+        status_before = status_path.read_bytes()
+        semantic_calls = self.semantic.provider.calls
+        governance_calls = provider.calls
+        with service.run_store.lock():
+            with self.assertRaisesRegex(WechatDigestError, "正在运行"):
+                service.seal_governance_timeout()
+        self.assertEqual(status_path.read_bytes(), status_before)
+        self.assertEqual(self.semantic.provider.calls, semantic_calls)
+        self.assertEqual(provider.calls, governance_calls)
 
     def test_session_cleanup_failure_prevents_checkpoint_and_next_run(self) -> None:
         self.create_object()
@@ -1601,6 +1871,8 @@ class WechatDigestTests(unittest.TestCase):
         result = service.run()
         self.assertEqual(self.semantic.provider.calls, provider_calls + 1)
         self.assertEqual(result.failed_closed, 1)
+        self.assertEqual(result.semantic_preserved_but_unabsorbed, 1)
+        self.assertEqual(result.governance_preserved_but_incomplete, 0)
         self.assertTrue(result.checkpoint_published)
         self.assertIsNone(service.run_store.active_run_id())
 
