@@ -23,11 +23,89 @@ from archeos.pyannote_speakers import PyannoteSpeakerProvider
 from archeos.representation_information import (
     FileRepresentationAnalysisProvider,
 )
+from archeos.wechat_digest import WechatDigestResult, WechatSemanticPreparation
 from archeos.workspace import WorkspaceConfig
 from archeos.world_model import SQLiteWorldModelRepository
 
 
 class CliTest(unittest.TestCase):
+    @patch("archeos.cli.WechatDigestService")
+    @patch("archeos.cli.WechatCliCaptureProvider")
+    @patch("archeos.cli.require_workspace")
+    def test_wechat_digest_prints_business_summary(
+        self,
+        require_workspace: Mock,
+        capture_provider: Mock,
+        digest_service: Mock,
+    ) -> None:
+        require_workspace.return_value = WorkspaceConfig(
+            Path("/workspace"), Path("/config")
+        )
+        digest_service.return_value.run.return_value = WechatDigestResult(
+            run_id="run_" + "a" * 32,
+            new_messages=3,
+            new_attachments=1,
+            durable_information=4,
+            local_only=1,
+            unsupported=2,
+            pending_human=1,
+            context_objects=2,
+            checkpoint_published=True,
+            replayed=False,
+        )
+        output = StringIO()
+        with redirect_stdout(output):
+            result = main(["wechat", "digest", "--from-now"])
+        self.assertEqual(result, 0)
+        self.assertIn("新增消息：3", output.getvalue())
+        self.assertIn("待你判断：1", output.getvalue())
+        self.assertIn("checkpoint：已推进", output.getvalue())
+        digest_service.return_value.run.assert_called_once_with(
+            since=None, from_now=True, all_history=False
+        )
+        capture_provider.assert_called_once()
+
+    @patch("archeos.cli.WechatDigestService")
+    @patch("archeos.cli.WechatCliCaptureProvider")
+    @patch("archeos.cli.require_workspace")
+    def test_wechat_digest_prepares_without_running_digest(self, require_workspace: Mock, capture_provider: Mock, digest_service: Mock) -> None:
+        require_workspace.return_value = WorkspaceConfig(Path("/workspace"), Path("/config"))
+        digest_service.return_value.prepare_next_semantic.return_value = WechatSemanticPreparation("run_" + "a" * 32, "repr_" + "b" * 32, ("unit_" + "c" * 64,))
+        output = StringIO()
+        with redirect_stdout(output):
+            result = main(["wechat", "digest", "--prepare-next-semantic"])
+        self.assertEqual(result, 0)
+        self.assertIn('"semantic_provider_calls": 0', output.getvalue())
+        self.assertIn('"governance_provider_calls": "unavailable"', output.getvalue())
+        digest_service.return_value.prepare_next_semantic.assert_called_once_with(batch_size=40)
+        digest_service.return_value.run.assert_not_called()
+        capture_provider.assert_called_once()
+
+    @patch("archeos.cli.WechatDigestService")
+    @patch("archeos.cli.WechatCliCaptureProvider")
+    @patch("archeos.cli.require_workspace")
+    def test_wechat_digest_explicitly_upgrades_active_v2_history_scope(
+        self,
+        require_workspace: Mock,
+        capture_provider: Mock,
+        digest_service: Mock,
+    ) -> None:
+        require_workspace.return_value = WorkspaceConfig(
+            Path("/workspace"), Path("/config")
+        )
+        run_id = "run_" + "a" * 32
+        digest_service.return_value.upgrade_active_v2_all_history.return_value = run_id
+        output = StringIO()
+        with redirect_stdout(output):
+            result = main(
+                ["wechat", "digest", "--upgrade-active-v2-all-history"]
+            )
+        self.assertEqual(result, 0)
+        self.assertIn('"semantic_provider_calls": 0', output.getvalue())
+        digest_service.return_value.upgrade_active_v2_all_history.assert_called_once_with()
+        digest_service.return_value.run.assert_not_called()
+        capture_provider.assert_called_once()
+
     @patch("archeos.cli.ingest_processing_package")
     @patch("archeos.cli.process_managed_audio")
     def test_constructs_file_backed_providers(
@@ -105,9 +183,12 @@ class CliTest(unittest.TestCase):
             "--output-root",
             "information",
         ]
-        with redirect_stdout(StringIO()), redirect_stderr(StringIO()):
-            with self.assertRaises(SystemExit) as error:
-                main(arguments)
+        with (
+            redirect_stdout(StringIO()),
+            redirect_stderr(StringIO()),
+            self.assertRaises(SystemExit) as error,
+        ):
+            main(arguments)
         self.assertEqual(error.exception.code, 2)
         extract.assert_not_called()
 

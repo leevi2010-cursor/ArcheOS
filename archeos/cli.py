@@ -46,6 +46,13 @@ from .source import (
 )
 from .speakers import FileSpeakerProvider
 from .transcription import FileTranscriptionProvider, MlxWhisperTranscriptionProvider
+from .wechat_digest import (
+    ExistingSemanticHandoff,
+    WechatCliCaptureProvider,
+    WechatDigestError,
+    WechatDigestService,
+    detect_codex_provider_version,
+)
 from .workspace import (
     codex_integration_status,
     doctor,
@@ -511,6 +518,48 @@ def build_parser() -> argparse.ArgumentParser:
     wechat_represent.add_argument(
         "--representation-root", type=Path, default=None
     )
+
+    wechat_product = subparsers.add_parser(
+        "wechat", help="消化从上次成功位置以来的微信信息。"
+    )
+    _add_workspace_config_argument(wechat_product)
+    wechat_product_commands = wechat_product.add_subparsers(
+        dest="wechat_command", required=True
+    )
+    wechat_digest = wechat_product_commands.add_parser(
+        "digest", help="增量保存并消化新增微信消息和附件。"
+    )
+    bootstrap = wechat_digest.add_mutually_exclusive_group()
+    bootstrap.add_argument("--since", help="首次从 ISO 日期或时间开始。")
+    bootstrap.add_argument(
+        "--from-now", action="store_true", help="首次从当前微信位置开始。"
+    )
+    bootstrap.add_argument(
+        "--all-history", action="store_true", help="首次处理全部可读历史。"
+    )
+    wechat_digest.add_argument("--wechat-cli-bin", default="wechat-cli")
+    wechat_digest.add_argument("--wechat-config", type=Path)
+    wechat_digest.add_argument("--codex-bin", default="codex")
+    wechat_digest.add_argument("--provider-version")
+    wechat_digest.add_argument("--timeout-seconds", type=float, default=120.0)
+    wechat_digest.add_argument(
+        "--batch-size", type=int, default=DEFAULT_EXTERNAL_AGENT_BATCH_SIZE
+    )
+    wechat_digest.add_argument(
+        "--prepare-next-semantic",
+        action="store_true",
+        help="仅准备下一 semantic batch；不新增 Semantic Handoff 调用。",
+    )
+    wechat_digest.add_argument(
+        "--upgrade-active-v1",
+        action="store_true",
+        help="零 Provider 升级当前 active v1 run 到当前计划版本。",
+    )
+    wechat_digest.add_argument(
+        "--upgrade-active-v2-all-history",
+        action="store_true",
+        help="零 Provider 为当前 active v2 全历史运行冻结全局上界。",
+    )
     return parser
 
 
@@ -904,6 +953,118 @@ def _conversation_command(args: argparse.Namespace) -> int:
         return 1
 
 
+def _wechat_product_command(args: argparse.Namespace) -> int:
+    if args.wechat_command != "digest":  # pragma: no cover - argparse enforces this
+        return 2
+    maintenance_count = sum(
+        (
+            args.prepare_next_semantic,
+            args.upgrade_active_v1,
+            args.upgrade_active_v2_all_history,
+        )
+    )
+    if maintenance_count > 1 or (
+        maintenance_count
+        and any((args.since is not None, args.from_now, args.all_history))
+    ):
+        print("error: 恢复维护入口不能与首次起点或其他维护入口同时使用。")
+        return 2
+    try:
+        workspace = require_workspace(args.config).workspace
+        capture = WechatCliCaptureProvider(
+            wechat_cli_binary=args.wechat_cli_bin,
+            config_path=args.wechat_config,
+        )
+
+        def semantic_handoff() -> ExistingSemanticHandoff:
+            provider_version = args.provider_version or detect_codex_provider_version(
+                args.codex_bin
+            )
+            source_repository = LocalManagedSourceRepository(
+                workspace / DEFAULT_MANAGED_SOURCE_ROOT
+            )
+            representation_repository = LocalRepresentationRepository(
+                workspace / DEFAULT_REPRESENTATION_ROOT
+            )
+            return ExistingSemanticHandoff(
+                source_repository=source_repository,
+                representation_repository=representation_repository,
+                information_root=workspace / DEFAULT_REPRESENTATION_INFORMATION_ROOT,
+                information_store=JsonlAtomicInformationStore(
+                    workspace / DEFAULT_ATOMIC_INFORMATION_STORE
+                ),
+                audit_root=workspace / DEFAULT_SEMANTIC_HANDOFF_AUDIT_ROOT,
+                codex_binary=args.codex_bin,
+                provider_version=provider_version,
+                timeout_seconds=args.timeout_seconds,
+                batch_size=args.batch_size,
+            )
+
+        service = WechatDigestService(
+            workspace=workspace,
+            capture_provider=capture,
+            semantic_handoff_factory=semantic_handoff,
+            interpretation_provider=CodexAtomicInformationInterpretationProvider(),
+            semantic_batch_size=args.batch_size,
+        )
+        if args.prepare_next_semantic:
+            prepared = service.prepare_next_semantic(batch_size=args.batch_size)
+            print(
+                json.dumps(
+                    {
+                        "run_id": prepared.run_id,
+                        "representation_id": prepared.representation_id,
+                        "anchor_unit_ids": list(prepared.anchor_unit_ids),
+                        "semantic_provider_calls": prepared.semantic_provider_calls,
+                        "governance_provider_calls": prepared.governance_provider_calls if prepared.governance_provider_calls is not None else "unavailable",
+                        "checkpoint_published": False,
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                )
+            )
+            return 0
+        if args.upgrade_active_v1:
+            print(json.dumps({"run_id": service.upgrade_active_v1(), "semantic_provider_calls": 0}, ensure_ascii=False))
+            return 0
+        if args.upgrade_active_v2_all_history:
+            print(
+                json.dumps(
+                    {
+                        "run_id": service.upgrade_active_v2_all_history(),
+                        "semantic_provider_calls": 0,
+                    },
+                    ensure_ascii=False,
+                )
+            )
+            return 0
+        result = service.run(
+            since=args.since,
+            from_now=args.from_now,
+            all_history=args.all_history,
+        )
+    except (
+        OSError,
+        RuntimeError,
+        sqlite3.Error,
+        TypeError,
+        ValueError,
+        WechatDigestError,
+    ) as exc:
+        print(f"error: {exc}")
+        return 1
+    checkpoint = "已推进" if result.checkpoint_published else "未推进"
+    print(f"新增消息：{result.new_messages}")
+    print(f"新增附件：{result.new_attachments}")
+    print(f"已形成长期信息：{result.durable_information}")
+    print(f"本地保留（隐私）：{result.local_only}")
+    print(f"暂不支持：{result.unsupported}")
+    print(f"待你判断：{result.pending_human}")
+    print(f"更新了 {result.context_objects} 个长期对象的 Context")
+    print(f"checkpoint：{checkpoint}")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     if args.command in {"init", "doctor", "config", "integration"}:
@@ -931,4 +1092,6 @@ def main(argv: list[str] | None = None) -> int:
         return _representation_command(args)
     if args.command == "conversation":
         return _conversation_command(args)
+    if args.command == "wechat":
+        return _wechat_product_command(args)
     return 2  # pragma: no cover - argparse enforces this

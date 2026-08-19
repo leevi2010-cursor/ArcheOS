@@ -7,15 +7,16 @@ import re
 from collections.abc import Iterable, Mapping
 from datetime import datetime
 from pathlib import Path
+from time import strptime
 
 from ..source.identity import require_managed_source_id
 from ..source.models import ManagedSource
 from .identity import require_content_hash
 from .models import AdapterArtifact, AdapterBuildResult
 
-
 WECHAT_CONVERSATION_KIND = "wechat_conversation"
 WECHAT_CONVERSATION_SCHEMA_VERSION = "1.0"
+WECHAT_CONVERSATION_V2_SCHEMA_VERSION = "2.0"
 DEFAULT_CONTEXT_MESSAGES = 1
 
 _EXPORT_FIELDS = {
@@ -95,6 +96,132 @@ class WechatConversationRepresentationAdapter:
         target.write_text(
             json.dumps(
                 conversation,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        return AdapterBuildResult(
+            self.kind,
+            (AdapterArtifact("conversation", locator, "application/json"),),
+            1.0,
+        )
+
+
+class WechatConversationV2RepresentationAdapter:
+    """Represent one bounded structured capture without creating Message Core."""
+
+    name = "wechat-conversation-v2"
+    version = "2.0.0"
+    kind = WECHAT_CONVERSATION_KIND
+    supported_media_types = ("application/json",)
+
+    def build(
+        self,
+        source: ManagedSource,
+        materialized_path: Path,
+        staging_dir: Path,
+        configuration: Mapping[str, object],
+    ) -> AdapterBuildResult:
+        if configuration:
+            raise WechatConversationError(
+                "WeChat Conversation v2 does not accept runtime configuration"
+            )
+        try:
+            raw = json.loads(materialized_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise WechatConversationError(
+                "WeChat capture Source must be valid UTF-8 JSON"
+            ) from exc
+        capture = _validate_v2_capture_source(raw)
+        conversation = capture["conversation"]
+        messages = capture["messages"]
+        assert isinstance(conversation, dict)
+        assert isinstance(messages, list)
+        participant_labels = tuple(
+            dict.fromkeys(
+                str(message["sender_label"])
+                for message in messages
+                if isinstance(message, dict)
+            )
+        )
+        artifact = {
+            "schema_version": WECHAT_CONVERSATION_V2_SCHEMA_VERSION,
+            "provider": "wechat",
+            "source": {
+                "source_id": source.source_id,
+                "content_hash": source.content_hash,
+            },
+            "conversation": {
+                "technical_key": conversation["conversation_key"],
+                "external_conversation_id": conversation[
+                    "provider_conversation_id"
+                ],
+                "conversation_label": conversation["conversation_label"],
+                "conversation_type": (
+                    "group" if conversation["is_group"] else "direct"
+                ),
+                "participants": [
+                    {"sender_label": label, "object_identity": "unavailable"}
+                    for label in participant_labels
+                ],
+                "time_range": {
+                    "start": messages[0]["sent_at"],
+                    "end": messages[-1]["sent_at"],
+                },
+                "messages": [
+                    {
+                        "sequence": sequence,
+                        "message_key": message["message_key"],
+                        "cursor": message["cursor"],
+                        "sender_label": message["sender_label"],
+                        "sent_at": message["sent_at"],
+                        "timestamp": message["timestamp"],
+                        "message_type": message["message_type"],
+                        "visible_content": message["visible_content"],
+                        "structured_payload": message["structured_payload"],
+                        "attachment_refs": message["attachments"],
+                        "source_locator": {
+                            "source_id": source.source_id,
+                            "message_key": message["message_key"],
+                            "cursor": message["cursor"],
+                        },
+                        "metadata_availability": {
+                            "external_message_id": "unavailable",
+                            "reply": "unavailable",
+                            "attachments": (
+                                "available"
+                                if message["attachments"]
+                                and all(
+                                    attachment["status"] == "available"
+                                    for attachment in message["attachments"]
+                                )
+                                else (
+                                    "unavailable"
+                                    if not message["attachments"]
+                                    else "partial"
+                                )
+                            ),
+                            "participant_identity": "unavailable",
+                        },
+                    }
+                    for sequence, message in enumerate(messages, start=1)
+                ],
+                "provider_metadata": {
+                    "provider_version": capture["provider_version"],
+                    "range": capture["range"],
+                },
+            },
+        }
+        validate_wechat_conversation_v2_artifact(artifact)
+        locator = "artifacts/conversation.json"
+        target = staging_dir / locator
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(
+            json.dumps(
+                artifact,
                 ensure_ascii=False,
                 sort_keys=True,
                 separators=(",", ":"),
@@ -249,6 +376,345 @@ def validate_wechat_conversation_artifact(value: object) -> dict[str, object]:
     return root
 
 
+def _v2_cursor(value: object, field: str) -> dict[str, object]:
+    cursor = _exact_object(
+        value, {"timestamp", "conversation_key", "message_key"}, field
+    )
+    _integer(cursor["timestamp"], f"{field}.timestamp", minimum=0)
+    if not isinstance(cursor["conversation_key"], str) or not isinstance(
+        cursor["message_key"], str
+    ):
+        raise WechatConversationError(f"{field} string fields are invalid")
+    return cursor
+
+
+def _v2_cursor_key(value: object, field: str) -> tuple[int, str, str]:
+    cursor = _v2_cursor(value, field)
+    return (
+        cursor["timestamp"],
+        cursor["conversation_key"],
+        cursor["message_key"],
+    )  # type: ignore[return-value]
+
+
+def _validate_v2_attachment(value: object, field: str) -> dict[str, object]:
+    item = _exact_object(
+        value,
+        {
+            "attachment_key",
+            "status",
+            "source_id",
+            "filename_hint",
+            "media_type",
+            "content_hash",
+            "size_bytes",
+        },
+        field,
+    )
+    for name in ("attachment_key", "filename_hint", "media_type"):
+        _non_empty(item[name], f"{field}.{name}")
+    if item["status"] not in {"available", "missing", "ambiguous"}:
+        raise WechatConversationError(f"{field}.status is invalid")
+    if item["status"] == "available":
+        try:
+            require_managed_source_id(item["source_id"])
+            require_content_hash(item["content_hash"], field=f"{field}.content_hash")
+        except ValueError as exc:
+            raise WechatConversationError(
+                f"{field} available Source identity is invalid"
+            ) from exc
+        _integer(item["size_bytes"], f"{field}.size_bytes", minimum=0)
+    elif any(
+        item[name] is not None for name in ("source_id", "content_hash", "size_bytes")
+    ):
+        raise WechatConversationError(
+            f"{field} unavailable attachment cannot claim a Source"
+        )
+    return item
+
+
+def _validate_v2_capture_source(value: object) -> dict[str, object]:
+    root = _exact_object(
+        value,
+        {
+            "schema_version",
+            "provider",
+            "provider_version",
+            "range",
+            "conversation",
+            "messages",
+        },
+        "WeChat capture Source",
+    )
+    if root["schema_version"] != "wechat-capture-source/1.0":
+        raise WechatConversationError("WeChat capture Source schema is unsupported")
+    if root["provider"] != "wechat":
+        raise WechatConversationError("WeChat capture provider is invalid")
+    _non_empty(root["provider_version"], "provider_version")
+    capture_range = _exact_object(
+        root["range"], {"after_cursor", "upper_bound"}, "capture range"
+    )
+    after = _v2_cursor_key(capture_range["after_cursor"], "after_cursor")
+    upper = _v2_cursor_key(capture_range["upper_bound"], "upper_bound")
+    if upper < after:
+        raise WechatConversationError("capture range is reversed")
+    conversation = _exact_object(
+        root["conversation"],
+        {
+            "conversation_key",
+            "provider_conversation_id",
+            "conversation_label",
+            "is_group",
+        },
+        "capture conversation",
+    )
+    for name in (
+        "conversation_key",
+        "provider_conversation_id",
+        "conversation_label",
+    ):
+        _non_empty(conversation[name], f"conversation.{name}")
+    if not isinstance(conversation["is_group"], bool):
+        raise WechatConversationError("conversation.is_group is invalid")
+    messages = _array(root["messages"], "capture messages")
+    if not messages:
+        raise WechatConversationError("capture messages must not be empty")
+    previous: tuple[int, str, str] | None = None
+    message_keys: set[str] = set()
+    attachment_keys: set[str] = set()
+    for index, value_item in enumerate(messages, start=1):
+        item = _exact_object(
+            value_item,
+            {
+                "message_key",
+                "cursor",
+                "sender_label",
+                "sent_at",
+                "timestamp",
+                "message_type",
+                "visible_content",
+                "structured_payload",
+                "attachments",
+            },
+            f"capture message[{index}]",
+        )
+        message_key = _non_empty(item["message_key"], "message_key")
+        if message_key in message_keys:
+            raise WechatConversationError("capture message identity is duplicated")
+        message_keys.add(message_key)
+        cursor = _v2_cursor_key(item["cursor"], "message.cursor")
+        if (
+            cursor[1] != conversation["conversation_key"]
+            or cursor[2] != message_key
+            or not after < cursor <= upper
+            or (previous is not None and cursor <= previous)
+        ):
+            raise WechatConversationError("capture message cursor is invalid")
+        previous = cursor
+        if item["timestamp"] != cursor[0]:
+            raise WechatConversationError("capture message timestamp is inconsistent")
+        for name in (
+            "sender_label",
+            "sent_at",
+            "message_type",
+            "visible_content",
+            "structured_payload",
+        ):
+            if not isinstance(item[name], str):
+                raise WechatConversationError(f"message.{name} is invalid")
+        try:
+            datetime.fromisoformat(str(item["sent_at"]))
+        except ValueError as exc:
+            raise WechatConversationError("message.sent_at is invalid") from exc
+        for attachment_index, attachment in enumerate(
+            _array(item["attachments"], "message.attachments"), start=1
+        ):
+            validated = _validate_v2_attachment(
+                attachment, f"message[{index}].attachment[{attachment_index}]"
+            )
+            key = str(validated["attachment_key"])
+            if key in attachment_keys:
+                raise WechatConversationError("attachment identity is duplicated")
+            attachment_keys.add(key)
+    return root
+
+
+def validate_wechat_conversation_v2_artifact(value: object) -> dict[str, object]:
+    root = _exact_object(
+        value,
+        {"schema_version", "provider", "source", "conversation"},
+        "Conversation v2 artifact",
+    )
+    if root["schema_version"] != WECHAT_CONVERSATION_V2_SCHEMA_VERSION:
+        raise WechatConversationError("Conversation v2 schema_version is unsupported")
+    if root["provider"] != "wechat":
+        raise WechatConversationError("Conversation v2 provider must be wechat")
+    source = _exact_object(
+        root["source"], {"source_id", "content_hash"}, "Conversation v2 source"
+    )
+    try:
+        require_managed_source_id(source["source_id"])
+        require_content_hash(source["content_hash"], field="Conversation content_hash")
+    except ValueError as exc:
+        raise WechatConversationError("Conversation v2 Source is invalid") from exc
+    conversation = _exact_object(
+        root["conversation"],
+        {
+            "technical_key",
+            "external_conversation_id",
+            "conversation_label",
+            "conversation_type",
+            "participants",
+            "time_range",
+            "messages",
+            "provider_metadata",
+        },
+        "Conversation v2",
+    )
+    for name in (
+        "technical_key",
+        "external_conversation_id",
+        "conversation_label",
+    ):
+        _non_empty(conversation[name], name)
+    if conversation["conversation_type"] not in {"direct", "group"}:
+        raise WechatConversationError("Conversation v2 type is invalid")
+    participants = _array(conversation["participants"], "participants")
+    for index, participant in enumerate(participants, start=1):
+        value_participant = _exact_object(
+            participant, {"sender_label", "object_identity"}, f"participant[{index}]"
+        )
+        _non_empty(value_participant["sender_label"], "participant sender_label")
+        if value_participant["object_identity"] != "unavailable":
+            raise WechatConversationError("participant identity must remain unavailable")
+    time_range = _exact_object(
+        conversation["time_range"], {"start", "end"}, "time_range"
+    )
+    _non_empty(time_range["start"], "time_range.start")
+    _non_empty(time_range["end"], "time_range.end")
+    provider_metadata = _exact_object(
+        conversation["provider_metadata"],
+        {"provider_version", "range"},
+        "provider_metadata",
+    )
+    _non_empty(provider_metadata["provider_version"], "provider_version")
+    capture_range = _exact_object(
+        provider_metadata["range"], {"after_cursor", "upper_bound"}, "range"
+    )
+    after = _v2_cursor_key(capture_range["after_cursor"], "after_cursor")
+    upper = _v2_cursor_key(capture_range["upper_bound"], "upper_bound")
+    messages = _array(conversation["messages"], "messages")
+    if not messages:
+        raise WechatConversationError("Conversation v2 messages must not be empty")
+    previous: tuple[int, str, str] | None = None
+    for sequence, value_item in enumerate(messages, start=1):
+        item = _exact_object(
+            value_item,
+            {
+                "sequence",
+                "message_key",
+                "cursor",
+                "sender_label",
+                "sent_at",
+                "timestamp",
+                "message_type",
+                "visible_content",
+                "structured_payload",
+                "attachment_refs",
+                "source_locator",
+                "metadata_availability",
+            },
+            f"message[{sequence}]",
+        )
+        if item["sequence"] != sequence:
+            raise WechatConversationError("Conversation v2 sequence is invalid")
+        cursor = _v2_cursor_key(item["cursor"], "message.cursor")
+        if (
+            cursor[1] != conversation["technical_key"]
+            or cursor[2] != item["message_key"]
+            or not after < cursor <= upper
+            or (previous is not None and cursor <= previous)
+            or item["timestamp"] != cursor[0]
+        ):
+            raise WechatConversationError("Conversation v2 cursor is invalid")
+        previous = cursor
+        for attachment_index, attachment in enumerate(
+            _array(item["attachment_refs"], "attachment_refs"), start=1
+        ):
+            _validate_v2_attachment(
+                attachment, f"message[{sequence}].attachment[{attachment_index}]"
+            )
+        locator = _exact_object(
+            item["source_locator"],
+            {"source_id", "message_key", "cursor"},
+            "source_locator",
+        )
+        if (
+            locator["source_id"] != source["source_id"]
+            or locator["message_key"] != item["message_key"]
+            or locator["cursor"] != item["cursor"]
+        ):
+            raise WechatConversationError("Conversation v2 source locator is invalid")
+        availability = _exact_object(
+            item["metadata_availability"],
+            {"external_message_id", "reply", "attachments", "participant_identity"},
+            "metadata_availability",
+        )
+        if availability["external_message_id"] != "unavailable" or any(
+            availability[name] not in {"available", "partial", "unavailable"}
+            for name in ("reply", "attachments", "participant_identity")
+        ):
+            raise WechatConversationError("Conversation v2 metadata availability is invalid")
+    return root
+
+
+def _wechat_conversation_v2_analysis_rows(value: object):
+    root = validate_wechat_conversation_v2_artifact(value)
+    conversation = root["conversation"]
+    assert isinstance(conversation, dict)
+    messages = conversation["messages"]
+    assert isinstance(messages, list)
+    by_sequence = {message["sequence"]: message for message in messages}
+    for sequence in sorted(by_sequence):
+        anchor = by_sequence[sequence]
+        eligible = anchor["message_type"] == "text" and bool(
+            str(anchor["visible_content"]).strip()
+        )
+        classification, reason = _classification(
+            str(anchor["message_type"]), eligible
+        )
+        nearby_sequences = (
+            tuple(
+                nearby
+                for nearby in range(
+                    max(1, sequence - DEFAULT_CONTEXT_MESSAGES),
+                    min(len(messages), sequence + DEFAULT_CONTEXT_MESSAGES) + 1,
+                )
+                if nearby != sequence
+            )
+            if eligible
+            else ()
+        )
+        yield (
+            "wechat_message",
+            anchor["visible_content"],
+            {
+                "sender_label": anchor["sender_label"],
+                "sent_at": anchor["sent_at"],
+                "message_type": anchor["message_type"],
+                "processing_classification": classification,
+                "external_message_id": "unavailable",
+                "reply_to": "unavailable",
+                "attachment_refs": anchor["attachment_refs"],
+            },
+            anchor["source_locator"],
+            "WeChat message; bounded context support is supplied separately.",
+            eligible,
+            reason,
+            tuple(by_sequence[nearby]["source_locator"] for nearby in nearby_sequences),
+        )
+
+
 def wechat_conversation_analysis_rows(
     value: object,
 ) -> Iterable[
@@ -263,6 +729,9 @@ def wechat_conversation_analysis_rows(
         tuple[object, ...],
     ]
 ]:
+    if isinstance(value, dict) and value.get("schema_version") == WECHAT_CONVERSATION_V2_SCHEMA_VERSION:
+        yield from _wechat_conversation_v2_analysis_rows(value)
+        return
     root = validate_wechat_conversation_artifact(value)
     conversation = root["conversation"]
     assert isinstance(conversation, dict)
@@ -317,6 +786,46 @@ def wechat_conversation_analysis_rows(
 
 
 def wechat_conversation_metrics(value: object) -> dict[str, int]:
+    if isinstance(value, dict) and value.get("schema_version") == WECHAT_CONVERSATION_V2_SCHEMA_VERSION:
+        root = validate_wechat_conversation_v2_artifact(value)
+        conversation = root["conversation"]
+        assert isinstance(conversation, dict)
+        messages = conversation["messages"]
+        assert isinstance(messages, list)
+        eligible = sum(
+            message["message_type"] == "text"
+            and bool(str(message["visible_content"]).strip())
+            for message in messages
+        )
+        locators = [
+            (
+                message["source_locator"]["source_id"],
+                message["source_locator"]["message_key"],
+            )
+            for message in messages
+        ]
+        return {
+            "message_total": len(messages),
+            "replayable_messages": len(messages),
+            "stable_locator_failures": len(messages) - len(set(locators)),
+            "participant_object_bindings": 0,
+            "analysis_eligible": eligible,
+            "context_support_references": sum(
+                min(len(messages), sequence + DEFAULT_CONTEXT_MESSAGES)
+                - max(1, sequence - DEFAULT_CONTEXT_MESSAGES)
+                for sequence, message in enumerate(messages, start=1)
+                if message["message_type"] == "text"
+                and bool(str(message["visible_content"]).strip())
+            ),
+            "excluded_or_unsupported": len(messages) - eligible,
+            "unresolved_reference_count": 0,
+            "missing_external_message_id_count": len(messages),
+            "missing_reply_metadata_count": len(messages),
+            "missing_attachment_metadata_count": sum(
+                message["metadata_availability"]["attachments"] != "available"
+                for message in messages
+            ),
+        }
     root = validate_wechat_conversation_artifact(value)
     conversation = root["conversation"]
     assert isinstance(conversation, dict)
@@ -408,7 +917,7 @@ def _parse_message(
         )
     sent_at = match.group("sent_at")
     try:
-        datetime.strptime(sent_at, "%Y-%m-%d %H:%M")
+        strptime(sent_at, "%Y-%m-%d %H:%M")
     except ValueError as exc:
         raise WechatConversationError(
             f"message {sequence} has an invalid timestamp"
@@ -496,7 +1005,7 @@ def _validate_message(
     _non_empty(item["sender_label"], "message sender_label")
     sent_at = _non_empty(item["sent_at"], "message sent_at")
     try:
-        datetime.strptime(sent_at, "%Y-%m-%d %H:%M")
+        strptime(sent_at, "%Y-%m-%d %H:%M")
     except ValueError as exc:
         raise WechatConversationError("message sent_at is invalid") from exc
     message_type = _non_empty(item["message_type"], "message_type")

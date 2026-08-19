@@ -37,7 +37,19 @@ PACKAGE_SCHEMA_VERSION = "2.0"
 PACKAGE_KIND = "representation_information"
 DEFAULT_CODEX_ANALYSIS_TIMEOUT_SECONDS = 120.0
 DEFAULT_EXTERNAL_AGENT_BATCH_SIZE = 40
-EXTERNAL_AGENT_PROTOCOL_VERSION = "external-agent-semantic-handoff/1.0"
+EXTERNAL_AGENT_PROTOCOL_V1 = "external-agent-semantic-handoff/1.0"
+EXTERNAL_AGENT_PROTOCOL_V2 = "external-agent-semantic-handoff/2.0"
+EXTERNAL_AGENT_PROTOCOL_V3 = "external-agent-semantic-handoff/3.0"
+EXTERNAL_AGENT_PROTOCOL_V3_1 = "external-agent-semantic-handoff/3.1"
+EXTERNAL_AGENT_PROTOCOL_VERSION = EXTERNAL_AGENT_PROTOCOL_V1
+SUPPORTED_EXTERNAL_AGENT_PROTOCOL_VERSIONS = frozenset(
+    {
+        EXTERNAL_AGENT_PROTOCOL_V1,
+        EXTERNAL_AGENT_PROTOCOL_V2,
+        EXTERNAL_AGENT_PROTOCOL_V3,
+        EXTERNAL_AGENT_PROTOCOL_V3_1,
+    }
+)
 EXTERNAL_AGENT_ROUTE = "codex-cli"
 
 
@@ -209,25 +221,178 @@ def representation_analysis_schema() -> dict[str, object]:
     }
 
 
-def external_agent_representation_analysis_schema() -> dict[str, object]:
+def external_agent_representation_analysis_schema(
+    protocol_version: str = EXTERNAL_AGENT_PROTOCOL_VERSION,
+    *,
+    batch: RepresentationAnalysisBatch | None = None,
+) -> dict[str, object]:
     """The #31 result contract with the #80 Codex serialization binding."""
-    schema = representation_analysis_schema()
+    if protocol_version not in SUPPORTED_EXTERNAL_AGENT_PROTOCOL_VERSIONS:
+        raise ValueError("unsupported External Agent protocol version")
+    if protocol_version in {
+        EXTERNAL_AGENT_PROTOCOL_V3,
+        EXTERNAL_AGENT_PROTOCOL_V3_1,
+    }:
+        if batch is None:
+            raise ValueError("v3 External Agent schema requires its bound batch")
+        schema = _external_agent_v3_analysis_schema(
+            batch,
+            exact_accounting=protocol_version == EXTERNAL_AGENT_PROTOCOL_V3_1,
+        )
+    else:
+        schema = representation_analysis_schema()
     required = schema["required"]
     properties = schema["properties"]
     assert isinstance(required, list) and isinstance(properties, dict)
-    schema["required"] = ["protocol_version", "input_fingerprint", *required]
-    schema["properties"] = {
+    protocol_properties: dict[str, object] = {
         "protocol_version": {
             "type": "string",
-            "const": EXTERNAL_AGENT_PROTOCOL_VERSION,
+            "const": protocol_version,
         },
         "input_fingerprint": {
             "type": "string",
             "pattern": "^sha256:[0-9a-f]{64}$",
         },
-        **properties,
     }
+    if protocol_version in {
+        EXTERNAL_AGENT_PROTOCOL_V2,
+        EXTERNAL_AGENT_PROTOCOL_V3,
+        EXTERNAL_AGENT_PROTOCOL_V3_1,
+    }:
+        required = ["anchor_accounting", *required]
+        anchor_unit_id: dict[str, object] = {
+            "type": "string",
+            "minLength": 1,
+        }
+        if protocol_version in {
+            EXTERNAL_AGENT_PROTOCOL_V3,
+            EXTERNAL_AGENT_PROTOCOL_V3_1,
+        }:
+            assert batch is not None
+            anchor_unit_id = {
+                "type": "string",
+                "enum": [unit.unit_id for unit in batch.anchor_units],
+            }
+        accounting_schema: dict[str, object] = {
+            "type": "array",
+            "minItems": 1,
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["anchor_unit_id", "accounted_as"],
+                "properties": {
+                    "anchor_unit_id": anchor_unit_id,
+                    "accounted_as": {
+                        "type": "string",
+                        "enum": ["candidate", "residue"],
+                    },
+                },
+            },
+        }
+        if protocol_version in {
+            EXTERNAL_AGENT_PROTOCOL_V3,
+            EXTERNAL_AGENT_PROTOCOL_V3_1,
+        }:
+            assert batch is not None
+            if protocol_version == EXTERNAL_AGENT_PROTOCOL_V3_1:
+                accounting_schema["minItems"] = len(batch.anchor_units)
+            accounting_schema["maxItems"] = len(batch.anchor_units)
+        protocol_properties["anchor_accounting"] = accounting_schema
+    schema["required"] = ["protocol_version", "input_fingerprint", *required]
+    schema["properties"] = {**protocol_properties, **properties}
     return schema
+
+
+def _external_agent_v3_analysis_schema(
+    batch: RepresentationAnalysisBatch,
+    *,
+    exact_accounting: bool,
+) -> dict[str, object]:
+    anchor_ids = [unit.unit_id for unit in batch.anchor_units]
+    context_ids = [
+        unit.unit_id
+        for unit in batch.context_support_units
+        if unit.analysis_eligible
+    ]
+    anchor_refs = {
+        "type": "array",
+        "items": {"type": "string", "enum": anchor_ids},
+        "minItems": 1,
+    }
+    context_refs: dict[str, object] = {
+        "type": "array",
+        "items": {"type": "string", "enum": context_ids},
+    }
+    if exact_accounting:
+        anchor_refs["maxItems"] = len(anchor_ids)
+        context_refs["maxItems"] = len(context_ids)
+    return {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "additionalProperties": False,
+        "required": ["candidates", "residue"],
+        "properties": {
+            "candidates": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "required": [
+                        "statement",
+                        "semantic_type",
+                        "concerns",
+                        "anchor_unit_ids",
+                        "supporting_evidence_unit_ids",
+                        "context",
+                        "confidence",
+                    ],
+                    "properties": {
+                        "statement": {"type": "string", "minLength": 1},
+                        "semantic_type": {
+                            "type": "string",
+                            "enum": sorted(SEMANTIC_TYPES),
+                        },
+                        "concerns": {
+                            "type": "array",
+                            "items": {"type": "string", "minLength": 1},
+                            "minItems": 1,
+                        },
+                        "anchor_unit_ids": anchor_refs,
+                        "supporting_evidence_unit_ids": context_refs,
+                        "context": {"type": "string", "minLength": 1},
+                        "confidence": {
+                            "type": "number",
+                            "minimum": 0,
+                            "maximum": 1,
+                        },
+                    },
+                },
+            },
+            "residue": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "required": [
+                        "anchor_unit_ids",
+                        "reason_not_absorbed",
+                        "future_value_or_uncertainty",
+                    ],
+                    "properties": {
+                        "anchor_unit_ids": anchor_refs,
+                        "reason_not_absorbed": {
+                            "type": "string",
+                            "minLength": 1,
+                        },
+                        "future_value_or_uncertainty": {
+                            "type": "string",
+                            "minLength": 1,
+                        },
+                    },
+                },
+            },
+        },
+    }
 
 
 def _provider_unit(unit: RepresentationAnalysisUnit, *, role: str) -> dict[str, object]:
@@ -1200,21 +1365,50 @@ def _utc_timestamp() -> str:
 
 def _external_agent_request(
     batch: RepresentationAnalysisBatch,
+    protocol_version: str = EXTERNAL_AGENT_PROTOCOL_VERSION,
 ) -> tuple[dict[str, object], str]:
+    if protocol_version not in SUPPORTED_EXTERNAL_AGENT_PROTOCOL_VERSIONS:
+        raise ValueError("unsupported External Agent protocol version")
+    rules = [
+        "Return only the strict structured result.",
+        "Account for every anchor with Candidate or Residue.",
+        "Candidate must cite an anchor; context is Evidence only when explicitly cited and evidence-capable.",
+        "Use Residue for unresolved or insufficient evidence; never invent identity, facts, or World Model state.",
+    ]
+    if protocol_version in {
+        EXTERNAL_AGENT_PROTOCOL_V2,
+        EXTERNAL_AGENT_PROTOCOL_V3,
+        EXTERNAL_AGENT_PROTOCOL_V3_1,
+    }:
+        rules.insert(
+            2,
+            "Emit exactly one anchor_accounting item for every supplied anchor; accounted_as must match whether that anchor is cited by Candidate or Residue.",
+        )
+    if protocol_version in {
+        EXTERNAL_AGENT_PROTOCOL_V3,
+        EXTERNAL_AGENT_PROTOCOL_V3_1,
+    }:
+        rules.insert(
+            3,
+            "For each Candidate, separate anchor_unit_ids from evidence-capable supporting_evidence_unit_ids; Residue may reference anchors only.",
+        )
     payload: dict[str, object] = {
-        "protocol_version": EXTERNAL_AGENT_PROTOCOL_VERSION,
-        "rules": [
-            "Return only the strict structured result.",
-            "Account for every anchor with Candidate or Residue.",
-            "Candidate must cite an anchor; context is Evidence only when explicitly cited and evidence-capable.",
-            "Use Residue for unresolved or insufficient evidence; never invent identity, facts, or World Model state.",
-        ],
+        "protocol_version": protocol_version,
+        "rules": rules,
         "anchor_units": [_provider_unit(unit, role="anchor") for unit in batch.anchor_units],
         "context_support_units": [
             _provider_unit(unit, role="context_support")
             for unit in batch.context_support_units
         ],
     }
+    if protocol_version == EXTERNAL_AGENT_PROTOCOL_V3_1:
+        result_schema = external_agent_representation_analysis_schema(
+            protocol_version,
+            batch=batch,
+        )
+        payload["result_schema_fingerprint"] = _canonical_fingerprint(
+            result_schema
+        )
     fingerprint = _canonical_fingerprint(payload)
     return ({**payload, "input_fingerprint": fingerprint}, fingerprint)
 
