@@ -3308,8 +3308,16 @@ class _SemanticGlobalAuthority:
                 "item_id",
                 "source_id",
                 "representation_id",
+                "representation_manifest",
+                "representation_artifact_inventory_fingerprint",
                 "failed_closed_status_fingerprint",
             }
+            or not isinstance(digest.get("representation_manifest"), dict)
+            or not _sha256_fingerprint(
+                digest.get(
+                    "representation_artifact_inventory_fingerprint"
+                )
+            )
             or not _sha256_fingerprint(
                 digest.get("failed_closed_status_fingerprint")
             )
@@ -3925,13 +3933,15 @@ class _SemanticGlobalAuthority:
     ]:
         if (
             authority.get("absolute_cap") != 1000
-            or len(attempts) < 86
-            or attempts[85].get("global_ordinal") != 166
+            or len(attempts) != 86
+            or attempts[-1].get("global_ordinal") != 166
+            or [attempt.get("global_ordinal") for attempt in attempts]
+            != list(range(81, 167))
         ):
             raise SemanticHandoffError(
                 "Semantic unknown resolution activation ledger 不匹配。"
             )
-        attempt = attempts[85]
+        attempt = attempts[-1]
         run_name = attempt.get("semantic_run_id")
         batch_ordinal = attempt.get("batch_ordinal")
         if not isinstance(run_name, str) or not isinstance(batch_ordinal, int):
@@ -3992,6 +4002,8 @@ class _SemanticGlobalAuthority:
             "item_id",
             "source_id",
             "representation_id",
+            "representation_manifest",
+            "representation_artifact_inventory_fingerprint",
         }
         batch_ordinal = attempt.get("batch_ordinal")
         batches = run_payload.get("batches")
@@ -4004,6 +4016,31 @@ class _SemanticGlobalAuthority:
         )
         representation = run_payload.get("representation")
         source = run_payload.get("source")
+        representation_manifest = digest_binding.get(
+            "representation_manifest"
+        )
+        manifest_source = (
+            representation_manifest.get("source")
+            if isinstance(representation_manifest, dict)
+            else None
+        )
+        manifest_artifacts = (
+            representation_manifest.get("artifacts")
+            if isinstance(representation_manifest, dict)
+            else None
+        )
+        projected_artifacts = (
+            [
+                {
+                    "artifact_id": item.get("artifact_id"),
+                    "content_hash": item.get("content_hash"),
+                }
+                for item in manifest_artifacts
+            ]
+            if isinstance(manifest_artifacts, list)
+            and all(isinstance(item, dict) for item in manifest_artifacts)
+            else None
+        )
         attempt_window = attempt.get("window")
         if (
             set(manifest)
@@ -4064,8 +4101,29 @@ class _SemanticGlobalAuthority:
             or set(digest_binding) != expected_digest_keys
             or manifest.get("digest") != dict(digest_binding)
             or not isinstance(representation, dict)
-            or representation.get("representation_id")
+            or representation
+            != {
+                "representation_id": digest_binding.get("representation_id"),
+                "manifest_fingerprint": _fingerprint(
+                    representation_manifest
+                ),
+                "artifacts": projected_artifacts,
+            }
+            or digest_binding.get(
+                "representation_artifact_inventory_fingerprint"
+            )
+            != _fingerprint(projected_artifacts)
+            or not isinstance(representation_manifest, dict)
+            or representation_manifest.get("representation_id")
             != digest_binding.get("representation_id")
+            or not isinstance(manifest_source, dict)
+            or manifest_source
+            != {
+                "source_id": digest_binding.get("source_id"),
+                "content_hash": source.get("content_hash")
+                if isinstance(source, dict)
+                else None,
+            }
             or not isinstance(source, dict)
             or source.get("source_id") != digest_binding.get("source_id")
             or not isinstance(attempt_window, dict)
@@ -4103,15 +4161,22 @@ class _SemanticGlobalAuthority:
         provider: CodexCliRepresentationAnalysisProvider,
         reviewed_git_head: str,
         digest_binding: Mapping[str, object],
-        commit_failed_closed_status: Callable[[str], str],
+        commit_failed_closed_status: Callable[
+            [str], tuple[str, Mapping[str, object]]
+        ],
     ) -> dict[str, object]:
         """Resolve ordinal 166 once, then continue at 167 without Provider."""
 
-        def validate_locked_state() -> tuple[
+        def validate_locked_state(
+            current_digest_binding: Mapping[str, object],
+        ) -> tuple[
             dict[str, object],
             dict[str, object] | None,
             dict[str, object],
-            list[dict[str, object]],
+            dict[str, object],
+            dict[str, object],
+            Path,
+            dict[str, object],
             dict[str, object],
             list[int],
         ]:
@@ -4152,31 +4217,83 @@ class _SemanticGlobalAuthority:
                 run_payload=run_payload,
                 audit_path=audit_path,
                 audit=audit,
-                digest_binding=digest_binding,
+                digest_binding=current_digest_binding,
                 reviewed_git_head=reviewed_git_head,
                 provider=provider,
             )
-            return grant, existing, previous, attempts, manifest, abandoned
+            return (
+                grant,
+                existing,
+                previous,
+                dict(attempt),
+                dict(run_payload),
+                audit_path,
+                dict(audit),
+                manifest,
+                abandoned,
+            )
 
-        preflight = validate_locked_state()
+        preflight = validate_locked_state(digest_binding)
         with self._locked():
-            locked = validate_locked_state()
-            if not _payloads_exactly_equal(preflight[4], locked[4]):
+            locked = validate_locked_state(digest_binding)
+            if (
+                preflight[5] != locked[5]
+                or not _payloads_exactly_equal(
+                    [*preflight[:5], *preflight[6:]],
+                    [*locked[:5], *locked[6:]],
+                )
+            ):
                 raise SemanticHandoffError(
                     "Semantic unknown resolution preflight 发生漂移。"
                 )
-            _grant, existing, previous, attempts, manifest, abandoned = locked
-            attempt = attempts[-1]
+            (
+                _grant,
+                existing,
+                previous,
+                attempt,
+                _run_payload,
+                audit_path,
+                audit,
+                manifest,
+                abandoned,
+            ) = locked
             manifest_fingerprint = manifest["payload_fingerprint"]
             resolution_id = (
                 "unknown_resolution_"
                 + str(manifest_fingerprint).removeprefix("sha256:")[:32]
             )
-            status_fingerprint = commit_failed_closed_status(resolution_id)
-            if not _sha256_fingerprint(status_fingerprint):
+            status_fingerprint, final_digest_binding = (
+                commit_failed_closed_status(resolution_id)
+            )
+            if (
+                not _sha256_fingerprint(status_fingerprint)
+                or not isinstance(final_digest_binding, Mapping)
+            ):
                 raise SemanticHandoffError(
                     "Semantic unknown resolution failed_closed status 读回失败。"
                 )
+            final = validate_locked_state(final_digest_binding)
+            if (
+                locked[5] != final[5]
+                or not _payloads_exactly_equal(
+                    [*locked[:5], *locked[6:]],
+                    [*final[:5], *final[6:]],
+                )
+            ):
+                raise SemanticHandoffError(
+                    "Semantic unknown resolution status 后 replay 发生漂移。"
+                )
+            (
+                _grant,
+                existing,
+                previous,
+                attempt,
+                _run_payload,
+                audit_path,
+                audit,
+                manifest,
+                abandoned,
+            ) = final
             if existing is not None:
                 digest = existing.get("digest")
                 if (
@@ -4200,20 +4317,7 @@ class _SemanticGlobalAuthority:
                     directories=(self.root, self.audit_root),
                 )
                 return dict(existing)
-            run_payload = _private_json_exact(
-                self.audit_root
-                / str(attempt["semantic_run_id"])
-                / "run-receipt.json"
-            )
             batch_ordinal = int(attempt["batch_ordinal"])
-            batches = run_payload["batches"]
-            assert isinstance(batches, list)
-            batch_receipt = batches[batch_ordinal - 1]
-            assert isinstance(batch_receipt, dict)
-            audit_path, audit = self._matching_failed_audit(
-                run_payload=run_payload,
-                batch_receipt=batch_receipt,
-            )
             without_fingerprint: dict[str, object] = {
                 "schema_version": _UNKNOWN_RESOLUTION_SCHEMA,
                 "artifact_kind": "semantic_handoff_unknown_resolution",
@@ -4255,7 +4359,7 @@ class _SemanticGlobalAuthority:
                     "audit_readback_status": "verified",
                 },
                 "digest": {
-                    **dict(digest_binding),
+                    **dict(final_digest_binding),
                     "failed_closed_status_fingerprint": status_fingerprint,
                 },
                 "abandoned_batch_ordinals": abandoned,
@@ -6712,7 +6816,9 @@ class ExternalAgentSemanticHandoffService:
         authority_manifest_file: Path,
         reviewed_git_head: str,
         digest_binding: Mapping[str, object],
-        commit_failed_closed_status: Callable[[str], str],
+        commit_failed_closed_status: Callable[
+            [str], tuple[str, Mapping[str, object]]
+        ],
     ) -> dict[str, object]:
         """Resolve the approved ordinal-166 failure without a Provider call."""
 

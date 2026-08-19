@@ -224,7 +224,9 @@ class SemanticHandoffPort(Protocol):
         *,
         authority_manifest_file: Path,
         digest_binding: Mapping[str, object],
-        commit_failed_closed_status: Callable[[str], str],
+        commit_failed_closed_status: Callable[
+            [str], tuple[str, Mapping[str, object]]
+        ],
     ) -> dict[str, object]: ...
 
     def validate_unknown_resolution_digest(
@@ -1056,7 +1058,9 @@ class ExistingSemanticHandoff:
         *,
         authority_manifest_file: Path,
         digest_binding: Mapping[str, object],
-        commit_failed_closed_status: Callable[[str], str],
+        commit_failed_closed_status: Callable[
+            [str], tuple[str, Mapping[str, object]]
+        ],
     ) -> dict[str, object]:
         return self.service.resolve_unknown(
             self.provider,
@@ -1719,6 +1723,34 @@ class WechatDigestService:
             raise WechatDigestError(
                 "Semantic unknown recovery item identity 损坏。"
             )
+        representation = self.representation_repository.get(representation_id)
+        verification = self.representation_repository.verify(representation_id)
+        if (
+            not verification.verified
+            or representation.source_id != source_id
+        ):
+            raise WechatDigestError(
+                "Semantic unknown recovery Representation 校验失败。"
+            )
+        manifest = representation.to_manifest_dict()
+        artifact_inventory: list[dict[str, object]] = []
+        for artifact in representation.artifacts:
+            raw = self.representation_repository.read_artifact(
+                representation_id, artifact.artifact_id
+            )
+            if (
+                _sha256_bytes(raw) != artifact.content_hash
+                or len(raw) != artifact.size_bytes
+            ):
+                raise WechatDigestError(
+                    "Semantic unknown recovery artifact bytes 漂移。"
+                )
+            artifact_inventory.append(
+                {
+                    "artifact_id": artifact.artifact_id,
+                    "content_hash": artifact.content_hash,
+                }
+            )
         receipt = self.run_store.plan_receipt(run_id)
         return {
             "run_id": run_id,
@@ -1729,6 +1761,10 @@ class WechatDigestService:
             "item_id": item_id,
             "source_id": source_id,
             "representation_id": representation_id,
+            "representation_manifest": manifest,
+            "representation_artifact_inventory_fingerprint": _sha256_bytes(
+                _canonical_json(artifact_inventory).encode("utf-8")
+            ),
         }
 
     def _commit_failed_closed_item(
@@ -1738,7 +1774,8 @@ class WechatDigestService:
         plan: Mapping[str, object],
         item_id: str,
         resolution_id: str,
-    ) -> str:
+        expected_digest_binding: Mapping[str, object],
+    ) -> tuple[str, Mapping[str, object]]:
         current = self.run_store.status(run_id)
         items = current.get("items")
         if not isinstance(items, dict):
@@ -1750,6 +1787,10 @@ class WechatDigestService:
             item_id=item_id,
             item=item,
         )
+        if binding != dict(expected_digest_binding):
+            raise WechatDigestError(
+                "Semantic unknown recovery Representation 首写前发生漂移。"
+            )
         representation_id = str(binding["representation_id"])
         package = (
             self.workspace
@@ -1814,7 +1855,20 @@ class WechatDigestService:
             items = current["items"]
             assert isinstance(items, dict)
             item = self._item(items, item_id)
-        return _sha256_bytes(_canonical_json(item).encode("utf-8"))
+        final_binding = self._unknown_resolution_digest_binding(
+            run_id=run_id,
+            plan=plan,
+            item_id=item_id,
+            item=item,
+        )
+        if final_binding != dict(expected_digest_binding):
+            raise WechatDigestError(
+                "Semantic unknown recovery Representation status 后发生漂移。"
+            )
+        return (
+            _sha256_bytes(_canonical_json(item).encode("utf-8")),
+            final_binding,
+        )
 
     def resolve_semantic_unknown(
         self,
@@ -1877,6 +1931,7 @@ class WechatDigestService:
                         plan=plan,
                         item_id=item_id,
                         resolution_id=resolution_id,
+                        expected_digest_binding=binding,
                     )
                 ),
             )

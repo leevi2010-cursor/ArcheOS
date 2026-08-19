@@ -4,6 +4,7 @@ import hashlib
 import inspect
 import json
 import os
+import shutil
 import stat
 import subprocess
 import sys
@@ -1993,6 +1994,7 @@ class SemanticHandoffTest(unittest.TestCase):
             representation, service = self.build_service(
                 root=item_root,
                 source_id=f"src_{ordinal:032x}",
+                blocks=41 if ordinal == 166 else 1,
             )
             runner = FakeRunner("nonzero" if ordinal == 166 else "valid")
             candidate = ExternalAgentSemanticHandoffService(
@@ -2055,6 +2057,20 @@ class SemanticHandoffTest(unittest.TestCase):
             "item_id": "conversation:synthetic",
             "source_id": failed_representation.source_id,
             "representation_id": failed_representation.representation_id,
+            "representation_manifest": (
+                failed_representation.to_manifest_dict()
+            ),
+            "representation_artifact_inventory_fingerprint": (
+                _canonical_fingerprint(
+                    [
+                        {
+                            "artifact_id": artifact.artifact_id,
+                            "content_hash": artifact.content_hash,
+                        }
+                        for artifact in failed_representation.artifacts
+                    ]
+                )
+            ),
         }
         continuation = {
             "previous_reviewed_git_head": extension["reviewed_git_head"],
@@ -9644,11 +9660,301 @@ print("passed")
         status_fingerprint = "sha256:" + "a" * 64
         calls: list[str] = []
 
-        def commit(resolution_id: str) -> str:
-            calls.append(resolution_id)
-            return status_fingerprint
+        authority = handoff_module._SemanticGlobalAuthority(failed.audit_root)
+        base = authority._read_base_grant()
+        extension = authority._read_extension(base)
+        self.assertIsNotNone(extension)
+        previous = authority._effective_authority_before_resolution(
+            base, extension
+        )
+        attempts, unknown = authority._global_attempts(previous)
+        self.assertTrue(unknown)
+        attempt_166 = attempts[-1]
+        failed_run = failed.audit_root / str(
+            attempt_166["semantic_run_id"]
+        )
+        run_payload = json.loads(
+            (failed_run / "run-receipt.json").read_text(encoding="utf-8")
+        )
+        failed_batch = run_payload["batches"][
+            int(attempt_166["batch_ordinal"]) - 1
+        ]
+        failure_audit_path, failure_audit = authority._matching_failed_audit(
+            run_payload=run_payload,
+            batch_receipt=failed_batch,
+        )
+        resolution_path = (
+            failed.audit_root
+            / "semantic_global_authority"
+            / "unknown-resolution-ordinal-0166.json"
+        )
+        status_path = self.root / "unknown-166-failed-closed-status.json"
 
+        def current_digest() -> dict[str, object]:
+            repository = (
+                failed.representation_service.representation_repository
+            )
+            representation = repository.get(
+                failed_representation.representation_id
+            )
+            verification = repository.verify(representation.representation_id)
+            if not verification.verified:
+                raise SemanticHandoffError(
+                    "synthetic Representation replay verification failed"
+                )
+            inventory = []
+            for artifact in representation.artifacts:
+                raw = repository.read_artifact(
+                    representation.representation_id, artifact.artifact_id
+                )
+                if (
+                    "sha256:" + hashlib.sha256(raw).hexdigest()
+                    != artifact.content_hash
+                    or len(raw) != artifact.size_bytes
+                ):
+                    raise SemanticHandoffError(
+                        "synthetic artifact replay verification failed"
+                    )
+                inventory.append(
+                    {
+                        "artifact_id": artifact.artifact_id,
+                        "content_hash": artifact.content_hash,
+                    }
+                )
+            return {
+                **{
+                    key: value
+                    for key, value in digest.items()
+                    if key
+                    not in {
+                        "representation_manifest",
+                        "representation_artifact_inventory_fingerprint",
+                    }
+                },
+                "representation_manifest": representation.to_manifest_dict(),
+                "representation_artifact_inventory_fingerprint": (
+                    _canonical_fingerprint(inventory)
+                ),
+            }
+
+        def commit(
+            resolution_id: str,
+        ) -> tuple[str, dict[str, object]]:
+            calls.append(resolution_id)
+            observed_digest = current_digest()
+            if observed_digest != digest:
+                raise SemanticHandoffError(
+                    "synthetic Representation pre-status drift"
+                )
+            expected_status = {
+                "resolution_id": resolution_id,
+                "state": "failed_closed",
+            }
+            if status_path.exists():
+                self.assertEqual(
+                    json.loads(status_path.read_text(encoding="utf-8")),
+                    expected_status,
+                )
+            else:
+                status_path.write_text(
+                    json.dumps(expected_status), encoding="utf-8"
+                )
+                status_path.chmod(0o600)
+            return status_fingerprint, current_digest()
+
+        manifest_bytes = manifest_path.read_bytes()
+        for label, mutate in (
+            (
+                "generated_at",
+                lambda payload: payload["digest"][
+                    "representation_manifest"
+                ]["representation"].update(
+                    {"generated_at": "2026-08-20T00:00:00.000Z"}
+                ),
+            ),
+            (
+                "inventory_fingerprint",
+                lambda payload: payload["digest"].update(
+                    {
+                        "representation_artifact_inventory_fingerprint": (
+                            "sha256:" + "0" * 64
+                        )
+                    }
+                ),
+            ),
+        ):
+            with self.subTest(prewrite_manifest_drift=label):
+                tampered = json.loads(manifest_bytes)
+                mutate(tampered)
+                without_fingerprint = dict(tampered)
+                without_fingerprint.pop("payload_fingerprint")
+                tampered["payload_fingerprint"] = _canonical_fingerprint(
+                    without_fingerprint
+                )
+                manifest_path.write_text(
+                    json.dumps(tampered), encoding="utf-8"
+                )
+                manifest_path.chmod(0o600)
+                before = self.tree_snapshot(failed.audit_root)
+                with self.assertRaises(SemanticHandoffError):
+                    failed.resolve_unknown(
+                        next_provider,
+                        authority_manifest_file=manifest_path,
+                        reviewed_git_head="8" * 40,
+                        digest_binding=digest,
+                        commit_failed_closed_status=commit,
+                    )
+                self.assertEqual(self.tree_snapshot(failed.audit_root), before)
+                self.assertFalse(status_path.exists())
+                self.assertFalse(resolution_path.exists())
+                self.assertEqual(calls, [])
+        manifest_path.write_bytes(manifest_bytes)
+        manifest_path.chmod(0o600)
+
+        recovery = handoff_module._SemanticRecoveryRun(
+            failed.representation_service,
+            failed.audit_root,
+            failed_representation.representation_id,
+            next_provider,
+            self.privacy_binding(),
+            global_authority=authority,
+            window_binding=current_window,
+        )
+        self.assertEqual(len(recovery.batches), 2)
+        recovery._validated_global_grant = previous
+        attempt_167_path = recovery.attempts_dir / "batch_0002.json"
+        attempt_167 = recovery._global_attempt_payload(
+            2,
+            attempt_nonce="f" * 64,
+            global_ordinal=167,
+            grant=previous,
+            window=current_window,
+        )
         original_publish = handoff_module._publish_private_json_marker
+        original_publish(attempt_167_path, attempt_167)
+        parseable_runner = FakeRunner()
+        parseable_provider = CodexCliRepresentationAnalysisProvider(
+            provider_version="0.147.0",
+            timeout_seconds=300,
+            runner=parseable_runner,
+        )
+        parseable_provider._capture_successful_raw = True
+        try:
+            parseable_result = parseable_provider.analyze(recovery.batches[1])
+        finally:
+            parseable_provider._capture_successful_raw = False
+        RepresentationInformationService._validate_batch_result(
+            recovery.batches[1], parseable_result
+        )
+        recovery.publish_result(
+            2,
+            parseable_provider._successful_results.pop(),
+            parseable_provider.execution_records[-1],
+        )
+        before_167_reject = self.tree_snapshot(failed.audit_root)
+        with self.assertRaises(SemanticHandoffError):
+            failed.resolve_unknown(
+                next_provider,
+                authority_manifest_file=manifest_path,
+                reviewed_git_head="8" * 40,
+                digest_binding=digest,
+                commit_failed_closed_status=commit,
+            )
+        self.assertEqual(
+            self.tree_snapshot(failed.audit_root), before_167_reject
+        )
+        self.assertFalse(status_path.exists())
+        self.assertFalse(resolution_path.exists())
+        self.assertEqual(calls, [])
+        shutil.rmtree(recovery._result_path(2))
+        attempt_167_path.unlink()
+        if recovery.results_dir.exists() and not any(
+            recovery.results_dir.iterdir()
+        ):
+            recovery.results_dir.rmdir()
+
+        def assert_post_status_drift_rejected(
+            label: str,
+            mutate,
+            restore,
+        ) -> None:
+            def commit_with_drift(
+                resolution_id: str,
+            ) -> tuple[str, dict[str, object]]:
+                fingerprint, binding = commit(resolution_id)
+                mutate()
+                return fingerprint, binding
+
+            before_records = len(next_provider.execution_records)
+            with self.subTest(post_status_drift=label):
+                try:
+                    with self.assertRaises(SemanticHandoffError):
+                        failed.resolve_unknown(
+                            next_provider,
+                            authority_manifest_file=manifest_path,
+                            reviewed_git_head="8" * 40,
+                            digest_binding=digest,
+                            commit_failed_closed_status=commit_with_drift,
+                        )
+                    self.assertEqual(
+                        json.loads(status_path.read_text(encoding="utf-8"))[
+                            "state"
+                        ],
+                        "failed_closed",
+                    )
+                    self.assertFalse(resolution_path.exists())
+                    self.assertEqual(
+                        len(next_provider.execution_records), before_records
+                    )
+                finally:
+                    restore()
+
+        result_path = failed_run / "results" / "batch_0001"
+
+        def publish_sudden_result() -> None:
+            result_path.parent.mkdir(mode=0o700, exist_ok=True)
+            result_path.write_bytes(b"synthetic-result-drift")
+
+        def remove_sudden_result() -> None:
+            result_path.unlink(missing_ok=True)
+            if result_path.parent.exists() and not any(
+                result_path.parent.iterdir()
+            ):
+                result_path.parent.rmdir()
+
+        assert_post_status_drift_rejected(
+            "result_appeared",
+            publish_sudden_result,
+            remove_sudden_result,
+        )
+
+        assert_post_status_drift_rejected(
+            "attempt_167",
+            lambda: original_publish(attempt_167_path, attempt_167),
+            lambda: attempt_167_path.unlink(missing_ok=True),
+        )
+
+        shadow_run_id = "run_" + "e" * 32
+        shadow_audit_path = (
+            failed.audit_root / shadow_run_id / "processing-run-audit.json"
+        )
+
+        def publish_shadow_audit() -> None:
+            shadow_audit_path.parent.mkdir(mode=0o700)
+            shadow = dict(failure_audit)
+            shadow["processing_run_id"] = shadow_run_id
+            shadow_audit_path.write_text(
+                json.dumps(shadow), encoding="utf-8"
+            )
+            shadow_audit_path.chmod(0o600)
+
+        assert_post_status_drift_rejected(
+            "shadow_audit",
+            publish_shadow_audit,
+            lambda: shutil.rmtree(shadow_audit_path.parent),
+        )
+
+        self.assertTrue(failure_audit_path.exists())
 
         def interrupt_receipt(path, payload):
             if path.name == "unknown-resolution-ordinal-0166.json":

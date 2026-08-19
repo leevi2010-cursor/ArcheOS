@@ -238,6 +238,7 @@ class SyntheticSemanticHandoff:
         self.installed_grant = None
         self.installed_extension = None
         self.unknown_resolution = None
+        self.before_unknown_commit = None
         self.campaign_binding = None
         self.authority_bindings = []
 
@@ -364,7 +365,12 @@ class SyntheticSemanticHandoff:
         manifest = json.loads(Path(authority_manifest_file).read_text("utf-8"))
         assert manifest["digest"]["item_id"] == digest_binding["item_id"]
         resolution_id = "unknown_resolution_" + "a" * 32
-        status_fingerprint = commit_failed_closed_status(resolution_id)
+        if self.before_unknown_commit is not None:
+            self.before_unknown_commit()
+        status_fingerprint, final_digest_binding = (
+            commit_failed_closed_status(resolution_id)
+        )
+        assert final_digest_binding == digest_binding
         expected = {
             "global_ordinal": 166,
             "resolution_id": resolution_id,
@@ -1153,6 +1159,89 @@ class WechatDigestTests(unittest.TestCase):
         self.assertEqual(result.failed_closed, 1)
         self.assertTrue(result.checkpoint_published)
         self.assertIsNone(service.run_store.active_run_id())
+
+    def test_unknown_resolution_rejects_representation_drift_before_status_write(
+        self,
+    ) -> None:
+        capture = SyntheticCaptureProvider([message(1, conversation="failed")])
+        service = self.service(capture)
+        self.semantic.failures_remaining = 1
+        with self.assertRaises(WechatDigestError):
+            service.run(all_history=True)
+        prepared = service.prepare_next_semantic()
+        status = service.run_store.status(prepared.run_id)
+        item_id = next(
+            key
+            for key, value in status["items"].items()
+            if value.get("representation_id") == prepared.representation_id
+        )
+        manifest_path = self.workspace / "private-unknown-authority.json"
+        manifest_path.write_text(
+            json.dumps({"digest": {"item_id": item_id}}), encoding="utf-8"
+        )
+        os.chmod(manifest_path, 0o600)
+        item = status["items"][item_id]
+        representation_manifest_path = (
+            self.workspace
+            / "02_processing"
+            / "representations"
+            / item["source_id"]
+            / prepared.representation_id
+            / "manifest.json"
+        )
+        original_manifest = representation_manifest_path.read_bytes()
+        parsed_manifest = json.loads(original_manifest)
+        artifact_path = (
+            representation_manifest_path.parent
+            / parsed_manifest["artifacts"][0]["locator"]
+        )
+        original_artifact = artifact_path.read_bytes()
+        provider_calls = self.semantic.provider.calls
+
+        def generated_at_drift() -> None:
+            payload = json.loads(original_manifest)
+            payload["representation"]["generated_at"] = (
+                "2026-08-20T00:00:00.000Z"
+            )
+            representation_manifest_path.write_text(
+                json.dumps(payload), encoding="utf-8"
+            )
+
+        def inventory_drift() -> None:
+            payload = json.loads(original_manifest)
+            artifact_id = payload["artifacts"][0]["artifact_id"]
+            payload["artifacts"][0]["artifact_id"] = (
+                artifact_id[:-1]
+                + ("0" if artifact_id[-1] != "0" else "1")
+            )
+            representation_manifest_path.write_text(
+                json.dumps(payload), encoding="utf-8"
+            )
+
+        def artifact_bytes_drift() -> None:
+            artifact_path.write_bytes(original_artifact + b"drift")
+
+        for label, mutate in (
+            ("generated_at", generated_at_drift),
+            ("inventory", inventory_drift),
+            ("artifact_bytes", artifact_bytes_drift),
+        ):
+            with self.subTest(label=label):
+                self.semantic.before_unknown_commit = mutate
+                try:
+                    with self.assertRaises(WechatDigestError):
+                        service.resolve_semantic_unknown(
+                            authority_manifest_file=manifest_path
+                        )
+                finally:
+                    representation_manifest_path.write_bytes(original_manifest)
+                    artifact_path.write_bytes(original_artifact)
+                    self.semantic.before_unknown_commit = None
+                self.assertEqual(
+                    service.run_store.status(prepared.run_id), status
+                )
+                self.assertIsNone(self.semantic.unknown_resolution)
+                self.assertEqual(self.semantic.provider.calls, provider_calls)
 
     def test_prepare_replays_existing_package_without_provider(self) -> None:
         self.create_object()
