@@ -138,10 +138,18 @@ _V32_LOCAL_VALIDATOR_CONTRACT_VERSION = "external-agent-local-validator/3.2"
 _V33_LOCAL_VALIDATOR_CONTRACT_VERSION = "external-agent-local-validator/3.3"
 _LOCAL_VALIDATOR_CONTRACT_VERSION = "external-agent-local-validator/3.4"
 _GLOBAL_AUTHORITY_SCHEMA = "semantic-handoff-global-authority-grant/3.0"
+_GLOBAL_AUTHORITY_EXTENSION_SCHEMA = (
+    "semantic-handoff-global-authority-extension/1.0"
+)
 _INVENTORY_AUTHORITY_SCHEMA = "semantic-handoff-inventory-authority/1.0"
 _GLOBAL_AUTHORITY_DIRECTORY = "semantic_global_authority"
 _GLOBAL_AUTHORITY_GRANT = "grant.json"
+_GLOBAL_AUTHORITY_EXTENSION = "extension-cap-1000.json"
 _GLOBAL_AUTHORITY_LOCK = "authority.lock"
+_GLOBAL_AUTHORITY_EXTENSION_DECISION = (
+    "https://github.com/leevi2010-cursor/ArcheOS/issues/107"
+    "#issuecomment-5338978422"
+)
 _EXECUTION_RECORD_FIELDS = frozenset(
     ExternalAgentExecutionRecord.__dataclass_fields__
 )
@@ -416,7 +424,11 @@ def _validate_global_authority_directory(path: Path) -> None:
         children = {child.name: child for child in path.iterdir()}
     except OSError as exc:
         raise SemanticHandoffError("Semantic global authority 目录不可读。") from exc
-    if not set(children) <= {_GLOBAL_AUTHORITY_LOCK, _GLOBAL_AUTHORITY_GRANT}:
+    if not set(children) <= {
+        _GLOBAL_AUTHORITY_LOCK,
+        _GLOBAL_AUTHORITY_GRANT,
+        _GLOBAL_AUTHORITY_EXTENSION,
+    }:
         raise SemanticHandoffError("Semantic global authority inventory 损坏。")
     lock_path = children.get(_GLOBAL_AUTHORITY_LOCK)
     if lock_path is None:
@@ -425,6 +437,9 @@ def _validate_global_authority_directory(path: Path) -> None:
     grant_path = children.get(_GLOBAL_AUTHORITY_GRANT)
     if grant_path is not None:
         _require_private_file(grant_path)
+    extension_path = children.get(_GLOBAL_AUTHORITY_EXTENSION)
+    if extension_path is not None:
+        _require_private_file(extension_path)
 
 
 def _validate_shared_recovery_root(root: Path, *, create: bool) -> bool:
@@ -788,6 +803,7 @@ class _SemanticRecoveryRun:
         self.privacy = privacy
         self.global_authority = global_authority
         self.window_binding = window_binding
+        self._validated_global_grant: dict[str, object] | None = None
         representation = representation_service.representation_repository.get(
             representation_id
         )
@@ -1202,21 +1218,44 @@ class _SemanticRecoveryRun:
         payload = _private_json_exact(self._attempt_path(ordinal))
         if payload.get("schema_version") == _GLOBAL_ATTEMPT_SCHEMA:
             observed_window = _authority_window_from_payload(payload.get("window"))
-            window = self.window_binding or observed_window
-            if self.window_binding is not None and self.window_binding != observed_window:
+            if self.window_binding is None:
+                global_authority = self.global_authority or _SemanticGlobalAuthority(
+                    self.audit_root
+                )
+                base = global_authority._read_base_grant()
+                effective = global_authority._effective_authority(
+                    base, global_authority._read_extension(base)
+                )
+                attempts, _unknown = global_authority._global_attempts(effective)
+                if not any(
+                    _payloads_exactly_equal(payload, attempt)
+                    for attempt in attempts
+                ):
+                    raise SemanticHandoffError(
+                        "Semantic global authority historical attempt 损坏。"
+                    )
+                return payload
+            if self.window_binding != observed_window:
                 raise SemanticHandoffError(
                     "Semantic global authority attempt window binding 漂移。"
                 )
             global_authority = self.global_authority or _SemanticGlobalAuthority(
                 self.audit_root
             )
-            grant = global_authority._load_grant(window, self.provider)
+            grant = global_authority._guard_grant
+            if grant is None:
+                grant = self._validated_global_grant
+                if grant is None:
+                    grant = global_authority._load_grant(
+                        self.window_binding, self.provider
+                    )
+                    self._validated_global_grant = grant
             expected = self._global_attempt_payload(
                 ordinal,
                 attempt_nonce=payload.get("attempt_nonce"),
                 global_ordinal=payload.get("global_ordinal"),
                 grant=grant,
-                window=window,
+                window=self.window_binding,
             )
             if not _payloads_exactly_equal(payload, expected):
                 raise SemanticHandoffError(
@@ -2236,7 +2275,10 @@ class _SemanticGlobalAuthority:
         self.audit_root = Path(os.path.abspath(Path(audit_root).expanduser()))
         self.root = self.audit_root / _GLOBAL_AUTHORITY_DIRECTORY
         self.grant_path = self.root / _GLOBAL_AUTHORITY_GRANT
+        self.extension_path = self.root / _GLOBAL_AUTHORITY_EXTENSION
         self.lock_path = self.root / _GLOBAL_AUTHORITY_LOCK
+        self._guard_grant: dict[str, object] | None = None
+        self._guard_next_ordinal: int | None = None
 
     @property
     def exists(self) -> bool:
@@ -2246,10 +2288,10 @@ class _SemanticGlobalAuthority:
         if not self.exists:
             return None
         _validate_shared_recovery_root(self.audit_root, create=False)
-        grant = _private_json_exact(self.grant_path)
-        fingerprint = grant.get("global_authority_fingerprint")
-        projected = dict(grant)
-        projected.pop("global_authority_fingerprint", None)
+        grant = self._read_base_grant()
+        extension = self._read_extension(grant)
+        effective = self._effective_authority(grant, extension)
+        self._global_attempts(effective)
         campaign = grant.get("campaign")
         lower = campaign.get("lower_cursor") if isinstance(campaign, dict) else None
         upper = (
@@ -2258,10 +2300,7 @@ class _SemanticGlobalAuthority:
             else None
         )
         if (
-            grant.get("schema_version") != _GLOBAL_AUTHORITY_SCHEMA
-            or not _sha256_fingerprint(fingerprint)
-            or fingerprint != _fingerprint(projected)
-            or not isinstance(lower, list)
+            not isinstance(lower, list)
             or len(lower) != 3
             or not isinstance(upper, list)
             or len(upper) != 3
@@ -2270,7 +2309,7 @@ class _SemanticGlobalAuthority:
             or isinstance(campaign.get("semantic_batch_size"), bool)
             or not isinstance(campaign.get("semantic_batch_size"), int)
             or not re.fullmatch(
-                r"[0-9a-f]{40}", str(grant.get("reviewed_git_head"))
+                r"[0-9a-f]{40}", str(effective.get("reviewed_git_head"))
             )
         ):
             raise SemanticHandoffError("Semantic global authority grant 损坏。")
@@ -2284,7 +2323,7 @@ class _SemanticGlobalAuthority:
             frozen_global_upper_cursor=upper_value,  # type: ignore[arg-type]
             capture_provider_version=str(campaign["capture_provider_version"]),
             semantic_batch_size=int(campaign["semantic_batch_size"]),
-            reviewed_git_head=str(grant["reviewed_git_head"]),
+            reviewed_git_head=str(effective["reviewed_git_head"]),
         )
 
     def _ensure_root(self) -> None:
@@ -3395,11 +3434,168 @@ class _SemanticGlobalAuthority:
                     )
                 return observed
 
-    def _load_grant(
+    def _expected_extension(
         self,
+        *,
+        grant: Mapping[str, object],
         window: SemanticWindowAuthorityBinding,
         provider: CodexCliRepresentationAnalysisProvider,
+        reviewed_git_head: str,
     ) -> dict[str, object]:
+        if re.fullmatch(r"[0-9a-f]{40}", reviewed_git_head) is None:
+            raise SemanticHandoffError(
+                "Semantic global authority extension reviewed head 无效。"
+            )
+        window_payload = _authority_window_payload(window)
+        self._validate_effective_window(window_payload, grant, grant)
+        attempts, unknown = self._global_attempts(grant)
+        total = int(grant["baseline_total"]) + len(attempts)
+        if (
+            total != 81
+            or unknown
+            or len(attempts) != 1
+            or attempts[0].get("global_ordinal") != 81
+        ):
+            raise SemanticHandoffError(
+                "Semantic global authority extension activation ledger 不匹配。"
+            )
+        without_fingerprint: dict[str, object] = {
+            "schema_version": _GLOBAL_AUTHORITY_EXTENSION_SCHEMA,
+            "artifact_kind": "semantic_handoff_global_authority_extension",
+            "base_global_authority_fingerprint": grant[
+                "global_authority_fingerprint"
+            ],
+            "decision_ref": _GLOBAL_AUTHORITY_EXTENSION_DECISION,
+            "campaign": grant["campaign"],
+            "activation_total": total,
+            "activation_unknown_count": 0,
+            "activation_last_global_ordinal": 81,
+            "activation_attempt_inventory_fingerprint": _fingerprint(attempts),
+            "base_reviewed_git_head": grant["reviewed_git_head"],
+            "base_execution_contract": grant["contract"],
+            "reviewed_git_head": reviewed_git_head,
+            "execution_contract": self._contract_payload(provider),
+            "previous_absolute_cap": 100,
+            "new_absolute_cap": 1000,
+            "first_authorized_ordinal": 82,
+            "last_authorized_ordinal": 1000,
+        }
+        return {
+            **without_fingerprint,
+            "extension_fingerprint": _fingerprint(without_fingerprint),
+        }
+
+    def _validate_existing_extension_for_install(
+        self,
+        *,
+        grant: Mapping[str, object],
+        extension: Mapping[str, object],
+        window: SemanticWindowAuthorityBinding,
+        provider: CodexCliRepresentationAnalysisProvider,
+        reviewed_git_head: str,
+    ) -> dict[str, object]:
+        effective = self._effective_authority(grant, extension)
+        window_payload = _authority_window_payload(window)
+        if window_payload.get("reviewed_git_head") not in {
+            grant.get("reviewed_git_head"),
+            extension.get("reviewed_git_head"),
+        }:
+            raise SemanticHandoffError(
+                "Semantic global authority extension window head 漂移。"
+            )
+        window_payload = dict(window_payload)
+        window_payload["reviewed_git_head"] = extension["reviewed_git_head"]
+        self._validate_effective_window(window_payload, grant, effective)
+        if (
+            reviewed_git_head != extension.get("reviewed_git_head")
+            or self._contract_payload(provider)
+            != extension.get("execution_contract")
+        ):
+            raise SemanticHandoffError(
+                "Semantic global authority extension 已存在且不匹配。"
+            )
+        attempts, _unknown = self._global_attempts(effective)
+        if (
+            not attempts
+            or attempts[0].get("global_ordinal") != 81
+            or extension.get("activation_attempt_inventory_fingerprint")
+            != _fingerprint(attempts[:1])
+        ):
+            raise SemanticHandoffError(
+                "Semantic global authority extension activation 漂移。"
+            )
+        return dict(extension)
+
+    def install_extension(
+        self,
+        *,
+        window: SemanticWindowAuthorityBinding,
+        provider: CodexCliRepresentationAnalysisProvider,
+        reviewed_git_head: str,
+    ) -> dict[str, object]:
+        """Append or exact-adopt the single approved cap-1000 extension."""
+
+        grant = self._read_base_grant()
+        existing = self._read_extension(grant)
+        if existing is not None:
+            preflight = self._validate_existing_extension_for_install(
+                grant=grant,
+                extension=existing,
+                window=window,
+                provider=provider,
+                reviewed_git_head=reviewed_git_head,
+            )
+        else:
+            preflight = self._expected_extension(
+                grant=grant,
+                window=window,
+                provider=provider,
+                reviewed_git_head=reviewed_git_head,
+            )
+        with self._locked():
+            locked_grant = self._read_base_grant()
+            if not _payloads_exactly_equal(locked_grant, grant):
+                raise SemanticHandoffError(
+                    "Semantic global authority extension base grant 漂移。"
+                )
+            existing = self._read_extension(locked_grant)
+            if existing is not None:
+                if not _payloads_exactly_equal(existing, preflight):
+                    raise SemanticHandoffError(
+                        "Semantic global authority extension 已存在且不匹配。"
+                    )
+            else:
+                expected = self._expected_extension(
+                    grant=locked_grant,
+                    window=window,
+                    provider=provider,
+                    reviewed_git_head=reviewed_git_head,
+                )
+                if not _payloads_exactly_equal(preflight, expected):
+                    raise SemanticHandoffError(
+                        "Semantic global authority extension preflight 漂移。"
+                    )
+                _publish_private_json_marker(self.extension_path, expected)
+            _refsync_and_readback(
+                files=(self.grant_path, self.extension_path, self.lock_path),
+                directories=(self.root, self.audit_root),
+            )
+            observed = self._read_extension(locked_grant)
+            if observed is None or not _payloads_exactly_equal(
+                observed, preflight
+            ):
+                raise SemanticHandoffError(
+                    "Semantic global authority extension 安装读回失败。"
+                )
+            return self._validate_existing_extension_for_install(
+                grant=locked_grant,
+                extension=observed,
+                window=window,
+                provider=provider,
+                reviewed_git_head=reviewed_git_head,
+            )
+
+    def _read_base_grant(self) -> dict[str, object]:
         if not self.exists:
             raise SemanticHandoffError(
                 "Semantic global authority 未安装；不得启动新 Provider call。"
@@ -3408,7 +3604,6 @@ class _SemanticGlobalAuthority:
         fingerprint = grant.get("global_authority_fingerprint")
         without_fingerprint = dict(grant)
         without_fingerprint.pop("global_authority_fingerprint", None)
-        window_payload = _authority_window_payload(window)
         campaign = grant.get("campaign")
         approved_versions = grant.get("historical_provider_versions")
         if (
@@ -3458,6 +3653,134 @@ class _SemanticGlobalAuthority:
             != legacy_fingerprint
             or grant.get("historical_provider_version_counts")
             != legacy_version_counts
+            or not isinstance(campaign, dict)
+            or set(campaign)
+            != {
+                "created_at",
+                "lower_cursor",
+                "frozen_global_upper_cursor",
+                "capture_provider_version",
+                "semantic_batch_size",
+            }
+            or re.fullmatch(
+                r"[0-9a-f]{40}", str(grant.get("reviewed_git_head"))
+            )
+            is None
+            or not isinstance(grant.get("contract"), dict)
+        ):
+            raise SemanticHandoffError("Semantic global authority binding 漂移。")
+        initial_window = grant.get("initial_window")
+        if not isinstance(initial_window, dict):
+            raise SemanticHandoffError("Semantic global authority binding 漂移。")
+        _authority_window_from_payload(initial_window)
+        if (
+            campaign.get("created_at")
+            != initial_window.get("campaign_created_at")
+            or campaign.get("lower_cursor")
+            != initial_window.get("campaign_lower_cursor")
+            or campaign.get("frozen_global_upper_cursor")
+            != initial_window.get("frozen_global_upper_cursor")
+            or campaign.get("capture_provider_version")
+            != initial_window.get("capture_provider_version")
+            or campaign.get("semantic_batch_size")
+            != initial_window.get("semantic_batch_size")
+            or grant.get("reviewed_git_head")
+            != initial_window.get("reviewed_git_head")
+        ):
+            raise SemanticHandoffError("Semantic global authority binding 漂移。")
+        return grant
+
+    def _read_extension(
+        self, grant: Mapping[str, object]
+    ) -> dict[str, object] | None:
+        if not os.path.lexists(self.extension_path):
+            return None
+        extension = _private_json_exact(self.extension_path)
+        projected = dict(extension)
+        fingerprint = projected.pop("extension_fingerprint", None)
+        if (
+            set(extension)
+            != {
+                "schema_version",
+                "artifact_kind",
+                "base_global_authority_fingerprint",
+                "decision_ref",
+                "campaign",
+                "activation_total",
+                "activation_unknown_count",
+                "activation_last_global_ordinal",
+                "activation_attempt_inventory_fingerprint",
+                "base_reviewed_git_head",
+                "base_execution_contract",
+                "reviewed_git_head",
+                "execution_contract",
+                "previous_absolute_cap",
+                "new_absolute_cap",
+                "first_authorized_ordinal",
+                "last_authorized_ordinal",
+                "extension_fingerprint",
+            }
+            or extension.get("schema_version")
+            != _GLOBAL_AUTHORITY_EXTENSION_SCHEMA
+            or extension.get("artifact_kind")
+            != "semantic_handoff_global_authority_extension"
+            or extension.get("base_global_authority_fingerprint")
+            != grant.get("global_authority_fingerprint")
+            or extension.get("decision_ref")
+            != _GLOBAL_AUTHORITY_EXTENSION_DECISION
+            or extension.get("campaign") != grant.get("campaign")
+            or extension.get("activation_total") != 81
+            or extension.get("activation_unknown_count") != 0
+            or extension.get("activation_last_global_ordinal") != 81
+            or not _sha256_fingerprint(
+                extension.get("activation_attempt_inventory_fingerprint")
+            )
+            or extension.get("base_reviewed_git_head")
+            != grant.get("reviewed_git_head")
+            or extension.get("base_execution_contract")
+            != grant.get("contract")
+            or re.fullmatch(
+                r"[0-9a-f]{40}", str(extension.get("reviewed_git_head"))
+            )
+            is None
+            or not isinstance(extension.get("execution_contract"), dict)
+            or extension.get("previous_absolute_cap") != 100
+            or extension.get("new_absolute_cap") != 1000
+            or extension.get("first_authorized_ordinal") != 82
+            or extension.get("last_authorized_ordinal") != 1000
+            or not _sha256_fingerprint(fingerprint)
+            or fingerprint != _fingerprint(projected)
+        ):
+            raise SemanticHandoffError(
+                "Semantic global authority extension binding 损坏。"
+            )
+        return extension
+
+    @staticmethod
+    def _effective_authority(
+        grant: Mapping[str, object],
+        extension: Mapping[str, object] | None,
+    ) -> dict[str, object]:
+        effective = dict(grant)
+        if extension is not None:
+            effective["global_authority_fingerprint"] = extension[
+                "extension_fingerprint"
+            ]
+            effective["reviewed_git_head"] = extension["reviewed_git_head"]
+            effective["contract"] = extension["execution_contract"]
+            effective["max_new"] = 920
+            effective["absolute_cap"] = 1000
+        return effective
+
+    @staticmethod
+    def _validate_effective_window(
+        window_payload: Mapping[str, object],
+        grant: Mapping[str, object],
+        effective: Mapping[str, object],
+    ) -> None:
+        campaign = grant.get("campaign")
+        if (
+            not isinstance(campaign, dict)
             or campaign
             != {
                 "created_at": window_payload["campaign_created_at"],
@@ -3470,17 +3793,53 @@ class _SemanticGlobalAuthority:
                 ],
                 "semantic_batch_size": window_payload["semantic_batch_size"],
             }
-            or grant.get("reviewed_git_head")
+            or effective.get("reviewed_git_head")
             != window_payload["reviewed_git_head"]
-            or grant.get("contract") != self._contract_payload(provider)
         ):
             raise SemanticHandoffError("Semantic global authority binding 漂移。")
-        return grant
+
+    def _load_grant(
+        self,
+        window: SemanticWindowAuthorityBinding,
+        provider: CodexCliRepresentationAnalysisProvider,
+    ) -> dict[str, object]:
+        grant = self._read_base_grant()
+        extension = self._read_extension(grant)
+        effective = self._effective_authority(grant, extension)
+        window_payload = _authority_window_payload(window)
+        self._validate_effective_window(window_payload, grant, effective)
+        if effective.get("contract") != self._contract_payload(provider):
+            raise SemanticHandoffError("Semantic global authority binding 漂移。")
+        attempts, _unknown = self._global_attempts(effective)
+        if extension is not None:
+            activation = attempts[:1]
+            if (
+                len(activation) != 1
+                or activation[0].get("global_ordinal") != 81
+                or extension.get("activation_attempt_inventory_fingerprint")
+                != _fingerprint(activation)
+            ):
+                raise SemanticHandoffError(
+                    "Semantic global authority extension activation 漂移。"
+                )
+        return effective
 
     def _global_attempts(
         self, grant: Mapping[str, object]
     ) -> tuple[list[dict[str, object]], bool]:
-        grant_fingerprint = grant["global_authority_fingerprint"]
+        base_grant = self._read_base_grant()
+        extension = self._read_extension(base_grant)
+        expected_effective = self._effective_authority(base_grant, extension)
+        if not _payloads_exactly_equal(grant, expected_effective):
+            raise SemanticHandoffError(
+                "Semantic global authority effective binding 漂移。"
+            )
+        base_fingerprint = base_grant["global_authority_fingerprint"]
+        extension_fingerprint = (
+            extension.get("extension_fingerprint")
+            if extension is not None
+            else None
+        )
         attempts: list[dict[str, object]] = []
         unknown = False
         for run in sorted(self.audit_root.glob("semantic_run_*")):
@@ -3502,16 +3861,6 @@ class _SemanticGlobalAuthority:
                 or run_receipt.get("semantic_run_id") != run.name
                 or run_receipt.get("protocol_version")
                 != EXTERNAL_AGENT_PROTOCOL_V3_4
-                or run_receipt.get("provider_route")
-                != grant["contract"]["provider_route"]  # type: ignore[index]
-                or run_receipt.get("provider")
-                != grant["contract"]["provider"]  # type: ignore[index]
-                or run_receipt.get("execution_deadline_ms")
-                != grant["contract"]["execution_deadline_ms"]  # type: ignore[index]
-                or run_receipt.get("prompt_template_fingerprint")
-                != grant["contract"]["prompt_template_fingerprint"]  # type: ignore[index]
-                or run_receipt.get("local_validator_contract_version")
-                != grant["contract"]["local_validator_contract_version"]  # type: ignore[index]
                 or not isinstance(batches, list)
                 or not batches
             ):
@@ -3531,9 +3880,47 @@ class _SemanticGlobalAuthority:
                     else None
                 )
                 window = payload.get("window")
-                campaign = grant.get("campaign")
+                campaign = base_grant.get("campaign")
+                global_ordinal = payload.get("global_ordinal")
+                authority_fingerprint = payload.get(
+                    "global_authority_fingerprint"
+                )
+                if authority_fingerprint == base_fingerprint:
+                    authority = base_grant
+                    if extension is not None and global_ordinal != 81:
+                        raise SemanticHandoffError(
+                            "Semantic global authority extension ordinal 损坏。"
+                        )
+                elif (
+                    extension is not None
+                    and authority_fingerprint == extension_fingerprint
+                ):
+                    authority = expected_effective
+                    if (
+                        isinstance(global_ordinal, bool)
+                        or not isinstance(global_ordinal, int)
+                        or not 82 <= global_ordinal <= 1000
+                    ):
+                        raise SemanticHandoffError(
+                            "Semantic global authority extension ordinal 损坏。"
+                        )
+                else:
+                    raise SemanticHandoffError(
+                        "Semantic global authority attempt authority 损坏。"
+                    )
+                contract = authority.get("contract")
                 if (
-                    set(payload)
+                    not isinstance(contract, dict)
+                    or run_receipt.get("provider_route")
+                    != contract.get("provider_route")
+                    or run_receipt.get("provider") != contract.get("provider")
+                    or run_receipt.get("execution_deadline_ms")
+                    != contract.get("execution_deadline_ms")
+                    or run_receipt.get("prompt_template_fingerprint")
+                    != contract.get("prompt_template_fingerprint")
+                    or run_receipt.get("local_validator_contract_version")
+                    != contract.get("local_validator_contract_version")
+                    or set(payload)
                     != {
                         "schema_version",
                         "artifact_kind",
@@ -3562,8 +3949,6 @@ class _SemanticGlobalAuthority:
                     != batch_receipt.get("batch_contract_fingerprint")
                     or payload.get("input_fingerprint")
                     != batch_receipt.get("input_fingerprint")
-                    or payload.get("global_authority_fingerprint")
-                    != grant_fingerprint
                     or not isinstance(window, dict)
                     or not isinstance(campaign, dict)
                     or window.get("campaign_created_at")
@@ -3577,14 +3962,14 @@ class _SemanticGlobalAuthority:
                     or window.get("semantic_batch_size")
                     != run_receipt.get("semantic_batch_size")
                     or window.get("reviewed_git_head")
-                    != grant.get("reviewed_git_head")
+                    != authority.get("reviewed_git_head")
                     or not _sha256_fingerprint(fingerprint)
                     or fingerprint != _fingerprint(without_fingerprint)
                 ):
                     raise SemanticHandoffError(
                         "Semantic global authority attempt binding 损坏。"
                     )
-                ordinal = payload.get("global_ordinal")
+                ordinal = global_ordinal
                 if isinstance(ordinal, bool) or not isinstance(ordinal, int):
                     raise SemanticHandoffError(
                         "Semantic global authority ordinal 损坏。"
@@ -3598,17 +3983,32 @@ class _SemanticGlobalAuthority:
                         result,
                         attempt=payload,
                         batch_receipt=batch_receipt,
-                        grant=grant,
+                        grant=authority,
                     )
         attempts.sort(key=lambda item: int(item["global_ordinal"]))
         expected = list(
             range(
-                int(grant["baseline_total"]) + 1,
-                int(grant["baseline_total"]) + len(attempts) + 1,
+                int(base_grant["baseline_total"]) + 1,
+                int(base_grant["baseline_total"]) + len(attempts) + 1,
             )
         )
         if [item["global_ordinal"] for item in attempts] != expected:
             raise SemanticHandoffError("Semantic global authority ordinal 不连续。")
+        if attempts and int(attempts[-1]["global_ordinal"]) > int(
+            grant["absolute_cap"]
+        ):
+            raise SemanticHandoffError("Semantic global authority ordinal 超过 cap。")
+        if extension is not None:
+            activation = attempts[:1]
+            if (
+                len(activation) != 1
+                or activation[0].get("global_ordinal") != 81
+                or extension.get("activation_attempt_inventory_fingerprint")
+                != _fingerprint(activation)
+            ):
+                raise SemanticHandoffError(
+                    "Semantic global authority extension activation 漂移。"
+                )
         previous_window: dict[str, object] | None = None
         for attempt in attempts:
             window = attempt.get("window")
@@ -3618,7 +4018,7 @@ class _SemanticGlobalAuthority:
                 )
             _authority_window_from_payload(window)
             if previous_window is None:
-                initial_window = grant.get("initial_window")
+                initial_window = base_grant.get("initial_window")
                 if not isinstance(initial_window, dict) or not (
                     _payloads_exactly_equal(window, initial_window)
                     or _window_history_extends(initial_window, window)
@@ -3821,7 +4221,15 @@ class _SemanticGlobalAuthority:
                 raise SemanticHandoffError(
                     "Semantic global authority 剩余调用额度不足。"
                 )
-            yield grant
+            self._guard_grant = grant
+            self._guard_next_ordinal = (
+                int(grant["baseline_total"]) + len(attempts) + 1
+            )
+            try:
+                yield grant
+            finally:
+                self._guard_grant = None
+                self._guard_next_ordinal = None
 
     def publish_attempt(
         self,
@@ -3832,25 +4240,28 @@ class _SemanticGlobalAuthority:
         window: SemanticWindowAuthorityBinding,
         provider: CodexCliRepresentationAnalysisProvider,
     ) -> dict[str, object]:
-        current = self._load_grant(window, provider)
-        if not _payloads_exactly_equal(current, grant):
+        current = self._guard_grant
+        global_ordinal = self._guard_next_ordinal
+        if (
+            current is None
+            or global_ordinal is None
+            or not _payloads_exactly_equal(current, grant)
+            or current.get("contract") != self._contract_payload(provider)
+            or current.get("reviewed_git_head") != window.reviewed_git_head
+        ):
             raise SemanticHandoffError("Semantic global authority grant 发生漂移。")
-        attempts, unknown = self._global_attempts(current)
-        current_total = int(current["baseline_total"]) + len(attempts)
-        if unknown:
-            raise SemanticHandoffError(
-                "Semantic global authority 存在 outcome unknown；停止调用。"
-            )
-        if current_total >= int(current["absolute_cap"]):
+        if global_ordinal > int(current["absolute_cap"]):
             raise SemanticHandoffError(
                 "Semantic global authority 已达到 absolute cap。"
             )
-        return recovery.publish_global_attempt(
+        published = recovery.publish_global_attempt(
             ordinal,
             grant=current,
-            global_ordinal=current_total + 1,
+            global_ordinal=global_ordinal,
             window=window,
         )
+        self._guard_next_ordinal = global_ordinal + 1
+        return published
 
 
 class _RecoveryAwareProvider:
@@ -3881,6 +4292,10 @@ class _RecoveryAwareProvider:
         self.records: list[ExternalAgentExecutionRecord] = []
         self.new_calls = 0
         self._ordinal = 0
+        self._loaded_results: list[
+            tuple[RepresentationAnalysisResult, ExternalAgentExecutionRecord]
+            | None
+        ] | None = None
 
     def _enter_authority_guard(self) -> None:
         if self._authority_guard is not None:
@@ -3990,7 +4405,12 @@ class _RecoveryAwareProvider:
         expected = self.recovery.batches[self._ordinal - 1]
         if batch != expected:
             raise SemanticHandoffError("Semantic recovery batch boundary 漂移。")
-        loaded, unknown = self.recovery.inspect()
+        if self._loaded_results is None:
+            loaded, unknown = self.recovery.inspect()
+            self._loaded_results = list(loaded)
+        else:
+            loaded = tuple(self._loaded_results)
+            unknown = 0
         if unknown:
             raise SemanticHandoffError(
                 "Semantic recovery 存在 outcome 不确定的 attempt；LEAD_DECISION_REQUIRED。"
@@ -4037,6 +4457,8 @@ class _RecoveryAwareProvider:
             )
             if loaded_result != result:
                 raise SemanticHandoffError("Semantic recovery strict result 读回漂移。")
+            assert self._loaded_results is not None
+            self._loaded_results[self._ordinal - 1] = (loaded_result, record)
             self.records.append(record)
             if self.new_calls == self.required_new_calls:
                 self._close_authority_guard()
@@ -5258,7 +5680,7 @@ class ExternalAgentSemanticHandoffService:
                         if authority_binding is not None
                         else None
                     ),
-                    window_binding=authority_binding,
+                    window_binding=None,
                 )
                 if recovery.exists:
                     return self._resume_recovery_package(
@@ -5476,6 +5898,21 @@ class ExternalAgentSemanticHandoffService:
             inventory_authority_file=inventory_authority_file,
             window=window_binding,
             provider=provider,
+        )
+
+    def install_global_authority_extension(
+        self,
+        provider: CodexCliRepresentationAnalysisProvider,
+        *,
+        window_binding: SemanticWindowAuthorityBinding,
+        reviewed_git_head: str,
+    ) -> dict[str, object]:
+        """Append or exact-read the approved cap-1000 authority extension."""
+
+        return _SemanticGlobalAuthority(self.audit_root).install_extension(
+            window=window_binding,
+            provider=provider,
+            reviewed_git_head=reviewed_git_head,
         )
 
     def global_campaign_binding(

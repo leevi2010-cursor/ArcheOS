@@ -582,6 +582,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="零 Provider 安装一次性 frozen-global-upper Semantic 调用授权。",
     )
     wechat_digest.add_argument(
+        "--install-semantic-authority-extension",
+        action="store_true",
+        help="零 Provider 安装已批准的 append-only cap-1000 Semantic 扩权。",
+    )
+    wechat_digest.add_argument(
         "--inventory-authority-file",
         type=Path,
         help="Private 0600 Lead-approved historical inventory authority manifest.",
@@ -990,6 +995,7 @@ def _wechat_product_command(args: argparse.Namespace) -> int:
             args.upgrade_active_v1,
             args.upgrade_active_v2_all_history,
             args.install_semantic_authority,
+            args.install_semantic_authority_extension,
         )
     )
     if maintenance_count > 1 or (
@@ -1089,6 +1095,32 @@ def _wechat_product_command(args: argparse.Namespace) -> int:
                         "absolute_cap": grant["absolute_cap"],
                         "global_authority_fingerprint": grant[
                             "global_authority_fingerprint"
+                        ],
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                )
+            )
+            return 0
+        if args.install_semantic_authority_extension:
+            extension = service.install_semantic_authority_extension()
+            print(
+                json.dumps(
+                    {
+                        "semantic_provider_calls": 0,
+                        "activation_total": extension["activation_total"],
+                        "previous_absolute_cap": extension[
+                            "previous_absolute_cap"
+                        ],
+                        "new_absolute_cap": extension["new_absolute_cap"],
+                        "first_authorized_ordinal": extension[
+                            "first_authorized_ordinal"
+                        ],
+                        "last_authorized_ordinal": extension[
+                            "last_authorized_ordinal"
+                        ],
+                        "extension_fingerprint": extension[
+                            "extension_fingerprint"
                         ],
                     },
                     ensure_ascii=False,

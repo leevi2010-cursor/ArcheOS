@@ -236,6 +236,7 @@ class SyntheticSemanticHandoff:
         self.profiled_v1 = False
         self.reviewed_git_head = "6" * 40
         self.installed_grant = None
+        self.installed_extension = None
         self.campaign_binding = None
         self.authority_bindings = []
 
@@ -314,6 +315,38 @@ class SyntheticSemanticHandoff:
             capture_provider_version=window_binding.capture_provider_version,
             semantic_batch_size=window_binding.semantic_batch_size,
             reviewed_git_head=window_binding.reviewed_git_head,
+        )
+        return expected
+
+    def install_global_authority_extension(
+        self,
+        *,
+        window_binding,
+    ):
+        assert self.installed_grant is not None
+        assert self.campaign_binding is not None
+        assert window_binding.reviewed_git_head == self.campaign_binding.reviewed_git_head
+        expected = {
+            "activation_total": 81,
+            "activation_unknown_count": 0,
+            "previous_absolute_cap": 100,
+            "new_absolute_cap": 1000,
+            "first_authorized_ordinal": 82,
+            "last_authorized_ordinal": 1000,
+            "extension_fingerprint": "sha256:" + "e" * 64,
+        }
+        if self.installed_extension is not None and self.installed_extension != expected:
+            raise RuntimeError("synthetic authority extension drift")
+        self.installed_extension = expected
+        self.campaign_binding = SimpleNamespace(
+            created_at=self.campaign_binding.created_at,
+            lower_cursor=self.campaign_binding.lower_cursor,
+            frozen_global_upper_cursor=(
+                self.campaign_binding.frozen_global_upper_cursor
+            ),
+            capture_provider_version=self.campaign_binding.capture_provider_version,
+            semantic_batch_size=self.campaign_binding.semantic_batch_size,
+            reviewed_git_head=self.reviewed_git_head,
         )
         return expected
 
@@ -1981,6 +2014,48 @@ class WechatDigestTests(unittest.TestCase):
             service.install_semantic_authority(
                 inventory_authority_file=Path("/private/authority-b.json"),
             )
+        self.assertEqual(self.semantic.provider.calls, provider_calls)
+
+    def test_cap1000_semantic_extension_requires_terminal_active_window(
+        self,
+    ) -> None:
+        self.create_object()
+        capture = SyntheticCaptureProvider([message(1)])
+        failures = {"remaining": 1}
+
+        def fail_checkpoint_once() -> None:
+            if failures["remaining"]:
+                failures["remaining"] -= 1
+                raise OSError("synthetic checkpoint interruption")
+
+        run_store = WechatDigestRunStore(
+            self.workspace / "02_processing" / "wechat_digest",
+            before_checkpoint_publish=fail_checkpoint_once,
+        )
+        service = self.service(capture, run_store=run_store)
+        with self.assertRaises(WechatDigestError):
+            service.run(all_history=True)
+        provider_calls = self.semantic.provider.calls
+        service.install_semantic_authority(
+            inventory_authority_file=Path("/private/authority-a.json"),
+        )
+        self.semantic.reviewed_git_head = "7" * 40
+        extension = service.install_semantic_authority_extension()
+        self.assertEqual(extension["activation_total"], 81)
+        self.assertEqual(extension["new_absolute_cap"], 1000)
+        self.assertEqual(self.semantic.provider.calls, provider_calls)
+        self.assertEqual(
+            service.install_semantic_authority_extension(), extension
+        )
+        self.assertEqual(self.semantic.provider.calls, provider_calls)
+
+        status_path = run_store.runs_root / run_store.active_run_id() / "status.json"
+        status = json.loads(status_path.read_text(encoding="utf-8"))
+        first = next(iter(status["items"].values()))
+        first["state"] = "represented"
+        status_path.write_text(json.dumps(status), encoding="utf-8")
+        with self.assertRaisesRegex(WechatDigestError, "terminal"):
+            service.install_semantic_authority_extension()
         self.assertEqual(self.semantic.provider.calls, provider_calls)
 
     def test_global_authority_uses_durable_completed_window_chain(self) -> None:

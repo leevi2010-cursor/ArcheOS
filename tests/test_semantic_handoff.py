@@ -1695,6 +1695,7 @@ class SemanticHandoffTest(unittest.TestCase):
         blocks: int = 1,
         root: Path | None = None,
         source_id: str = "src_" + "1" * 32,
+        batch_size: int = 40,
     ):
         root = self.root if root is None else root
         root.mkdir(parents=True, exist_ok=True)
@@ -1718,6 +1719,7 @@ class SemanticHandoffTest(unittest.TestCase):
             sources,
             representations,
             root / "information",
+            batch_size=batch_size,
             clock=lambda: "2026-08-15T00:00:00.000Z",
         )
         return representation, service
@@ -1888,6 +1890,66 @@ class SemanticHandoffTest(unittest.TestCase):
                 mutate=mutate,
             ),
             window_binding=binding,
+        )
+
+    def build_cap1000_extension_fixture(
+        self,
+        root: Path,
+        *,
+        batch_size: int = 40,
+    ):
+        representation, service = self.build_service(
+            root=root / "activation-source",
+            source_id="src_" + "e" * 32,
+            batch_size=batch_size,
+        )
+        audit_root = root / "audits"
+        handoff = ExternalAgentSemanticHandoffService(
+            service,
+            JsonlAtomicInformationStore(root / "activation-atomic.jsonl"),
+            audit_root,
+        )
+        provider = CodexCliRepresentationAnalysisProvider(
+            provider_version="0.147.0",
+            timeout_seconds=300,
+            runner=FakeRunner(),
+        )
+        base_window = self.semantic_window_binding(batch_size=batch_size)
+        grant = self.install_authority(
+            handoff, provider, base_window
+        )
+        handoff.execute(
+            representation.representation_id,
+            provider,
+            privacy_binding=self.privacy_binding(),
+            authority_binding=base_window,
+        )
+        grant_bytes = (
+            audit_root / "semantic_global_authority" / "grant.json"
+        ).read_bytes()
+        ordinal_81_bytes = next(
+            path.read_bytes()
+            for path in audit_root.glob("semantic_run_*/attempts/*.json")
+            if json.loads(path.read_text(encoding="utf-8")).get(
+                "global_ordinal"
+            )
+            == 81
+        )
+        final_head = "7" * 40
+        extension = handoff.install_global_authority_extension(
+            provider,
+            window_binding=base_window,
+            reviewed_git_head=final_head,
+        )
+        return (
+            handoff,
+            provider,
+            base_window,
+            grant,
+            extension,
+            representation,
+            grant_bytes,
+            ordinal_81_bytes,
         )
 
     @staticmethod
@@ -8983,6 +9045,419 @@ print("passed")
         self.assertNotIn("fallback_provider", source.lower())
         self.assertNotIn("fallback_model", source.lower())
         self.assertNotIn("provider_switch", source.lower())
+
+    def test_cap1000_extension_is_append_only_exact_and_replay_safe(self) -> None:
+        (
+            handoff,
+            provider,
+            base_window,
+            grant,
+            extension,
+            representation,
+            grant_bytes,
+            ordinal_81_bytes,
+        ) = self.build_cap1000_extension_fixture(self.root / "cap1000")
+        authority_root = handoff.audit_root / "semantic_global_authority"
+        self.assertEqual((authority_root / "grant.json").read_bytes(), grant_bytes)
+        ordinal_81_path = next(
+            path
+            for path in handoff.audit_root.glob(
+                "semantic_run_*/attempts/*.json"
+            )
+            if json.loads(path.read_text(encoding="utf-8")).get(
+                "global_ordinal"
+            )
+            == 81
+        )
+        self.assertEqual(ordinal_81_path.read_bytes(), ordinal_81_bytes)
+        self.assertEqual(extension["base_global_authority_fingerprint"], grant[
+            "global_authority_fingerprint"
+        ])
+        self.assertEqual(extension["activation_total"], 81)
+        self.assertEqual(extension["activation_unknown_count"], 0)
+        self.assertEqual(extension["previous_absolute_cap"], 100)
+        self.assertEqual(extension["new_absolute_cap"], 1000)
+        self.assertEqual(extension["first_authorized_ordinal"], 82)
+        self.assertEqual(extension["last_authorized_ordinal"], 1000)
+        self.assertEqual(
+            handoff.install_global_authority_extension(
+                provider,
+                window_binding=base_window,
+                reviewed_git_head="7" * 40,
+            ),
+            extension,
+        )
+        before_drift = self.tree_snapshot(handoff.audit_root)
+        with self.assertRaisesRegex(SemanticHandoffError, "已存在且不匹配"):
+            handoff.install_global_authority_extension(
+                provider,
+                window_binding=base_window,
+                reviewed_git_head="8" * 40,
+            )
+        self.assertEqual(self.tree_snapshot(handoff.audit_root), before_drift)
+        with self.assertRaisesRegex(SemanticHandoffError, "window head"):
+            handoff.install_global_authority_extension(
+                provider,
+                window_binding=replace(
+                    base_window, reviewed_git_head="8" * 40
+                ),
+                reviewed_git_head="7" * 40,
+            )
+        self.assertEqual(self.tree_snapshot(handoff.audit_root), before_drift)
+
+        replay_runner = FakeRunner()
+        replay = handoff.execute(
+            representation.representation_id,
+            CodexCliRepresentationAnalysisProvider(
+                provider_version="0.147.0",
+                timeout_seconds=300,
+                runner=replay_runner,
+            ),
+            privacy_binding=self.privacy_binding(),
+            authority_binding=replace(
+                base_window, reviewed_git_head="7" * 40
+            ),
+        )
+        self.assertTrue(replay.replayed_existing_package)
+        self.assertEqual(replay_runner.calls, [])
+
+    def test_cap1000_extension_requires_exact_activation_ledger(self) -> None:
+        representation, service = self.build_service(
+            root=self.root / "cap1000-invalid-source"
+        )
+        handoff = ExternalAgentSemanticHandoffService(
+            service,
+            JsonlAtomicInformationStore(self.root / "cap1000-invalid.jsonl"),
+            self.root / "cap1000-invalid-audits",
+        )
+        provider = CodexCliRepresentationAnalysisProvider(
+            provider_version="0.147.0",
+            timeout_seconds=300,
+            runner=FakeRunner(),
+        )
+        binding = self.semantic_window_binding()
+        self.install_authority(handoff, provider, binding)
+        before = self.tree_snapshot(handoff.audit_root)
+        with self.assertRaisesRegex(SemanticHandoffError, "activation ledger"):
+            handoff.install_global_authority_extension(
+                provider,
+                window_binding=binding,
+                reviewed_git_head="7" * 40,
+            )
+        self.assertEqual(self.tree_snapshot(handoff.audit_root), before)
+        self.assertFalse(
+            (
+                handoff.audit_root
+                / "semantic_global_authority"
+                / "extension-cap-1000.json"
+            ).exists()
+        )
+        self.assertFalse(
+            (service.output_root / representation.representation_id).exists()
+        )
+
+    def test_cap1000_extension_rejects_self_consistent_binding_tamper(
+        self,
+    ) -> None:
+        (
+            handoff,
+            provider,
+            base_window,
+            _grant,
+            extension,
+            _representation,
+            _grant_bytes,
+            _ordinal_81_bytes,
+        ) = self.build_cap1000_extension_fixture(self.root / "cap1000-tamper")
+        extension_path = (
+            handoff.audit_root
+            / "semantic_global_authority"
+            / "extension-cap-1000.json"
+        )
+        original = extension_path.read_bytes()
+
+        mutations = {
+            "base fingerprint": lambda payload: payload.__setitem__(
+                "base_global_authority_fingerprint", "sha256:" + "0" * 64
+            ),
+            "campaign": lambda payload: payload["campaign"].__setitem__(
+                "semantic_batch_size", 41
+            ),
+            "activation total": lambda payload: payload.__setitem__(
+                "activation_total", 82
+            ),
+            "activation unknown": lambda payload: payload.__setitem__(
+                "activation_unknown_count", 1
+            ),
+            "activation ordinal": lambda payload: payload.__setitem__(
+                "activation_last_global_ordinal", 82
+            ),
+            "activation inventory": lambda payload: payload.__setitem__(
+                "activation_attempt_inventory_fingerprint",
+                "sha256:" + "1" * 64,
+            ),
+            "base head": lambda payload: payload.__setitem__(
+                "base_reviewed_git_head", "8" * 40
+            ),
+            "current contract": lambda payload: payload[
+                "execution_contract"
+            ].__setitem__("execution_deadline_ms", 299000),
+            "absolute cap": lambda payload: payload.__setitem__(
+                "new_absolute_cap", 1001
+            ),
+            "ordinal range": lambda payload: payload.__setitem__(
+                "first_authorized_ordinal", 81
+            ),
+        }
+        for name, mutate in mutations.items():
+            with self.subTest(name=name):
+                payload = json.loads(original)
+                mutate(payload)
+                projected = dict(payload)
+                projected.pop("extension_fingerprint")
+                payload["extension_fingerprint"] = _canonical_fingerprint(
+                    projected
+                )
+                extension_path.write_text(
+                    json.dumps(payload), encoding="utf-8"
+                )
+                with self.assertRaises(SemanticHandoffError):
+                    handoff.install_global_authority_extension(
+                        provider,
+                        window_binding=base_window,
+                        reviewed_git_head="7" * 40,
+                    )
+                extension_path.write_bytes(original)
+                self.assertEqual(
+                    json.loads(original), extension
+                )
+
+    def test_cap1000_extension_converges_visible_receipt_after_fsync_failure(
+        self,
+    ) -> None:
+        import archeos.semantic_handoff as handoff_module
+
+        (
+            handoff,
+            provider,
+            base_window,
+            _grant,
+            extension,
+            _representation,
+            _grant_bytes,
+            _ordinal_81_bytes,
+        ) = self.build_cap1000_extension_fixture(self.root / "cap1000-crash")
+        extension_path = (
+            handoff.audit_root
+            / "semantic_global_authority"
+            / "extension-cap-1000.json"
+        )
+        extension_path.unlink()
+        original_fsync = handoff_module._fsync_directory
+        failed = False
+
+        def fail_after_visible(path):
+            nonlocal failed
+            if path == extension_path.parent and extension_path.exists() and not failed:
+                failed = True
+                raise OSError("synthetic extension fsync interruption")
+            return original_fsync(path)
+
+        with (
+            patch.object(handoff_module, "_fsync_directory", fail_after_visible),
+            self.assertRaises(OSError),
+        ):
+            handoff.install_global_authority_extension(
+                provider,
+                window_binding=base_window,
+                reviewed_git_head="7" * 40,
+            )
+        self.assertTrue(extension_path.is_file())
+        self.assertEqual(
+            handoff.install_global_authority_extension(
+                provider,
+                window_binding=base_window,
+                reviewed_git_head="7" * 40,
+            ),
+            extension,
+        )
+
+    def test_cap1000_extension_concurrent_exact_install_is_idempotent(
+        self,
+    ) -> None:
+        (
+            handoff,
+            provider,
+            base_window,
+            _grant,
+            extension,
+            _representation,
+            _grant_bytes,
+            _ordinal_81_bytes,
+        ) = self.build_cap1000_extension_fixture(
+            self.root / "cap1000-concurrent"
+        )
+        extension_path = (
+            handoff.audit_root
+            / "semantic_global_authority"
+            / "extension-cap-1000.json"
+        )
+        extension_path.unlink()
+        start = threading.Barrier(3)
+        outcomes: list[dict[str, object]] = []
+
+        def install() -> None:
+            start.wait()
+            try:
+                observed = handoff.install_global_authority_extension(
+                    provider,
+                    window_binding=base_window,
+                    reviewed_git_head="7" * 40,
+                )
+                outcomes.append({"state": "passed", "payload": observed})
+            except BaseException as error:  # noqa: BLE001 - concurrency evidence.
+                outcomes.append({"state": "failed", "error": repr(error)})
+
+        threads = [threading.Thread(target=install) for _ in range(2)]
+        for thread in threads:
+            thread.start()
+        start.wait()
+        for thread in threads:
+            thread.join(timeout=10)
+            self.assertFalse(thread.is_alive())
+        self.assertEqual(
+            sorted(str(outcome["state"]) for outcome in outcomes),
+            ["passed", "passed"],
+            outcomes,
+        )
+        self.assertTrue(
+            all(outcome.get("payload") == extension for outcome in outcomes),
+            outcomes,
+        )
+        self.assertEqual(
+            json.loads(extension_path.read_text(encoding="utf-8")), extension
+        )
+
+    def test_cap1000_extension_allows_82_through_1000_then_blocks_1001(
+        self,
+    ) -> None:
+        import archeos.semantic_handoff as handoff_module
+
+        shared = self.root / "cap1000-boundary"
+        (
+            _handoff,
+            _provider,
+            base_window,
+            _grant,
+            extension,
+            _representation,
+            _grant_bytes,
+            _ordinal_81_bytes,
+        ) = self.build_cap1000_extension_fixture(shared, batch_size=1)
+        representation, service = self.build_service(
+            root=shared / "remaining-source",
+            source_id="src_" + "f" * 32,
+            blocks=1,
+            batch_size=1,
+        )
+        handoff = ExternalAgentSemanticHandoffService(
+            service,
+            JsonlAtomicInformationStore(shared / "remaining-atomic.jsonl"),
+            shared / "audits",
+        )
+        completed = SemanticCompletedWindowBinding(
+            window_run_id=base_window.window_run_id,
+            window_plan_fingerprint=base_window.window_plan_fingerprint,
+            window_plan_receipt_fingerprint=(
+                base_window.window_plan_receipt_fingerprint
+            ),
+            window_status_fingerprint="sha256:" + "a" * 64,
+            window_after_cursor=base_window.window_after_cursor,
+            window_upper_cursor=base_window.window_upper_cursor,
+        )
+        next_window = replace(
+            base_window,
+            window_run_id="run_" + "8" * 32,
+            window_plan_fingerprint="sha256:" + "b" * 64,
+            window_plan_receipt_fingerprint="sha256:" + "c" * 64,
+            window_after_cursor=base_window.window_upper_cursor,
+            window_upper_cursor=(2, "next", "next"),
+            previous_checkpoint_fingerprint="sha256:" + "d" * 64,
+            completed_window_chain=(completed,),
+            reviewed_git_head="7" * 40,
+        )
+        runner = FakeRunner()
+        handoff.execute(
+            representation.representation_id,
+            CodexCliRepresentationAnalysisProvider(
+                provider_version="0.147.0",
+                timeout_seconds=300,
+                runner=runner,
+            ),
+            privacy_binding=self.privacy_binding(),
+            authority_binding=next_window,
+        )
+        self.assertEqual(len(runner.calls), 1)
+        attempts = sorted(
+            (
+                json.loads(path.read_text(encoding="utf-8"))
+                for path in (shared / "audits").glob(
+                    "semantic_run_*/attempts/*.json"
+                )
+            ),
+            key=lambda item: item["global_ordinal"],
+        )
+        self.assertEqual(
+            [item["global_ordinal"] for item in attempts],
+            [81, 82],
+        )
+        self.assertTrue(
+            all(
+                item["global_authority_fingerprint"]
+                == extension["extension_fingerprint"]
+                for item in attempts[1:]
+            )
+        )
+        at_cap = [
+            attempts[0],
+            *(
+                {**attempts[1], "global_ordinal": ordinal}
+                for ordinal in range(82, 1001)
+            ),
+        ]
+
+        blocked_representation, blocked_service = self.build_service(
+            root=shared / "blocked-source",
+            source_id="src_" + "9" * 32,
+            batch_size=1,
+        )
+        blocked_handoff = ExternalAgentSemanticHandoffService(
+            blocked_service,
+            JsonlAtomicInformationStore(shared / "blocked-atomic.jsonl"),
+            shared / "audits",
+        )
+        blocked_runner = FakeRunner()
+        before = self.tree_snapshot(shared / "audits")
+        with (
+            patch.object(
+                handoff_module._SemanticGlobalAuthority,
+                "_global_attempts",
+                return_value=(at_cap, False),
+            ),
+            self.assertRaisesRegex(SemanticHandoffError, "额度不足"),
+        ):
+            blocked_handoff.execute(
+                blocked_representation.representation_id,
+                CodexCliRepresentationAnalysisProvider(
+                    provider_version="0.147.0",
+                    timeout_seconds=300,
+                    runner=blocked_runner,
+                ),
+                privacy_binding=self.privacy_binding(),
+                authority_binding=next_window,
+            )
+        self.assertEqual(blocked_runner.calls, [])
+        self.assertEqual(self.tree_snapshot(shared / "audits"), before)
 
 
 if __name__ == "__main__":

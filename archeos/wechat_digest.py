@@ -213,6 +213,12 @@ class SemanticHandoffPort(Protocol):
         window_binding: SemanticWindowAuthorityBinding,
     ) -> dict[str, object]: ...
 
+    def install_global_authority_extension(
+        self,
+        *,
+        window_binding: SemanticWindowAuthorityBinding,
+    ) -> dict[str, object]: ...
+
     def global_campaign_binding(
         self,
     ) -> SemanticCampaignAuthorityBinding | None: ...
@@ -1018,6 +1024,17 @@ class ExistingSemanticHandoff:
             window_binding=window_binding,
         )
 
+    def install_global_authority_extension(
+        self,
+        *,
+        window_binding: SemanticWindowAuthorityBinding,
+    ) -> dict[str, object]:
+        return self.service.install_global_authority_extension(
+            self.provider,
+            window_binding=window_binding,
+            reviewed_git_head=self.reviewed_git_head,
+        )
+
     def global_campaign_binding(
         self,
     ) -> SemanticCampaignAuthorityBinding | None:
@@ -1370,7 +1387,7 @@ class WechatDigestService:
         return (cursor.timestamp, cursor.conversation_key, cursor.message_key)
 
     def _semantic_authority_binding(
-        self, run_id: str
+        self, run_id: str, *, allow_reviewed_head_extension: bool = False
     ) -> SemanticWindowAuthorityBinding:
         plan = self.run_store.plan(run_id)
         receipt = self.run_store.plan_receipt(run_id)
@@ -1397,7 +1414,10 @@ class WechatDigestService:
                 self._cursor_tuple(global_upper) != campaign_upper
                 or plan.get("provider_version") != campaign_provider_version
                 or self._plan_batch_size(plan) != campaign_batch_size
-                or port.reviewed_git_head != campaign_reviewed_head
+                or (
+                    not allow_reviewed_head_extension
+                    and port.reviewed_git_head != campaign_reviewed_head
+                )
             ):
                 raise WechatDigestError(
                     "微信运行计划与 frozen Semantic campaign 漂移。"
@@ -1598,6 +1618,47 @@ class WechatDigestService:
             if grant.get("global_authority_fingerprint") is None:
                 raise WechatDigestError("Semantic authority 安装读回失败。")
             return grant
+
+    def install_semantic_authority_extension(self) -> dict[str, object]:
+        """Install the approved append-only cap-1000 extension, zero Provider."""
+
+        with self.run_store.lock():
+            run_id = self.run_store.active_run_id()
+            if run_id is None:
+                raise WechatDigestError(
+                    "不存在可绑定 Semantic authority extension 的 active run。"
+                )
+            plan = self.run_store.plan(run_id)
+            if self._plan_all_history_upper(plan) is None:
+                raise WechatDigestError(
+                    "Semantic authority extension 只能绑定已冻结全局上界的 campaign。"
+                )
+            after = WechatCursor.from_dict(plan["after_cursor"], "plan.after_cursor")
+            upper = WechatCursor.from_dict(plan["upper_bound"], "plan.upper_bound")
+            capture = self.capture_provider.capture(after, upper_bound=upper)
+            self._verify_capture_against_plan(capture, plan)
+            status = self.run_store.status(run_id)
+            self._verify_plan_and_status(run_id, capture, plan, status)
+            items = status.get("items")
+            if not isinstance(items, dict) or any(
+                not isinstance(item, dict)
+                or item.get("state") not in TERMINAL_ITEM_STATES
+                for item in items.values()
+            ):
+                raise WechatDigestError(
+                    "Semantic authority extension 要求当前窗口全部 terminal。"
+                )
+            binding = self._semantic_authority_binding(
+                run_id, allow_reviewed_head_extension=True
+            )
+            extension = self._semantic_port().install_global_authority_extension(
+                window_binding=binding
+            )
+            if extension.get("extension_fingerprint") is None:
+                raise WechatDigestError(
+                    "Semantic authority extension 安装读回失败。"
+                )
+            return extension
 
     def run(
         self,
