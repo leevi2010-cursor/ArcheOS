@@ -76,6 +76,7 @@ class CodexExecutableIdentity:
     resolved_path: str
     provider_version: str
     binary_sha256: str
+    resolved_path_sha256: str
 
 
 def resolve_codex_executable_identity(
@@ -147,6 +148,8 @@ def resolve_codex_executable_identity(
         resolved_path=str(resolved),
         provider_version=actual_version,
         binary_sha256="sha256:" + digest.hexdigest(),
+        resolved_path_sha256="sha256:"
+        + hashlib.sha256(str(resolved).encode("utf-8")).hexdigest(),
     )
 
 
@@ -1394,6 +1397,8 @@ class CodexCliRepresentationAnalysisProvider:
                 + hashlib.sha256(
                     ("injected-runner\0" + self.codex_binary + "\0" + self.provider_version).encode()
                 ).hexdigest(),
+                resolved_path_sha256="sha256:"
+                + hashlib.sha256(self.codex_binary.encode("utf-8")).hexdigest(),
             )
         else:
             identity = resolve_codex_executable_identity(

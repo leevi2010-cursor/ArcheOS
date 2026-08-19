@@ -290,22 +290,17 @@ class SyntheticSemanticHandoff:
     def install_global_authority(
         self,
         *,
-        authority_ref,
-        expected_total,
-        max_new,
-        absolute_cap,
+        inventory_authority_file,
         window_binding,
-        historical_provider_versions=(),
     ):
-        assert authority_ref.startswith("sha256:")
-        assert (expected_total, max_new, absolute_cap) == (80, 20, 100)
+        assert isinstance(inventory_authority_file, Path)
         expected = {
-            "authority_ref": authority_ref,
+            "authority_ref": "sha256:" + "a" * 64,
             "baseline_total": 80,
             "max_new": 20,
             "absolute_cap": 100,
             "global_authority_fingerprint": "sha256:" + "5" * 64,
-            "historical_provider_versions": tuple(historical_provider_versions),
+            "inventory_authority_file": str(inventory_authority_file),
         }
         if self.installed_grant is not None and self.installed_grant != expected:
             raise RuntimeError("synthetic authority drift")
@@ -1910,29 +1905,20 @@ class WechatDigestTests(unittest.TestCase):
             service.run(all_history=True)
         provider_calls = self.semantic.provider.calls
         grant = service.install_semantic_authority(
-            authority_ref="sha256:" + "a" * 64,
-            expected_total=80,
-            max_new=20,
-            absolute_cap=100,
+            inventory_authority_file=Path("/private/authority-a.json"),
         )
         self.assertEqual(grant["baseline_total"], 80)
         self.assertEqual(grant["max_new"], 20)
         self.assertEqual(self.semantic.provider.calls, provider_calls)
         self.assertEqual(
             service.install_semantic_authority(
-                authority_ref="sha256:" + "a" * 64,
-                expected_total=80,
-                max_new=20,
-                absolute_cap=100,
+                inventory_authority_file=Path("/private/authority-a.json"),
             ),
             grant,
         )
         with self.assertRaises(RuntimeError):
             service.install_semantic_authority(
-                authority_ref="sha256:" + "b" * 64,
-                expected_total=80,
-                max_new=20,
-                absolute_cap=100,
+                inventory_authority_file=Path("/private/authority-b.json"),
             )
         self.assertEqual(self.semantic.provider.calls, provider_calls)
 
@@ -1950,10 +1936,7 @@ class WechatDigestTests(unittest.TestCase):
         with self.assertRaises(WechatDigestError):
             service.run(all_history=True)
         service.install_semantic_authority(
-            authority_ref="sha256:" + "a" * 64,
-            expected_total=80,
-            max_new=20,
-            absolute_cap=100,
+            inventory_authority_file=Path("/private/authority-a.json"),
         )
         result = service.run()
         self.assertGreaterEqual(result.new_messages, 2)

@@ -13,6 +13,7 @@ from io import StringIO
 from pathlib import Path
 from unittest import mock
 
+import archeos.semantic_handoff as semantic_handoff_module
 import archeos.workspace as workspace_module
 from archeos.atomic_information import (
     AtomicInformationRevision,
@@ -128,12 +129,41 @@ class WorkspaceAndMcpTest(unittest.TestCase):
                     completed_window_chain=(),
                     reviewed_git_head="6" * 40,
                 )
+                inventory_authority = root / "semantic-inventory-authority.json"
+                inventory_payload = {
+                    "schema_version": "semantic-handoff-inventory-authority/1.0",
+                    "artifact_kind": "semantic_handoff_inventory_authority",
+                    "authority_ref": "sha256:" + "5" * 64,
+                    "reviewed_git_head": binding.reviewed_git_head,
+                    "campaign": {
+                        "created_at": binding.campaign_created_at,
+                        "lower_cursor": list(binding.campaign_lower_cursor),
+                        "frozen_global_upper_cursor": list(
+                            binding.frozen_global_upper_cursor
+                        ),
+                        "capture_provider_version": binding.capture_provider_version,
+                        "semantic_batch_size": binding.semantic_batch_size,
+                    },
+                    "expected_raw_provider_labels": [],
+                    "historical_provider_version_counts": {},
+                    "local_total": 0,
+                    "legacy_inventory_fingerprint": (
+                        semantic_handoff_module._fingerprint([])
+                    ),
+                    "baseline_total": 80,
+                    "max_new": 20,
+                    "absolute_cap": 100,
+                }
+                inventory_payload["payload_fingerprint"] = (
+                    semantic_handoff_module._fingerprint(inventory_payload)
+                )
+                inventory_authority.write_text(
+                    json.dumps(inventory_payload), encoding="utf-8"
+                )
+                inventory_authority.chmod(0o600)
                 handoff.install_global_authority(
                     provider,
-                    authority_ref="sha256:" + "5" * 64,
-                    expected_total=80,
-                    max_new=20,
-                    absolute_cap=100,
+                    inventory_authority_file=inventory_authority,
                     window_binding=binding,
                 )
                 first = handoff.execute(

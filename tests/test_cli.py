@@ -131,35 +131,23 @@ class CliTest(unittest.TestCase):
                     "wechat",
                     "digest",
                     "--install-semantic-authority",
-                    "--expected-total",
-                    "80",
-                    "--max-new",
-                    "20",
-                    "--absolute-cap",
-                    "100",
-                    "--authority-ref",
-                    "sha256:" + "b" * 64,
-                    "--historical-provider-version",
-                    "0.146.0",
-                    "--historical-provider-version",
-                    "0.145.0",
+                    "--inventory-authority-file",
+                    "/private/semantic-inventory-authority.json",
                 ]
             )
         self.assertEqual(result, 0)
         self.assertIn('"semantic_provider_calls": 0', output.getvalue())
         digest_service.return_value.install_semantic_authority.assert_called_once_with(
-            authority_ref="sha256:" + "b" * 64,
-            expected_total=80,
-            max_new=20,
-            absolute_cap=100,
-            historical_provider_versions=("0.145.0", "0.146.0"),
+            inventory_authority_file=Path(
+                "/private/semantic-inventory-authority.json"
+            ),
         )
         digest_service.return_value.run.assert_not_called()
         capture_provider.assert_called_once()
 
     @patch("archeos.cli.WechatCliCaptureProvider")
     @patch("archeos.cli.require_workspace")
-    def test_wechat_semantic_authority_rejects_cap_drift_before_workspace(
+    def test_wechat_semantic_authority_file_requires_install_before_workspace(
         self,
         require_workspace: Mock,
         capture_provider: Mock,
@@ -169,15 +157,8 @@ class CliTest(unittest.TestCase):
                 [
                     "wechat",
                     "digest",
-                    "--install-semantic-authority",
-                    "--expected-total",
-                    "80",
-                    "--max-new",
-                    "21",
-                    "--absolute-cap",
-                    "100",
-                    "--authority-ref",
-                    "sha256:" + "b" * 64,
+                    "--inventory-authority-file",
+                    "/private/semantic-inventory-authority.json",
                 ]
             )
         self.assertEqual(result, 2)

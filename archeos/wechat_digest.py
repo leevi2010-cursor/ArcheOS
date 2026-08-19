@@ -209,12 +209,8 @@ class SemanticHandoffPort(Protocol):
     def install_global_authority(
         self,
         *,
-        authority_ref: str,
-        expected_total: int,
-        max_new: int,
-        absolute_cap: int,
+        inventory_authority_file: Path,
         window_binding: SemanticWindowAuthorityBinding,
-        historical_provider_versions: tuple[str, ...] = (),
     ) -> dict[str, object]: ...
 
     def global_campaign_binding(
@@ -1013,21 +1009,13 @@ class ExistingSemanticHandoff:
     def install_global_authority(
         self,
         *,
-        authority_ref: str,
-        expected_total: int,
-        max_new: int,
-        absolute_cap: int,
+        inventory_authority_file: Path,
         window_binding: SemanticWindowAuthorityBinding,
-        historical_provider_versions: tuple[str, ...] = (),
     ) -> dict[str, object]:
         return self.service.install_global_authority(
             self.provider,
-            authority_ref=authority_ref,
-            expected_total=expected_total,
-            max_new=max_new,
-            absolute_cap=absolute_cap,
+            inventory_authority_file=inventory_authority_file,
             window_binding=window_binding,
-            historical_provider_versions=historical_provider_versions,
         )
 
     def global_campaign_binding(
@@ -1583,11 +1571,7 @@ class WechatDigestService:
     def install_semantic_authority(
         self,
         *,
-        authority_ref: str,
-        expected_total: int,
-        max_new: int,
-        absolute_cap: int,
-        historical_provider_versions: tuple[str, ...] = (),
+        inventory_authority_file: Path,
     ) -> dict[str, object]:
         """Install the one frozen campaign grant without starting a Provider."""
 
@@ -1608,12 +1592,8 @@ class WechatDigestService:
             self._verify_plan_and_status(run_id, capture, plan, status)
             binding = self._semantic_authority_binding(run_id)
             grant = self._semantic_port().install_global_authority(
-                authority_ref=authority_ref,
-                expected_total=expected_total,
-                max_new=max_new,
-                absolute_cap=absolute_cap,
+                inventory_authority_file=inventory_authority_file,
                 window_binding=binding,
-                historical_provider_versions=historical_provider_versions,
             )
             if grant.get("global_authority_fingerprint") is None:
                 raise WechatDigestError("Semantic authority 安装读回失败。")

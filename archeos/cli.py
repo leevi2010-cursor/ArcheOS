@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import re
 import sqlite3
 import sys
 from dataclasses import asdict
@@ -582,15 +581,10 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="零 Provider 安装一次性 frozen-global-upper Semantic 调用授权。",
     )
-    wechat_digest.add_argument("--expected-total", type=int)
-    wechat_digest.add_argument("--max-new", type=int)
-    wechat_digest.add_argument("--absolute-cap", type=int)
-    wechat_digest.add_argument("--authority-ref")
     wechat_digest.add_argument(
-        "--historical-provider-version",
-        action="append",
-        default=[],
-        help="Repeat for each exact historical Provider version approved for baseline inventory.",
+        "--inventory-authority-file",
+        type=Path,
+        help="Private 0600 Lead-approved historical inventory authority manifest.",
     )
     return parser
 
@@ -1004,39 +998,12 @@ def _wechat_product_command(args: argparse.Namespace) -> int:
     ):
         print("error: 恢复维护入口不能与首次起点或其他维护入口同时使用。")
         return 2
-    authority_values = (
-        args.expected_total,
-        args.max_new,
-        args.absolute_cap,
-        args.authority_ref,
-    )
     if args.install_semantic_authority:
-        if any(value is None for value in authority_values):
-            print("error: 安装 Semantic authority 必须完整指定总账、增量、上限和授权引用。")
+        if args.inventory_authority_file is None:
+            print("error: 安装 Semantic authority 必须指定私有 inventory authority file。")
             return 2
-        if (args.expected_total, args.max_new, args.absolute_cap) != (
-            80,
-            20,
-            100,
-        ):
-            print("error: Semantic authority 必须严格使用 80 + 20 = 100。")
-            return 2
-        historical_versions = tuple(args.historical_provider_version)
-        if (
-            len(set(historical_versions)) != len(historical_versions)
-            or any(
-                re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", item)
-                is None
-                for item in historical_versions
-            )
-        ):
-            print("error: historical Provider version 必须是唯一的安全精确标签。")
-            return 2
-    elif any(value is not None for value in authority_values):
-        print("error: Semantic authority 参数只能与安装入口一起使用。")
-        return 2
-    elif args.historical_provider_version:
-        print("error: historical Provider version 只能与安装入口一起使用。")
+    elif args.inventory_authority_file is not None:
+        print("error: inventory authority file 只能与安装入口一起使用。")
         return 2
     try:
         workspace = require_workspace(args.config).workspace
@@ -1111,13 +1078,7 @@ def _wechat_product_command(args: argparse.Namespace) -> int:
             return 0
         if args.install_semantic_authority:
             grant = service.install_semantic_authority(
-                authority_ref=args.authority_ref,
-                expected_total=args.expected_total,
-                max_new=args.max_new,
-                absolute_cap=args.absolute_cap,
-                historical_provider_versions=tuple(
-                    sorted(args.historical_provider_version)
-                ),
+                inventory_authority_file=args.inventory_authority_file,
             )
             print(
                 json.dumps(
