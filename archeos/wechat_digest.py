@@ -1276,7 +1276,7 @@ def _validated_global_attempt_summary(value: object) -> dict[str, int]:
         or summary["global_unknown"] != 0
         or summary["next_global_ordinal"]
         != summary["global_attempt_total"] + 1
-        or summary["global_attempt_total"] >= summary["absolute_cap"]
+        or summary["global_attempt_total"] > summary["absolute_cap"]
     ):
         raise WechatDigestError(
             "Semantic global attempt ledger 尚未满足治理超时封存条件。"

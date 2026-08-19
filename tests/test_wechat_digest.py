@@ -1116,6 +1116,25 @@ class WechatDigestTests(unittest.TestCase):
         self.assertEqual(self.semantic.provider.calls, semantic_calls)
         self.assertEqual(provider.calls, governance_calls)
 
+    def test_governance_timeout_seal_allows_attempt_total_at_cap(self) -> None:
+        service, _capture, provider, _run_id, _item_id = (
+            self.governance_timeout_fixture(include_next=False)
+        )
+        self.semantic.global_attempt_total = 1000
+        self.semantic.absolute_cap = 1000
+        semantic_calls = self.semantic.provider.calls
+        governance_calls = provider.calls
+
+        resolution = service.seal_governance_timeout()
+
+        self.assertEqual(resolution["global_attempt_total"], 1000)
+        self.assertEqual(resolution["absolute_cap"], 1000)
+        self.assertEqual(resolution["next_global_ordinal"], 1001)
+        self.assertEqual(resolution["semantic_provider_calls"], 0)
+        self.assertEqual(resolution["governance_provider_calls"], 0)
+        self.assertEqual(self.semantic.provider.calls, semantic_calls)
+        self.assertEqual(provider.calls, governance_calls)
+
     def test_governance_timeout_seal_rejects_missing_semantic_package(self) -> None:
         def mutate(service, run_id, item_id):
             item = service.run_store.status(run_id)["items"][item_id]
