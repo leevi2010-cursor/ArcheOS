@@ -1,8 +1,12 @@
 from __future__ import annotations
 
 import json
+import signal
 import tempfile
-from collections.abc import Callable
+import threading
+import time
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from dataclasses import asdict
 from pathlib import Path
 
@@ -16,6 +20,12 @@ from .models import DigestionWorldState, InterpretationResult
 from .serialization import operation_from_dict
 
 SdkLoader = Callable[[], tuple[type[object], object, object]]
+DEFAULT_INTERPRETATION_TURN_TIMEOUT_SECONDS = 300.0
+DEFAULT_INTERPRETATION_INTERRUPT_GRACE_SECONDS = 1.0
+
+
+class CodexInterpretationTimeout(RuntimeError):
+    """The current governance turn did not reach a terminal result in time."""
 
 
 def interpretation_schema() -> dict[str, object]:
@@ -212,47 +222,257 @@ Input:
 class CodexAtomicInformationInterpretationProvider:
     name = "codex-app-server"
 
-    def __init__(self, *, sdk_loader: SdkLoader = _load_sdk) -> None:
+    def __init__(
+        self,
+        *,
+        sdk_loader: SdkLoader = _load_sdk,
+        timeout_seconds: float = DEFAULT_INTERPRETATION_TURN_TIMEOUT_SECONDS,
+        interrupt_grace_seconds: float = (
+            DEFAULT_INTERPRETATION_INTERRUPT_GRACE_SECONDS
+        ),
+        monotonic_ns: Callable[[], int] = time.monotonic_ns,
+    ) -> None:
+        for field, value in (
+            ("timeout_seconds", timeout_seconds),
+            ("interrupt_grace_seconds", interrupt_grace_seconds),
+        ):
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or value <= 0
+            ):
+                raise ValueError(f"{field} must be a positive number")
         self.sdk_loader = sdk_loader
+        self.timeout_seconds = float(timeout_seconds)
+        self.interrupt_grace_seconds = float(interrupt_grace_seconds)
+        self.monotonic_ns = monotonic_ns
+        self._session_active = False
+        self._session_failed = False
+        self._codex_manager: object | None = None
+        self._codex: object | None = None
+        self._deny_all: object | None = None
+        self._read_only: object | None = None
+        self._metric_events: list[tuple[str, int, str | None]] = []
+
+    @contextmanager
+    def session(self) -> Iterator[CodexAtomicInformationInterpretationProvider]:
+        """Reuse one lazy app-server while keeping every Atomic on a new thread."""
+
+        if self._session_active:
+            raise RuntimeError("Codex interpretation session is already active")
+        self._session_active = True
+        self._session_failed = False
+        previous_sigterm, sigterm_handler = self._install_sigterm_handler()
+        try:
+            yield self
+        finally:
+            try:
+                self._close_session()
+            except Exception as exc:
+                self._metric_events.append(("failure", 0, "cleanup"))
+                raise RuntimeError("Codex interpretation session cleanup failed") from exc
+            finally:
+                self._restore_sigterm_handler(previous_sigterm, sigterm_handler)
+                self._session_active = False
+                self._session_failed = False
+
+    def metrics_cursor(self) -> int:
+        return len(self._metric_events)
+
+    def metrics_since(self, cursor: int) -> dict[str, object]:
+        if isinstance(cursor, bool) or not isinstance(cursor, int) or cursor < 0:
+            raise ValueError("metrics cursor is invalid")
+        events = self._metric_events[cursor:]
+        turn_durations = [duration for kind, duration, _ in events if kind == "turn"]
+        categories: dict[str, int] = {}
+        for _, _, category in events:
+            if category is not None:
+                categories[category] = categories.get(category, 0) + 1
+        return {
+            "app_server_start_count": sum(kind == "startup" for kind, _, _ in events),
+            "thread_count": sum(kind == "thread" for kind, _, _ in events),
+            "turn_count": len(turn_durations),
+            "startup_wall_ms": sum(
+                duration for kind, duration, _ in events if kind == "startup"
+            ),
+            "turn_wall_ms_sum": sum(turn_durations),
+            "turn_wall_ms_max": max(turn_durations, default=0),
+            "governance_wall_ms": 0,
+            "timeout_count": categories.get("timeout", 0),
+            "failure_count": sum(categories.values()),
+            "failure_categories": categories,
+        }
+
+    @property
+    def session_usable(self) -> bool:
+        return self._session_active and not self._session_failed
+
+    def invalidate(self, failure_category: str) -> None:
+        """Destroy a session after downstream validation/apply/readback failure."""
+
+        if not isinstance(failure_category, str) or not failure_category:
+            raise ValueError("failure category must not be empty")
+        if not self._session_failed:
+            self._metric_events.append(("failure", 0, failure_category))
+        self._session_failed = True
+        self._close_session()
 
     def interpret(
         self,
         atomic_information: AtomicInformationRevision,
         current_world_state: DigestionWorldState,
     ) -> InterpretationResult:
-        codex_type, deny_all, read_only = self.sdk_loader()
+        if not self._session_active:
+            with self.session():
+                return self.interpret(atomic_information, current_world_state)
+        if self._session_failed:
+            raise RuntimeError("Codex interpretation session cannot be reused")
+        self._ensure_session()
+        assert self._codex is not None
+        assert self._deny_all is not None
+        assert self._read_only is not None
         with tempfile.TemporaryDirectory(prefix="archeos-digestion-") as temp_dir:
             try:
-                with codex_type() as codex:  # type: ignore[attr-defined]
-                    thread = codex.thread_start(
-                        approval_mode=deny_all,
-                        cwd=temp_dir,
-                        developer_instructions=(
-                            "Do not call tools. Return only the requested "
-                            "structured interpretation."
-                        ),
-                        ephemeral=True,
-                        sandbox=read_only,
+                thread = self._codex.thread_start(  # type: ignore[attr-defined]
+                    approval_mode=self._deny_all,
+                    cwd=str(Path(temp_dir)),
+                    developer_instructions=(
+                        "Do not call tools. Return only the requested structured interpretation."
+                    ),
+                    ephemeral=True,
+                    sandbox=self._read_only,
+                )
+                self._metric_events.append(("thread", 0, None))
+                turn = thread.turn(
+                    _prompt(atomic_information, current_world_state),
+                    output_schema=interpretation_schema(),
+                    sandbox=self._read_only,
+                )
+                started = self.monotonic_ns()
+                try:
+                    result = self._run_turn_with_deadline(turn)
+                except Exception as exc:
+                    category = (
+                        "timeout"
+                        if isinstance(exc, CodexInterpretationTimeout)
+                        else "transport"
                     )
-                    result = thread.run(
-                        _prompt(atomic_information, current_world_state),
-                        output_schema=interpretation_schema(),
-                        sandbox=read_only,
+                    self._metric_events.append(
+                        ("turn", self._elapsed_ms(started), category)
                     )
+                    self._session_failed = True
+                    self._close_session()
+                    raise
+                self._metric_events.append(("turn", self._elapsed_ms(started), None))
             except Exception as exc:
-                detail = str(exc).strip() or exc.__class__.__name__
+                if not self._session_failed:
+                    self._metric_events.append(("failure", 0, "transport"))
+                    self._session_failed = True
+                    self._close_session()
+                if isinstance(exc, CodexInterpretationTimeout):
+                    raise
                 raise RuntimeError(
-                    f"Codex app-server interpretation failed: {detail}"
+                    "Codex app-server interpretation failed before a structured result"
                 ) from exc
         final_response = getattr(result, "final_response", None)
         if not isinstance(final_response, str) or not final_response.strip():
+            self._fail_schema()
             raise RuntimeError(
                 "Codex app-server completed without structured interpretation"
             )
         try:
             payload = json.loads(final_response)
-        except json.JSONDecodeError as exc:
+            return parse_interpretation(payload)
+        except (json.JSONDecodeError, TypeError, ValueError) as exc:
+            self._fail_schema()
             raise RuntimeError(
                 "Codex app-server returned invalid structured interpretation"
             ) from exc
-        return parse_interpretation(payload)
+
+    def _ensure_session(self) -> None:
+        if self._codex is not None:
+            return
+        started = self.monotonic_ns()
+        try:
+            codex_type, self._deny_all, self._read_only = self.sdk_loader()
+            manager = codex_type()
+            self._codex_manager = manager
+            self._codex = manager.__enter__()  # type: ignore[attr-defined]
+        except Exception:  # noqa: BLE001 - SDK startup errors cross this boundary.
+            self._metric_events.append(
+                ("startup", self._elapsed_ms(started), "startup")
+            )
+            self._session_failed = True
+            self._close_session()
+            raise RuntimeError(
+                "Codex app-server interpretation startup failed"
+            ) from None
+        self._metric_events.append(("startup", self._elapsed_ms(started), None))
+
+    def _run_turn_with_deadline(self, turn: object) -> object:
+        completed = threading.Event()
+        outcome: dict[str, object] = {}
+
+        def collect() -> None:
+            try:
+                outcome["result"] = turn.run()  # type: ignore[attr-defined]
+            except Exception as exc:  # noqa: BLE001 - SDK errors cross this boundary.
+                outcome["error"] = exc
+            finally:
+                completed.set()
+
+        worker = threading.Thread(target=collect, daemon=True)
+        worker.start()
+        if not completed.wait(self.timeout_seconds):
+            try:
+                turn.interrupt()  # type: ignore[attr-defined]
+            except Exception:  # noqa: BLE001, S110 - cleanup remains best effort.
+                pass
+            completed.wait(self.interrupt_grace_seconds)
+            raise CodexInterpretationTimeout(
+                "Codex app-server interpretation timed out before a structured result"
+            )
+        error = outcome.get("error")
+        if isinstance(error, Exception):
+            raise error
+        if "result" not in outcome:
+            raise RuntimeError("Codex app-server returned no turn result")
+        return outcome["result"]
+
+    def _fail_schema(self) -> None:
+        self._metric_events.append(("failure", 0, "schema"))
+        self._session_failed = True
+        self._close_session()
+
+    def _close_session(self) -> None:
+        manager = self._codex_manager
+        self._codex_manager = None
+        self._codex = None
+        self._deny_all = None
+        self._read_only = None
+        if manager is not None:
+            manager.__exit__(None, None, None)  # type: ignore[attr-defined]
+
+    def _elapsed_ms(self, started: int) -> int:
+        return max(0, (self.monotonic_ns() - started) // 1_000_000)
+
+    @staticmethod
+    def _install_sigterm_handler() -> tuple[object | None, object | None]:
+        if threading.current_thread() is not threading.main_thread():
+            return None, None
+        previous = signal.getsignal(signal.SIGTERM)
+        if previous is not signal.SIG_DFL:
+            return None, None
+
+        def terminate(signum: int, _frame: object) -> None:
+            raise SystemExit(128 + signum)
+
+        signal.signal(signal.SIGTERM, terminate)
+        return previous, terminate
+
+    @staticmethod
+    def _restore_sigterm_handler(previous: object | None, handler: object | None) -> None:
+        if previous is None or handler is None:
+            return
+        if signal.getsignal(signal.SIGTERM) is handler:
+            signal.signal(signal.SIGTERM, previous)

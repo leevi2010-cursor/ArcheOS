@@ -15,8 +15,9 @@ import os
 import re
 import subprocess
 import tempfile
+import time
 from collections.abc import Callable, Iterator, Mapping, Sequence
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -93,6 +94,19 @@ SEMANTIC_ATTACHMENT_ADAPTERS = {
 IMAGE_MEDIA_TYPES = frozenset({"image/jpeg", "image/png", "image/gif"})
 SEMANTIC_PRIVACY_POLICY = "wechat-local-deterministic-privacy-gate"
 SEMANTIC_PRIVACY_POLICY_VERSION = "1.0"
+
+
+GOVERNANCE_METRIC_COUNTERS = (
+    "app_server_start_count",
+    "thread_count",
+    "turn_count",
+    "startup_wall_ms",
+    "turn_wall_ms_sum",
+    "turn_wall_ms_max",
+    "governance_wall_ms",
+    "timeout_count",
+    "failure_count",
+)
 
 
 class WechatDigestError(RuntimeError):
@@ -1054,6 +1068,77 @@ class WechatDigestResult:
     checkpoint_published: bool
     replayed: bool
     context_object_ids: tuple[str, ...] = ()
+    governance_app_server_starts: int = 0
+    governance_threads: int = 0
+    governance_turns: int = 0
+    governance_startup_wall_ms: int = 0
+    governance_turn_wall_ms_sum: int = 0
+    governance_turn_wall_ms_max: int = 0
+    governance_wall_ms: int = 0
+    governance_timeouts: int = 0
+    governance_failures: int = 0
+
+
+def _empty_governance_metrics() -> dict[str, object]:
+    return {
+        **{field: 0 for field in GOVERNANCE_METRIC_COUNTERS},
+        "failure_categories": {},
+    }
+
+
+def _validated_governance_metrics(value: object) -> dict[str, object]:
+    if not isinstance(value, dict) or set(value) != {
+        *GOVERNANCE_METRIC_COUNTERS,
+        "failure_categories",
+    }:
+        raise WechatDigestError("微信 Governance metrics 损坏。")
+    for field in GOVERNANCE_METRIC_COUNTERS:
+        candidate = value[field]
+        if (
+            isinstance(candidate, bool)
+            or not isinstance(candidate, int)
+            or candidate < 0
+        ):
+            raise WechatDigestError("微信 Governance metrics 损坏。")
+    categories = value["failure_categories"]
+    if not isinstance(categories, dict) or any(
+        not isinstance(category, str)
+        or not category
+        or isinstance(count, bool)
+        or not isinstance(count, int)
+        or count < 1
+        for category, count in categories.items()
+    ):
+        raise WechatDigestError("微信 Governance metrics 损坏。")
+    if sum(categories.values()) != value["failure_count"]:
+        raise WechatDigestError("微信 Governance metrics 损坏。")
+    if value["timeout_count"] != categories.get("timeout", 0):
+        raise WechatDigestError("微信 Governance metrics 损坏。")
+    return dict(value)
+
+
+def _merge_governance_metrics(
+    existing: object, current: Mapping[str, object]
+) -> dict[str, object]:
+    before = (
+        _empty_governance_metrics()
+        if existing is None
+        else _validated_governance_metrics(existing)
+    )
+    after = _validated_governance_metrics(dict(current))
+    merged = {
+        field: (
+            max(int(before[field]), int(after[field]))
+            if field == "turn_wall_ms_max"
+            else int(before[field]) + int(after[field])
+        )
+        for field in GOVERNANCE_METRIC_COUNTERS
+    }
+    categories = dict(before["failure_categories"])
+    for category, count in dict(after["failure_categories"]).items():
+        categories[category] = int(categories.get(category, 0)) + int(count)
+    merged["failure_categories"] = categories
+    return merged
 
 
 def _capture_fingerprint(capture: WechatCapture) -> str:
@@ -1672,15 +1757,15 @@ class WechatDigestService:
             raise WechatDigestError(
                 "首次起点只能选择 --since、--from-now 或 --all-history 之一。"
             )
-        with self.run_store.lock():
+        session_factory = getattr(self.interpretation_provider, "session", None)
+        session = session_factory() if callable(session_factory) else nullcontext()
+        with session, self.run_store.lock():
             try:
                 active_run_id = self.run_store.active_run_id()
                 history_scope = all_history
                 if active_run_id is not None:
                     history_scope = (
-                        self._plan_all_history_upper(
-                            self.run_store.plan(active_run_id)
-                        )
+                        self._plan_all_history_upper(self.run_store.plan(active_run_id))
                         is not None
                     )
                 results: list[WechatDigestResult] = []
@@ -1709,9 +1794,15 @@ class WechatDigestService:
         self, *, batch_size: int = DEFAULT_EXTERNAL_AGENT_BATCH_SIZE
     ) -> WechatSemanticPreparation:
         """Recover an active run only up to its next single semantic batch."""
-        if isinstance(batch_size, bool) or not isinstance(batch_size, int) or batch_size < 1:
+        if (
+            isinstance(batch_size, bool)
+            or not isinstance(batch_size, int)
+            or batch_size < 1
+        ):
             raise WechatDigestError("semantic batch size 必须是正整数。")
-        with self.run_store.lock():
+        session_factory = getattr(self.interpretation_provider, "session", None)
+        session = session_factory() if callable(session_factory) else nullcontext()
+        with session, self.run_store.lock():
             run_id = self.run_store.active_run_id()
             if run_id is None:
                 raise WechatDigestError("不存在可恢复的微信运行；未创建新 capture。")
@@ -1726,7 +1817,9 @@ class WechatDigestService:
                 ),
             )
             self._verify_capture_against_plan(capture, plan)
-            self._verify_plan_and_status(run_id, capture, plan, self.run_store.status(run_id))
+            self._verify_plan_and_status(
+                run_id, capture, plan, self.run_store.status(run_id)
+            )
             return self._prepare_next_semantic_locked(
                 run_id,
                 capture,
@@ -2202,6 +2295,8 @@ class WechatDigestService:
             item = self._item(items, item_id)
             if item.get("kind") != kind or item.get("source_id") != source_id:
                 raise WechatDigestError("微信运行状态 binding 损坏。")
+            if item.get("governance_metrics") is not None:
+                _validated_governance_metrics(item["governance_metrics"])
             if item.get("state") in {"represented", "local_only", "processed", "pending_human"}:
                 representation_id = item.get("representation_id")
                 if not isinstance(representation_id, str):
@@ -2505,9 +2600,7 @@ class WechatDigestService:
             captured = by_attachment.get(str(attachment_plan["attachment_key"]))
             if captured is None or captured.path is None:
                 raise WechatDigestError("微信附件重放无法精确定位。")
-            self._process_attachment(
-                run_id, status, item_id, attachment_plan, captured
-            )
+            self._process_attachment(run_id, status, item_id, attachment_plan, captured)
 
         for conversation_plan in _plan_sequence(
             plan.get("conversations"), "conversations"
@@ -2533,8 +2626,7 @@ class WechatDigestService:
         current_status = self.run_store.status(run_id)
         current_items = current_status.get("items")
         if not isinstance(current_items, dict) or any(
-            not isinstance(item, dict)
-            or item.get("state") not in TERMINAL_ITEM_STATES
+            not isinstance(item, dict) or item.get("state") not in TERMINAL_ITEM_STATES
             for item in current_items.values()
         ):
             raise WechatDigestError("微信运行尚未达到 terminal convergence。")
@@ -2603,9 +2695,13 @@ class WechatDigestService:
         atomic_ids = item.get("atomic_information_ids")
         if not isinstance(atomic_ids, list):
             raise WechatDigestError("微信 terminal item Information 记录损坏。")
+        if item.get("governance_metrics") is not None:
+            _validated_governance_metrics(item["governance_metrics"])
         for atomic_id in atomic_ids:
             if not isinstance(atomic_id, str):
-                raise WechatDigestError("微信 terminal item Information identity 损坏。")
+                raise WechatDigestError(
+                    "微信 terminal item Information identity 损坏。"
+                )
             self.information_store.get_current(atomic_id)
         return True
 
@@ -2787,7 +2883,9 @@ class WechatDigestService:
         ):
             return representation.representation_id
         atomic_ids = self._semantic(run_id, representation.representation_id, privacy)
-        pending, object_ids = self._govern(atomic_ids)
+        pending, object_ids = self._govern_item(
+            run_id, status, item_id, atomic_ids
+        )
         self._update_item(
             run_id,
             status,
@@ -2865,7 +2963,9 @@ class WechatDigestService:
         ):
             return representation.representation_id
         atomic_ids = self._semantic(run_id, representation.representation_id, privacy)
-        pending, object_ids = self._govern(atomic_ids)
+        pending, object_ids = self._govern_item(
+            run_id, status, item_id, atomic_ids
+        )
         self._update_item(
             run_id,
             status,
@@ -3026,6 +3126,60 @@ class WechatDigestService:
                     raise WechatDigestError("受影响 Object 的 Context 读回不一致。")
         return pending, tuple(sorted(affected))
 
+    def _govern_item(
+        self,
+        run_id: str,
+        status: dict[str, object],
+        item_id: str,
+        atomic_ids: Sequence[str],
+    ) -> tuple[bool, tuple[str, ...]]:
+        cursor_reader = getattr(self.interpretation_provider, "metrics_cursor", None)
+        metrics_reader = getattr(self.interpretation_provider, "metrics_since", None)
+        invalidator = getattr(self.interpretation_provider, "invalidate", None)
+        cursor = cursor_reader() if callable(cursor_reader) else None
+        started = time.monotonic_ns()
+        failure: BaseException | None = None
+        try:
+            return self._govern(atomic_ids)
+        except BaseException as exc:
+            failure = exc
+            if callable(invalidator):
+                observed = (
+                    metrics_reader(cursor)
+                    if cursor is not None and callable(metrics_reader)
+                    else _empty_governance_metrics()
+                )
+                if int(observed["failure_count"]) == 0:
+                    invalidator("apply_or_readback")
+            raise
+        finally:
+            elapsed_ms = max(0, (time.monotonic_ns() - started) // 1_000_000)
+            metrics = (
+                metrics_reader(cursor)
+                if cursor is not None and callable(metrics_reader)
+                else _empty_governance_metrics()
+            )
+            metrics = dict(metrics)
+            metrics["governance_wall_ms"] = elapsed_ms
+            if failure is not None and int(metrics["failure_count"]) == 0:
+                categories = dict(metrics["failure_categories"])
+                categories["governance"] = categories.get("governance", 0) + 1
+                metrics["failure_categories"] = categories
+                metrics["failure_count"] = int(metrics["failure_count"]) + 1
+            current = self.run_store.status(run_id)
+            current_items = current.get("items")
+            if not isinstance(current_items, dict):
+                raise WechatDigestError("微信运行状态 items 损坏。")
+            current_item = self._item(current_items, item_id)
+            self._update_item(
+                run_id,
+                status,
+                item_id,
+                governance_metrics=_merge_governance_metrics(
+                    current_item.get("governance_metrics"), metrics
+                ),
+            )
+
     @staticmethod
     def _aggregate_results(
         results: Sequence[WechatDigestResult],
@@ -3047,18 +3201,32 @@ class WechatDigestService:
             run_id=results[-1].run_id,
             new_messages=sum(result.new_messages for result in results),
             new_attachments=sum(result.new_attachments for result in results),
-            durable_information=sum(
-                result.durable_information for result in results
-            ),
+            durable_information=sum(result.durable_information for result in results),
             local_only=sum(result.local_only for result in results),
             unsupported=sum(result.unsupported for result in results),
             pending_human=sum(result.pending_human for result in results),
             context_objects=len(context_object_ids),
-            checkpoint_published=all(
-                result.checkpoint_published for result in results
-            ),
+            checkpoint_published=all(result.checkpoint_published for result in results),
             replayed=any(result.replayed for result in results),
             context_object_ids=context_object_ids,
+            governance_app_server_starts=sum(
+                result.governance_app_server_starts for result in results
+            ),
+            governance_threads=sum(result.governance_threads for result in results),
+            governance_turns=sum(result.governance_turns for result in results),
+            governance_startup_wall_ms=sum(
+                result.governance_startup_wall_ms for result in results
+            ),
+            governance_turn_wall_ms_sum=sum(
+                result.governance_turn_wall_ms_sum for result in results
+            ),
+            governance_turn_wall_ms_max=max(
+                (result.governance_turn_wall_ms_max for result in results),
+                default=0,
+            ),
+            governance_wall_ms=sum(result.governance_wall_ms for result in results),
+            governance_timeouts=sum(result.governance_timeouts for result in results),
+            governance_failures=sum(result.governance_failures for result in results),
         )
 
     @staticmethod
@@ -3081,6 +3249,11 @@ class WechatDigestService:
             for object_id in item.get("context_object_ids", [])
             if isinstance(object_id, str)
         }
+        metrics = [
+            _validated_governance_metrics(item["governance_metrics"])
+            for item in values
+            if item.get("governance_metrics") is not None
+        ]
         return WechatDigestResult(
             run_id=run_id,
             new_messages=sum(
@@ -3097,4 +3270,22 @@ class WechatDigestService:
             checkpoint_published=bool(status.get("checkpoint_published")),
             replayed=replayed,
             context_object_ids=tuple(sorted(object_ids)),
+            governance_app_server_starts=sum(
+                int(item["app_server_start_count"]) for item in metrics
+            ),
+            governance_threads=sum(int(item["thread_count"]) for item in metrics),
+            governance_turns=sum(int(item["turn_count"]) for item in metrics),
+            governance_startup_wall_ms=sum(
+                int(item["startup_wall_ms"]) for item in metrics
+            ),
+            governance_turn_wall_ms_sum=sum(
+                int(item["turn_wall_ms_sum"]) for item in metrics
+            ),
+            governance_turn_wall_ms_max=max(
+                (int(item["turn_wall_ms_max"]) for item in metrics),
+                default=0,
+            ),
+            governance_wall_ms=sum(int(item["governance_wall_ms"]) for item in metrics),
+            governance_timeouts=sum(int(item["timeout_count"]) for item in metrics),
+            governance_failures=sum(int(item["failure_count"]) for item in metrics),
         )

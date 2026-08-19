@@ -1151,6 +1151,19 @@ def _wechat_product_command(args: argparse.Namespace) -> int:
     print(f"暂不支持：{result.unsupported}")
     print(f"待你判断：{result.pending_human}")
     print(f"更新了 {result.context_objects} 个长期对象的 Context")
+    print(f"治理 app-server 启动：{result.governance_app_server_starts}")
+    print(f"治理 thread / turn：{result.governance_threads} / {result.governance_turns}")
+    print(
+        "治理耗时（ms）："
+        f"startup={result.governance_startup_wall_ms}, "
+        f"turn_sum={result.governance_turn_wall_ms_sum}, "
+        f"turn_max={result.governance_turn_wall_ms_max}, "
+        f"total={result.governance_wall_ms}"
+    )
+    print(
+        "治理 timeout / failure："
+        f"{result.governance_timeouts} / {result.governance_failures}"
+    )
     print(f"checkpoint：{checkpoint}")
     return 0
 

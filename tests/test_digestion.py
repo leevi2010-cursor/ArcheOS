@@ -1,12 +1,15 @@
 from __future__ import annotations
 
-import inspect
 import hashlib
+import inspect
 import json
+import signal
 import tempfile
+import threading
 import unittest
 from dataclasses import replace
 from pathlib import Path
+from unittest.mock import patch
 
 import archeos.atomic_information.jsonl_store as atomic_store_adapter
 import archeos.world_model.sqlite_repository as world_model_adapter
@@ -31,6 +34,7 @@ from archeos.digestion import (
     JsonlChangeProposalStore,
     WorldModelOperation,
 )
+from archeos.digestion.providers import CodexInterpretationTimeout
 from archeos.world_model import (
     ALLOWED_RELATIONSHIPS,
     ObjectResolver,
@@ -1265,9 +1269,12 @@ class CodexDigestionProviderTest(unittest.TestCase):
             final_response = payload
 
         class Thread:
-            def run(self, prompt, **kwargs):
+            def turn(self, prompt, **kwargs):
                 observed["prompt"] = prompt
                 observed["run"] = kwargs
+                return self
+
+            def run(self):
                 return Result()
 
         class Codex:
@@ -1305,6 +1312,231 @@ class CodexDigestionProviderTest(unittest.TestCase):
         ]
         self.assertEqual(set(relation_schema["enum"]), {*ALLOWED_RELATIONSHIPS, None})
         self.assertIn("related_atomic_information", observed["prompt"])
+
+
+    def test_run_session_reuses_app_server_but_not_thread_or_cwd(self) -> None:
+        operation = {
+            "kind": "no_structural_change",
+            "target_object_id": None,
+            "secondary_object_id": None,
+            "name": None,
+            "role": None,
+            "relation": None,
+            "relationship_id": None,
+            "lifecycle_state": None,
+            "start_at": None,
+            "actual_end_at": None,
+            "target_end_at": None,
+            "completion_condition": None,
+        }
+        response = json.dumps(
+            {
+                "operations": [operation],
+                "rationale": "No durable structural change.",
+                "evidence_sufficient": True,
+                "conflict": False,
+                "ambiguous": False,
+                "claim": None,
+            }
+        )
+
+        class Turn:
+            def run(self):
+                return type("Result", (), {"final_response": response})()
+
+            def interrupt(self):
+                raise AssertionError("successful turn must not be interrupted")
+
+        class Thread:
+            def __init__(self, prompt_log):
+                self.prompt_log = prompt_log
+
+            def turn(self, prompt, **kwargs):
+                self.prompt_log.append((prompt, kwargs))
+                return Turn()
+
+        instances = []
+
+        class Codex:
+            def __init__(self):
+                self.closed = False
+                self.thread_kwargs = []
+                self.prompts = []
+                instances.append(self)
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                self.closed = True
+
+            def thread_start(self, **kwargs):
+                self.thread_kwargs.append(kwargs)
+                return Thread(self.prompts)
+
+        provider = CodexAtomicInformationInterpretationProvider(
+            sdk_loader=lambda: (Codex, "deny-all", "read-only")
+        )
+        first = replace(
+            atomic_information("atomic-one", "One", strict_identity=True),
+            statement="FIRST_PRIVATE_STATEMENT",
+        )
+        second = replace(
+            atomic_information("atomic-two", "Two", strict_identity=True),
+            statement="SECOND_PRIVATE_STATEMENT",
+        )
+        world_state = DigestionWorldState((), (), ())
+        with provider.session():
+            provider.interpret(first, world_state)
+            provider.interpret(second, world_state)
+
+        self.assertEqual(len(instances), 1)
+        instance = instances[0]
+        self.assertTrue(instance.closed)
+        self.assertEqual(len(instance.thread_kwargs), 2)
+        cwd_values = [item["cwd"] for item in instance.thread_kwargs]
+        self.assertEqual(len(set(cwd_values)), 2)
+        self.assertTrue(all(item["ephemeral"] for item in instance.thread_kwargs))
+        self.assertTrue(all(not Path(path).exists() for path in cwd_values))
+        self.assertIn("FIRST_PRIVATE_STATEMENT", instance.prompts[0][0])
+        self.assertNotIn("FIRST_PRIVATE_STATEMENT", instance.prompts[1][0])
+        self.assertIn("SECOND_PRIVATE_STATEMENT", instance.prompts[1][0])
+        metrics = provider.metrics_since(0)
+        self.assertEqual(metrics["app_server_start_count"], 1)
+        self.assertEqual(metrics["thread_count"], 2)
+        self.assertEqual(metrics["turn_count"], 2)
+        self.assertEqual(metrics["failure_count"], 0)
+
+    def test_timeout_interrupts_destroys_session_and_prevents_next_turn(self) -> None:
+        operation = {
+            "kind": "no_structural_change",
+            "target_object_id": None,
+            "secondary_object_id": None,
+            "name": None,
+            "role": None,
+            "relation": None,
+            "relationship_id": None,
+            "lifecycle_state": None,
+            "start_at": None,
+            "actual_end_at": None,
+            "target_end_at": None,
+            "completion_condition": None,
+        }
+        response = json.dumps(
+            {
+                "operations": [operation],
+                "rationale": "No durable structural change.",
+                "evidence_sufficient": True,
+                "conflict": False,
+                "ambiguous": False,
+                "claim": None,
+            }
+        )
+
+        class Turn:
+            def __init__(self):
+                self.released = threading.Event()
+                self.interrupted = False
+
+            def run(self):
+                self.released.wait()
+                return type("Result", (), {"final_response": response})()
+
+            def interrupt(self):
+                self.interrupted = True
+                self.released.set()
+
+        class Thread:
+            turn_handle = Turn()
+
+            def turn(self, *_args, **_kwargs):
+                return self.turn_handle
+
+        class Codex:
+            instance = None
+
+            def __init__(self):
+                self.closed = False
+                self.thread_starts = 0
+                self.__class__.instance = self
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                self.closed = True
+
+            def thread_start(self, **_kwargs):
+                self.thread_starts += 1
+                return Thread()
+
+        provider = CodexAtomicInformationInterpretationProvider(
+            sdk_loader=lambda: (Codex, "deny-all", "read-only"),
+            timeout_seconds=0.01,
+            interrupt_grace_seconds=0.1,
+        )
+        item = atomic_information("atomic-timeout", "Timeout", strict_identity=True)
+        with provider.session():
+            with self.assertRaises(CodexInterpretationTimeout):
+                provider.interpret(item, DigestionWorldState((), (), ()))
+            with self.assertRaisesRegex(RuntimeError, "cannot be reused"):
+                provider.interpret(item, DigestionWorldState((), (), ()))
+
+        assert Codex.instance is not None
+        self.assertTrue(Thread.turn_handle.interrupted)
+        self.assertTrue(Codex.instance.closed)
+        self.assertEqual(Codex.instance.thread_starts, 1)
+        metrics = provider.metrics_since(0)
+        self.assertEqual(metrics["timeout_count"], 1)
+        self.assertEqual(metrics["failure_categories"], {"timeout": 1})
+
+    def test_sigterm_closes_session_and_restores_previous_handler(self) -> None:
+        class Codex:
+            instance = None
+
+            def __init__(self):
+                self.closed = False
+                self.__class__.instance = self
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                self.closed = True
+
+        current_handler = {"value": signal.SIG_DFL}
+
+        def getsignal(_signum):
+            return current_handler["value"]
+
+        def install_signal(_signum, handler):
+            previous = current_handler["value"]
+            current_handler["value"] = handler
+            return previous
+
+        provider = CodexAtomicInformationInterpretationProvider(
+            sdk_loader=lambda: (Codex, "deny-all", "read-only")
+        )
+        with (
+            patch(
+                "archeos.digestion.providers.signal.getsignal",
+                side_effect=getsignal,
+            ),
+            patch(
+                "archeos.digestion.providers.signal.signal",
+                side_effect=install_signal,
+            ),
+            self.assertRaises(SystemExit),
+            provider.session(),
+        ):
+            provider._ensure_session()
+            handler = current_handler["value"]
+            self.assertTrue(callable(handler))
+            handler(signal.SIGTERM, None)
+
+        assert Codex.instance is not None
+        self.assertTrue(Codex.instance.closed)
+        self.assertIs(current_handler["value"], signal.SIG_DFL)
 
 
 if __name__ == "__main__":
