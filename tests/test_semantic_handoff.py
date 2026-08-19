@@ -5848,6 +5848,73 @@ class SemanticHandoffTest(unittest.TestCase):
         )
         self.assertEqual(grant["external_prior_count"], 78)
 
+    def test_global_authority_counts_two_same_binding_runs_with_own_audits(
+        self,
+    ) -> None:
+        import archeos.semantic_handoff as handoff_module
+
+        root = self.root / "two-same-binding-runs-with-own-audits"
+        representation, service = self.build_service(root=root / "source")
+        handoff = ExternalAgentSemanticHandoffService(
+            service,
+            JsonlAtomicInformationStore(root / "atomic.jsonl"),
+            root / "audits",
+        )
+        provider = CodexCliRepresentationAnalysisProvider(
+            provider_version="0.147.0",
+            timeout_seconds=300,
+            runner=FakeRunner(),
+        )
+
+        def publish_exact(privacy_receipt: str):
+            recovery = handoff_module._SemanticRecoveryRun(
+                service,
+                handoff.audit_root,
+                representation.representation_id,
+                provider,
+                replace(
+                    self.privacy_binding(),
+                    receipt_fingerprint=privacy_receipt,
+                ),
+            )
+            recovery.ensure_run_receipt()
+            recovery.publish_attempt(1)
+            provider._capture_successful_raw = True
+            try:
+                result = provider.analyze(recovery.batches[0])
+            finally:
+                provider._capture_successful_raw = False
+            record = provider.execution_records[-1]
+            raw_result = provider._successful_results.pop()
+            RepresentationInformationService._validate_batch_result(
+                recovery.batches[0], result
+            )
+            recovery.publish_result(1, raw_result, record)
+            handoff._persist_audits(
+                (record,),
+                package_published=True,
+                information_ingested=False,
+                durable_ingestion_status="pending",
+                package_fingerprint="sha256:" + "9" * 64,
+                handoff_status="pending",
+            )
+            return recovery
+
+        recovery_one = publish_exact("sha256:" + "7" * 64)
+        recovery_two = publish_exact("sha256:" + "8" * 64)
+        self.assertNotEqual(
+            recovery_one.semantic_run_id, recovery_two.semantic_run_id
+        )
+
+        grant = self.install_authority(
+            handoff,
+            provider,
+            self.semantic_window_binding(),
+            labels=("0.147.0",),
+        )
+        self.assertEqual(grant["legacy_attempt_inventory_count"], 2)
+        self.assertEqual(grant["external_prior_count"], 78)
+
     def test_global_authority_does_not_lend_one_related_audit_to_two_attempts(
         self,
     ) -> None:
