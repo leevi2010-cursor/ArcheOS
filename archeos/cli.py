@@ -592,6 +592,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="零 Provider 把已批准的 Semantic unknown 收敛为 failed_closed。",
     )
     wechat_digest.add_argument(
+        "--seal-governance-timeout",
+        action="store_true",
+        help="零 Provider 封存 Governance timeout 并允许后续项目继续。",
+    )
+    wechat_digest.add_argument(
         "--inventory-authority-file",
         type=Path,
         help="Private 0600 Lead-approved historical inventory authority manifest.",
@@ -1007,6 +1012,7 @@ def _wechat_product_command(args: argparse.Namespace) -> int:
             args.install_semantic_authority,
             args.install_semantic_authority_extension,
             args.resolve_semantic_unknown,
+            args.seal_governance_timeout,
         )
     )
     if maintenance_count > 1 or (
@@ -1174,6 +1180,10 @@ def _wechat_product_command(args: argparse.Namespace) -> int:
                 )
             )
             return 0
+        if args.seal_governance_timeout:
+            resolution = service.seal_governance_timeout()
+            print(json.dumps(resolution, ensure_ascii=False, indent=2))
+            return 0
         result = service.run(
             since=args.since,
             from_now=args.from_now,
@@ -1196,7 +1206,14 @@ def _wechat_product_command(args: argparse.Namespace) -> int:
     print(f"本地保留（隐私）：{result.local_only}")
     print(f"暂不支持：{result.unsupported}")
     print(f"待你判断：{result.pending_human}")
-    print(f"已保留但未吸收：{result.failed_closed}")
+    print(
+        "已保留但未形成长期信息："
+        f"{result.semantic_preserved_but_unabsorbed}"
+    )
+    print(
+        "已形成长期信息但治理未完整确认："
+        f"{result.governance_preserved_but_incomplete}"
+    )
     print(f"更新了 {result.context_objects} 个长期对象的 Context")
     print(f"治理 app-server 启动：{result.governance_app_server_starts}")
     print(f"治理 thread / turn：{result.governance_threads} / {result.governance_turns}")
