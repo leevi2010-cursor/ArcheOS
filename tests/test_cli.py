@@ -106,6 +106,97 @@ class CliTest(unittest.TestCase):
         digest_service.return_value.run.assert_not_called()
         capture_provider.assert_called_once()
 
+    @patch("archeos.cli.WechatDigestService")
+    @patch("archeos.cli.WechatCliCaptureProvider")
+    @patch("archeos.cli.require_workspace")
+    def test_wechat_digest_installs_one_global_semantic_authority(
+        self,
+        require_workspace: Mock,
+        capture_provider: Mock,
+        digest_service: Mock,
+    ) -> None:
+        require_workspace.return_value = WorkspaceConfig(
+            Path("/workspace"), Path("/config")
+        )
+        digest_service.return_value.install_semantic_authority.return_value = {
+            "baseline_total": 80,
+            "max_new": 20,
+            "absolute_cap": 100,
+            "global_authority_fingerprint": "sha256:" + "a" * 64,
+        }
+        output = StringIO()
+        with redirect_stdout(output):
+            result = main(
+                [
+                    "wechat",
+                    "digest",
+                    "--install-semantic-authority",
+                    "--inventory-authority-file",
+                    "/private/semantic-inventory-authority.json",
+                ]
+            )
+        self.assertEqual(result, 0)
+        self.assertIn('"semantic_provider_calls": 0', output.getvalue())
+        digest_service.return_value.install_semantic_authority.assert_called_once_with(
+            inventory_authority_file=Path(
+                "/private/semantic-inventory-authority.json"
+            ),
+        )
+        digest_service.return_value.run.assert_not_called()
+        capture_provider.assert_called_once()
+
+    @patch("archeos.cli.WechatDigestService")
+    @patch("archeos.cli.WechatCliCaptureProvider")
+    @patch("archeos.cli.require_workspace")
+    def test_wechat_digest_installs_fixed_cap1000_semantic_extension(
+        self,
+        require_workspace: Mock,
+        capture_provider: Mock,
+        digest_service: Mock,
+    ) -> None:
+        require_workspace.return_value = WorkspaceConfig(
+            Path("/workspace"), Path("/config")
+        )
+        digest_service.return_value.install_semantic_authority_extension.return_value = {
+            "activation_total": 81,
+            "previous_absolute_cap": 100,
+            "new_absolute_cap": 1000,
+            "first_authorized_ordinal": 82,
+            "last_authorized_ordinal": 1000,
+            "extension_fingerprint": "sha256:" + "e" * 64,
+        }
+        output = StringIO()
+        with redirect_stdout(output):
+            result = main(
+                ["wechat", "digest", "--install-semantic-authority-extension"]
+            )
+        self.assertEqual(result, 0)
+        self.assertIn('"semantic_provider_calls": 0', output.getvalue())
+        self.assertIn('"new_absolute_cap": 1000', output.getvalue())
+        digest_service.return_value.install_semantic_authority_extension.assert_called_once_with()
+        digest_service.return_value.run.assert_not_called()
+        capture_provider.assert_called_once()
+
+    @patch("archeos.cli.WechatCliCaptureProvider")
+    @patch("archeos.cli.require_workspace")
+    def test_wechat_semantic_authority_file_requires_install_before_workspace(
+        self,
+        require_workspace: Mock,
+        capture_provider: Mock,
+    ) -> None:
+        with redirect_stdout(StringIO()):
+            result = main(
+                [
+                    "wechat",
+                    "digest",
+                    "--inventory-authority-file",
+                    "/private/semantic-inventory-authority.json",
+                ]
+            )
+        self.assertEqual(result, 2)
+        require_workspace.assert_not_called()
+        capture_provider.assert_not_called()
+
     @patch("archeos.cli.ingest_processing_package")
     @patch("archeos.cli.process_managed_audio")
     def test_constructs_file_backed_providers(

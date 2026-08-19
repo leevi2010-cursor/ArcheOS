@@ -15,7 +15,9 @@ import tempfile
 import threading
 import time
 import uuid
+from collections import Counter
 from collections.abc import Callable, Mapping, Sequence
+from contextlib import nullcontext
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -41,20 +43,114 @@ EXTERNAL_AGENT_PROTOCOL_V1 = "external-agent-semantic-handoff/1.0"
 EXTERNAL_AGENT_PROTOCOL_V2 = "external-agent-semantic-handoff/2.0"
 EXTERNAL_AGENT_PROTOCOL_V3 = "external-agent-semantic-handoff/3.0"
 EXTERNAL_AGENT_PROTOCOL_V3_1 = "external-agent-semantic-handoff/3.1"
-EXTERNAL_AGENT_PROTOCOL_VERSION = EXTERNAL_AGENT_PROTOCOL_V1
+EXTERNAL_AGENT_PROTOCOL_V3_2 = "external-agent-semantic-handoff/3.2"
+EXTERNAL_AGENT_PROTOCOL_V3_3 = "external-agent-semantic-handoff/3.3"
+EXTERNAL_AGENT_PROTOCOL_V3_4 = "external-agent-semantic-handoff/3.4"
+EXTERNAL_AGENT_PROTOCOL_VERSION = EXTERNAL_AGENT_PROTOCOL_V3_4
 SUPPORTED_EXTERNAL_AGENT_PROTOCOL_VERSIONS = frozenset(
     {
         EXTERNAL_AGENT_PROTOCOL_V1,
         EXTERNAL_AGENT_PROTOCOL_V2,
         EXTERNAL_AGENT_PROTOCOL_V3,
         EXTERNAL_AGENT_PROTOCOL_V3_1,
+        EXTERNAL_AGENT_PROTOCOL_V3_2,
+        EXTERNAL_AGENT_PROTOCOL_V3_3,
+        EXTERNAL_AGENT_PROTOCOL_V3_4,
     }
 )
 EXTERNAL_AGENT_ROUTE = "codex-cli"
+DEFAULT_SEMANTIC_MODEL = "gpt-5.6-terra"
+DEFAULT_SEMANTIC_REASONING_EFFORT = "medium"
+DEFAULT_SEMANTIC_FALLBACK_POLICY = "none"
+SEMANTIC_REASONING_EFFORTS = frozenset({"low", "medium", "high", "xhigh"})
 
 
 class RepresentationInformationError(RuntimeError):
     pass
+
+
+@dataclass(frozen=True)
+class CodexExecutableIdentity:
+    """Verified identity of the exact executable used for a new call."""
+
+    resolved_path: str
+    provider_version: str
+    binary_sha256: str
+    resolved_path_sha256: str
+
+
+def resolve_codex_executable_identity(
+    codex_binary: str,
+    *,
+    expected_provider_version: str | None = None,
+) -> CodexExecutableIdentity:
+    """Resolve, hash and version-check the real Codex executable fail closed."""
+
+    candidate = shutil.which(codex_binary) if not os.path.isabs(codex_binary) else codex_binary
+    if candidate is None:
+        raise RepresentationInformationError("Codex executable could not be resolved")
+    try:
+        resolved = Path(candidate).expanduser().resolve(strict=True)
+        for ancestor in (resolved, *resolved.parents):
+            metadata = ancestor.lstat()
+            if stat.S_ISLNK(metadata.st_mode) or stat.S_IMODE(metadata.st_mode) & 0o022:
+                raise RepresentationInformationError("Codex executable path is unsafe")
+        before = resolved.lstat()
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or before.st_uid != os.getuid()
+            or before.st_nlink != 1
+            or stat.S_IMODE(before.st_mode) & 0o022
+            or not os.access(resolved, os.X_OK)
+        ):
+            raise RepresentationInformationError("Codex executable identity is unsafe")
+        descriptor = os.open(resolved, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        try:
+            opened_before = os.fstat(descriptor)
+            digest = hashlib.sha256()
+            while chunk := os.read(descriptor, 1024 * 1024):
+                digest.update(chunk)
+            opened_after = os.fstat(descriptor)
+        finally:
+            os.close(descriptor)
+        stable_fields = ("st_dev", "st_ino", "st_size", "st_mtime_ns", "st_mode", "st_uid")
+        if any(
+            getattr(before, field) != getattr(opened_before, field)
+            or getattr(opened_before, field) != getattr(opened_after, field)
+            for field in stable_fields
+        ):
+            raise RepresentationInformationError("Codex executable changed during readback")
+        version = subprocess.run(
+            [str(resolved), "--version"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        match = re.fullmatch(
+            r"codex-cli ([0-9]+\.[0-9]+\.[0-9]+(?:[-+][A-Za-z0-9._-]+)?)\n?",
+            version.stdout,
+        )
+        after = resolved.lstat()
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise RepresentationInformationError("Codex executable identity could not be verified") from exc
+    if (
+        version.returncode != 0
+        or version.stderr
+        or match is None
+        or any(getattr(before, field) != getattr(after, field) for field in stable_fields)
+    ):
+        raise RepresentationInformationError("Codex executable version is not trustworthy")
+    actual_version = match.group(1)
+    if expected_provider_version is not None and actual_version != expected_provider_version:
+        raise RepresentationInformationError("Codex executable version does not match the approved assertion")
+    return CodexExecutableIdentity(
+        resolved_path=str(resolved),
+        provider_version=actual_version,
+        binary_sha256="sha256:" + digest.hexdigest(),
+        resolved_path_sha256="sha256:"
+        + hashlib.sha256(str(resolved).encode("utf-8")).hexdigest(),
+    )
 
 
 @dataclass(frozen=True)
@@ -111,6 +207,18 @@ class RepresentationResidueDraft:
 class RepresentationAnalysisResult:
     candidates: tuple[RepresentationCandidateDraft, ...]
     residue: tuple[RepresentationResidueDraft, ...]
+
+
+@dataclass(frozen=True)
+class _InternalAnalysisFinalization:
+    outputs: tuple[RepresentationAnalysisResult, ...]
+    verify_before_publish: Callable[[], None]
+
+
+@dataclass(frozen=True)
+class _AnchorAccounting:
+    anchor_unit_id: str
+    accounted_as: str
 
 
 class RepresentationAnalysisProvider(Protocol):
@@ -230,14 +338,27 @@ def external_agent_representation_analysis_schema(
     if protocol_version not in SUPPORTED_EXTERNAL_AGENT_PROTOCOL_VERSIONS:
         raise ValueError("unsupported External Agent protocol version")
     if protocol_version in {
+        EXTERNAL_AGENT_PROTOCOL_V3_3,
+        EXTERNAL_AGENT_PROTOCOL_V3_4,
+    }:
+        if batch is None:
+            raise ValueError("v3.3+ External Agent schema requires its bound batch")
+        label = "v3.4" if protocol_version == EXTERNAL_AGENT_PROTOCOL_V3_4 else "v3.3"
+        _validate_exact_batch_identity(batch, label)
+        if protocol_version == EXTERNAL_AGENT_PROTOCOL_V3_4:
+            return _external_agent_v34_analysis_schema(batch)
+        return _external_agent_v33_analysis_schema(batch)
+    elif protocol_version in {
         EXTERNAL_AGENT_PROTOCOL_V3,
         EXTERNAL_AGENT_PROTOCOL_V3_1,
+        EXTERNAL_AGENT_PROTOCOL_V3_2,
     }:
         if batch is None:
             raise ValueError("v3 External Agent schema requires its bound batch")
         schema = _external_agent_v3_analysis_schema(
             batch,
-            exact_accounting=protocol_version == EXTERNAL_AGENT_PROTOCOL_V3_1,
+            exact_accounting=protocol_version
+            in {EXTERNAL_AGENT_PROTOCOL_V3_1, EXTERNAL_AGENT_PROTOCOL_V3_2},
         )
     else:
         schema = representation_analysis_schema()
@@ -258,8 +379,32 @@ def external_agent_representation_analysis_schema(
         EXTERNAL_AGENT_PROTOCOL_V2,
         EXTERNAL_AGENT_PROTOCOL_V3,
         EXTERNAL_AGENT_PROTOCOL_V3_1,
+        EXTERNAL_AGENT_PROTOCOL_V3_2,
     }:
         required = ["anchor_accounting", *required]
+        if protocol_version == EXTERNAL_AGENT_PROTOCOL_V3_2:
+            assert batch is not None
+            _validate_exact_batch_identity(batch, "v3.2")
+            anchor_ids = [unit.unit_id for unit in batch.anchor_units]
+            protocol_properties["anchor_accounting"] = {
+                "type": "object",
+                "properties": {
+                    unit_id: {
+                        "type": "string",
+                        "enum": ["candidate", "residue"],
+                    }
+                    for unit_id in anchor_ids
+                },
+                "required": anchor_ids,
+                "additionalProperties": False,
+            }
+            schema["required"] = [
+                "protocol_version",
+                "input_fingerprint",
+                *required,
+            ]
+            schema["properties"] = {**protocol_properties, **properties}
+            return schema
         anchor_unit_id: dict[str, object] = {
             "type": "string",
             "minLength": 1,
@@ -301,6 +446,233 @@ def external_agent_representation_analysis_schema(
     schema["required"] = ["protocol_version", "input_fingerprint", *required]
     schema["properties"] = {**protocol_properties, **properties}
     return schema
+
+
+def _validate_exact_batch_identity(
+    batch: RepresentationAnalysisBatch,
+    protocol_label: str,
+) -> None:
+    anchor_ids = [unit.unit_id for unit in batch.anchor_units]
+    context_ids = [unit.unit_id for unit in batch.context_support_units]
+    if (
+        not anchor_ids
+        or len(set(anchor_ids)) != len(anchor_ids)
+        or len(set(context_ids)) != len(context_ids)
+        or set(anchor_ids).intersection(context_ids)
+    ):
+        raise ValueError(
+            f"{protocol_label} External Agent batch identity is invalid"
+        )
+
+
+def _external_agent_v33_analysis_schema(
+    batch: RepresentationAnalysisBatch,
+) -> dict[str, object]:
+    anchor_ids = [unit.unit_id for unit in batch.anchor_units]
+    context_ids = [
+        unit.unit_id
+        for unit in batch.context_support_units
+        if unit.analysis_eligible
+    ]
+    result_record_id = {"type": "string", "minLength": 1}
+    candidate_record = {
+        "type": "object",
+        "additionalProperties": False,
+        "required": [
+            "result_record_id",
+            "statement",
+            "semantic_type",
+            "concerns",
+            "supporting_evidence_unit_ids",
+            "context",
+            "confidence",
+        ],
+        "properties": {
+            "result_record_id": result_record_id,
+            "statement": {"type": "string", "minLength": 1},
+            "semantic_type": {
+                "type": "string",
+                "enum": sorted(SEMANTIC_TYPES),
+            },
+            "concerns": {
+                "type": "array",
+                "items": {"type": "string", "minLength": 1},
+                "minItems": 1,
+            },
+            "supporting_evidence_unit_ids": {
+                "type": "array",
+                "items": {"type": "string", "enum": context_ids},
+                "maxItems": len(context_ids),
+            },
+            "context": {"type": "string", "minLength": 1},
+            "confidence": {
+                "type": "number",
+                "minimum": 0,
+                "maximum": 1,
+            },
+        },
+    }
+
+    residue_record = {
+        "type": "object",
+        "additionalProperties": False,
+        "required": [
+            "result_record_id",
+            "reason_not_absorbed",
+            "future_value_or_uncertainty",
+        ],
+        "properties": {
+            "result_record_id": result_record_id,
+            "reason_not_absorbed": {"type": "string", "minLength": 1},
+            "future_value_or_uncertainty": {
+                "type": "string",
+                "minLength": 1,
+            },
+        },
+    }
+
+    def branch(classification: str, record: dict[str, object]) -> dict[str, object]:
+        return {
+            "type": "object",
+            "additionalProperties": False,
+            "required": ["classification", "records"],
+            "properties": {
+                "classification": {
+                    "type": "string",
+                    "const": classification,
+                },
+                "records": {
+                    "type": "array",
+                    "minItems": 1,
+                    "items": record,
+                },
+            },
+        }
+
+    return {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "additionalProperties": False,
+        "required": [
+            "protocol_version",
+            "input_fingerprint",
+            "anchor_results",
+        ],
+        "properties": {
+            "protocol_version": {
+                "type": "string",
+                "const": EXTERNAL_AGENT_PROTOCOL_V3_3,
+            },
+            "input_fingerprint": {
+                "type": "string",
+                "pattern": "^sha256:[0-9a-f]{64}$",
+            },
+            "anchor_results": {
+                "type": "object",
+                "properties": {
+                    unit_id: {
+                        "anyOf": [
+                            branch("candidate", candidate_record),
+                            branch("residue", residue_record),
+                        ]
+                    }
+                    for unit_id in anchor_ids
+                },
+                "required": anchor_ids,
+                "additionalProperties": False,
+            },
+        },
+    }
+
+
+def _external_agent_v34_analysis_schema(
+    batch: RepresentationAnalysisBatch,
+) -> dict[str, object]:
+    anchor_ids = [unit.unit_id for unit in batch.anchor_units]
+    context_ids = [
+        unit.unit_id
+        for unit in batch.context_support_units
+        if unit.analysis_eligible
+    ]
+    candidate_record = {
+        "type": "object",
+        "additionalProperties": False,
+        "required": [
+            "statement",
+            "semantic_type",
+            "concerns",
+            "supporting_evidence_unit_ids",
+            "context",
+            "confidence",
+        ],
+        "properties": {
+            "statement": {"type": "string", "minLength": 1},
+            "semantic_type": {"type": "string", "enum": sorted(SEMANTIC_TYPES)},
+            "concerns": {
+                "type": "array",
+                "items": {"type": "string", "minLength": 1},
+                "minItems": 1,
+            },
+            "supporting_evidence_unit_ids": {
+                "type": "array",
+                "items": {"type": "string", "enum": context_ids},
+                "maxItems": len(context_ids),
+            },
+            "context": {"type": "string", "minLength": 1},
+            "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+        },
+    }
+    residue_record = {
+        "type": "object",
+        "additionalProperties": False,
+        "required": ["reason_not_absorbed", "future_value_or_uncertainty"],
+        "properties": {
+            "reason_not_absorbed": {"type": "string", "minLength": 1},
+            "future_value_or_uncertainty": {"type": "string", "minLength": 1},
+        },
+    }
+
+    def branch(classification: str, record: dict[str, object]) -> dict[str, object]:
+        return {
+            "type": "object",
+            "additionalProperties": False,
+            "required": ["classification", "records"],
+            "properties": {
+                "classification": {"type": "string", "const": classification},
+                "records": {"type": "array", "minItems": 1, "items": record},
+            },
+        }
+
+    return {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "additionalProperties": False,
+        "required": ["protocol_version", "input_fingerprint", "anchor_results"],
+        "properties": {
+            "protocol_version": {
+                "type": "string",
+                "const": EXTERNAL_AGENT_PROTOCOL_V3_4,
+            },
+            "input_fingerprint": {
+                "type": "string",
+                "pattern": "^sha256:[0-9a-f]{64}$",
+            },
+            "anchor_results": {
+                "type": "object",
+                "properties": {
+                    unit_id: {
+                        "anyOf": [
+                            branch("candidate", candidate_record),
+                            branch("residue", residue_record),
+                        ]
+                    }
+                    for unit_id in anchor_ids
+                },
+                "required": anchor_ids,
+                "additionalProperties": False,
+            },
+        },
+    }
 
 
 def _external_agent_v3_analysis_schema(
@@ -588,6 +960,9 @@ class ExternalAgentExecutionRecord:
     anchor_unit_ids: tuple[str, ...]
     provider_route: str
     provider_version: str
+    model: str
+    reasoning_effort: str
+    fallback_policy: str
     started_at: str
     finished_at: str
     execution_status: str
@@ -597,6 +972,21 @@ class ExternalAgentExecutionRecord:
     result_fingerprint: str | None
     eligible_units: int
     covered_units: int
+    contract_failure_stage: str | None
+    candidate_item_count: int
+    residue_item_count: int
+    accounting_item_count: int
+    candidate_anchor_ref_count: int
+    residue_anchor_ref_count: int
+    duplicate_anchor_ref_count: int
+    duplicate_accounting_count: int
+    dual_assignment_count: int
+    missing_anchor_count: int
+    unknown_anchor_ref_count: int
+    raw_record_count: int
+    projected_record_count: int
+    duplicate_exact_body_count: int
+    grouping_collision_count: int
     diagnostic_schema_version: str
     elapsed_ms: int
     deadline_ms: int
@@ -611,8 +1001,57 @@ class ExternalAgentExecutionRecord:
     process_cleanup_status: str
 
 
-DIAGNOSTIC_SCHEMA_VERSION = "external-agent-diagnostics/1.0"
-_MAX_DIAGNOSTIC_STREAM_BYTES = 64 * 1024
+@dataclass(frozen=True)
+class ExternalAgentTechnicalObservation:
+    """Content-free, in-memory execution details for the synthetic Gate only."""
+
+    processing_run_id: str
+    execution_status: str
+    failure_category: str | None
+    contract_failure_detail: str | None
+    strict_validation_status: str
+    covered_units: int
+    contract_failure_stage: str | None
+    candidate_item_count: int
+    residue_item_count: int
+    accounting_item_count: int
+    candidate_anchor_ref_count: int
+    residue_anchor_ref_count: int
+    duplicate_anchor_ref_count: int
+    duplicate_accounting_count: int
+    dual_assignment_count: int
+    missing_anchor_count: int
+    unknown_anchor_ref_count: int
+    raw_record_count: int
+    projected_record_count: int
+    duplicate_exact_body_count: int
+    grouping_collision_count: int
+    exit_code: int | None
+    termination_signal: int | None
+    provider_error_category: str | None
+    result_file_present: bool
+    result_size_bytes: int
+    stdout_bytes: int
+    stderr_bytes: int
+    stdout_sha256: str
+    stderr_sha256: str
+    result_readback_status: str
+    process_cleanup_status: str
+    diagnostic_persistence_status: str
+
+
+@dataclass(frozen=True)
+class _ExternalAgentSuccessfulResult:
+    """Private in-memory handoff for a strict result before temp cleanup."""
+
+    processing_run_id: str
+    input_fingerprint: str
+    raw_bytes: bytes
+
+
+DIAGNOSTIC_SCHEMA_V1 = "external-agent-diagnostics/1.0"
+DIAGNOSTIC_SCHEMA_V2 = "external-agent-diagnostics/2.0"
+DIAGNOSTIC_SCHEMA_VERSION = "external-agent-diagnostics/3.0"
 _DIAGNOSTIC_TTL_SECONDS = 24 * 60 * 60
 CONTRACT_FAILURE_DETAILS = frozenset(
     {
@@ -621,6 +1060,8 @@ CONTRACT_FAILURE_DETAILS = frozenset(
         "residue_schema",
         "evidence_reference",
         "anchor_coverage",
+        "anchor_accounting",
+        "record_grouping",
         "unknown",
     }
 )
@@ -634,6 +1075,248 @@ class _ExternalAgentContractFailure(RepresentationInformationError):
             raise ValueError("unsupported External Agent contract failure detail")
         super().__init__("result_contract_failure")
         self.detail = detail
+
+
+_CONTRACT_FAILURE_STAGES = {
+    "top_level_schema": "top_level",
+    "candidate_schema": "candidate",
+    "residue_schema": "residue",
+    "evidence_reference": "evidence_reference",
+    "anchor_coverage": "coverage",
+    "anchor_accounting": "accounting_cross_check",
+    "record_grouping": "record_grouping",
+    "unknown": "validation",
+}
+
+
+def _empty_contract_failure_diagnostics() -> dict[str, object]:
+    return {
+        "contract_failure_stage": None,
+        "candidate_item_count": 0,
+        "residue_item_count": 0,
+        "accounting_item_count": 0,
+        "candidate_anchor_ref_count": 0,
+        "residue_anchor_ref_count": 0,
+        "duplicate_anchor_ref_count": 0,
+        "duplicate_accounting_count": 0,
+        "dual_assignment_count": 0,
+        "missing_anchor_count": 0,
+        "unknown_anchor_ref_count": 0,
+        "raw_record_count": 0,
+        "projected_record_count": 0,
+        "duplicate_exact_body_count": 0,
+        "grouping_collision_count": 0,
+    }
+
+
+def _contract_failure_diagnostics(
+    raw: str,
+    batch: RepresentationAnalysisBatch,
+    detail: str,
+) -> dict[str, object]:
+    """Summarize a rejected result without retaining content or unit IDs."""
+
+    summary = _empty_contract_failure_diagnostics()
+    summary["contract_failure_stage"] = _CONTRACT_FAILURE_STAGES[detail]
+    try:
+        payload = json.loads(raw, object_pairs_hook=_DuplicateKeyAwareDict)
+    except json.JSONDecodeError:
+        return summary
+    if not isinstance(payload, dict):
+        return summary
+
+    anchor_results = payload.get("anchor_results")
+    if isinstance(anchor_results, dict):
+        anchor_ids = {unit.unit_id for unit in batch.anchor_units}
+        covered: set[str] = set()
+        candidate_ids: list[str] = []
+        residue_ids: list[str] = []
+        candidate_items = 0
+        residue_items = 0
+        candidate_refs = 0
+        residue_refs = 0
+        duplicate_record_ids = 0
+        raw_records = 0
+        duplicate_exact_bodies = 0
+        grouping_collisions = 0
+        projected_bodies: dict[str, list[bytes]] = {}
+        for anchor_id, anchor_result in anchor_results.items():
+            if not isinstance(anchor_result, dict):
+                continue
+            classification = anchor_result.get("classification")
+            records = anchor_result.get("records")
+            if (
+                anchor_id not in anchor_ids
+                or classification not in {"candidate", "residue"}
+                or not isinstance(records, list)
+                or not records
+            ):
+                continue
+            covered.add(anchor_id)
+            raw_records += len(records)
+            seen_bodies: set[bytes] = set()
+            for record in records:
+                if not isinstance(record, dict):
+                    continue
+                body_bytes = _canonical_json_bytes(
+                    {"classification": classification, "record": record}
+                )
+                if body_bytes in seen_bodies:
+                    duplicate_exact_bodies += 1
+                seen_bodies.add(body_bytes)
+                digest = _v34_record_digest(body_bytes)
+                bucket = projected_bodies.setdefault(digest, [])
+                if body_bytes not in bucket:
+                    if bucket:
+                        grouping_collisions += 1
+                    bucket.append(body_bytes)
+            record_ids = [
+                record.get("result_record_id")
+                for record in records
+                if isinstance(record, dict)
+                and isinstance(record.get("result_record_id"), str)
+            ]
+            duplicate_record_ids += sum(
+                count - 1
+                for count in Counter(record_ids).values()
+                if count > 1
+            )
+            if classification == "candidate":
+                candidate_items += len(records)
+                candidate_refs += len(records)
+                candidate_ids.extend(record_ids)
+            else:
+                residue_items += len(records)
+                residue_refs += len(records)
+                residue_ids.extend(record_ids)
+        candidate_set = set(candidate_ids)
+        residue_set = set(residue_ids)
+        summary.update(
+            {
+                "candidate_item_count": candidate_items,
+                "residue_item_count": residue_items,
+                "accounting_item_count": len(anchor_results),
+                "candidate_anchor_ref_count": candidate_refs,
+                "residue_anchor_ref_count": residue_refs,
+                "duplicate_anchor_ref_count": duplicate_record_ids,
+                "duplicate_accounting_count": (
+                    anchor_results.duplicate_key_count
+                    if isinstance(anchor_results, _DuplicateKeyAwareDict)
+                    else 0
+                ),
+                "dual_assignment_count": len(candidate_set & residue_set),
+                "missing_anchor_count": len(anchor_ids - covered),
+                "unknown_anchor_ref_count": sum(
+                    anchor_id not in anchor_ids for anchor_id in anchor_results
+                ),
+                "raw_record_count": raw_records,
+                "projected_record_count": sum(
+                    len(bucket) for bucket in projected_bodies.values()
+                ),
+                "duplicate_exact_body_count": duplicate_exact_bodies,
+                "grouping_collision_count": grouping_collisions,
+                "covered_units": len(covered),
+            }
+        )
+        return summary
+
+    def items(field: str) -> list[object]:
+        value = payload.get(field)
+        return value if isinstance(value, list) else []
+
+    def references(values: list[object], field: str) -> list[str]:
+        result: list[str] = []
+        for value in values:
+            if not isinstance(value, dict):
+                continue
+            refs = value.get(field)
+            if isinstance(refs, list):
+                result.extend(ref for ref in refs if isinstance(ref, str))
+        return result
+
+    candidates = items("candidates")
+    residue = items("residue")
+    accounting_value = payload.get("anchor_accounting")
+    accounting = accounting_value if isinstance(accounting_value, list) else []
+    candidate_refs = references(candidates, "anchor_unit_ids")
+    residue_refs = references(residue, "anchor_unit_ids")
+    if isinstance(accounting_value, dict):
+        accounting_refs = list(accounting_value)
+        accounting_item_count = len(accounting_value)
+        duplicate_accounting_count = (
+            accounting_value.duplicate_key_count
+            if isinstance(accounting_value, _DuplicateKeyAwareDict)
+            else 0
+        )
+    else:
+        accounting_refs = [
+            value["anchor_unit_id"]
+            for value in accounting
+            if isinstance(value, dict)
+            and isinstance(value.get("anchor_unit_id"), str)
+        ]
+        accounting_item_count = len(accounting)
+        duplicate_accounting_count = sum(
+            count - 1
+            for count in Counter(accounting_refs).values()
+            if count > 1
+        )
+    anchor_ids = {unit.unit_id for unit in batch.anchor_units}
+    candidate_known = [ref for ref in candidate_refs if ref in anchor_ids]
+    residue_known = [ref for ref in residue_refs if ref in anchor_ids]
+    candidate_set = set(candidate_known)
+    residue_set = set(residue_known)
+    covered = candidate_set | residue_set
+    summary.update(
+        {
+            "candidate_item_count": len(candidates),
+            "residue_item_count": len(residue),
+            "accounting_item_count": accounting_item_count,
+            "candidate_anchor_ref_count": len(candidate_refs),
+            "residue_anchor_ref_count": len(residue_refs),
+            "duplicate_anchor_ref_count": sum(
+                count - 1
+                for count in (
+                    *Counter(candidate_known).values(),
+                    *Counter(residue_known).values(),
+                )
+                if count > 1
+            ),
+            "duplicate_accounting_count": duplicate_accounting_count,
+            "dual_assignment_count": len(candidate_set & residue_set),
+            "missing_anchor_count": len(anchor_ids - covered),
+            "unknown_anchor_ref_count": sum(
+                ref not in anchor_ids
+                for ref in (*candidate_refs, *residue_refs, *accounting_refs)
+            ),
+            "covered_units": len(covered),
+        }
+    )
+    return summary
+
+
+def _successful_v34_grouping_diagnostics(
+    raw: str,
+    result: RepresentationAnalysisResult,
+) -> dict[str, object]:
+    diagnostics = _empty_contract_failure_diagnostics()
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError:
+        return diagnostics
+    anchor_results = payload.get("anchor_results") if isinstance(payload, dict) else None
+    if not isinstance(anchor_results, dict):
+        return diagnostics
+    diagnostics["raw_record_count"] = sum(
+        len(records)
+        for value in anchor_results.values()
+        if isinstance(value, dict)
+        and isinstance((records := value.get("records")), list)
+    )
+    diagnostics["projected_record_count"] = (
+        len(result.candidates) + len(result.residue)
+    )
+    return diagnostics
 
 
 class CodexCliRepresentationAnalysisProvider:
@@ -650,6 +1333,9 @@ class CodexCliRepresentationAnalysisProvider:
         *,
         codex_binary: str = "codex",
         provider_version: str,
+        model: str = DEFAULT_SEMANTIC_MODEL,
+        reasoning_effort: str = DEFAULT_SEMANTIC_REASONING_EFFORT,
+        fallback_policy: str = DEFAULT_SEMANTIC_FALLBACK_POLICY,
         timeout_seconds: float = DEFAULT_CODEX_ANALYSIS_TIMEOUT_SECONDS,
         runner: Callable[..., Any] = subprocess.Popen,
         diagnostic_root: Path | None = None,
@@ -660,6 +1346,14 @@ class CodexCliRepresentationAnalysisProvider:
             r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", provider_version
         ):
             raise ValueError("provider_version must be a safe non-empty version label")
+        if not isinstance(model, str) or not re.fullmatch(
+            r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", model
+        ):
+            raise ValueError("model must be a safe non-empty model label")
+        if reasoning_effort not in SEMANTIC_REASONING_EFFORTS:
+            raise ValueError("reasoning_effort is not supported")
+        if fallback_policy != "none":
+            raise ValueError("fallback_policy must be none")
         if (
             isinstance(timeout_seconds, bool)
             or not isinstance(timeout_seconds, (int, float))
@@ -668,6 +1362,9 @@ class CodexCliRepresentationAnalysisProvider:
             raise ValueError("timeout_seconds must be a positive number")
         self.codex_binary = codex_binary
         self.provider_version = provider_version
+        self.model = model
+        self.reasoning_effort = reasoning_effort
+        self.fallback_policy = fallback_policy
         self.timeout_seconds = float(timeout_seconds)
         self.runner = runner
         self.diagnostic_root = (
@@ -677,6 +1374,43 @@ class CodexCliRepresentationAnalysisProvider:
             else Path(diagnostic_root).expanduser()
         )
         self.execution_records: list[ExternalAgentExecutionRecord] = []
+        self.technical_observations: list[ExternalAgentTechnicalObservation] = []
+        self._immutable_technical_observations: list[
+            ExternalAgentTechnicalObservation
+        ] = []
+        self._successful_results: list[_ExternalAgentSuccessfulResult] = []
+        self._capture_successful_raw = False
+        self.provider_start_count = 0
+        self._executable_identity: CodexExecutableIdentity | None = None
+
+    def verified_executable_identity(self) -> CodexExecutableIdentity:
+        """Revalidate the executable for install and every future call boundary."""
+
+        if self.runner is not subprocess.Popen:
+            # An injected runner never starts the production subprocess.  Its
+            # explicit version remains test authority without touching a local
+            # Codex installation.
+            identity = CodexExecutableIdentity(
+                resolved_path=self.codex_binary,
+                provider_version=self.provider_version,
+                binary_sha256="sha256:"
+                + hashlib.sha256(
+                    ("injected-runner\0" + self.codex_binary + "\0" + self.provider_version).encode()
+                ).hexdigest(),
+                resolved_path_sha256="sha256:"
+                + hashlib.sha256(self.codex_binary.encode("utf-8")).hexdigest(),
+            )
+        else:
+            identity = resolve_codex_executable_identity(
+                self.codex_binary,
+                expected_provider_version=self.provider_version,
+            )
+        if self._executable_identity is not None and identity != self._executable_identity:
+            raise RepresentationInformationError("Codex executable identity drifted")
+        self._executable_identity = identity
+        if self.runner is subprocess.Popen:
+            self.codex_binary = identity.resolved_path
+        return identity
 
     def cleanup_failure_diagnostics(self) -> bool:
         """Explicitly remove local-only failure diagnostics after review."""
@@ -690,11 +1424,17 @@ class CodexCliRepresentationAnalysisProvider:
             return False
 
     def analyze(self, batch: RepresentationAnalysisBatch) -> RepresentationAnalysisResult:
+        if self.runner is subprocess.Popen:
+            self.verified_executable_identity()
         started_monotonic = time.monotonic()
         diagnostic_root_ready = _purge_expired_diagnostic_bundles(
             self.diagnostic_root
         )
-        request, fingerprint = _external_agent_request(batch)
+        schema = external_agent_representation_analysis_schema(batch=batch)
+        request, fingerprint = _external_agent_request(
+            batch,
+            result_schema=schema,
+        )
         record_base = {
             "processing_run_id": "run_" + uuid.uuid4().hex,
             "protocol_version": EXTERNAL_AGENT_PROTOCOL_VERSION,
@@ -702,41 +1442,53 @@ class CodexCliRepresentationAnalysisProvider:
             "anchor_unit_ids": tuple(unit.unit_id for unit in batch.anchor_units),
             "provider_route": EXTERNAL_AGENT_ROUTE,
             "provider_version": self.provider_version,
+            "model": self.model,
+            "reasoning_effort": self.reasoning_effort,
+            "fallback_policy": self.fallback_policy,
             "started_at": _utc_timestamp(),
         }
         if not diagnostic_root_ready:
-            self.execution_records.append(
-                ExternalAgentExecutionRecord(
-                    **record_base,
-                    finished_at=_utc_timestamp(),
-                    execution_status="failed",
-                    failure_category="runtime_execution_failure",
-                    contract_failure_detail=None,
-                    strict_validation_status="failed",
-                    result_fingerprint=None,
-                    eligible_units=len(batch.anchor_units),
-                    covered_units=0,
-                    diagnostic_schema_version=DIAGNOSTIC_SCHEMA_VERSION,
-                    elapsed_ms=_elapsed_ms(started_monotonic),
-                    deadline_ms=round(self.timeout_seconds * 1000),
-                    exit_code=None,
-                    termination_signal=None,
-                    timeout_phase=None,
-                    provider_error_category=None,
-                    result_file_present=False,
-                    result_size_bytes=0,
-                    stdout_bytes=0,
-                    stderr_bytes=0,
-                    process_cleanup_status="not_started",
-                )
+            record = ExternalAgentExecutionRecord(
+                **record_base,
+                finished_at=_utc_timestamp(),
+                execution_status="failed",
+                failure_category="runtime_execution_failure",
+                contract_failure_detail=None,
+                strict_validation_status="failed",
+                result_fingerprint=None,
+                eligible_units=len(batch.anchor_units),
+                covered_units=0,
+                **_empty_contract_failure_diagnostics(),
+                diagnostic_schema_version=DIAGNOSTIC_SCHEMA_VERSION,
+                elapsed_ms=_elapsed_ms(started_monotonic),
+                deadline_ms=round(self.timeout_seconds * 1000),
+                exit_code=None,
+                termination_signal=None,
+                timeout_phase=None,
+                provider_error_category=None,
+                result_file_present=False,
+                result_size_bytes=0,
+                stdout_bytes=0,
+                stderr_bytes=0,
+                process_cleanup_status="not_started",
+            )
+            self.execution_records.append(record)
+            self._append_technical_observation(
+                record,
+                stdout="",
+                stderr="",
+                result_readback_status="not_applicable",
+                diagnostic_persistence_status="preflight_failed",
             )
             raise RepresentationInformationError(
                 "External Agent 诊断目录不安全；未启动 Provider。"
             )
-        schema = external_agent_representation_analysis_schema()
         _require_codex_schema_compatibility(schema)
         result_file_present = False
         result_size_bytes = 0
+        result_fingerprint: str | None = None
+        raw: str | None = None
+        raw_bytes: bytes | None = None
         with tempfile.TemporaryDirectory(prefix="archeos-external-agent-") as directory:
             temp = Path(directory)
             os.chmod(temp, 0o700)
@@ -751,6 +1503,12 @@ class CodexCliRepresentationAnalysisProvider:
                 self.codex_binary,
                 "exec",
                 "--ephemeral",
+                "--ignore-user-config",
+                "--strict-config",
+                "--model",
+                self.model,
+                "--config",
+                f'model_reasoning_effort="{self.reasoning_effort}"',
                 "--sandbox",
                 "read-only",
                 "--skip-git-repo-check",
@@ -767,16 +1525,21 @@ class CodexCliRepresentationAnalysisProvider:
                     command,
                     _external_agent_prompt(request),
                     self.timeout_seconds,
-                    self.runner,
+                    self._start_provider,
                 )
                 result_file_present, result_size_bytes = _result_file_metadata(
                     result_path
                 )
+                if result_file_present:
+                    result_fingerprint = "sha256:" + hashlib.sha256(
+                        result_path.read_bytes()
+                    ).hexdigest()
                 if outcome.failure_category is not None:
                     raise RepresentationInformationError(outcome.failure_category)
                 if not result_file_present:
                     raise RepresentationInformationError("no_result")
-                raw = result_path.read_text(encoding="utf-8")
+                raw_bytes = result_path.read_bytes()
+                raw = raw_bytes.decode("utf-8")
                 result = _parse_external_agent_result(raw, batch, fingerprint)
             except (OSError, RuntimeError, ValueError, json.JSONDecodeError) as exc:
                 category = str(exc)
@@ -802,6 +1565,20 @@ class CodexCliRepresentationAnalysisProvider:
                     contract_failure_detail = contract_failure_detail or "unknown"
                 else:
                     contract_failure_detail = None
+                contract_diagnostics = _empty_contract_failure_diagnostics()
+                covered_units = 0
+                if (
+                    contract_failure_detail is not None
+                    and raw is not None
+                ):
+                    contract_diagnostics = _contract_failure_diagnostics(
+                        raw,
+                        batch,
+                        contract_failure_detail,
+                    )
+                    covered_units = int(
+                        contract_diagnostics.pop("covered_units", 0)
+                    )
                 record = ExternalAgentExecutionRecord(
                     **record_base,
                     finished_at=_utc_timestamp(),
@@ -809,9 +1586,10 @@ class CodexCliRepresentationAnalysisProvider:
                     failure_category=category,
                     contract_failure_detail=contract_failure_detail,
                     strict_validation_status="failed",
-                    result_fingerprint=None,
+                    result_fingerprint=result_fingerprint,
                     eligible_units=len(batch.anchor_units),
-                    covered_units=0,
+                    covered_units=covered_units,
+                    **contract_diagnostics,
                     diagnostic_schema_version=DIAGNOSTIC_SCHEMA_VERSION,
                     elapsed_ms=_elapsed_ms(started_monotonic),
                     deadline_ms=round(self.timeout_seconds * 1000),
@@ -825,43 +1603,143 @@ class CodexCliRepresentationAnalysisProvider:
                     stderr_bytes=_stream_bytes(outcome.stderr),
                     process_cleanup_status=outcome.process_cleanup_status,
                 )
-                if not _write_failure_diagnostic_bundle(
+                diagnostic_written = _write_failure_diagnostic_bundle(
                     self.diagnostic_root, record, outcome
-                ):
+                )
+                if not diagnostic_written:
                     # Keep this local-only: the durable run audit is intentionally
                     # limited to its approved allowlist.
                     _LOGGER.warning("External Agent 本机失败诊断材料写入失败")
                 self.execution_records.append(record)
+                self._append_technical_observation(
+                    record,
+                    stdout=outcome.stdout,
+                    stderr=outcome.stderr,
+                    result_readback_status=(
+                        "verified"
+                        if result_file_present and result_fingerprint is not None
+                        else "not_applicable"
+                    ),
+                    diagnostic_persistence_status=(
+                        "verified" if diagnostic_written else "failed"
+                    ),
+                )
                 raise RepresentationInformationError(
                     "External Agent 未产生可验证的结构化结果；未发布信息包。"
                 ) from exc
-        self.execution_records.append(
-            ExternalAgentExecutionRecord(
-                **record_base,
-                finished_at=_utc_timestamp(),
-                execution_status="succeeded",
-                failure_category=None,
-                contract_failure_detail=None,
-                strict_validation_status="passed",
-                result_fingerprint="sha256:"
-                + hashlib.sha256(raw.encode("utf-8")).hexdigest(),
-                eligible_units=len(batch.anchor_units),
-                covered_units=len(batch.anchor_units),
-                diagnostic_schema_version=DIAGNOSTIC_SCHEMA_VERSION,
-                elapsed_ms=_elapsed_ms(started_monotonic),
-                deadline_ms=round(self.timeout_seconds * 1000),
-                exit_code=outcome.exit_code,
-                termination_signal=outcome.termination_signal,
-                timeout_phase=outcome.timeout_phase,
-                provider_error_category=None,
-                result_file_present=result_file_present,
-                result_size_bytes=result_size_bytes,
-                stdout_bytes=_stream_bytes(outcome.stdout),
-                stderr_bytes=_stream_bytes(outcome.stderr),
-                process_cleanup_status=outcome.process_cleanup_status,
-            )
+        assert (
+            raw is not None
+            and raw_bytes is not None
+            and result_fingerprint is not None
         )
+        success_diagnostics = _successful_v34_grouping_diagnostics(raw, result)
+        success_record = ExternalAgentExecutionRecord(
+            **record_base,
+            finished_at=_utc_timestamp(),
+            execution_status="succeeded",
+            failure_category=None,
+            contract_failure_detail=None,
+            strict_validation_status="passed",
+            result_fingerprint=result_fingerprint,
+            eligible_units=len(batch.anchor_units),
+            covered_units=len(batch.anchor_units),
+            **success_diagnostics,
+            diagnostic_schema_version=DIAGNOSTIC_SCHEMA_VERSION,
+            elapsed_ms=_elapsed_ms(started_monotonic),
+            deadline_ms=round(self.timeout_seconds * 1000),
+            exit_code=outcome.exit_code,
+            termination_signal=outcome.termination_signal,
+            timeout_phase=outcome.timeout_phase,
+            provider_error_category=None,
+            result_file_present=result_file_present,
+            result_size_bytes=result_size_bytes,
+            stdout_bytes=_stream_bytes(outcome.stdout),
+            stderr_bytes=_stream_bytes(outcome.stderr),
+            process_cleanup_status=outcome.process_cleanup_status,
+        )
+        self.execution_records.append(success_record)
+        self._append_technical_observation(
+            success_record,
+            stdout=outcome.stdout,
+            stderr=outcome.stderr,
+            result_readback_status="verified",
+            diagnostic_persistence_status="not_applicable",
+        )
+        if self._capture_successful_raw:
+            self._successful_results.append(
+                _ExternalAgentSuccessfulResult(
+                    processing_run_id=success_record.processing_run_id,
+                    input_fingerprint=fingerprint,
+                    raw_bytes=raw_bytes,
+                )
+            )
         return result
+
+    def _append_technical_observation(
+        self,
+        record: ExternalAgentExecutionRecord,
+        *,
+        stdout: str,
+        stderr: str,
+        result_readback_status: str,
+        diagnostic_persistence_status: str,
+    ) -> None:
+        """Freeze the exact content-free execution projection at its trusted source."""
+
+        observation = ExternalAgentTechnicalObservation(
+            processing_run_id=record.processing_run_id,
+            execution_status=record.execution_status,
+            failure_category=record.failure_category,
+            contract_failure_detail=record.contract_failure_detail,
+            strict_validation_status=record.strict_validation_status,
+            covered_units=record.covered_units,
+            contract_failure_stage=record.contract_failure_stage,
+            candidate_item_count=record.candidate_item_count,
+            residue_item_count=record.residue_item_count,
+            accounting_item_count=record.accounting_item_count,
+            candidate_anchor_ref_count=record.candidate_anchor_ref_count,
+            residue_anchor_ref_count=record.residue_anchor_ref_count,
+            duplicate_anchor_ref_count=record.duplicate_anchor_ref_count,
+            duplicate_accounting_count=record.duplicate_accounting_count,
+            dual_assignment_count=record.dual_assignment_count,
+            missing_anchor_count=record.missing_anchor_count,
+            unknown_anchor_ref_count=record.unknown_anchor_ref_count,
+            raw_record_count=record.raw_record_count,
+            projected_record_count=record.projected_record_count,
+            duplicate_exact_body_count=record.duplicate_exact_body_count,
+            grouping_collision_count=record.grouping_collision_count,
+            exit_code=record.exit_code,
+            termination_signal=record.termination_signal,
+            provider_error_category=record.provider_error_category,
+            result_file_present=record.result_file_present,
+            result_size_bytes=record.result_size_bytes,
+            stdout_bytes=record.stdout_bytes,
+            stderr_bytes=record.stderr_bytes,
+            stdout_sha256=_stream_fingerprint(stdout),
+            stderr_sha256=_stream_fingerprint(stderr),
+            result_readback_status=result_readback_status,
+            process_cleanup_status=record.process_cleanup_status,
+            diagnostic_persistence_status=diagnostic_persistence_status,
+        )
+        self.technical_observations.append(observation)
+        self._immutable_technical_observations.append(observation)
+
+    def _start_provider(self, *args: object, **kwargs: object) -> Any:
+        """Count only a process that the configured production runner started."""
+        if self.runner is subprocess.Popen:
+            identity = self.verified_executable_identity()
+            command = args[0] if args else None
+            if (
+                not isinstance(command, list)
+                or not command
+                or command[0] != identity.resolved_path
+            ):
+                raise RepresentationInformationError(
+                    "Codex executable command binding drifted"
+                )
+        process = self.runner(*args, **kwargs)
+        self.provider_start_count += 1
+        return process
 
 
 @dataclass(frozen=True)
@@ -1067,6 +1945,11 @@ def _stream_bytes(value: str) -> int:
     return len(value.encode("utf-8", errors="replace"))
 
 
+def _stream_fingerprint(value: str) -> str:
+    encoded = value.encode("utf-8", errors="replace")
+    return "sha256:" + hashlib.sha256(encoded).hexdigest()
+
+
 def _merge_stream_output(existing: str, incoming: str) -> str:
     if not incoming:
         return existing
@@ -1153,39 +2036,6 @@ def _provider_error_category(stderr: str) -> str:
         if re.search(pattern, normalized):
             return category
     return "unknown"
-
-
-_BEARER_CREDENTIAL = re.compile(
-    r"(?i)(?:authorization\s*[:=]\s*)?bearer\s+[^\s\"']+"
-)
-_BASIC_CREDENTIAL = re.compile(
-    r"(?i)(authorization\s*[:=]\s*)basic\s+[^\s\"']+"
-)
-_QUOTED_CREDENTIAL = re.compile(
-    r"(?i)((?:[\"']?(?:access[_ -]?token|api[_ -]?key|token|password|authorization)"
-    r"[\"']?)\s*[:=]\s*)([\"'])[^\"']*\2"
-)
-_KEY_VALUE_CREDENTIAL = re.compile(
-    r"(?i)((?:access[_ -]?token|api[_ -]?key|token|password|authorization)"
-    r"\s*[:=]\s*)[^\s\"']+"
-)
-
-
-def _redact_credential_like(value: str) -> str:
-    return _KEY_VALUE_CREDENTIAL.sub(
-        r"\1[REDACTED]",
-        _QUOTED_CREDENTIAL.sub(
-            r"\1\2[REDACTED]\2",
-            _BASIC_CREDENTIAL.sub(
-                r"\1[REDACTED]", _BEARER_CREDENTIAL.sub("[REDACTED]", value)
-            ),
-        ),
-    )
-
-
-def _bounded_redacted_tail(value: str) -> str:
-    encoded = _redact_credential_like(value).encode("utf-8", errors="replace")
-    return encoded[-_MAX_DIAGNOSTIC_STREAM_BYTES :].decode("utf-8", errors="ignore")
 
 
 def _diagnostic_root_is_safe(root: Path, *, require_private_root: bool = True) -> bool:
@@ -1301,12 +2151,32 @@ def _write_failure_diagnostic_bundle(
         ).replace("+00:00", "Z")
         metadata = {
             "diagnostic_schema_version": DIAGNOSTIC_SCHEMA_VERSION,
+            "execution_status": record.execution_status,
+            "strict_validation_status": record.strict_validation_status,
             "provider_route": record.provider_route,
             "provider_version": record.provider_version,
+            "model": record.model,
+            "reasoning_effort": record.reasoning_effort,
+            "fallback_policy": record.fallback_policy,
             "protocol_version": record.protocol_version,
-            "input_fingerprint": record.input_fingerprint,
             "eligible_units": record.eligible_units,
             "covered_units": record.covered_units,
+            "contract_failure_stage": record.contract_failure_stage,
+            "contract_failure_detail": record.contract_failure_detail,
+            "candidate_item_count": record.candidate_item_count,
+            "residue_item_count": record.residue_item_count,
+            "accounting_item_count": record.accounting_item_count,
+            "candidate_anchor_ref_count": record.candidate_anchor_ref_count,
+            "residue_anchor_ref_count": record.residue_anchor_ref_count,
+            "duplicate_anchor_ref_count": record.duplicate_anchor_ref_count,
+            "duplicate_accounting_count": record.duplicate_accounting_count,
+            "dual_assignment_count": record.dual_assignment_count,
+            "missing_anchor_count": record.missing_anchor_count,
+            "unknown_anchor_ref_count": record.unknown_anchor_ref_count,
+            "raw_record_count": record.raw_record_count,
+            "projected_record_count": record.projected_record_count,
+            "duplicate_exact_body_count": record.duplicate_exact_body_count,
+            "grouping_collision_count": record.grouping_collision_count,
             "started_at": record.started_at,
             "finished_at": record.finished_at,
             "created_at": record.finished_at,
@@ -1322,21 +2192,22 @@ def _write_failure_diagnostic_bundle(
             "result_size_bytes": record.result_size_bytes,
             "stdout_bytes": record.stdout_bytes,
             "stderr_bytes": record.stderr_bytes,
+            "stdout_sha256": _stream_fingerprint(outcome.stdout),
+            "stderr_sha256": _stream_fingerprint(outcome.stderr),
             "process_cleanup_status": record.process_cleanup_status,
         }
-        _private_diagnostic_write(
-            staging / "stdout.tail", _bounded_redacted_tail(outcome.stdout)
-        )
-        _private_diagnostic_write(
-            staging / "stderr.tail", _bounded_redacted_tail(outcome.stderr)
-        )
         _private_diagnostic_write(
             staging / "metadata.json",
             json.dumps(metadata, ensure_ascii=False, sort_keys=True) + "\n",
         )
         os.rename(staging, bundle)
-        return True
-    except OSError:
+        metadata_path = bundle / "metadata.json"
+        return not (
+            stat.S_IMODE(bundle.stat().st_mode) != 0o700
+            or stat.S_IMODE(metadata_path.stat().st_mode) != 0o600
+            or json.loads(metadata_path.read_text(encoding="utf-8")) != metadata
+        )
+    except (OSError, ValueError, TypeError):
         if "staging" in locals() and staging.exists():
             shutil.rmtree(staging, ignore_errors=True)
         return False
@@ -1351,10 +2222,18 @@ def _private_diagnostic_write(path: Path, value: str) -> None:
 
 
 def _canonical_fingerprint(value: object) -> str:
-    canonical = json.dumps(
+    return "sha256:" + hashlib.sha256(_canonical_json_bytes(value)).hexdigest()
+
+
+def _canonical_json_bytes(value: object) -> bytes:
+    return json.dumps(
         value, ensure_ascii=False, sort_keys=True, separators=(",", ":")
-    )
-    return "sha256:" + hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    ).encode("utf-8")
+
+
+def _v34_record_digest(value: bytes) -> str:
+    """Index exact business bytes; equality is always checked separately."""
+    return hashlib.sha256(value).hexdigest()
 
 
 def _utc_timestamp() -> str:
@@ -1366,9 +2245,24 @@ def _utc_timestamp() -> str:
 def _external_agent_request(
     batch: RepresentationAnalysisBatch,
     protocol_version: str = EXTERNAL_AGENT_PROTOCOL_VERSION,
+    *,
+    result_schema: Mapping[str, object] | None = None,
 ) -> tuple[dict[str, object], str]:
     if protocol_version not in SUPPORTED_EXTERNAL_AGENT_PROTOCOL_VERSIONS:
         raise ValueError("unsupported External Agent protocol version")
+    if protocol_version in {
+        EXTERNAL_AGENT_PROTOCOL_V3_2,
+        EXTERNAL_AGENT_PROTOCOL_V3_3,
+        EXTERNAL_AGENT_PROTOCOL_V3_4,
+    }:
+        _validate_exact_batch_identity(
+            batch,
+            {
+                EXTERNAL_AGENT_PROTOCOL_V3_2: "v3.2",
+                EXTERNAL_AGENT_PROTOCOL_V3_3: "v3.3",
+                EXTERNAL_AGENT_PROTOCOL_V3_4: "v3.4",
+            }[protocol_version],
+        )
     rules = [
         "Return only the strict structured result.",
         "Account for every anchor with Candidate or Residue.",
@@ -1384,9 +2278,31 @@ def _external_agent_request(
             2,
             "Emit exactly one anchor_accounting item for every supplied anchor; accounted_as must match whether that anchor is cited by Candidate or Residue.",
         )
+    elif protocol_version == EXTERNAL_AGENT_PROTOCOL_V3_2:
+        rules.insert(
+            2,
+            "Emit anchor_accounting as an object whose exact keys are every supplied anchor unit_id; each candidate|residue value must match that anchor's Candidate or Residue Evidence.",
+        )
+    elif protocol_version == EXTERNAL_AGENT_PROTOCOL_V3_3:
+        rules = [
+            "Return only protocol_version, input_fingerprint, and anchor_results.",
+            "Emit exactly one anchor_results key for every supplied anchor unit_id; each value must choose Candidate or Residue and contain one or more records.",
+            "Use the same result_record_id and exactly identical business fields when one record is supported by multiple anchors; never repeat an ID within one anchor or reuse it across classifications.",
+            "Candidate supporting Evidence may cite only supplied evidence-capable context units; context cannot replace the anchor expressed by the map key.",
+            "Use Residue for unresolved or insufficient evidence; never invent identity, facts, or World Model state.",
+        ]
+    elif protocol_version == EXTERNAL_AGENT_PROTOCOL_V3_4:
+        rules = [
+            "Return only protocol_version, input_fingerprint, and anchor_results.",
+            "Emit exactly one anchor_results key for every supplied anchor unit_id; each value must choose Candidate or Residue and contain one or more complete business records.",
+            "When multiple anchors support exactly the same result, repeat exactly the same business fields; do not generate record identifiers or grouping keys.",
+            "Candidate supporting Evidence may cite only supplied evidence-capable context units; context cannot replace the anchor expressed by the map key.",
+            "Use Residue for unresolved or insufficient evidence; never invent identity, facts, or World Model state.",
+        ]
     if protocol_version in {
         EXTERNAL_AGENT_PROTOCOL_V3,
         EXTERNAL_AGENT_PROTOCOL_V3_1,
+        EXTERNAL_AGENT_PROTOCOL_V3_2,
     }:
         rules.insert(
             3,
@@ -1401,14 +2317,18 @@ def _external_agent_request(
             for unit in batch.context_support_units
         ],
     }
-    if protocol_version == EXTERNAL_AGENT_PROTOCOL_V3_1:
-        result_schema = external_agent_representation_analysis_schema(
-            protocol_version,
-            batch=batch,
-        )
-        payload["result_schema_fingerprint"] = _canonical_fingerprint(
-            result_schema
-        )
+    if protocol_version in {
+        EXTERNAL_AGENT_PROTOCOL_V3_1,
+        EXTERNAL_AGENT_PROTOCOL_V3_2,
+        EXTERNAL_AGENT_PROTOCOL_V3_3,
+        EXTERNAL_AGENT_PROTOCOL_V3_4,
+    }:
+        if result_schema is None:
+            result_schema = external_agent_representation_analysis_schema(
+                protocol_version,
+                batch=batch,
+            )
+        payload["result_schema_fingerprint"] = _canonical_fingerprint(result_schema)
     fingerprint = _canonical_fingerprint(payload)
     return ({**payload, "input_fingerprint": fingerprint}, fingerprint)
 
@@ -1424,45 +2344,649 @@ Request:
 """ + json.dumps(request, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
 
+class _DuplicateKeyAwareDict(dict[str, object]):
+    def __init__(self, pairs: list[tuple[str, object]]) -> None:
+        counts = Counter(key for key, _ in pairs)
+        self.duplicate_key_count = sum(
+            count - 1 for count in counts.values() if count > 1
+        )
+        super().__init__(pairs)
+
+
+def _contains_duplicate_json_key(value: object) -> bool:
+    if isinstance(value, _DuplicateKeyAwareDict):
+        return value.duplicate_key_count > 0 or any(
+            _contains_duplicate_json_key(item) for item in value.values()
+        )
+    if isinstance(value, list):
+        return any(_contains_duplicate_json_key(item) for item in value)
+    return False
+
+
 def _parse_external_agent_result(
     raw: str,
     batch: RepresentationAnalysisBatch,
     expected_fingerprint: str,
+    expected_protocol_version: str = EXTERNAL_AGENT_PROTOCOL_VERSION,
 ) -> RepresentationAnalysisResult:
     try:
-        payload = json.loads(raw)
+        payload = json.loads(
+            raw,
+            object_pairs_hook=(
+                _DuplicateKeyAwareDict
+                if expected_protocol_version
+                in {
+                    EXTERNAL_AGENT_PROTOCOL_V3_2,
+                    EXTERNAL_AGENT_PROTOCOL_V3_3,
+                    EXTERNAL_AGENT_PROTOCOL_V3_4,
+                }
+                else None
+            ),
+        )
     except json.JSONDecodeError as exc:
         raise RepresentationInformationError("invalid_json") from exc
-    if not isinstance(payload, dict) or set(payload) != {
-        "protocol_version", "input_fingerprint", "candidates", "residue"
+    if expected_protocol_version not in SUPPORTED_EXTERNAL_AGENT_PROTOCOL_VERSIONS:
+        raise ValueError("unsupported External Agent protocol version")
+    if expected_protocol_version in {
+        EXTERNAL_AGENT_PROTOCOL_V3_3,
+        EXTERNAL_AGENT_PROTOCOL_V3_4,
     }:
+        expected_fields = {
+            "protocol_version",
+            "input_fingerprint",
+            "anchor_results",
+        }
+    else:
+        expected_fields = {
+            "protocol_version",
+            "input_fingerprint",
+            "candidates",
+            "residue",
+        }
+    if expected_protocol_version in {
+        EXTERNAL_AGENT_PROTOCOL_V2,
+        EXTERNAL_AGENT_PROTOCOL_V3,
+        EXTERNAL_AGENT_PROTOCOL_V3_1,
+        EXTERNAL_AGENT_PROTOCOL_V3_2,
+    }:
+        expected_fields.add("anchor_accounting")
+    if not isinstance(payload, dict) or set(payload) != expected_fields:
         raise _ExternalAgentContractFailure("top_level_schema")
     if (
-        payload["protocol_version"] != EXTERNAL_AGENT_PROTOCOL_VERSION
+        payload["protocol_version"] != expected_protocol_version
         or payload["input_fingerprint"] != expected_fingerprint
     ):
         raise RepresentationInformationError("result_binding_failure")
-    try:
-        candidates = tuple(
-            _candidate_draft(item) for item in _items(payload["candidates"], "candidates")
+    if expected_protocol_version in {
+        EXTERNAL_AGENT_PROTOCOL_V3_2,
+        EXTERNAL_AGENT_PROTOCOL_V3_3,
+        EXTERNAL_AGENT_PROTOCOL_V3_4,
+    }:
+        accounting_field = (
+            "anchor_results"
+            if expected_protocol_version
+            in {EXTERNAL_AGENT_PROTOCOL_V3_3, EXTERNAL_AGENT_PROTOCOL_V3_4}
+            else "anchor_accounting"
         )
-    except RepresentationInformationError as exc:
-        raise _ExternalAgentContractFailure("candidate_schema") from exc
-    try:
-        residue = tuple(
-            _residue_draft(item) for item in _items(payload["residue"], "residue")
+        accounting_value = payload[accounting_field]
+        if (
+            isinstance(accounting_value, _DuplicateKeyAwareDict)
+            and accounting_value.duplicate_key_count
+        ):
+            raise _ExternalAgentContractFailure("anchor_accounting")
+        if _contains_duplicate_json_key(payload):
+            raise _ExternalAgentContractFailure("top_level_schema")
+    if expected_protocol_version == EXTERNAL_AGENT_PROTOCOL_V3_4:
+        candidates, residue, accounting = _v34_project_anchor_results(
+            payload["anchor_results"], batch
         )
-    except RepresentationInformationError as exc:
-        raise _ExternalAgentContractFailure("residue_schema") from exc
+    elif expected_protocol_version == EXTERNAL_AGENT_PROTOCOL_V3_3:
+        candidates, residue, accounting = _v33_project_anchor_results(
+            payload["anchor_results"], batch
+        )
+    elif expected_protocol_version in {
+        EXTERNAL_AGENT_PROTOCOL_V3,
+        EXTERNAL_AGENT_PROTOCOL_V3_1,
+        EXTERNAL_AGENT_PROTOCOL_V3_2,
+    }:
+        candidates = _v3_candidate_drafts(payload["candidates"], batch)
+        residue = _v3_residue_drafts(payload["residue"], batch)
+    else:
+        try:
+            candidates = tuple(
+                _candidate_draft(item)
+                for item in _items(payload["candidates"], "candidates")
+            )
+        except RepresentationInformationError as exc:
+            raise _ExternalAgentContractFailure("candidate_schema") from exc
+        try:
+            residue = tuple(
+                _residue_draft(item)
+                for item in _items(payload["residue"], "residue")
+            )
+        except RepresentationInformationError as exc:
+            raise _ExternalAgentContractFailure("residue_schema") from exc
+    if expected_protocol_version not in {
+        EXTERNAL_AGENT_PROTOCOL_V3_3,
+        EXTERNAL_AGENT_PROTOCOL_V3_4,
+    }:
+        accounting: tuple[_AnchorAccounting, ...] | None = None
+    if expected_protocol_version in {
+        EXTERNAL_AGENT_PROTOCOL_V2,
+        EXTERNAL_AGENT_PROTOCOL_V3,
+        EXTERNAL_AGENT_PROTOCOL_V3_1,
+        EXTERNAL_AGENT_PROTOCOL_V3_2,
+    }:
+        try:
+            if expected_protocol_version == EXTERNAL_AGENT_PROTOCOL_V3_2:
+                accounting = _v32_anchor_accounting(
+                    payload["anchor_accounting"]
+                )
+            else:
+                accounting = tuple(
+                    _anchor_accounting(item)
+                    for item in _items(
+                        payload["anchor_accounting"], "anchor_accounting"
+                    )
+                )
+        except RepresentationInformationError as exc:
+            raise _ExternalAgentContractFailure("anchor_accounting") from exc
     try:
         RepresentationInformationService._validate_batch_result(
-            batch, RepresentationAnalysisResult(candidates, residue), external_contract=True
+            batch,
+            RepresentationAnalysisResult(candidates, residue),
+            external_contract=True,
+            anchor_accounting=accounting,
         )
     except _ExternalAgentContractFailure:
         raise
     except RepresentationInformationError as exc:
         raise _ExternalAgentContractFailure("unknown") from exc
     return RepresentationAnalysisResult(candidates, residue)
+
+
+def _v33_project_anchor_results(
+    value: object,
+    batch: RepresentationAnalysisBatch,
+) -> tuple[
+    tuple[RepresentationCandidateDraft, ...],
+    tuple[RepresentationResidueDraft, ...],
+    tuple[_AnchorAccounting, ...],
+]:
+    anchor_ids = [unit.unit_id for unit in batch.anchor_units]
+    context_ids = {
+        unit.unit_id
+        for unit in batch.context_support_units
+        if unit.analysis_eligible
+    }
+    if not isinstance(value, dict) or set(value) != set(anchor_ids):
+        raise _ExternalAgentContractFailure("anchor_coverage")
+
+    candidate_bodies: dict[
+        str,
+        tuple[str, str, tuple[str, ...], tuple[str, ...], str, float],
+    ] = {}
+    candidate_anchors: dict[str, list[str]] = {}
+    residue_bodies: dict[str, tuple[str, str]] = {}
+    residue_anchors: dict[str, list[str]] = {}
+    classifications: dict[str, str] = {}
+    accounting: list[_AnchorAccounting] = []
+
+    for anchor_id in anchor_ids:
+        anchor_result = value[anchor_id]
+        if not isinstance(anchor_result, dict) or set(anchor_result) != {
+            "classification",
+            "records",
+        }:
+            raise _ExternalAgentContractFailure("anchor_accounting")
+        classification = anchor_result["classification"]
+        if classification not in {"candidate", "residue"}:
+            raise _ExternalAgentContractFailure("anchor_accounting")
+        try:
+            records = _items(anchor_result["records"], "anchor result records")
+        except RepresentationInformationError as exc:
+            raise _ExternalAgentContractFailure("anchor_accounting") from exc
+        if not records:
+            raise _ExternalAgentContractFailure("anchor_coverage")
+        seen_ids: set[str] = set()
+        for record in records:
+            expected = (
+                {
+                    "result_record_id",
+                    "statement",
+                    "semantic_type",
+                    "concerns",
+                    "supporting_evidence_unit_ids",
+                    "context",
+                    "confidence",
+                }
+                if classification == "candidate"
+                else {
+                    "result_record_id",
+                    "reason_not_absorbed",
+                    "future_value_or_uncertainty",
+                }
+            )
+            if not isinstance(record, dict) or set(record) != expected:
+                raise _ExternalAgentContractFailure(
+                    "candidate_schema"
+                    if classification == "candidate"
+                    else "residue_schema"
+                )
+            try:
+                record_id = _text(
+                    record["result_record_id"], "result_record_id"
+                )
+            except RepresentationInformationError as exc:
+                raise _ExternalAgentContractFailure(
+                    "candidate_schema"
+                    if classification == "candidate"
+                    else "residue_schema"
+                ) from exc
+            if record_id in seen_ids:
+                raise _ExternalAgentContractFailure("anchor_accounting")
+            seen_ids.add(record_id)
+            previous_classification = classifications.get(record_id)
+            if (
+                previous_classification is not None
+                and previous_classification != classification
+            ):
+                raise _ExternalAgentContractFailure("anchor_accounting")
+            classifications[record_id] = classification
+            if classification == "candidate":
+                try:
+                    supporting = _unique_strings(
+                        record["supporting_evidence_unit_ids"],
+                        "candidate supporting_evidence_unit_ids",
+                        required=False,
+                    )
+                    if any(unit_id not in context_ids for unit_id in supporting):
+                        raise _ExternalAgentContractFailure(
+                            "evidence_reference"
+                        )
+                    confidence = record["confidence"]
+                    if (
+                        isinstance(confidence, bool)
+                        or not isinstance(confidence, (int, float))
+                        or not 0 <= confidence <= 1
+                    ):
+                        raise RepresentationInformationError(
+                            "candidate confidence must be between 0 and 1"
+                        )
+                    semantic_type = _text(
+                        record["semantic_type"], "candidate semantic_type"
+                    )
+                    if semantic_type not in SEMANTIC_TYPES:
+                        raise RepresentationInformationError(
+                            "candidate semantic_type is not supported"
+                        )
+                    body = (
+                        _text(record["statement"], "candidate statement"),
+                        semantic_type,
+                        _strings(record["concerns"], "candidate concerns"),
+                        supporting,
+                        _text(record["context"], "candidate context"),
+                        float(confidence),
+                    )
+                except _ExternalAgentContractFailure:
+                    raise
+                except RepresentationInformationError as exc:
+                    raise _ExternalAgentContractFailure(
+                        "candidate_schema"
+                    ) from exc
+                if (
+                    record_id in candidate_bodies
+                    and candidate_bodies[record_id] != body
+                ):
+                    raise _ExternalAgentContractFailure("anchor_accounting")
+                candidate_bodies.setdefault(record_id, body)
+                candidate_anchors.setdefault(record_id, []).append(anchor_id)
+            else:
+                try:
+                    body = (
+                        _text(
+                            record["reason_not_absorbed"],
+                            "Residue reason_not_absorbed",
+                        ),
+                        _text(
+                            record["future_value_or_uncertainty"],
+                            "Residue future_value_or_uncertainty",
+                        ),
+                    )
+                except RepresentationInformationError as exc:
+                    raise _ExternalAgentContractFailure(
+                        "residue_schema"
+                    ) from exc
+                if record_id in residue_bodies and residue_bodies[record_id] != body:
+                    raise _ExternalAgentContractFailure("anchor_accounting")
+                residue_bodies.setdefault(record_id, body)
+                residue_anchors.setdefault(record_id, []).append(anchor_id)
+        accounting.append(_AnchorAccounting(anchor_id, classification))
+
+    candidates = tuple(
+        RepresentationCandidateDraft(
+            statement=body[0],
+            semantic_type=body[1],
+            concerns=body[2],
+            evidence_unit_ids=(*candidate_anchors[record_id], *body[3]),
+            context=body[4],
+            confidence=body[5],
+        )
+        for record_id, body in candidate_bodies.items()
+    )
+    residue = tuple(
+        RepresentationResidueDraft(
+            evidence_unit_ids=tuple(residue_anchors[record_id]),
+            reason_not_absorbed=body[0],
+            future_value_or_uncertainty=body[1],
+        )
+        for record_id, body in residue_bodies.items()
+    )
+    return candidates, residue, tuple(accounting)
+
+
+def _v34_project_anchor_results(
+    value: object,
+    batch: RepresentationAnalysisBatch,
+) -> tuple[
+    tuple[RepresentationCandidateDraft, ...],
+    tuple[RepresentationResidueDraft, ...],
+    tuple[_AnchorAccounting, ...],
+]:
+    anchor_ids = [unit.unit_id for unit in batch.anchor_units]
+    context_ids = {
+        unit.unit_id
+        for unit in batch.context_support_units
+        if unit.analysis_eligible
+    }
+    if not isinstance(value, dict) or set(value) != set(anchor_ids):
+        raise _ExternalAgentContractFailure("anchor_coverage")
+
+    groups: dict[str, list[dict[str, object]]] = {}
+    ordered_groups: list[dict[str, object]] = []
+    accounting: list[_AnchorAccounting] = []
+    for anchor_id in anchor_ids:
+        anchor_result = value[anchor_id]
+        if not isinstance(anchor_result, dict) or set(anchor_result) != {
+            "classification",
+            "records",
+        }:
+            raise _ExternalAgentContractFailure("anchor_accounting")
+        classification = anchor_result["classification"]
+        if classification not in {"candidate", "residue"}:
+            raise _ExternalAgentContractFailure("anchor_accounting")
+        try:
+            records = _items(anchor_result["records"], "anchor result records")
+        except RepresentationInformationError as exc:
+            raise _ExternalAgentContractFailure("anchor_accounting") from exc
+        if not records:
+            raise _ExternalAgentContractFailure("anchor_coverage")
+
+        seen_bodies: set[bytes] = set()
+        for record in records:
+            if classification == "candidate":
+                expected = {
+                    "statement",
+                    "semantic_type",
+                    "concerns",
+                    "supporting_evidence_unit_ids",
+                    "context",
+                    "confidence",
+                }
+                if not isinstance(record, dict) or set(record) != expected:
+                    raise _ExternalAgentContractFailure("candidate_schema")
+                try:
+                    supporting = _unique_strings(
+                        record["supporting_evidence_unit_ids"],
+                        "candidate supporting_evidence_unit_ids",
+                        required=False,
+                    )
+                    if any(unit_id not in context_ids for unit_id in supporting):
+                        raise _ExternalAgentContractFailure("evidence_reference")
+                    confidence = record["confidence"]
+                    if (
+                        isinstance(confidence, bool)
+                        or not isinstance(confidence, (int, float))
+                        or not 0 <= confidence <= 1
+                    ):
+                        raise RepresentationInformationError(
+                            "candidate confidence must be between 0 and 1"
+                        )
+                    semantic_type = _text(
+                        record["semantic_type"], "candidate semantic_type"
+                    )
+                    if semantic_type not in SEMANTIC_TYPES:
+                        raise RepresentationInformationError(
+                            "candidate semantic_type is not supported"
+                        )
+                    body: dict[str, object] = {
+                        "classification": "candidate",
+                        "statement": _text(
+                            record["statement"], "candidate statement"
+                        ),
+                        "semantic_type": semantic_type,
+                        "concerns": list(
+                            _strings(record["concerns"], "candidate concerns")
+                        ),
+                        "supporting_evidence_unit_ids": list(supporting),
+                        "context": _text(record["context"], "candidate context"),
+                        "confidence": float(confidence),
+                    }
+                except _ExternalAgentContractFailure:
+                    raise
+                except RepresentationInformationError as exc:
+                    raise _ExternalAgentContractFailure(
+                        "candidate_schema"
+                    ) from exc
+            else:
+                expected = {
+                    "reason_not_absorbed",
+                    "future_value_or_uncertainty",
+                }
+                if not isinstance(record, dict) or set(record) != expected:
+                    raise _ExternalAgentContractFailure("residue_schema")
+                try:
+                    body = {
+                        "classification": "residue",
+                        "reason_not_absorbed": _text(
+                            record["reason_not_absorbed"],
+                            "Residue reason_not_absorbed",
+                        ),
+                        "future_value_or_uncertainty": _text(
+                            record["future_value_or_uncertainty"],
+                            "Residue future_value_or_uncertainty",
+                        ),
+                    }
+                except RepresentationInformationError as exc:
+                    raise _ExternalAgentContractFailure("residue_schema") from exc
+
+            body_bytes = _canonical_json_bytes(body)
+            if body_bytes in seen_bodies:
+                raise _ExternalAgentContractFailure("record_grouping")
+            seen_bodies.add(body_bytes)
+            digest = _v34_record_digest(body_bytes)
+            bucket = groups.setdefault(digest, [])
+            group = next(
+                (item for item in bucket if item["body_bytes"] == body_bytes),
+                None,
+            )
+            if group is None:
+                if bucket:
+                    raise _ExternalAgentContractFailure("record_grouping")
+                group = {
+                    "body": body,
+                    "body_bytes": body_bytes,
+                    "anchor_ids": [],
+                }
+                bucket.append(group)
+                ordered_groups.append(group)
+            group_anchor_ids = group["anchor_ids"]
+            assert isinstance(group_anchor_ids, list)
+            group_anchor_ids.append(anchor_id)
+        accounting.append(_AnchorAccounting(anchor_id, classification))
+
+    candidates: list[RepresentationCandidateDraft] = []
+    residue: list[RepresentationResidueDraft] = []
+    for group in ordered_groups:
+        body = group["body"]
+        anchor_refs = group["anchor_ids"]
+        assert isinstance(body, dict) and isinstance(anchor_refs, list)
+        if body["classification"] == "candidate":
+            supporting = body["supporting_evidence_unit_ids"]
+            concerns = body["concerns"]
+            assert isinstance(supporting, list) and isinstance(concerns, list)
+            candidates.append(
+                RepresentationCandidateDraft(
+                    statement=str(body["statement"]),
+                    semantic_type=str(body["semantic_type"]),
+                    concerns=tuple(str(value) for value in concerns),
+                    evidence_unit_ids=(
+                        *(str(value) for value in anchor_refs),
+                        *(str(value) for value in supporting),
+                    ),
+                    context=str(body["context"]),
+                    confidence=float(body["confidence"]),
+                )
+            )
+        else:
+            residue.append(
+                RepresentationResidueDraft(
+                    evidence_unit_ids=tuple(str(value) for value in anchor_refs),
+                    reason_not_absorbed=str(body["reason_not_absorbed"]),
+                    future_value_or_uncertainty=str(
+                        body["future_value_or_uncertainty"]
+                    ),
+                )
+            )
+    return tuple(candidates), tuple(residue), tuple(accounting)
+
+
+def _v32_anchor_accounting(value: object) -> tuple[_AnchorAccounting, ...]:
+    if not isinstance(value, dict):
+        raise RepresentationInformationError(
+            "anchor accounting map does not match the execution contract"
+        )
+    accounting: list[_AnchorAccounting] = []
+    for anchor_unit_id, accounted_as in value.items():
+        if accounted_as not in {"candidate", "residue"}:
+            raise RepresentationInformationError(
+                "anchor accounting outcome is not supported"
+            )
+        accounting.append(
+            _AnchorAccounting(
+                anchor_unit_id=anchor_unit_id,
+                accounted_as=accounted_as,
+            )
+        )
+    return tuple(accounting)
+
+
+def _v3_candidate_drafts(
+    value: object,
+    batch: RepresentationAnalysisBatch,
+) -> tuple[RepresentationCandidateDraft, ...]:
+    anchor_ids = {unit.unit_id for unit in batch.anchor_units}
+    context_ids = {
+        unit.unit_id for unit in batch.context_support_units if unit.analysis_eligible
+    }
+    drafts: list[RepresentationCandidateDraft] = []
+    try:
+        items = _items(value, "candidates")
+        for item in items:
+            if not isinstance(item, dict) or set(item) != {
+                "statement",
+                "semantic_type",
+                "concerns",
+                "anchor_unit_ids",
+                "supporting_evidence_unit_ids",
+                "context",
+                "confidence",
+            }:
+                raise RepresentationInformationError(
+                    "candidate does not match the v3 execution contract"
+                )
+            anchors = _unique_strings(
+                item["anchor_unit_ids"], "candidate anchor_unit_ids", required=True
+            )
+            supporting = _unique_strings(
+                item["supporting_evidence_unit_ids"],
+                "candidate supporting_evidence_unit_ids",
+                required=False,
+            )
+            if any(unit_id not in anchor_ids for unit_id in anchors) or any(
+                unit_id not in context_ids for unit_id in supporting
+            ):
+                raise _ExternalAgentContractFailure("evidence_reference")
+            confidence = item["confidence"]
+            if (
+                isinstance(confidence, bool)
+                or not isinstance(confidence, (int, float))
+                or not 0 <= confidence <= 1
+            ):
+                raise RepresentationInformationError(
+                    "candidate confidence must be between 0 and 1"
+                )
+            semantic_type = _text(item["semantic_type"], "candidate semantic_type")
+            if semantic_type not in SEMANTIC_TYPES:
+                raise RepresentationInformationError(
+                    "candidate semantic_type is not supported"
+                )
+            drafts.append(
+                RepresentationCandidateDraft(
+                    statement=_text(item["statement"], "candidate statement"),
+                    semantic_type=semantic_type,
+                    concerns=_strings(item["concerns"], "candidate concerns"),
+                    evidence_unit_ids=(*anchors, *supporting),
+                    context=_text(item["context"], "candidate context"),
+                    confidence=float(confidence),
+                )
+            )
+    except _ExternalAgentContractFailure:
+        raise
+    except RepresentationInformationError as exc:
+        raise _ExternalAgentContractFailure("candidate_schema") from exc
+    return tuple(drafts)
+
+
+def _v3_residue_drafts(
+    value: object,
+    batch: RepresentationAnalysisBatch,
+) -> tuple[RepresentationResidueDraft, ...]:
+    anchor_ids = {unit.unit_id for unit in batch.anchor_units}
+    drafts: list[RepresentationResidueDraft] = []
+    try:
+        items = _items(value, "residue")
+        for item in items:
+            if not isinstance(item, dict) or set(item) != {
+                "anchor_unit_ids",
+                "reason_not_absorbed",
+                "future_value_or_uncertainty",
+            }:
+                raise RepresentationInformationError(
+                    "Residue does not match the v3 execution contract"
+                )
+            anchors = _unique_strings(
+                item["anchor_unit_ids"], "Residue anchor_unit_ids", required=True
+            )
+            if any(unit_id not in anchor_ids for unit_id in anchors):
+                raise _ExternalAgentContractFailure("evidence_reference")
+            drafts.append(
+                RepresentationResidueDraft(
+                    evidence_unit_ids=anchors,
+                    reason_not_absorbed=_text(
+                        item["reason_not_absorbed"], "Residue reason_not_absorbed"
+                    ),
+                    future_value_or_uncertainty=_text(
+                        item["future_value_or_uncertainty"],
+                        "Residue future_value_or_uncertainty",
+                    ),
+                )
+            )
+    except _ExternalAgentContractFailure:
+        raise
+    except RepresentationInformationError as exc:
+        raise _ExternalAgentContractFailure("residue_schema") from exc
+    return tuple(drafts)
 
 
 def _require_codex_schema_compatibility(schema: Mapping[str, object]) -> None:
@@ -1504,6 +3028,21 @@ def _strings(value: object, field: str) -> tuple[str, ...]:
     return tuple(_text(item, field) for item in value)
 
 
+def _unique_strings(
+    value: object,
+    field: str,
+    *,
+    required: bool,
+) -> tuple[str, ...]:
+    if not isinstance(value, list) or required and not value:
+        requirement = "a non-empty array" if required else "an array"
+        raise RepresentationInformationError(f"{field} must be {requirement}")
+    result = tuple(_text(item, field) for item in value)
+    if len(set(result)) != len(result):
+        raise RepresentationInformationError(f"{field} must contain unique values")
+    return result
+
+
 def _candidate_draft(value: object) -> RepresentationCandidateDraft:
     if not isinstance(value, dict) or set(value) != {
         "statement", "semantic_type", "concerns", "evidence_unit_ids", "context", "confidence"
@@ -1539,6 +3078,27 @@ def _residue_draft(value: object) -> RepresentationResidueDraft:
     )
 
 
+def _anchor_accounting(value: object) -> _AnchorAccounting:
+    if not isinstance(value, dict) or set(value) != {
+        "anchor_unit_id",
+        "accounted_as",
+    }:
+        raise RepresentationInformationError(
+            "anchor accounting item does not match the execution contract"
+        )
+    accounted_as = _text(value["accounted_as"], "anchor accounting outcome")
+    if accounted_as not in {"candidate", "residue"}:
+        raise RepresentationInformationError(
+            "anchor accounting outcome is not supported"
+        )
+    return _AnchorAccounting(
+        anchor_unit_id=_text(
+            value["anchor_unit_id"], "anchor accounting unit_id"
+        ),
+        accounted_as=accounted_as,
+    )
+
+
 class RepresentationInformationService:
     def __init__(
         self,
@@ -1562,6 +3122,36 @@ class RepresentationInformationService:
         representation_id: str,
         provider: RepresentationAnalysisProvider,
     ) -> Path:
+        return self._extract(
+            representation_id,
+            provider,
+            finalize_results=None,
+        )
+
+    def _extract_with_internal_finalization(
+        self,
+        representation_id: str,
+        provider: RepresentationAnalysisProvider,
+        finalize_results: Callable[
+            [tuple[RepresentationAnalysisResult, ...]], object
+        ],
+    ) -> Path:
+        return self._extract(
+            representation_id,
+            provider,
+            finalize_results=finalize_results,
+        )
+
+    def _extract(
+        self,
+        representation_id: str,
+        provider: RepresentationAnalysisProvider,
+        *,
+        finalize_results: Callable[
+            [tuple[RepresentationAnalysisResult, ...]], object
+        ]
+        | None,
+    ) -> Path:
         try:
             representation_id = require_representation_id(representation_id)
             representation = self.representation_repository.get(representation_id)
@@ -1576,44 +3166,77 @@ class RepresentationInformationService:
                 representation,
                 self.representation_repository,
             )
-            candidates, residue, batches = self._analyze(units, provider)
+            outputs, batches = self._analysis_outputs(units, provider)
             self._verify_source(representation)
         except (OSError, RuntimeError, ValueError, TypeError, json.JSONDecodeError) as exc:
             if isinstance(exc, RepresentationInformationError):
                 raise
             raise RepresentationInformationError(str(exc)) from exc
 
-        manifest = _manifest(
-            representation,
-            units,
-            candidates,
-            residue,
-            batches,
-            provider.name,
-            self._timestamp(),
+        finalization_context = (
+            finalize_results(tuple(outputs))
+            if finalize_results is not None
+            else nullcontext(
+                _InternalAnalysisFinalization(tuple(outputs), lambda: None)
+            )
         )
-        self.output_root.mkdir(parents=True, exist_ok=True)
-        with tempfile.TemporaryDirectory(prefix=f".{representation_id}-", dir=self.output_root) as temp:
-            staging = Path(temp)
-            (staging / "manifest.json").write_text(
-                json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+        with finalization_context as finalization:
+            if type(finalization) is not _InternalAnalysisFinalization:
+                raise RepresentationInformationError(
+                    "Representation finalization returned invalid results"
+                )
+            finalized_outputs = finalization.outputs
+            if finalize_results is not None:
+                canonical_batches = _analysis_batches(units, self.batch_size)
+                self._validate_finalized_outputs(
+                    canonical_batches, finalized_outputs
+                )
+            candidates, residue = _output_records(
+                units, list(finalized_outputs), self._timestamp()
             )
-            (staging / "atomic_information_candidates.jsonl").write_text(
-                _jsonl(candidates), encoding="utf-8"
+            manifest = _manifest(
+                representation,
+                units,
+                candidates,
+                residue,
+                batches,
+                provider,
+                self._timestamp(),
             )
-            (staging / "residue.jsonl").write_text(_jsonl(residue), encoding="utf-8")
-            (staging / "processing_summary.md").write_text(
-                _summary(manifest), encoding="utf-8"
-            )
-            validate_representation_information_package(staging)
-            self._verify_source(representation)
-            verification = self.representation_repository.verify(representation_id)
-            if not verification.verified:
-                raise RepresentationInformationError("Representation changed during extraction")
-            try:
-                publish_directory_no_replace(staging, final)
-            except (FileExistsError, OSError) as exc:
-                raise RepresentationInformationError("Representation information package could not publish safely") from exc
+            self.output_root.mkdir(parents=True, exist_ok=True)
+            with tempfile.TemporaryDirectory(
+                prefix=f".{representation_id}-", dir=self.output_root
+            ) as temp:
+                staging = Path(temp)
+                (staging / "manifest.json").write_text(
+                    json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
+                    encoding="utf-8",
+                )
+                (staging / "atomic_information_candidates.jsonl").write_text(
+                    _jsonl(candidates), encoding="utf-8"
+                )
+                (staging / "residue.jsonl").write_text(
+                    _jsonl(residue), encoding="utf-8"
+                )
+                (staging / "processing_summary.md").write_text(
+                    _summary(manifest), encoding="utf-8"
+                )
+                validate_representation_information_package(staging)
+                self._verify_source(representation)
+                verification = self.representation_repository.verify(
+                    representation_id
+                )
+                if not verification.verified:
+                    raise RepresentationInformationError(
+                        "Representation changed during extraction"
+                    )
+                finalization.verify_before_publish()
+                try:
+                    publish_directory_no_replace(staging, final)
+                except (FileExistsError, OSError) as exc:
+                    raise RepresentationInformationError(
+                        "Representation information package could not publish safely"
+                    ) from exc
         return final
 
     def _verify_source(self, representation: NormalizedRepresentation) -> None:
@@ -1633,7 +3256,18 @@ class RepresentationInformationService:
         self,
         units: tuple[RepresentationAnalysisUnit, ...],
         provider: RepresentationAnalysisProvider,
-    ) -> tuple[list[dict[str, object]], list[dict[str, object]], list[dict[str, object]]]:
+    ) -> tuple[
+        list[dict[str, object]], list[dict[str, object]], list[dict[str, object]]
+    ]:
+        outputs, batches = self._analysis_outputs(units, provider)
+        candidates, residue = _output_records(units, outputs, self._timestamp())
+        return candidates, residue, batches
+
+    def _analysis_outputs(
+        self,
+        units: tuple[RepresentationAnalysisUnit, ...],
+        provider: RepresentationAnalysisProvider,
+    ) -> tuple[list[RepresentationAnalysisResult], list[dict[str, object]]]:
         if not isinstance(getattr(provider, "name", None), str) or not provider.name.strip():
             raise RepresentationInformationError("Representation analysis provider must have a name")
         outputs: list[RepresentationAnalysisResult] = []
@@ -1650,8 +3284,43 @@ class RepresentationInformationService:
             batches.append(
                 {"batch_id": f"batch_{len(batches) + 1:04d}", "unit_ids": [unit.unit_id for unit in batch.anchor_units]}
             )
-        candidates, residue = _output_records(units, outputs, self._timestamp())
-        return candidates, residue, batches
+        return outputs, batches
+
+    @classmethod
+    def _validate_finalized_outputs(
+        cls,
+        batches: tuple[RepresentationAnalysisBatch, ...],
+        outputs: tuple[RepresentationAnalysisResult, ...],
+    ) -> None:
+        if len(outputs) != len(batches) or any(
+            not isinstance(item, RepresentationAnalysisResult) for item in outputs
+        ):
+            raise RepresentationInformationError(
+                "Representation finalization returned invalid results"
+            )
+        for batch, result in zip(batches, outputs, strict=True):
+            anchor_ids = {unit.unit_id for unit in batch.anchor_units}
+            candidate_refs = {
+                unit_id
+                for item in result.candidates
+                if isinstance(item, RepresentationCandidateDraft)
+                for unit_id in item.evidence_unit_ids
+                if unit_id in anchor_ids
+            }
+            accounting = tuple(
+                _AnchorAccounting(
+                    anchor_unit_id=unit.unit_id,
+                    accounted_as=(
+                        "candidate" if unit.unit_id in candidate_refs else "residue"
+                    ),
+                )
+                for unit in batch.anchor_units
+            )
+            cls._validate_batch_result(
+                batch,
+                result,
+                anchor_accounting=accounting,
+            )
 
     @staticmethod
     def _validate_batch_result(
@@ -1659,6 +3328,7 @@ class RepresentationInformationService:
         result: RepresentationAnalysisResult,
         *,
         external_contract: bool = False,
+        anchor_accounting: tuple[_AnchorAccounting, ...] | None = None,
     ) -> None:
         def fail(detail: str, message: str) -> None:
             if external_contract:
@@ -1674,6 +3344,8 @@ class RepresentationInformationService:
             unit_id for unit_id, unit in supplied.items() if unit.analysis_eligible
         }
         covered: set[str] = set()
+        candidate_anchor_refs: set[str] = set()
+        residue_anchor_refs: set[str] = set()
         for item in result.candidates:
             if not isinstance(item, RepresentationCandidateDraft):
                 fail("candidate_schema", "Representation analysis result item is invalid")
@@ -1684,7 +3356,9 @@ class RepresentationInformationService:
                 fail("evidence_reference", "Representation analysis references an invalid unit")
             if not anchor_ids.intersection(references):
                 fail("evidence_reference", "Representation analysis result must account for an anchor unit")
-            covered.update(anchor_ids.intersection(references))
+            candidate_refs = anchor_ids.intersection(references)
+            candidate_anchor_refs.update(candidate_refs)
+            covered.update(candidate_refs)
         for item in result.residue:
             if not isinstance(item, RepresentationResidueDraft):
                 fail("residue_schema", "Representation analysis result item is invalid")
@@ -1695,10 +3369,34 @@ class RepresentationInformationService:
                 fail("evidence_reference", "Representation Residue references an invalid unit")
             if not references:
                 fail("evidence_reference", "Representation analysis result must account for an anchor unit")
+            residue_anchor_refs.update(references)
             covered.update(references)
         missing = anchor_ids - covered
         if missing:
             fail("anchor_coverage", "eligible Representation units were not covered")
+        if anchor_accounting is not None:
+            accounted_ids = [item.anchor_unit_id for item in anchor_accounting]
+            if (
+                len(accounted_ids) != len(anchor_ids)
+                or len(set(accounted_ids)) != len(accounted_ids)
+                or set(accounted_ids) != anchor_ids
+            ):
+                fail(
+                    "anchor_coverage",
+                    "anchor accounting does not enumerate every supplied anchor exactly once",
+                )
+            for item in anchor_accounting:
+                candidate_ref = item.anchor_unit_id in candidate_anchor_refs
+                residue_ref = item.anchor_unit_id in residue_anchor_refs
+                if item.accounted_as == "candidate":
+                    matches = candidate_ref and not residue_ref
+                else:
+                    matches = residue_ref and not candidate_ref
+                if not matches:
+                    fail(
+                        "anchor_accounting",
+                        "anchor accounting does not match Candidate or Residue Evidence",
+                    )
 
     def _timestamp(self) -> str:
         if self.clock is not None:
@@ -1994,12 +3692,30 @@ def _evidence(unit_ids: Sequence[str], by_id: Mapping[str, RepresentationAnalysi
     return result
 
 
-def _manifest(representation: NormalizedRepresentation, units: Sequence[RepresentationAnalysisUnit], candidates: Sequence[dict[str, object]], residue: Sequence[dict[str, object]], batches: Sequence[dict[str, object]], provider_name: str, processed_at: str) -> dict[str, object]:
+def _provider_manifest(provider: RepresentationAnalysisProvider) -> dict[str, str]:
+    payload = {"name": provider.name}
+    profile_fields = ("provider_version", "model", "reasoning_effort", "fallback_policy")
+    present = tuple(hasattr(provider, field) for field in profile_fields)
+    if any(present):
+        if not all(present):
+            raise RepresentationInformationError(
+                "Representation analysis provider execution profile is incomplete"
+            )
+        payload.update(
+            {
+                field: str(getattr(provider, field))
+                for field in profile_fields
+            }
+        )
+    return payload
+
+
+def _manifest(representation: NormalizedRepresentation, units: Sequence[RepresentationAnalysisUnit], candidates: Sequence[dict[str, object]], residue: Sequence[dict[str, object]], batches: Sequence[dict[str, object]], provider: RepresentationAnalysisProvider, processed_at: str) -> dict[str, object]:
     eligible = [unit for unit in units if unit.analysis_eligible]
     covered = {evidence["unit_id"] for item in (*candidates, *residue) for evidence in item["source_evidence"]}  # type: ignore[index]
     if covered != {unit.unit_id for unit in eligible}:
         raise RepresentationInformationError("eligible Representation unit coverage is incomplete")
-    return {"schema_version": PACKAGE_SCHEMA_VERSION, "package_kind": PACKAGE_KIND, "source": {"id": representation.source_id, "content_hash": representation.source_content_hash}, "representation": {"representation_id": representation.representation_id, "kind": representation.kind, "artifacts": [{"artifact_id": artifact.artifact_id, "locator": artifact.locator, "content_hash": artifact.content_hash} for artifact in representation.artifacts]}, "provider": {"name": provider_name}, "processed_at": processed_at, "artifacts": ["manifest.json", "atomic_information_candidates.jsonl", "residue.jsonl", "processing_summary.md"], "units": [{"unit_id": unit.unit_id, "artifact_id": unit.artifact_id, "kind": unit.kind, "locator": unit.locator, "analysis_eligible": unit.analysis_eligible, "exclusion_reason": unit.exclusion_reason} for unit in units], "batches": list(batches), "counts": {"total_units": len(units), "eligible_units": len(eligible), "excluded_units": len(units) - len(eligible), "atomic_information_candidates": len(candidates), "residue_items": len(residue), "unaccounted_eligible_units": 0}, "downstream": {"atomic_information_ingestion": "automatic_after_contract_validation", "world_model_write": "not_performed"}}
+    return {"schema_version": PACKAGE_SCHEMA_VERSION, "package_kind": PACKAGE_KIND, "source": {"id": representation.source_id, "content_hash": representation.source_content_hash}, "representation": {"representation_id": representation.representation_id, "kind": representation.kind, "artifacts": [{"artifact_id": artifact.artifact_id, "locator": artifact.locator, "content_hash": artifact.content_hash} for artifact in representation.artifacts]}, "provider": _provider_manifest(provider), "processed_at": processed_at, "artifacts": ["manifest.json", "atomic_information_candidates.jsonl", "residue.jsonl", "processing_summary.md"], "units": [{"unit_id": unit.unit_id, "artifact_id": unit.artifact_id, "kind": unit.kind, "locator": unit.locator, "analysis_eligible": unit.analysis_eligible, "exclusion_reason": unit.exclusion_reason} for unit in units], "batches": list(batches), "counts": {"total_units": len(units), "eligible_units": len(eligible), "excluded_units": len(units) - len(eligible), "atomic_information_candidates": len(candidates), "residue_items": len(residue), "unaccounted_eligible_units": 0}, "downstream": {"atomic_information_ingestion": "automatic_after_contract_validation", "world_model_write": "not_performed"}}
 
 
 def _jsonl(records: Sequence[dict[str, object]]) -> str:
@@ -2044,6 +3760,7 @@ def validate_representation_information_package(package: Path) -> tuple[dict[str
         raise RepresentationInformationError("unsupported Representation information package")
     source = manifest["source"]
     representation = manifest["representation"]
+    provider = manifest["provider"]
     if not isinstance(source, dict) or set(source) != {"id", "content_hash"}:
         raise RepresentationInformationError("Representation information source is invalid")
     require_managed_source_id(source["id"])
@@ -2051,6 +3768,37 @@ def validate_representation_information_package(package: Path) -> tuple[dict[str
         raise RepresentationInformationError("Representation information source hash is invalid")
     if not isinstance(representation, dict) or set(representation) != {"representation_id", "kind", "artifacts"}:
         raise RepresentationInformationError("Representation information representation is invalid")
+    if not isinstance(provider, dict) or frozenset(provider) not in {
+        frozenset({"name"}),
+        frozenset(
+            {
+                "name",
+                "provider_version",
+                "model",
+                "reasoning_effort",
+                "fallback_policy",
+            }
+        ),
+    }:
+        raise RepresentationInformationError(
+            "Representation information provider is invalid"
+        )
+    if not isinstance(provider.get("name"), str) or not provider["name"].strip():
+        raise RepresentationInformationError(
+            "Representation information provider name is invalid"
+        )
+    if len(provider) > 1 and (
+        any(
+            not isinstance(provider.get(field), str)
+            or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", provider[field])
+            for field in ("provider_version", "model")
+        )
+        or provider.get("reasoning_effort") not in SEMANTIC_REASONING_EFFORTS
+        or provider.get("fallback_policy") != "none"
+    ):
+        raise RepresentationInformationError(
+            "Representation information execution profile is invalid"
+        )
     require_representation_id(representation["representation_id"])
     if not isinstance(representation["artifacts"], list) or any(
         not isinstance(item, dict)

@@ -32,6 +32,8 @@ from .representation import (
 from .representation.registry import production_adapter
 from .representation_information import (
     DEFAULT_EXTERNAL_AGENT_BATCH_SIZE,
+    DEFAULT_SEMANTIC_MODEL,
+    DEFAULT_SEMANTIC_REASONING_EFFORT,
     CodexCliRepresentationAnalysisProvider,
     FileRepresentationAnalysisProvider,
     RepresentationInformationError,
@@ -253,9 +255,16 @@ def build_parser() -> argparse.ArgumentParser:
         choices=("codex-cli",),
         help="Explicit approved External Agent route; no automatic fallback.",
     )
-    extract.add_argument("--provider-version", help="Required safe provider version label for the External Agent audit.")
+    extract.add_argument(
+        "--provider-version",
+        help="Expected Codex version assertion; the executable remains the fact source.",
+    )
     extract.add_argument("--codex-bin", default="codex", help="Explicit Codex CLI executable for the approved route.")
     extract.add_argument("--timeout-seconds", type=float, default=120.0)
+    extract.add_argument("--model", default=DEFAULT_SEMANTIC_MODEL)
+    extract.add_argument(
+        "--reasoning-effort", default=DEFAULT_SEMANTIC_REASONING_EFFORT
+    )
     extract.add_argument(
         "--audit-root", type=Path, default=None
     )
@@ -540,8 +549,15 @@ def build_parser() -> argparse.ArgumentParser:
     wechat_digest.add_argument("--wechat-cli-bin", default="wechat-cli")
     wechat_digest.add_argument("--wechat-config", type=Path)
     wechat_digest.add_argument("--codex-bin", default="codex")
-    wechat_digest.add_argument("--provider-version")
-    wechat_digest.add_argument("--timeout-seconds", type=float, default=120.0)
+    wechat_digest.add_argument(
+        "--provider-version",
+        help="Expected Codex version assertion; actual version is read from --codex-bin.",
+    )
+    wechat_digest.add_argument("--timeout-seconds", type=float, default=300.0)
+    wechat_digest.add_argument("--model", default=DEFAULT_SEMANTIC_MODEL)
+    wechat_digest.add_argument(
+        "--reasoning-effort", default=DEFAULT_SEMANTIC_REASONING_EFFORT
+    )
     wechat_digest.add_argument(
         "--batch-size", type=int, default=DEFAULT_EXTERNAL_AGENT_BATCH_SIZE
     )
@@ -559,6 +575,21 @@ def build_parser() -> argparse.ArgumentParser:
         "--upgrade-active-v2-all-history",
         action="store_true",
         help="零 Provider 为当前 active v2 全历史运行冻结全局上界。",
+    )
+    wechat_digest.add_argument(
+        "--install-semantic-authority",
+        action="store_true",
+        help="零 Provider 安装一次性 frozen-global-upper Semantic 调用授权。",
+    )
+    wechat_digest.add_argument(
+        "--install-semantic-authority-extension",
+        action="store_true",
+        help="零 Provider 安装已批准的 append-only cap-1000 Semantic 扩权。",
+    )
+    wechat_digest.add_argument(
+        "--inventory-authority-file",
+        type=Path,
+        help="Private 0600 Lead-approved historical inventory authority manifest.",
     )
     return parser
 
@@ -693,6 +724,8 @@ def _information_command(args: argparse.Namespace) -> int:
                 provider = CodexCliRepresentationAnalysisProvider(
                     codex_binary=args.codex_bin,
                     provider_version=args.provider_version,
+                    model=args.model,
+                    reasoning_effort=args.reasoning_effort,
                     timeout_seconds=args.timeout_seconds,
                 )
                 handoff = ExternalAgentSemanticHandoffService(
@@ -961,6 +994,8 @@ def _wechat_product_command(args: argparse.Namespace) -> int:
             args.prepare_next_semantic,
             args.upgrade_active_v1,
             args.upgrade_active_v2_all_history,
+            args.install_semantic_authority,
+            args.install_semantic_authority_extension,
         )
     )
     if maintenance_count > 1 or (
@@ -968,6 +1003,13 @@ def _wechat_product_command(args: argparse.Namespace) -> int:
         and any((args.since is not None, args.from_now, args.all_history))
     ):
         print("error: 恢复维护入口不能与首次起点或其他维护入口同时使用。")
+        return 2
+    if args.install_semantic_authority:
+        if args.inventory_authority_file is None:
+            print("error: 安装 Semantic authority 必须指定私有 inventory authority file。")
+            return 2
+    elif args.inventory_authority_file is not None:
+        print("error: inventory authority file 只能与安装入口一起使用。")
         return 2
     try:
         workspace = require_workspace(args.config).workspace
@@ -996,6 +1038,8 @@ def _wechat_product_command(args: argparse.Namespace) -> int:
                 audit_root=workspace / DEFAULT_SEMANTIC_HANDOFF_AUDIT_ROOT,
                 codex_binary=args.codex_bin,
                 provider_version=provider_version,
+                model=args.model,
+                reasoning_effort=args.reasoning_effort,
                 timeout_seconds=args.timeout_seconds,
                 batch_size=args.batch_size,
             )
@@ -1035,6 +1079,52 @@ def _wechat_product_command(args: argparse.Namespace) -> int:
                         "semantic_provider_calls": 0,
                     },
                     ensure_ascii=False,
+                )
+            )
+            return 0
+        if args.install_semantic_authority:
+            grant = service.install_semantic_authority(
+                inventory_authority_file=args.inventory_authority_file,
+            )
+            print(
+                json.dumps(
+                    {
+                        "semantic_provider_calls": 0,
+                        "baseline_total": grant["baseline_total"],
+                        "max_new": grant["max_new"],
+                        "absolute_cap": grant["absolute_cap"],
+                        "global_authority_fingerprint": grant[
+                            "global_authority_fingerprint"
+                        ],
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                )
+            )
+            return 0
+        if args.install_semantic_authority_extension:
+            extension = service.install_semantic_authority_extension()
+            print(
+                json.dumps(
+                    {
+                        "semantic_provider_calls": 0,
+                        "activation_total": extension["activation_total"],
+                        "previous_absolute_cap": extension[
+                            "previous_absolute_cap"
+                        ],
+                        "new_absolute_cap": extension["new_absolute_cap"],
+                        "first_authorized_ordinal": extension[
+                            "first_authorized_ordinal"
+                        ],
+                        "last_authorized_ordinal": extension[
+                            "last_authorized_ordinal"
+                        ],
+                        "extension_fingerprint": extension[
+                            "extension_fingerprint"
+                        ],
+                    },
+                    ensure_ascii=False,
+                    indent=2,
                 )
             )
             return 0

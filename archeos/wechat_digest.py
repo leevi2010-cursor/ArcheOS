@@ -42,15 +42,23 @@ from .representation import (
 from .representation.registry import production_adapter
 from .representation_information import (
     DEFAULT_EXTERNAL_AGENT_BATCH_SIZE,
+    DEFAULT_SEMANTIC_MODEL,
+    DEFAULT_SEMANTIC_REASONING_EFFORT,
     CodexCliRepresentationAnalysisProvider,
     RepresentationInformationError,
     RepresentationInformationService,
+    _analysis_batches,
     _units_from_representation,
+    resolve_codex_executable_identity,
     validate_representation_information_package,
 )
 from .semantic_handoff import (
     ExternalAgentSemanticHandoffService,
+    SemanticCampaignAuthorityBinding,
+    SemanticCompletedWindowBinding,
     SemanticHandoffError,
+    SemanticPrivacyBinding,
+    SemanticWindowAuthorityBinding,
     _package_fingerprint,
     validate_completed_published_audits,
 )
@@ -83,6 +91,8 @@ SEMANTIC_ATTACHMENT_ADAPTERS = {
     "application/vnd.ms-powerpoint.presentation.macroenabled.12": "pptx",
 }
 IMAGE_MEDIA_TYPES = frozenset({"image/jpeg", "image/png", "image/gif"})
+SEMANTIC_PRIVACY_POLICY = "wechat-local-deterministic-privacy-gate"
+SEMANTIC_PRIVACY_POLICY_VERSION = "1.0"
 
 
 class WechatDigestError(RuntimeError):
@@ -186,8 +196,32 @@ class WechatCaptureProvider(Protocol):
 
 class SemanticHandoffPort(Protocol):
     provider: CodexCliRepresentationAnalysisProvider
+    reviewed_git_head: str
 
-    def execute(self, representation_id: str): ...
+    def execute(
+        self,
+        representation_id: str,
+        *,
+        privacy_binding: SemanticPrivacyBinding,
+        authority_binding: SemanticWindowAuthorityBinding,
+    ): ...
+
+    def install_global_authority(
+        self,
+        *,
+        inventory_authority_file: Path,
+        window_binding: SemanticWindowAuthorityBinding,
+    ) -> dict[str, object]: ...
+
+    def install_global_authority_extension(
+        self,
+        *,
+        window_binding: SemanticWindowAuthorityBinding,
+    ) -> dict[str, object]: ...
+
+    def global_campaign_binding(
+        self,
+    ) -> SemanticCampaignAuthorityBinding | None: ...
 
 
 def _canonical_json(value: object) -> str:
@@ -893,21 +927,39 @@ def parse_since(value: str) -> WechatCursor:
 
 def detect_codex_provider_version(codex_binary: str = "codex") -> str:
     try:
-        result = subprocess.run(
-            [codex_binary, "--version"],
+        return resolve_codex_executable_identity(codex_binary).provider_version
+    except RepresentationInformationError as exc:
+        raise WechatDigestError("无法验证 Semantic Provider 版本。") from exc
+
+
+def detect_clean_git_head(repository_root: Path | None = None) -> str:
+    """Read the reviewed build head and reject a dirty implementation tree."""
+
+    root = repository_root or Path(__file__).resolve().parents[1]
+    try:
+        head = subprocess.run(
+            ["git", "-C", str(root), "rev-parse", "HEAD"],
+            check=False,
             capture_output=True,
             text=True,
-            timeout=10,
+        )
+        status = subprocess.run(
+            ["git", "-C", str(root), "status", "--porcelain"],
             check=False,
+            capture_output=True,
+            text=True,
         )
     except (OSError, subprocess.SubprocessError) as exc:
-        raise WechatDigestError("无法验证 Semantic Provider 版本。") from exc
-    if result.returncode != 0:
-        raise WechatDigestError("无法验证 Semantic Provider 版本。")
-    normalized = re.sub(r"[^A-Za-z0-9._-]+", "-", result.stdout.strip()).strip("-")
-    if not normalized or len(normalized) > 128:
-        raise WechatDigestError("无法验证 Semantic Provider 版本。")
-    return normalized
+        raise WechatDigestError("无法验证当前 ArcheOS build。") from exc
+    value = head.stdout.strip()
+    if (
+        head.returncode != 0
+        or status.returncode != 0
+        or status.stdout
+        or re.fullmatch(r"[0-9a-f]{40}", value) is None
+    ):
+        raise WechatDigestError("当前 ArcheOS build 未达到 reviewed clean head。")
+    return value
 
 
 class ExistingSemanticHandoff:
@@ -922,7 +974,10 @@ class ExistingSemanticHandoff:
         codex_binary: str,
         provider_version: str,
         timeout_seconds: float,
+        model: str = DEFAULT_SEMANTIC_MODEL,
+        reasoning_effort: str = DEFAULT_SEMANTIC_REASONING_EFFORT,
         batch_size: int = DEFAULT_EXTERNAL_AGENT_BATCH_SIZE,
+        reviewed_git_head: str | None = None,
     ) -> None:
         self.service = ExternalAgentSemanticHandoffService(
             RepresentationInformationService(
@@ -937,11 +992,53 @@ class ExistingSemanticHandoff:
         self.provider = CodexCliRepresentationAnalysisProvider(
             codex_binary=codex_binary,
             provider_version=provider_version,
+            model=model,
+            reasoning_effort=reasoning_effort,
             timeout_seconds=timeout_seconds,
         )
+        self.reviewed_git_head = reviewed_git_head or detect_clean_git_head()
 
-    def execute(self, representation_id: str):
-        return self.service.execute(representation_id, self.provider)
+    def execute(
+        self,
+        representation_id: str,
+        *,
+        privacy_binding: SemanticPrivacyBinding,
+        authority_binding: SemanticWindowAuthorityBinding,
+    ):
+        return self.service.execute(
+            representation_id,
+            self.provider,
+            privacy_binding=privacy_binding,
+            authority_binding=authority_binding,
+        )
+
+    def install_global_authority(
+        self,
+        *,
+        inventory_authority_file: Path,
+        window_binding: SemanticWindowAuthorityBinding,
+    ) -> dict[str, object]:
+        return self.service.install_global_authority(
+            self.provider,
+            inventory_authority_file=inventory_authority_file,
+            window_binding=window_binding,
+        )
+
+    def install_global_authority_extension(
+        self,
+        *,
+        window_binding: SemanticWindowAuthorityBinding,
+    ) -> dict[str, object]:
+        return self.service.install_global_authority_extension(
+            self.provider,
+            window_binding=window_binding,
+            reviewed_git_head=self.reviewed_git_head,
+        )
+
+    def global_campaign_binding(
+        self,
+    ) -> SemanticCampaignAuthorityBinding | None:
+        return self.service.global_campaign_binding()
 
 
 @dataclass(frozen=True)
@@ -1284,6 +1381,284 @@ class WechatDigestService:
         if isinstance(semantic_batch_size, bool) or not isinstance(semantic_batch_size, int) or semantic_batch_size < 1:
             raise ValueError("semantic batch size must be positive")
         self.semantic_batch_size = semantic_batch_size
+
+    @staticmethod
+    def _cursor_tuple(cursor: WechatCursor) -> tuple[int, str, str]:
+        return (cursor.timestamp, cursor.conversation_key, cursor.message_key)
+
+    def _semantic_authority_binding(
+        self, run_id: str, *, allow_reviewed_head_extension: bool = False
+    ) -> SemanticWindowAuthorityBinding:
+        plan = self.run_store.plan(run_id)
+        receipt = self.run_store.plan_receipt(run_id)
+        after = WechatCursor.from_dict(plan.get("after_cursor"), "plan.after_cursor")
+        upper = WechatCursor.from_dict(plan.get("upper_bound"), "plan.upper_bound")
+        global_upper = self._plan_all_history_upper(plan) or upper
+        port = self._semantic_port()
+        campaign = port.global_campaign_binding()
+        if campaign is None:
+            campaign_created_at = plan.get("created_at")
+            campaign_lower = self._cursor_tuple(after)
+            campaign_upper = self._cursor_tuple(global_upper)
+            campaign_provider_version = plan.get("provider_version")
+            campaign_batch_size = self._plan_batch_size(plan)
+            campaign_reviewed_head = port.reviewed_git_head
+        else:
+            campaign_created_at = campaign.created_at
+            campaign_lower = campaign.lower_cursor
+            campaign_upper = campaign.frozen_global_upper_cursor
+            campaign_provider_version = campaign.capture_provider_version
+            campaign_batch_size = campaign.semantic_batch_size
+            campaign_reviewed_head = campaign.reviewed_git_head
+            if (
+                self._cursor_tuple(global_upper) != campaign_upper
+                or plan.get("provider_version") != campaign_provider_version
+                or self._plan_batch_size(plan) != campaign_batch_size
+                or (
+                    not allow_reviewed_head_extension
+                    and port.reviewed_git_head != campaign_reviewed_head
+                )
+            ):
+                raise WechatDigestError(
+                    "微信运行计划与 frozen Semantic campaign 漂移。"
+                )
+        completed_windows: list[SemanticCompletedWindowBinding] = []
+        candidates: list[
+            tuple[
+                WechatCursor,
+                WechatCursor,
+                str,
+                dict[str, object],
+                dict[str, object],
+                dict[str, object],
+            ]
+        ] = []
+        if self.run_store.runs_root.exists():
+            for path in sorted(self.run_store.runs_root.iterdir()):
+                if path.name == run_id:
+                    continue
+                if not path.is_dir() or re.fullmatch(
+                    r"run_[0-9a-f]{32}", path.name
+                ) is None:
+                    raise WechatDigestError(
+                        "微信 Semantic completed window inventory 损坏。"
+                    )
+                candidate_plan = self.run_store.plan(path.name)
+                if candidate_plan.get("created_at") != campaign_created_at:
+                    continue
+                candidate_global_upper = self._plan_all_history_upper(
+                    candidate_plan
+                )
+                if (
+                    candidate_global_upper is None
+                    or self._cursor_tuple(candidate_global_upper)
+                    != campaign_upper
+                    or candidate_plan.get("provider_version")
+                    != campaign_provider_version
+                    or self._plan_batch_size(candidate_plan)
+                    != campaign_batch_size
+                ):
+                    if campaign is None:
+                        continue
+                    raise WechatDigestError(
+                        "微信 Semantic completed window campaign 漂移。"
+                    )
+                candidate_after = WechatCursor.from_dict(
+                    candidate_plan.get("after_cursor"),
+                    "plan.after_cursor",
+                )
+                candidate_upper = WechatCursor.from_dict(
+                    candidate_plan.get("upper_bound"),
+                    "plan.upper_bound",
+                )
+                if candidate_upper > after:
+                    continue
+                candidate_receipt = self.run_store.plan_receipt(path.name)
+                candidate_status = self.run_store.status(path.name)
+                candidate_capture = self.capture_provider.capture(
+                    candidate_after,
+                    upper_bound=candidate_upper,
+                )
+                self._verify_capture_against_plan(
+                    candidate_capture, candidate_plan
+                )
+                self._verify_plan_and_status(
+                    path.name,
+                    candidate_capture,
+                    candidate_plan,
+                    candidate_status,
+                )
+                if (
+                    candidate_status.get("state") != "completed"
+                    or candidate_status.get("checkpoint_published") is not True
+                ):
+                    raise WechatDigestError(
+                        "微信 Semantic completed window 未完成 checkpoint。"
+                    )
+                candidates.append(
+                    (
+                        candidate_after,
+                        candidate_upper,
+                        path.name,
+                        candidate_plan,
+                        candidate_receipt,
+                        candidate_status,
+                    )
+                )
+        candidates.sort(key=lambda item: item[0])
+        if campaign is None and candidates:
+            campaign_lower = self._cursor_tuple(candidates[0][0])
+        chain_cursor = WechatCursor(*campaign_lower)
+        for (
+            candidate_after,
+            candidate_upper,
+            candidate_run_id,
+            candidate_plan,
+            candidate_receipt,
+            candidate_status,
+        ) in candidates:
+            if candidate_after != chain_cursor:
+                raise WechatDigestError(
+                    "微信 Semantic completed window chain 不连续。"
+                )
+            completed_windows.append(
+                SemanticCompletedWindowBinding(
+                    window_run_id=candidate_run_id,
+                    window_plan_fingerprint=_plan_fingerprint(candidate_plan),
+                    window_plan_receipt_fingerprint=_sha256_bytes(
+                        _canonical_json(candidate_receipt).encode("utf-8")
+                    ),
+                    window_status_fingerprint=_sha256_bytes(
+                        _canonical_json(candidate_status).encode("utf-8")
+                    ),
+                    window_after_cursor=self._cursor_tuple(candidate_after),
+                    window_upper_cursor=self._cursor_tuple(candidate_upper),
+                )
+            )
+            chain_cursor = candidate_upper
+        if chain_cursor != after:
+            raise WechatDigestError(
+                "微信 Semantic completed window chain 不完整。"
+            )
+        checkpoint_fingerprint = None
+        checkpoint = self.run_store.checkpoint()
+        if checkpoint is not None:
+            if checkpoint != after:
+                raise WechatDigestError(
+                    "微信 checkpoint 与当前 Semantic window 不连续。"
+                )
+            checkpoint_payload = self.run_store._read_json(
+                self.run_store.checkpoint_path
+            )
+            if (
+                completed_windows
+                and isinstance(checkpoint_payload, dict)
+                and checkpoint_payload.get("run_id")
+                != completed_windows[-1].window_run_id
+            ):
+                raise WechatDigestError(
+                    "微信 checkpoint 与 completed window chain 不一致。"
+                )
+            checkpoint_fingerprint = _sha256_bytes(
+                _canonical_json(checkpoint_payload).encode("utf-8")
+            )
+        elif self._cursor_tuple(after) != campaign_lower:
+            raise WechatDigestError(
+                "微信 Semantic window 缺少 previous checkpoint receipt。"
+            )
+        if not isinstance(campaign_created_at, str) or not isinstance(
+            campaign_provider_version, str
+        ):
+            raise WechatDigestError("微信运行计划缺少 Semantic authority binding。")
+        return SemanticWindowAuthorityBinding(
+            campaign_created_at=campaign_created_at,
+            campaign_lower_cursor=campaign_lower,
+            frozen_global_upper_cursor=campaign_upper,
+            capture_provider_version=campaign_provider_version,
+            semantic_batch_size=campaign_batch_size,
+            window_run_id=run_id,
+            window_plan_fingerprint=_plan_fingerprint(plan),
+            window_plan_receipt_fingerprint=_sha256_bytes(
+                _canonical_json(receipt).encode("utf-8")
+            ),
+            window_after_cursor=self._cursor_tuple(after),
+            window_upper_cursor=self._cursor_tuple(upper),
+            previous_checkpoint_fingerprint=checkpoint_fingerprint,
+            completed_window_chain=tuple(completed_windows),
+            reviewed_git_head=campaign_reviewed_head,
+        )
+
+    def install_semantic_authority(
+        self,
+        *,
+        inventory_authority_file: Path,
+    ) -> dict[str, object]:
+        """Install the one frozen campaign grant without starting a Provider."""
+
+        with self.run_store.lock():
+            run_id = self.run_store.active_run_id()
+            if run_id is None:
+                raise WechatDigestError("不存在可绑定 Semantic authority 的 active run。")
+            plan = self.run_store.plan(run_id)
+            if self._plan_all_history_upper(plan) is None:
+                raise WechatDigestError(
+                    "Semantic authority 只能绑定已冻结全局上界的 campaign。"
+                )
+            after = WechatCursor.from_dict(plan["after_cursor"], "plan.after_cursor")
+            upper = WechatCursor.from_dict(plan["upper_bound"], "plan.upper_bound")
+            capture = self.capture_provider.capture(after, upper_bound=upper)
+            self._verify_capture_against_plan(capture, plan)
+            status = self.run_store.status(run_id)
+            self._verify_plan_and_status(run_id, capture, plan, status)
+            binding = self._semantic_authority_binding(run_id)
+            grant = self._semantic_port().install_global_authority(
+                inventory_authority_file=inventory_authority_file,
+                window_binding=binding,
+            )
+            if grant.get("global_authority_fingerprint") is None:
+                raise WechatDigestError("Semantic authority 安装读回失败。")
+            return grant
+
+    def install_semantic_authority_extension(self) -> dict[str, object]:
+        """Install the approved append-only cap-1000 extension, zero Provider."""
+
+        with self.run_store.lock():
+            run_id = self.run_store.active_run_id()
+            if run_id is None:
+                raise WechatDigestError(
+                    "不存在可绑定 Semantic authority extension 的 active run。"
+                )
+            plan = self.run_store.plan(run_id)
+            if self._plan_all_history_upper(plan) is None:
+                raise WechatDigestError(
+                    "Semantic authority extension 只能绑定已冻结全局上界的 campaign。"
+                )
+            after = WechatCursor.from_dict(plan["after_cursor"], "plan.after_cursor")
+            upper = WechatCursor.from_dict(plan["upper_bound"], "plan.upper_bound")
+            capture = self.capture_provider.capture(after, upper_bound=upper)
+            self._verify_capture_against_plan(capture, plan)
+            status = self.run_store.status(run_id)
+            self._verify_plan_and_status(run_id, capture, plan, status)
+            items = status.get("items")
+            if not isinstance(items, dict) or any(
+                not isinstance(item, dict)
+                or item.get("state") not in TERMINAL_ITEM_STATES
+                for item in items.values()
+            ):
+                raise WechatDigestError(
+                    "Semantic authority extension 要求当前窗口全部 terminal。"
+                )
+            binding = self._semantic_authority_binding(
+                run_id, allow_reviewed_head_extension=True
+            )
+            extension = self._semantic_port().install_global_authority_extension(
+                window_binding=binding
+            )
+            if extension.get("extension_fingerprint") is None:
+                raise WechatDigestError(
+                    "Semantic authority extension 安装读回失败。"
+                )
+            return extension
 
     def run(
         self,
@@ -1693,18 +2068,19 @@ class WechatDigestService:
         self, run_id: str, representation_id: str, batch_size: int
     ) -> WechatSemanticPreparation:
         representation = self.representation_repository.get(representation_id)
-        eligible = tuple(
-            unit.unit_id
-            for unit in _units_from_representation(
+        batches = _analysis_batches(
+            _units_from_representation(
                 representation, self.representation_repository
-            )
-            if unit.analysis_eligible
+            ),
+            batch_size,
         )
-        if not eligible:
+        if not batches:
             raise WechatDigestError("semantic item 缺少 eligible units。")
-        if len(eligible) > batch_size:
-            raise WechatDigestError("下一个 semantic item 需要多个 batch；未跳过该 item。")
-        return WechatSemanticPreparation(run_id, representation_id, eligible)
+        return WechatSemanticPreparation(
+            run_id,
+            representation_id,
+            tuple(unit.unit_id for unit in batches[0].anchor_units),
+        )
 
     @staticmethod
     def _plan_batch_size(plan: Mapping[str, object]) -> int:
@@ -1921,7 +2297,6 @@ class WechatDigestService:
                     / "semantic_handoff_runs"
                 ),
                 package_fingerprint=_package_fingerprint(package),
-                provider=self._semantic_port().provider,
             )
             observed = item.get("atomic_information_ids")
             if (
@@ -2411,7 +2786,7 @@ class WechatDigestService:
             representation.representation_id
         ):
             return representation.representation_id
-        atomic_ids = self._semantic(representation.representation_id)
+        atomic_ids = self._semantic(run_id, representation.representation_id, privacy)
         pending, object_ids = self._govern(atomic_ids)
         self._update_item(
             run_id,
@@ -2489,7 +2864,7 @@ class WechatDigestService:
             representation.representation_id
         ):
             return representation.representation_id
-        atomic_ids = self._semantic(representation.representation_id)
+        atomic_ids = self._semantic(run_id, representation.representation_id, privacy)
         pending, object_ids = self._govern(atomic_ids)
         self._update_item(
             run_id,
@@ -2522,8 +2897,31 @@ class WechatDigestService:
                 continue
         return tuple(texts)
 
-    def _semantic(self, representation_id: str) -> tuple[str, ...]:
-        result = self._semantic_port().execute(representation_id)
+    def _semantic(
+        self, run_id: str, representation_id: str, privacy: PrivacyDecision
+    ) -> tuple[str, ...]:
+        representation = self.representation_repository.get(representation_id)
+        privacy_payload = {
+            "policy": SEMANTIC_PRIVACY_POLICY,
+            "policy_version": SEMANTIC_PRIVACY_POLICY_VERSION,
+            "route": privacy.route,
+            "categories": list(privacy.categories),
+            "representation_id": representation.representation_id,
+            "representation_manifest_fingerprint": _sha256_bytes(
+                _canonical_json(representation.to_manifest_dict()).encode("utf-8")
+            ),
+        }
+        privacy_binding = SemanticPrivacyBinding(
+            policy=SEMANTIC_PRIVACY_POLICY,
+            policy_version=SEMANTIC_PRIVACY_POLICY_VERSION,
+            route=privacy.route,
+            receipt_fingerprint=_sha256_bytes(_canonical_json(privacy_payload).encode()),
+        )
+        result = self._semantic_port().execute(
+            representation_id,
+            privacy_binding=privacy_binding,
+            authority_binding=self._semantic_authority_binding(run_id),
+        )
         atomic_ids = tuple(result.ingestion.atomic_information_ids)
         for atomic_id in atomic_ids:
             self.information_store.get_current(atomic_id)
