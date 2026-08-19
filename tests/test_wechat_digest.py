@@ -237,6 +237,7 @@ class SyntheticSemanticHandoff:
         self.reviewed_git_head = "6" * 40
         self.installed_grant = None
         self.installed_extension = None
+        self.unknown_resolution = None
         self.campaign_binding = None
         self.authority_bindings = []
 
@@ -352,6 +353,48 @@ class SyntheticSemanticHandoff:
 
     def global_campaign_binding(self):
         return self.campaign_binding
+
+    def resolve_unknown(
+        self,
+        *,
+        authority_manifest_file,
+        digest_binding,
+        commit_failed_closed_status,
+    ):
+        manifest = json.loads(Path(authority_manifest_file).read_text("utf-8"))
+        assert manifest["digest"]["item_id"] == digest_binding["item_id"]
+        resolution_id = "unknown_resolution_" + "a" * 32
+        status_fingerprint = commit_failed_closed_status(resolution_id)
+        expected = {
+            "global_ordinal": 166,
+            "resolution_id": resolution_id,
+            "preserved_but_unabsorbed": True,
+            "digest": {
+                **dict(digest_binding),
+                "failed_closed_status_fingerprint": status_fingerprint,
+            },
+            "continuation": {"next_global_ordinal": 167},
+            "resolution_receipt_fingerprint": "sha256:" + "f" * 64,
+        }
+        if self.unknown_resolution is not None:
+            assert self.unknown_resolution == expected
+        self.unknown_resolution = expected
+        return expected
+
+    def validate_unknown_resolution_digest(
+        self,
+        *,
+        digest_binding,
+        failed_closed_status_fingerprint,
+        resolution_id,
+    ):
+        assert self.unknown_resolution is not None
+        assert self.unknown_resolution["resolution_id"] == resolution_id
+        assert self.unknown_resolution["digest"] == {
+            **dict(digest_binding),
+            "failed_closed_status_fingerprint": failed_closed_status_fingerprint,
+        }
+        return self.unknown_resolution
 
     def _write_success_audits(
         self, package: Path, representation_id: str
@@ -1051,6 +1094,65 @@ class WechatDigestTests(unittest.TestCase):
         status = service.run_store.status(first.run_id)
         self.assertFalse(status["checkpoint_published"])
         self.assertEqual(service.run_store.active_run_id(), first.run_id)
+
+    def test_unknown_resolution_marks_one_item_failed_closed_and_skips_it(
+        self,
+    ) -> None:
+        capture = SyntheticCaptureProvider(
+            [
+                message(1, conversation="failed"),
+                message(2, conversation="next"),
+            ]
+        )
+        service = self.service(capture)
+        self.semantic.failures_remaining = 1
+        with self.assertRaises(WechatDigestError):
+            service.run(all_history=True)
+        prepared = service.prepare_next_semantic()
+        status = service.run_store.status(prepared.run_id)
+        item_id = next(
+            key
+            for key, value in status["items"].items()
+            if value.get("representation_id") == prepared.representation_id
+        )
+        manifest_path = self.workspace / "private-unknown-authority.json"
+        manifest_path.write_text(
+            json.dumps({"digest": {"item_id": item_id}}), encoding="utf-8"
+        )
+        os.chmod(manifest_path, 0o600)
+        provider_calls = self.semantic.provider.calls
+        resolution = service.resolve_semantic_unknown(
+            authority_manifest_file=manifest_path
+        )
+        self.assertEqual(self.semantic.provider.calls, provider_calls)
+        self.assertEqual(resolution["global_ordinal"], 166)
+        failed_status = service.run_store.status(prepared.run_id)
+        failed_item = failed_status["items"][item_id]
+        self.assertEqual(failed_item["state"], "failed_closed")
+        self.assertEqual(failed_item["atomic_information_ids"], [])
+        self.assertFalse(failed_item["pending_human"])
+        self.assertEqual(failed_item["context_object_ids"], [])
+        self.assertFalse(
+            (
+                self.workspace
+                / "02_processing"
+                / "information"
+                / prepared.representation_id
+            ).exists()
+        )
+        self.assertEqual(
+            service.resolve_semantic_unknown(
+                authority_manifest_file=manifest_path
+            ),
+            resolution,
+        )
+        self.assertEqual(self.semantic.provider.calls, provider_calls)
+
+        result = service.run()
+        self.assertEqual(self.semantic.provider.calls, provider_calls + 1)
+        self.assertEqual(result.failed_closed, 1)
+        self.assertTrue(result.checkpoint_published)
+        self.assertIsNone(service.run_store.active_run_id())
 
     def test_prepare_replays_existing_package_without_provider(self) -> None:
         self.create_object()

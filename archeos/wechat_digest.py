@@ -78,7 +78,7 @@ SUPPORTED_WECHAT_CLI_VERSION = "0.5.0"
 DEFAULT_CAPTURE_WINDOW_DAYS = 30
 DEFAULT_CAPTURE_WINDOW_MESSAGES = 1000
 TERMINAL_ITEM_STATES = frozenset(
-    {"processed", "local_only", "unsupported", "pending_human"}
+    {"processed", "local_only", "unsupported", "pending_human", "failed_closed"}
 )
 SEMANTIC_ATTACHMENT_ADAPTERS = {
     "text/markdown": "markdown",
@@ -217,6 +217,22 @@ class SemanticHandoffPort(Protocol):
         self,
         *,
         window_binding: SemanticWindowAuthorityBinding,
+    ) -> dict[str, object]: ...
+
+    def resolve_unknown(
+        self,
+        *,
+        authority_manifest_file: Path,
+        digest_binding: Mapping[str, object],
+        commit_failed_closed_status: Callable[[str], str],
+    ) -> dict[str, object]: ...
+
+    def validate_unknown_resolution_digest(
+        self,
+        *,
+        digest_binding: Mapping[str, object],
+        failed_closed_status_fingerprint: str,
+        resolution_id: str,
     ) -> dict[str, object]: ...
 
     def global_campaign_binding(
@@ -1035,6 +1051,34 @@ class ExistingSemanticHandoff:
             reviewed_git_head=self.reviewed_git_head,
         )
 
+    def resolve_unknown(
+        self,
+        *,
+        authority_manifest_file: Path,
+        digest_binding: Mapping[str, object],
+        commit_failed_closed_status: Callable[[str], str],
+    ) -> dict[str, object]:
+        return self.service.resolve_unknown(
+            self.provider,
+            authority_manifest_file=authority_manifest_file,
+            reviewed_git_head=self.reviewed_git_head,
+            digest_binding=digest_binding,
+            commit_failed_closed_status=commit_failed_closed_status,
+        )
+
+    def validate_unknown_resolution_digest(
+        self,
+        *,
+        digest_binding: Mapping[str, object],
+        failed_closed_status_fingerprint: str,
+        resolution_id: str,
+    ) -> dict[str, object]:
+        return self.service.validate_unknown_resolution_digest(
+            digest_binding=digest_binding,
+            failed_closed_status_fingerprint=failed_closed_status_fingerprint,
+            resolution_id=resolution_id,
+        )
+
     def global_campaign_binding(
         self,
     ) -> SemanticCampaignAuthorityBinding | None:
@@ -1054,6 +1098,7 @@ class WechatDigestResult:
     checkpoint_published: bool
     replayed: bool
     context_object_ids: tuple[str, ...] = ()
+    failed_closed: int = 0
 
 
 def _capture_fingerprint(capture: WechatCapture) -> str:
@@ -1660,6 +1705,194 @@ class WechatDigestService:
                 )
             return extension
 
+    def _unknown_resolution_digest_binding(
+        self,
+        *,
+        run_id: str,
+        plan: Mapping[str, object],
+        item_id: str,
+        item: Mapping[str, object],
+    ) -> dict[str, object]:
+        representation_id = item.get("representation_id")
+        source_id = item.get("source_id")
+        if not isinstance(representation_id, str) or not isinstance(source_id, str):
+            raise WechatDigestError(
+                "Semantic unknown recovery item identity 损坏。"
+            )
+        receipt = self.run_store.plan_receipt(run_id)
+        return {
+            "run_id": run_id,
+            "plan_fingerprint": _plan_fingerprint(plan),
+            "plan_receipt_fingerprint": _sha256_bytes(
+                _canonical_json(receipt).encode("utf-8")
+            ),
+            "item_id": item_id,
+            "source_id": source_id,
+            "representation_id": representation_id,
+        }
+
+    def _commit_failed_closed_item(
+        self,
+        *,
+        run_id: str,
+        plan: Mapping[str, object],
+        item_id: str,
+        resolution_id: str,
+    ) -> str:
+        current = self.run_store.status(run_id)
+        items = current.get("items")
+        if not isinstance(items, dict):
+            raise WechatDigestError("微信运行状态 items 损坏。")
+        item = self._item(items, item_id)
+        binding = self._unknown_resolution_digest_binding(
+            run_id=run_id,
+            plan=plan,
+            item_id=item_id,
+            item=item,
+        )
+        representation_id = str(binding["representation_id"])
+        package = (
+            self.workspace
+            / "02_processing"
+            / "information"
+            / representation_id
+        )
+        expected_failure = {
+            "resolution_id": resolution_id,
+            "global_ordinal": 166,
+            "failure_category": "runtime_nonzero_exit",
+            "result_present": False,
+            "preserved_but_unabsorbed": True,
+        }
+        if (
+            item.get("state") not in {"represented", "failed_closed"}
+            or os.path.lexists(package)
+            or item.get("atomic_information_ids") != []
+            or item.get("pending_human") is not False
+            or item.get("context_object_ids") != []
+            or item.get("privacy_route") not in {None, "approved"}
+            or item.get("state") == "failed_closed"
+            and item.get("semantic_failure") != expected_failure
+        ):
+            raise WechatDigestError(
+                "Semantic unknown recovery item 不满足 preserved-but-unabsorbed 边界。"
+            )
+        if any(
+            revision.origin_source_id == binding["source_id"]
+            for revision in self.information_store.list_atomic_information()
+        ):
+            raise WechatDigestError(
+                "Semantic unknown recovery item 已存在 Durable Atomic Information。"
+            )
+        if item.get("state") == "represented":
+            updated_item = {
+                **item,
+                "state": "failed_closed",
+                "privacy_route": "approved",
+                "privacy_categories": [],
+                "atomic_information_ids": [],
+                "pending_human": False,
+                "context_object_ids": [],
+                "semantic_failure": expected_failure,
+            }
+            updated_items = dict(items)
+            updated_items[item_id] = updated_item
+            updated_status = {
+                **current,
+                "items": updated_items,
+                "state": "processing",
+                "failure_category": None,
+                "updated_at": self.clock(),
+            }
+            self.run_store.update_status(run_id, updated_status)
+            readback = self.run_store.status(run_id)
+            if readback != updated_status:
+                raise WechatDigestError(
+                    "Semantic unknown recovery failed_closed 状态读回失败。"
+                )
+            current = readback
+            items = current["items"]
+            assert isinstance(items, dict)
+            item = self._item(items, item_id)
+        return _sha256_bytes(_canonical_json(item).encode("utf-8"))
+
+    def resolve_semantic_unknown(
+        self,
+        *,
+        authority_manifest_file: Path,
+    ) -> dict[str, object]:
+        """Resolve the approved unknown item with zero Semantic/Governance calls."""
+
+        try:
+            manifest = json.loads(Path(authority_manifest_file).read_text("utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise WechatDigestError(
+                "Semantic unknown recovery authority manifest 不可读。"
+            ) from exc
+        digest = manifest.get("digest") if isinstance(manifest, dict) else None
+        item_id = digest.get("item_id") if isinstance(digest, dict) else None
+        if not isinstance(item_id, str):
+            raise WechatDigestError(
+                "Semantic unknown recovery authority manifest binding 损坏。"
+            )
+        with self.run_store.lock():
+            run_id = self.run_store.active_run_id()
+            if run_id is None:
+                raise WechatDigestError(
+                    "不存在可恢复 Semantic unknown 的 active run。"
+                )
+            plan = self.run_store.plan(run_id)
+            if self._plan_all_history_upper(plan) is None:
+                raise WechatDigestError(
+                    "Semantic unknown recovery 只能绑定 frozen campaign。"
+                )
+            after = WechatCursor.from_dict(plan["after_cursor"], "plan.after_cursor")
+            upper = WechatCursor.from_dict(plan["upper_bound"], "plan.upper_bound")
+            capture = self.capture_provider.capture(after, upper_bound=upper)
+            self._verify_capture_against_plan(capture, plan)
+            status = self.run_store.status(run_id)
+            self._verify_plan_and_status(
+                run_id,
+                capture,
+                plan,
+                status,
+                allow_pending_unknown_resolution=True,
+            )
+            items = status.get("items")
+            if not isinstance(items, dict):
+                raise WechatDigestError("微信运行状态 items 损坏。")
+            item = self._item(items, item_id)
+            binding = self._unknown_resolution_digest_binding(
+                run_id=run_id,
+                plan=plan,
+                item_id=item_id,
+                item=item,
+            )
+            resolution = self._semantic_port().resolve_unknown(
+                authority_manifest_file=authority_manifest_file,
+                digest_binding=binding,
+                commit_failed_closed_status=lambda resolution_id: (
+                    self._commit_failed_closed_item(
+                        run_id=run_id,
+                        plan=plan,
+                        item_id=item_id,
+                        resolution_id=resolution_id,
+                    )
+                ),
+            )
+            final_status = self.run_store.status(run_id)
+            final_items = final_status.get("items")
+            if not isinstance(final_items, dict):
+                raise WechatDigestError("微信运行状态 items 损坏。")
+            final_item = self._item(final_items, item_id)
+            self._verify_failed_closed_item(
+                run_id=run_id,
+                plan=plan,
+                item_id=item_id,
+                item=final_item,
+            )
+            return resolution
+
     def run(
         self,
         *,
@@ -2127,6 +2360,7 @@ class WechatDigestService:
         *,
         require_receipt: bool = True,
         allow_legacy_status: bool = False,
+        allow_pending_unknown_resolution: bool = False,
     ) -> None:
         run_id = plan.get("run_id")
         created_at = plan.get("created_at")
@@ -2202,7 +2436,13 @@ class WechatDigestService:
             item = self._item(items, item_id)
             if item.get("kind") != kind or item.get("source_id") != source_id:
                 raise WechatDigestError("微信运行状态 binding 损坏。")
-            if item.get("state") in {"represented", "local_only", "processed", "pending_human"}:
+            if item.get("state") in {
+                "represented",
+                "local_only",
+                "processed",
+                "pending_human",
+                "failed_closed",
+            }:
                 representation_id = item.get("representation_id")
                 if not isinstance(representation_id, str):
                     raise WechatDigestError("微信运行状态 receipt 损坏。")
@@ -2226,10 +2466,96 @@ class WechatDigestService:
                 privacy = self.privacy_gate.evaluate(self._representation_texts(representation_id), semantic_completeness_known=(representation.status == "complete" and representation.completeness == 1.0 and not representation.warnings))
                 if item.get("state") == "represented" and privacy.route != "approved":
                     raise WechatDigestError("微信运行状态 privacy receipt 损坏。")
+                if item.get("state") == "failed_closed" and privacy.route != "approved":
+                    raise WechatDigestError("微信运行状态 privacy receipt 损坏。")
                 if item.get("state") == "local_only" and privacy.route != "local_only":
                     raise WechatDigestError("微信运行状态 privacy receipt 损坏。")
                 if item.get("state") in {"processed", "pending_human"}:
                     self._verify_semantic_receipts(representation_id, item)
+                if (
+                    item.get("state") == "failed_closed"
+                    and not allow_pending_unknown_resolution
+                ):
+                    self._verify_failed_closed_item(
+                        run_id=active_run_id,
+                        plan=plan,
+                        item_id=item_id,
+                        item=item,
+                    )
+
+    def _verify_failed_closed_item(
+        self,
+        *,
+        run_id: str,
+        plan: Mapping[str, object],
+        item_id: str,
+        item: Mapping[str, object],
+    ) -> None:
+        failure = item.get("semantic_failure")
+        if (
+            not isinstance(failure, dict)
+            or set(failure)
+            != {
+                "resolution_id",
+                "global_ordinal",
+                "failure_category",
+                "result_present",
+                "preserved_but_unabsorbed",
+            }
+            or re.fullmatch(
+                r"unknown_resolution_[0-9a-f]{32}",
+                str(failure.get("resolution_id")),
+            )
+            is None
+            or failure.get("global_ordinal") != 166
+            or failure.get("failure_category") != "runtime_nonzero_exit"
+            or failure.get("result_present") is not False
+            or failure.get("preserved_but_unabsorbed") is not True
+            or item.get("privacy_route") != "approved"
+            or item.get("privacy_categories") != []
+            or item.get("atomic_information_ids") != []
+            or item.get("pending_human") is not False
+            or item.get("context_object_ids") != []
+        ):
+            raise WechatDigestError(
+                "微信 failed_closed item receipt 损坏。"
+            )
+        representation_id = item.get("representation_id")
+        if not isinstance(representation_id, str) or os.path.lexists(
+            self.workspace
+            / "02_processing"
+            / "information"
+            / representation_id
+        ):
+            raise WechatDigestError(
+                "微信 failed_closed item 不得存在 Semantic package。"
+            )
+        source_id = item.get("source_id")
+        if any(
+            revision.origin_source_id == source_id
+            for revision in self.information_store.list_atomic_information()
+        ):
+            raise WechatDigestError(
+                "微信 failed_closed item 不得存在 Durable Atomic Information。"
+            )
+        binding = self._unknown_resolution_digest_binding(
+            run_id=run_id,
+            plan=plan,
+            item_id=item_id,
+            item=item,
+        )
+        try:
+            self._semantic_port().validate_unknown_resolution_digest(
+                digest_binding=binding,
+                failed_closed_status_fingerprint=_sha256_bytes(
+                    _canonical_json(item).encode("utf-8")
+                ),
+                resolution_id=str(failure["resolution_id"]),
+            )
+        except SemanticHandoffError as exc:
+            raise WechatDigestError(
+                "微信 failed_closed item authority receipt 损坏。"
+            ) from exc
 
     def _verify_semantic_receipts(
         self, representation_id: str, item: Mapping[str, object]
@@ -3053,6 +3379,7 @@ class WechatDigestService:
             local_only=sum(result.local_only for result in results),
             unsupported=sum(result.unsupported for result in results),
             pending_human=sum(result.pending_human for result in results),
+            failed_closed=sum(result.failed_closed for result in results),
             context_objects=len(context_object_ids),
             checkpoint_published=all(
                 result.checkpoint_published for result in results
@@ -3093,6 +3420,7 @@ class WechatDigestService:
             local_only=sum(item.get("state") == "local_only" for item in values),
             unsupported=sum(item.get("state") == "unsupported" for item in values),
             pending_human=sum(item.get("state") == "pending_human" for item in values),
+            failed_closed=sum(item.get("state") == "failed_closed" for item in values),
             context_objects=len(object_ids),
             checkpoint_published=bool(status.get("checkpoint_published")),
             replayed=replayed,
