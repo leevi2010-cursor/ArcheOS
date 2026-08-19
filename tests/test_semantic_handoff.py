@@ -5737,7 +5737,9 @@ class SemanticHandoffTest(unittest.TestCase):
         linked_clone_path.write_text(json.dumps(linked_payload), encoding="utf-8")
         linked_clone_path.chmod(0o600)
         linked_before = self.tree_snapshot(linked_root)
-        with self.assertRaisesRegex(SemanticHandoffError, "shadow"):
+        with self.assertRaisesRegex(
+            SemanticHandoffError, "shadow|无法一一绑定"
+        ):
             self.install_authority(
                 linked_handoff,
                 linked_provider,
@@ -5845,6 +5847,85 @@ class SemanticHandoffTest(unittest.TestCase):
             {"codex-cli-0.147.0": 2},
         )
         self.assertEqual(grant["external_prior_count"], 78)
+
+    def test_global_authority_does_not_lend_one_related_audit_to_two_attempts(
+        self,
+    ) -> None:
+        import archeos.semantic_handoff as handoff_module
+
+        root = self.root / "one-audit-two-related-attempts"
+        representation, service = self.build_service(root=root / "source")
+        handoff = ExternalAgentSemanticHandoffService(
+            service,
+            JsonlAtomicInformationStore(root / "atomic.jsonl"),
+            root / "audits",
+        )
+        provider = CodexCliRepresentationAnalysisProvider(
+            provider_version="0.147.0",
+            timeout_seconds=300,
+            runner=FakeRunner(),
+        )
+        recovery_one = handoff_module._SemanticRecoveryRun(
+            service,
+            handoff.audit_root,
+            representation.representation_id,
+            provider,
+            self.privacy_binding(),
+        )
+        recovery_one.ensure_run_receipt()
+        recovery_one.publish_attempt(1)
+        provider._capture_successful_raw = True
+        try:
+            result = provider.analyze(recovery_one.batches[0])
+        finally:
+            provider._capture_successful_raw = False
+        record = provider.execution_records[-1]
+        raw_result = provider._successful_results.pop()
+        RepresentationInformationService._validate_batch_result(
+            recovery_one.batches[0], result
+        )
+        recovery_one.publish_result(1, raw_result, record)
+        handoff._persist_audits(
+            (record,),
+            package_published=True,
+            information_ingested=False,
+            durable_ingestion_status="pending",
+            package_fingerprint="sha256:" + "9" * 64,
+            handoff_status="pending",
+        )
+        binding = self.semantic_window_binding()
+        manifest = self.write_inventory_authority(
+            handoff,
+            provider,
+            binding,
+            labels=("0.147.0",),
+        )
+        recovery_two = handoff_module._SemanticRecoveryRun(
+            service,
+            handoff.audit_root,
+            representation.representation_id,
+            provider,
+            replace(
+                self.privacy_binding(),
+                receipt_fingerprint="sha256:" + "8" * 64,
+            ),
+        )
+        recovery_two.ensure_run_receipt()
+        recovery_two.publish_attempt(1)
+        self.assertNotEqual(
+            recovery_one.semantic_run_id, recovery_two.semantic_run_id
+        )
+        before = self.tree_snapshot(handoff.audit_root)
+        with self.assertRaisesRegex(SemanticHandoffError, "无法一一绑定"):
+            handoff.install_global_authority(
+                provider,
+                inventory_authority_file=manifest,
+                window_binding=binding,
+            )
+        self.assertEqual(self.tree_snapshot(handoff.audit_root), before)
+        self.assertFalse(
+            (handoff.audit_root / "semantic_global_authority").exists()
+        )
 
     def test_global_authority_rejects_linked_historical_provenance_drift(
         self,

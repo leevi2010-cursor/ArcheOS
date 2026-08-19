@@ -3059,11 +3059,11 @@ class _SemanticGlobalAuthority:
             raise SemanticHandoffError(
                 "Semantic global authority audit/attempt binding 冲突。"
             )
-        exact_audits = set(audit_to_attempts)
-        for related in related_edges.values():
-            if not related <= exact_audits:
+        for index, related in related_edges.items():
+            own_exact = set(exact_edges[index])
+            if related != own_exact:
                 raise SemanticHandoffError(
-                    "Semantic global authority audit/attempt shadow 漂移。"
+                    "Semantic global authority audit/attempt 无法一一绑定。"
                 )
 
         for index, node in enumerate(attempt_nodes):
