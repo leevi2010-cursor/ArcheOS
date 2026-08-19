@@ -8083,6 +8083,97 @@ class SemanticHandoffTest(unittest.TestCase):
         self.assertEqual(blocked_runner.calls, [])
         self.assertEqual(self.tree_snapshot(shared_audits), before_cap)
 
+    def test_global_attempt_summary_accepts_canonical_representation_identity(
+        self,
+    ) -> None:
+        import archeos.semantic_handoff as handoff_module
+
+        representation, service = self.build_service(
+            root=self.root / "global-summary-source"
+        )
+        audit_root = self.root / "global-summary-audits"
+        handoff = ExternalAgentSemanticHandoffService(
+            service,
+            JsonlAtomicInformationStore(self.root / "global-summary.jsonl"),
+            audit_root,
+        )
+        runner = FakeRunner()
+        provider = CodexCliRepresentationAnalysisProvider(
+            provider_version="0.147.0",
+            timeout_seconds=300,
+            runner=runner,
+        )
+        binding = self.semantic_window_binding()
+        self.install_authority(handoff, provider, binding)
+        handoff.execute(
+            representation.representation_id,
+            provider,
+            privacy_binding=self.privacy_binding(),
+            authority_binding=binding,
+        )
+        handoff.install_global_authority_extension(
+            provider,
+            window_binding=binding,
+            reviewed_git_head="7" * 40,
+        )
+        authority = handoff_module._SemanticGlobalAuthority(audit_root)
+        base = authority._read_base_grant()
+        attempts, unknown = authority._global_attempts(
+            authority._effective_authority(
+                base,
+                authority._read_extension(base),
+                authority._read_unknown_resolution(),
+            )
+        )
+        self.assertFalse(unknown)
+        latest = attempts[-1]
+        production_shaped_attempts = [
+            {**latest, "global_ordinal": ordinal}
+            for ordinal in range(81, 177)
+        ]
+        provider_calls = len(runner.calls)
+
+        with patch.object(
+            handoff_module._SemanticGlobalAuthority,
+            "_global_attempts",
+            return_value=(production_shaped_attempts, False),
+        ):
+            summary = handoff.global_attempt_summary(
+                representation.representation_id
+            )
+
+        self.assertEqual(
+            summary,
+            {
+                "global_attempt_total": 176,
+                "global_unknown": 0,
+                "next_global_ordinal": 177,
+                "absolute_cap": 1000,
+            },
+        )
+        self.assertEqual(len(runner.calls), provider_calls)
+
+    def test_global_attempt_summary_rejects_noncanonical_identity_before_write(
+        self,
+    ) -> None:
+        _representation, service = self.build_service(
+            root=self.root / "invalid-global-summary-source"
+        )
+        audit_root = self.root / "invalid-global-summary-audits"
+        handoff = ExternalAgentSemanticHandoffService(
+            service,
+            JsonlAtomicInformationStore(
+                self.root / "invalid-global-summary.jsonl"
+            ),
+            audit_root,
+        )
+        before = self.tree_snapshot(audit_root)
+
+        with self.assertRaisesRegex(SemanticHandoffError, "identity 无效"):
+            handoff.global_attempt_summary("representation-invalid")
+
+        self.assertEqual(self.tree_snapshot(audit_root), before)
+
     def test_global_authority_unknown_and_unbound_paths_fail_closed(self) -> None:
         shared_audits = self.root / "unknown-audits"
         representation, service = self.build_service(

@@ -1191,7 +1191,7 @@ class WechatDigestTests(unittest.TestCase):
     def test_governance_timeout_seal_rejects_later_semantic_attempt(self) -> None:
         def mutate(_service, _run_id, _item_id):
             self.semantic.global_attempt_total += 1
-            self.semantic.latest_representation_id = "repr_" + "f" * 32
+            self.semantic.latest_representation_id = "repr_" + "f" * 64
 
         self.assert_governance_timeout_seal_rejected(mutate)
 

@@ -19,6 +19,7 @@ from pathlib import Path
 from .atomic_information import IngestionResult, ingest_processing_package
 from .atomic_information.store import AtomicInformationStore
 from .filesystem import publish_directory_no_replace, publish_file_no_replace
+from .representation.identity import require_representation_id
 from .representation_information import (
     CONTRACT_FAILURE_DETAILS,
     DIAGNOSTIC_SCHEMA_V1,
@@ -6861,10 +6862,12 @@ class ExternalAgentSemanticHandoffService:
     def global_attempt_summary(self, representation_id: str) -> dict[str, int]:
         """Read the validated global attempt ledger without starting a Provider."""
 
-        if re.fullmatch(r"repr_[0-9a-f]{32}", representation_id) is None:
+        try:
+            require_representation_id(representation_id)
+        except ValueError as exc:
             raise SemanticHandoffError(
                 "Semantic global attempt Representation identity 无效。"
-            )
+            ) from exc
         authority = _SemanticGlobalAuthority(self.audit_root)
         if not authority.exists:
             raise SemanticHandoffError("Semantic global authority 未安装。")
