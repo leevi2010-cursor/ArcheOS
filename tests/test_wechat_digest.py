@@ -295,6 +295,7 @@ class SyntheticSemanticHandoff:
         max_new,
         absolute_cap,
         window_binding,
+        historical_provider_versions=(),
     ):
         assert authority_ref.startswith("sha256:")
         assert (expected_total, max_new, absolute_cap) == (80, 20, 100)
@@ -304,6 +305,7 @@ class SyntheticSemanticHandoff:
             "max_new": 20,
             "absolute_cap": 100,
             "global_authority_fingerprint": "sha256:" + "5" * 64,
+            "historical_provider_versions": tuple(historical_provider_versions),
         }
         if self.installed_grant is not None and self.installed_grant != expected:
             raise RuntimeError("synthetic authority drift")

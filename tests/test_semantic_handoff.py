@@ -1765,14 +1765,22 @@ class SemanticHandoffTest(unittest.TestCase):
         binding = self.semantic_window_binding(
             batch_size=handoff.representation_service.batch_size
         )
-        handoff.install_global_authority(
-            provider,
-            authority_ref="sha256:" + "5" * 64,
-            expected_total=80,
-            max_new=20,
-            absolute_cap=100,
-            window_binding=binding,
-        )
+        if not (
+            handoff.audit_root
+            / "semantic_global_authority"
+            / "grant.json"
+        ).is_file():
+            handoff.install_global_authority(
+                provider,
+                authority_ref="sha256:" + "5" * 64,
+                expected_total=80,
+                max_new=20,
+                absolute_cap=100,
+                window_binding=binding,
+                historical_provider_versions=self.historical_provider_versions(
+                    handoff.audit_root
+                ),
+            )
         package = handoff.representation_service.output_root / representation_id
         if not package.exists():
             preflight = handoff.recovery_preflight(
@@ -1863,7 +1871,34 @@ class SemanticHandoffTest(unittest.TestCase):
             max_new=20,
             absolute_cap=100,
             window_binding=self.semantic_window_binding(),
+            historical_provider_versions=self.historical_provider_versions(
+                handoff.audit_root
+            ),
         )
+
+    @staticmethod
+    def historical_provider_versions(audit_root: Path) -> tuple[str, ...]:
+        versions: set[str] = set()
+        for path in audit_root.glob("run_*/processing-run-audit.json"):
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            value = payload.get("provider_version")
+            if isinstance(value, str):
+                versions.add(value)
+        for path in audit_root.glob("semantic_run_*/run-receipt.json"):
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            provider = payload.get("provider")
+            value = provider.get("provider_version") if isinstance(provider, dict) else None
+            if isinstance(value, str):
+                attempts = path.parent / "attempts"
+                if attempts.is_dir() and any(
+                    json.loads(attempt.read_text(encoding="utf-8")).get(
+                        "schema_version"
+                    )
+                    == "semantic-handoff-attempt-receipt/2.0"
+                    for attempt in attempts.iterdir()
+                ):
+                    versions.add(value)
+        return tuple(sorted(versions))
 
     def build_wechat_service(self):
         root = self.root / "wechat"
@@ -1956,7 +1991,8 @@ class SemanticHandoffTest(unittest.TestCase):
         )
         self.assertNotIn("Synthetic business input.", first.audit_paths[0].read_text())
         replay_provider = CodexCliRepresentationAnalysisProvider(
-            provider_version="0.147.0", runner=FakeRunner()
+            codex_binary=str(self.root / "absent-codex"),
+            provider_version="0.147.0",
         )
         second = handoff.execute(representation.representation_id, replay_provider)
         self.assertTrue(second.replayed_existing_package)
@@ -5134,6 +5170,7 @@ class SemanticHandoffTest(unittest.TestCase):
             max_new=20,
             absolute_cap=100,
             window_binding=self.semantic_window_binding(),
+            historical_provider_versions=("0.147.0",),
         )
         self.assertEqual(grant["legacy_attempt_inventory_count"], 1)
         self.assertEqual(grant["external_prior_count"], 79)
@@ -5218,6 +5255,14 @@ class SemanticHandoffTest(unittest.TestCase):
         self.assertEqual(grant["legacy_attempt_inventory_count"], 2)
         self.assertEqual(grant["external_prior_count"], 78)
         self.assertEqual(
+            grant["historical_provider_versions"],
+            ["0.145.0", "0.146.0"],
+        )
+        self.assertEqual(
+            grant["historical_provider_version_counts"],
+            {"0.145.0": 1, "0.146.0": 1},
+        )
+        self.assertEqual(
             grant["contract"]["provider"]["provider_version"],
             "0.147.0",
         )
@@ -5241,6 +5286,244 @@ class SemanticHandoffTest(unittest.TestCase):
                 ),
             )
         self.assertEqual(self.tree_snapshot(root), before)
+
+    def test_global_authority_requires_exact_approved_historical_version_set(
+        self,
+    ) -> None:
+        for name, approved, succeeds, error in (
+            ("exact", ("0.146.0",), True, ""),
+            ("missing", (), False, "version 集合不匹配"),
+            ("extra", ("0.146.0", "999"), False, "version 集合不匹配"),
+            ("unsafe", ("../unsafe", "0.146.0"), False, "授权无效"),
+        ):
+            with self.subTest(name=name):
+                root = self.root / f"historical-version-set-{name}"
+                (
+                    _representation,
+                    _service,
+                    handoff,
+                    provider,
+                    _recovery,
+                    _legacy_run,
+                    _linked_audit,
+                ) = self.build_linked_v31_inventory_fixture(root)
+                before = self.tree_snapshot(root)
+                if succeeds:
+                    grant = handoff.install_global_authority(
+                        provider,
+                        authority_ref="sha256:" + "5" * 64,
+                        expected_total=80,
+                        max_new=20,
+                        absolute_cap=100,
+                        window_binding=self.semantic_window_binding(),
+                        historical_provider_versions=approved,
+                    )
+                    self.assertEqual(
+                        grant["historical_provider_versions"], list(approved)
+                    )
+                    self.assertEqual(
+                        grant["historical_provider_version_counts"],
+                        {"0.146.0": 1},
+                    )
+                else:
+                    with self.assertRaisesRegex(
+                        SemanticHandoffError, error
+                    ):
+                        handoff.install_global_authority(
+                            provider,
+                            authority_ref="sha256:" + "5" * 64,
+                            expected_total=80,
+                            max_new=20,
+                            absolute_cap=100,
+                            window_binding=self.semantic_window_binding(),
+                            historical_provider_versions=approved,
+                        )
+                    self.assertEqual(self.tree_snapshot(root), before)
+                    self.assertFalse(
+                        (handoff.audit_root / "semantic_global_authority").exists()
+                    )
+
+    def test_global_authority_binds_verified_current_codex_executable(
+        self,
+    ) -> None:
+        root = self.root / "verified-codex-executable"
+        executable = root / "bin" / "codex"
+        executable.parent.mkdir(parents=True, mode=0o700)
+        executable.write_text(
+            "#!/bin/sh\n"
+            "if [ \"$1\" = \"--version\" ]; then\n"
+            "  echo 'codex-cli 0.147.0'\n"
+            "  exit 0\n"
+            "fi\n"
+            "exit 99\n",
+            encoding="utf-8",
+        )
+        executable.chmod(0o700)
+        _representation, service = self.build_service(root=root / "source")
+        handoff = ExternalAgentSemanticHandoffService(
+            service,
+            JsonlAtomicInformationStore(root / "atomic.jsonl"),
+            root / "audits",
+        )
+        provider = CodexCliRepresentationAnalysisProvider(
+            codex_binary=str(executable),
+            provider_version="0.147.0",
+            timeout_seconds=300,
+        )
+        grant = handoff.install_global_authority(
+            provider,
+            authority_ref="sha256:" + "5" * 64,
+            expected_total=80,
+            max_new=20,
+            absolute_cap=100,
+            window_binding=self.semantic_window_binding(),
+        )
+        contract = grant["contract"]
+        self.assertEqual(contract["provider"]["provider_version"], "0.147.0")
+        self.assertRegex(contract["provider_binary_sha256"], r"^sha256:[0-9a-f]{64}$")
+        self.assertNotIn(str(executable), json.dumps(grant))
+        self.assertEqual(provider.provider_start_count, 0)
+        executable.write_text(
+            executable.read_text(encoding="utf-8") + "# changed\n",
+            encoding="utf-8",
+        )
+        executable.chmod(0o700)
+        with self.assertRaisesRegex(
+            RepresentationInformationError, "identity drifted"
+        ):
+            handoff.execute(
+                _representation.representation_id,
+                provider,
+                privacy_binding=self.privacy_binding(),
+                authority_binding=self.semantic_window_binding(),
+            )
+        self.assertEqual(provider.provider_start_count, 0)
+        self.assertEqual(list(handoff.audit_root.glob("semantic_run_*")), [])
+
+        mismatch_root = self.root / "verified-codex-mismatch"
+        _representation, mismatch_service = self.build_service(
+            root=mismatch_root / "source"
+        )
+        mismatch = ExternalAgentSemanticHandoffService(
+            mismatch_service,
+            JsonlAtomicInformationStore(mismatch_root / "atomic.jsonl"),
+            mismatch_root / "audits",
+        )
+        before = self.tree_snapshot(mismatch_root)
+        with self.assertRaisesRegex(
+            RepresentationInformationError, "approved assertion"
+        ):
+            mismatch.install_global_authority(
+                CodexCliRepresentationAnalysisProvider(
+                    codex_binary=str(executable),
+                    provider_version="999",
+                    timeout_seconds=300,
+                ),
+                authority_ref="sha256:" + "5" * 64,
+                expected_total=80,
+                max_new=20,
+                absolute_cap=100,
+                window_binding=self.semantic_window_binding(),
+            )
+        self.assertEqual(self.tree_snapshot(mismatch_root), before)
+
+        unsafe_root = self.root / "unsafe-codex-executable"
+        unsafe_bin = unsafe_root / "world-writable" / "codex"
+        unsafe_bin.parent.mkdir(parents=True, mode=0o700)
+        unsafe_bin.write_text(
+            "#!/bin/sh\necho 'codex-cli 0.147.0'\n", encoding="utf-8"
+        )
+        unsafe_bin.chmod(0o700)
+        unsafe_bin.parent.chmod(0o777)
+        _representation, unsafe_service = self.build_service(
+            root=unsafe_root / "source"
+        )
+        unsafe_handoff = ExternalAgentSemanticHandoffService(
+            unsafe_service,
+            JsonlAtomicInformationStore(unsafe_root / "atomic.jsonl"),
+            unsafe_root / "audits",
+        )
+        unsafe_before = self.tree_snapshot(unsafe_root)
+        with self.assertRaisesRegex(
+            RepresentationInformationError, "path is unsafe"
+        ):
+            unsafe_handoff.install_global_authority(
+                CodexCliRepresentationAnalysisProvider(
+                    codex_binary=str(unsafe_bin),
+                    provider_version="0.147.0",
+                    timeout_seconds=300,
+                ),
+                authority_ref="sha256:" + "5" * 64,
+                expected_total=80,
+                max_new=20,
+                absolute_cap=100,
+                window_binding=self.semantic_window_binding(),
+            )
+        self.assertEqual(self.tree_snapshot(unsafe_root), unsafe_before)
+
+    def test_global_authority_rejects_unbound_and_linked_audit_shadows(
+        self,
+    ) -> None:
+        root = self.root / "unbound-audit-shadow"
+        (
+            _representation,
+            _service,
+            handoff,
+            provider,
+            _batch,
+            audit_path,
+        ) = self.build_historical_inventory_audit(root, runner_mode="nonzero")
+        audit = json.loads(audit_path.read_text(encoding="utf-8"))
+        clone_id = "run_" + "e" * 32
+        audit["processing_run_id"] = clone_id
+        clone_dir = handoff.audit_root / clone_id
+        clone_dir.mkdir(mode=0o700)
+        clone_path = clone_dir / "processing-run-audit.json"
+        clone_path.write_text(json.dumps(audit), encoding="utf-8")
+        clone_path.chmod(0o600)
+        before = self.tree_snapshot(root)
+        with self.assertRaisesRegex(SemanticHandoffError, "shadow"):
+            handoff.install_global_authority(
+                provider,
+                authority_ref="sha256:" + "5" * 64,
+                expected_total=80,
+                max_new=20,
+                absolute_cap=100,
+                window_binding=self.semantic_window_binding(),
+                historical_provider_versions=("0.147.0",),
+            )
+        self.assertEqual(self.tree_snapshot(root), before)
+
+        linked_root = self.root / "linked-audit-shadow"
+        (
+            _representation,
+            _service,
+            linked_handoff,
+            linked_provider,
+            _recovery,
+            _legacy_run,
+            linked_audit,
+        ) = self.build_linked_v31_inventory_fixture(linked_root)
+        linked_payload = json.loads(linked_audit.read_text(encoding="utf-8"))
+        linked_clone_id = "run_" + "d" * 32
+        linked_payload["processing_run_id"] = linked_clone_id
+        linked_clone_dir = linked_handoff.audit_root / linked_clone_id
+        linked_clone_dir.mkdir(mode=0o700)
+        linked_clone_path = linked_clone_dir / "processing-run-audit.json"
+        linked_clone_path.write_text(json.dumps(linked_payload), encoding="utf-8")
+        linked_clone_path.chmod(0o600)
+        linked_before = self.tree_snapshot(linked_root)
+        with self.assertRaisesRegex(SemanticHandoffError, "shadow"):
+            linked_handoff.install_global_authority(
+                linked_provider,
+                authority_ref="sha256:" + "5" * 64,
+                expected_total=80,
+                max_new=20,
+                absolute_cap=100,
+                window_binding=self.semantic_window_binding(),
+                historical_provider_versions=("0.146.0",),
+            )
+        self.assertEqual(self.tree_snapshot(linked_root), linked_before)
 
     def test_global_authority_exactly_deduplicates_linked_failed_audit(
         self,
@@ -6451,6 +6734,7 @@ class SemanticHandoffTest(unittest.TestCase):
                 max_new=20,
                 absolute_cap=100,
                 window_binding=self.semantic_window_binding(),
+                historical_provider_versions=("0.147.0",),
             )
         self.assertEqual(self.tree_snapshot(audit_root), before)
         self.assertFalse((audit_root / "semantic_global_authority").exists())

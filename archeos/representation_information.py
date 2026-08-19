@@ -70,6 +70,87 @@ class RepresentationInformationError(RuntimeError):
 
 
 @dataclass(frozen=True)
+class CodexExecutableIdentity:
+    """Verified identity of the exact executable used for a new call."""
+
+    resolved_path: str
+    provider_version: str
+    binary_sha256: str
+
+
+def resolve_codex_executable_identity(
+    codex_binary: str,
+    *,
+    expected_provider_version: str | None = None,
+) -> CodexExecutableIdentity:
+    """Resolve, hash and version-check the real Codex executable fail closed."""
+
+    candidate = shutil.which(codex_binary) if not os.path.isabs(codex_binary) else codex_binary
+    if candidate is None:
+        raise RepresentationInformationError("Codex executable could not be resolved")
+    try:
+        resolved = Path(candidate).expanduser().resolve(strict=True)
+        for ancestor in (resolved, *resolved.parents):
+            metadata = ancestor.lstat()
+            if stat.S_ISLNK(metadata.st_mode) or stat.S_IMODE(metadata.st_mode) & 0o022:
+                raise RepresentationInformationError("Codex executable path is unsafe")
+        before = resolved.lstat()
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or before.st_uid != os.getuid()
+            or before.st_nlink != 1
+            or stat.S_IMODE(before.st_mode) & 0o022
+            or not os.access(resolved, os.X_OK)
+        ):
+            raise RepresentationInformationError("Codex executable identity is unsafe")
+        descriptor = os.open(resolved, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        try:
+            opened_before = os.fstat(descriptor)
+            digest = hashlib.sha256()
+            while chunk := os.read(descriptor, 1024 * 1024):
+                digest.update(chunk)
+            opened_after = os.fstat(descriptor)
+        finally:
+            os.close(descriptor)
+        stable_fields = ("st_dev", "st_ino", "st_size", "st_mtime_ns", "st_mode", "st_uid")
+        if any(
+            getattr(before, field) != getattr(opened_before, field)
+            or getattr(opened_before, field) != getattr(opened_after, field)
+            for field in stable_fields
+        ):
+            raise RepresentationInformationError("Codex executable changed during readback")
+        version = subprocess.run(
+            [str(resolved), "--version"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        match = re.fullmatch(
+            r"codex-cli ([0-9]+\.[0-9]+\.[0-9]+(?:[-+][A-Za-z0-9._-]+)?)\n?",
+            version.stdout,
+        )
+        after = resolved.lstat()
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise RepresentationInformationError("Codex executable identity could not be verified") from exc
+    if (
+        version.returncode != 0
+        or version.stderr
+        or match is None
+        or any(getattr(before, field) != getattr(after, field) for field in stable_fields)
+    ):
+        raise RepresentationInformationError("Codex executable version is not trustworthy")
+    actual_version = match.group(1)
+    if expected_provider_version is not None and actual_version != expected_provider_version:
+        raise RepresentationInformationError("Codex executable version does not match the approved assertion")
+    return CodexExecutableIdentity(
+        resolved_path=str(resolved),
+        provider_version=actual_version,
+        binary_sha256="sha256:" + digest.hexdigest(),
+    )
+
+
+@dataclass(frozen=True)
 class RepresentationAnalysisUnit:
     unit_id: str
     representation_id: str
@@ -1297,6 +1378,34 @@ class CodexCliRepresentationAnalysisProvider:
         self._successful_results: list[_ExternalAgentSuccessfulResult] = []
         self._capture_successful_raw = False
         self.provider_start_count = 0
+        self._executable_identity: CodexExecutableIdentity | None = None
+
+    def verified_executable_identity(self) -> CodexExecutableIdentity:
+        """Revalidate the executable for install and every future call boundary."""
+
+        if self.runner is not subprocess.Popen:
+            # An injected runner never starts the production subprocess.  Its
+            # explicit version remains test authority without touching a local
+            # Codex installation.
+            identity = CodexExecutableIdentity(
+                resolved_path=self.codex_binary,
+                provider_version=self.provider_version,
+                binary_sha256="sha256:"
+                + hashlib.sha256(
+                    ("injected-runner\0" + self.codex_binary + "\0" + self.provider_version).encode()
+                ).hexdigest(),
+            )
+        else:
+            identity = resolve_codex_executable_identity(
+                self.codex_binary,
+                expected_provider_version=self.provider_version,
+            )
+        if self._executable_identity is not None and identity != self._executable_identity:
+            raise RepresentationInformationError("Codex executable identity drifted")
+        self._executable_identity = identity
+        if self.runner is subprocess.Popen:
+            self.codex_binary = identity.resolved_path
+        return identity
 
     def cleanup_failure_diagnostics(self) -> bool:
         """Explicitly remove local-only failure diagnostics after review."""
@@ -1310,6 +1419,8 @@ class CodexCliRepresentationAnalysisProvider:
             return False
 
     def analyze(self, batch: RepresentationAnalysisBatch) -> RepresentationAnalysisResult:
+        if self.runner is subprocess.Popen:
+            self.verified_executable_identity()
         started_monotonic = time.monotonic()
         diagnostic_root_ready = _purge_expired_diagnostic_bundles(
             self.diagnostic_root
@@ -1610,6 +1721,17 @@ class CodexCliRepresentationAnalysisProvider:
 
     def _start_provider(self, *args: object, **kwargs: object) -> Any:
         """Count only a process that the configured production runner started."""
+        if self.runner is subprocess.Popen:
+            identity = self.verified_executable_identity()
+            command = args[0] if args else None
+            if (
+                not isinstance(command, list)
+                or not command
+                or command[0] != identity.resolved_path
+            ):
+                raise RepresentationInformationError(
+                    "Codex executable command binding drifted"
+                )
         process = self.runner(*args, **kwargs)
         self.provider_start_count += 1
         return process

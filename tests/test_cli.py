@@ -139,6 +139,10 @@ class CliTest(unittest.TestCase):
                     "100",
                     "--authority-ref",
                     "sha256:" + "b" * 64,
+                    "--historical-provider-version",
+                    "0.146.0",
+                    "--historical-provider-version",
+                    "0.145.0",
                 ]
             )
         self.assertEqual(result, 0)
@@ -148,6 +152,7 @@ class CliTest(unittest.TestCase):
             expected_total=80,
             max_new=20,
             absolute_cap=100,
+            historical_provider_versions=("0.145.0", "0.146.0"),
         )
         digest_service.return_value.run.assert_not_called()
         capture_provider.assert_called_once()

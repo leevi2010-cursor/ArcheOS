@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sqlite3
 import sys
 from dataclasses import asdict
@@ -255,7 +256,10 @@ def build_parser() -> argparse.ArgumentParser:
         choices=("codex-cli",),
         help="Explicit approved External Agent route; no automatic fallback.",
     )
-    extract.add_argument("--provider-version", help="Required safe provider version label for the External Agent audit.")
+    extract.add_argument(
+        "--provider-version",
+        help="Expected Codex version assertion; the executable remains the fact source.",
+    )
     extract.add_argument("--codex-bin", default="codex", help="Explicit Codex CLI executable for the approved route.")
     extract.add_argument("--timeout-seconds", type=float, default=120.0)
     extract.add_argument("--model", default=DEFAULT_SEMANTIC_MODEL)
@@ -546,7 +550,10 @@ def build_parser() -> argparse.ArgumentParser:
     wechat_digest.add_argument("--wechat-cli-bin", default="wechat-cli")
     wechat_digest.add_argument("--wechat-config", type=Path)
     wechat_digest.add_argument("--codex-bin", default="codex")
-    wechat_digest.add_argument("--provider-version")
+    wechat_digest.add_argument(
+        "--provider-version",
+        help="Expected Codex version assertion; actual version is read from --codex-bin.",
+    )
     wechat_digest.add_argument("--timeout-seconds", type=float, default=300.0)
     wechat_digest.add_argument("--model", default=DEFAULT_SEMANTIC_MODEL)
     wechat_digest.add_argument(
@@ -579,6 +586,12 @@ def build_parser() -> argparse.ArgumentParser:
     wechat_digest.add_argument("--max-new", type=int)
     wechat_digest.add_argument("--absolute-cap", type=int)
     wechat_digest.add_argument("--authority-ref")
+    wechat_digest.add_argument(
+        "--historical-provider-version",
+        action="append",
+        default=[],
+        help="Repeat for each exact historical Provider version approved for baseline inventory.",
+    )
     return parser
 
 
@@ -1008,8 +1021,22 @@ def _wechat_product_command(args: argparse.Namespace) -> int:
         ):
             print("error: Semantic authority 必须严格使用 80 + 20 = 100。")
             return 2
+        historical_versions = tuple(args.historical_provider_version)
+        if (
+            len(set(historical_versions)) != len(historical_versions)
+            or any(
+                re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", item)
+                is None
+                for item in historical_versions
+            )
+        ):
+            print("error: historical Provider version 必须是唯一的安全精确标签。")
+            return 2
     elif any(value is not None for value in authority_values):
         print("error: Semantic authority 参数只能与安装入口一起使用。")
+        return 2
+    elif args.historical_provider_version:
+        print("error: historical Provider version 只能与安装入口一起使用。")
         return 2
     try:
         workspace = require_workspace(args.config).workspace
@@ -1088,6 +1115,9 @@ def _wechat_product_command(args: argparse.Namespace) -> int:
                 expected_total=args.expected_total,
                 max_new=args.max_new,
                 absolute_cap=args.absolute_cap,
+                historical_provider_versions=tuple(
+                    sorted(args.historical_provider_version)
+                ),
             )
             print(
                 json.dumps(

@@ -49,6 +49,7 @@ from .representation_information import (
     RepresentationInformationService,
     _analysis_batches,
     _units_from_representation,
+    resolve_codex_executable_identity,
     validate_representation_information_package,
 )
 from .semantic_handoff import (
@@ -213,6 +214,7 @@ class SemanticHandoffPort(Protocol):
         max_new: int,
         absolute_cap: int,
         window_binding: SemanticWindowAuthorityBinding,
+        historical_provider_versions: tuple[str, ...] = (),
     ) -> dict[str, object]: ...
 
     def global_campaign_binding(
@@ -923,21 +925,9 @@ def parse_since(value: str) -> WechatCursor:
 
 def detect_codex_provider_version(codex_binary: str = "codex") -> str:
     try:
-        result = subprocess.run(
-            [codex_binary, "--version"],
-            capture_output=True,
-            text=True,
-            timeout=10,
-            check=False,
-        )
-    except (OSError, subprocess.SubprocessError) as exc:
+        return resolve_codex_executable_identity(codex_binary).provider_version
+    except RepresentationInformationError as exc:
         raise WechatDigestError("无法验证 Semantic Provider 版本。") from exc
-    if result.returncode != 0:
-        raise WechatDigestError("无法验证 Semantic Provider 版本。")
-    normalized = re.sub(r"[^A-Za-z0-9._-]+", "-", result.stdout.strip()).strip("-")
-    if not normalized or len(normalized) > 128:
-        raise WechatDigestError("无法验证 Semantic Provider 版本。")
-    return normalized
 
 
 def detect_clean_git_head(repository_root: Path | None = None) -> str:
@@ -1028,6 +1018,7 @@ class ExistingSemanticHandoff:
         max_new: int,
         absolute_cap: int,
         window_binding: SemanticWindowAuthorityBinding,
+        historical_provider_versions: tuple[str, ...] = (),
     ) -> dict[str, object]:
         return self.service.install_global_authority(
             self.provider,
@@ -1036,6 +1027,7 @@ class ExistingSemanticHandoff:
             max_new=max_new,
             absolute_cap=absolute_cap,
             window_binding=window_binding,
+            historical_provider_versions=historical_provider_versions,
         )
 
     def global_campaign_binding(
@@ -1595,6 +1587,7 @@ class WechatDigestService:
         expected_total: int,
         max_new: int,
         absolute_cap: int,
+        historical_provider_versions: tuple[str, ...] = (),
     ) -> dict[str, object]:
         """Install the one frozen campaign grant without starting a Provider."""
 
@@ -1620,6 +1613,7 @@ class WechatDigestService:
                 max_new=max_new,
                 absolute_cap=absolute_cap,
                 window_binding=binding,
+                historical_provider_versions=historical_provider_versions,
             )
             if grant.get("global_authority_fingerprint") is None:
                 raise WechatDigestError("Semantic authority 安装读回失败。")
