@@ -2712,7 +2712,9 @@ class _SemanticGlobalAuthority:
             or provider.get("model") != "gpt-5.6-terra"
             or provider.get("reasoning_effort") != "medium"
             or provider.get("fallback_policy") != "none"
-            or run_payload.get("execution_deadline_ms") != 300000
+            or isinstance(run_payload.get("execution_deadline_ms"), bool)
+            or not isinstance(run_payload.get("execution_deadline_ms"), int)
+            or int(run_payload["execution_deadline_ms"]) <= 0
             or isinstance(run_payload.get("semantic_batch_size"), bool)
             or not isinstance(run_payload.get("semantic_batch_size"), int)
             or int(run_payload["semantic_batch_size"]) < 1
@@ -5078,7 +5080,7 @@ def _validate_versioned_published_audits(
                 or int(audit["elapsed_ms"]) < 0
                 or isinstance(audit.get("deadline_ms"), bool)
                 or not isinstance(audit.get("deadline_ms"), int)
-                or audit.get("deadline_ms") != 300000
+                or int(audit["deadline_ms"]) <= 0
                 or audit.get("exit_code") != 0
                 or audit.get("termination_signal") is not None
                 or audit.get("timeout_phase") is not None

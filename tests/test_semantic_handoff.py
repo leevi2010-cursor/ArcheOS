@@ -2419,7 +2419,7 @@ class SemanticHandoffTest(unittest.TestCase):
                 self.assertTrue(replay.replayed_existing_package)
                 self.assertEqual(replay.ingestion.existing, 1)
                 self.assertEqual(replay_runner.calls, [])
-                for invalid_deadline in (299000, 1):
+                for invalid_deadline in (True, 0, -1, "300000"):
                     with self.subTest(
                         protocol=protocol,
                         invalid_deadline=invalid_deadline,
@@ -3024,6 +3024,7 @@ class SemanticHandoffTest(unittest.TestCase):
         committed: bool = False,
         protocol_version: str = EXTERNAL_AGENT_PROTOCOL_V3_1,
         provider_version: str = "0.147.0",
+        deadline_ms: int = 300000,
     ) -> None:
         import archeos.semantic_handoff as handoff_module
 
@@ -3149,7 +3150,7 @@ class SemanticHandoffTest(unittest.TestCase):
             grouping_collision_count=0,
             diagnostic_schema_version="external-agent-diagnostics/2.0",
             elapsed_ms=1000,
-            deadline_ms=300000,
+            deadline_ms=deadline_ms,
             exit_code=0,
             termination_signal=None,
             timeout_phase=None,
@@ -3233,6 +3234,7 @@ class SemanticHandoffTest(unittest.TestCase):
         source_id: str = "src_" + "a" * 32,
         audit_root: Path | None = None,
         blocks: int = 1,
+        timeout_seconds: int = 300,
     ):
         import archeos.semantic_handoff as handoff_module
 
@@ -3246,7 +3248,7 @@ class SemanticHandoffTest(unittest.TestCase):
         os.chmod(audit_root, 0o700)
         current_provider = CodexCliRepresentationAnalysisProvider(
             provider_version="0.147.0",
-            timeout_seconds=300,
+            timeout_seconds=timeout_seconds,
             runner=FakeRunner(),
         )
         recovery = handoff_module._SemanticRecoveryRun(
@@ -3279,6 +3281,7 @@ class SemanticHandoffTest(unittest.TestCase):
                 ordinal,
                 committed=True,
                 provider_version=provider_version,
+                deadline_ms=timeout_seconds * 1000,
             )
             result_receipt = json.loads(
                 (
@@ -5636,6 +5639,108 @@ class SemanticHandoffTest(unittest.TestCase):
             )
         self.assertEqual(self.tree_snapshot(root), before)
 
+    def test_global_authority_accepts_linked_historical_noncurrent_deadline(
+        self,
+    ) -> None:
+        root = self.root / "linked-historical-120-second-deadline"
+        (
+            _representation,
+            _service,
+            handoff,
+            _historical_provider,
+            _recovery,
+            legacy_run,
+            audit_path,
+        ) = self.build_linked_v31_inventory_fixture(
+            root,
+            timeout_seconds=120,
+        )
+        result_receipt = json.loads(
+            (
+                legacy_run
+                / "results"
+                / "batch_0001"
+                / "result-receipt.json"
+            ).read_text(encoding="utf-8")
+        )
+        self.assertEqual(
+            json.loads(
+                (legacy_run / "run-receipt.json").read_text(encoding="utf-8")
+            )["execution_deadline_ms"],
+            120000,
+        )
+        self.assertEqual(
+            result_receipt["execution_record"]["deadline_ms"], 120000
+        )
+        self.assertEqual(
+            json.loads(audit_path.read_text(encoding="utf-8"))["deadline_ms"],
+            120000,
+        )
+
+        current_provider = CodexCliRepresentationAnalysisProvider(
+            provider_version="0.147.0",
+            timeout_seconds=300,
+            runner=FakeRunner(),
+        )
+        grant = self.install_historical_inventory_authority(
+            handoff, current_provider
+        )
+        self.assertEqual(grant["legacy_attempt_inventory_count"], 1)
+        self.assertEqual(grant["contract"]["execution_deadline_ms"], 300000)
+
+    def test_standalone_historical_deadline_is_frozen_by_private_manifest(
+        self,
+    ) -> None:
+        for drift_after_manifest in (False, True):
+            with self.subTest(drift_after_manifest=drift_after_manifest):
+                root = self.root / (
+                    "standalone-deadline-drift"
+                    if drift_after_manifest
+                    else "standalone-deadline-accepted"
+                )
+                (
+                    _representation,
+                    _service,
+                    handoff,
+                    provider,
+                    _batch,
+                    audit_path,
+                ) = self.build_historical_inventory_audit(root)
+                audit = json.loads(audit_path.read_text(encoding="utf-8"))
+                audit["deadline_ms"] = 120000
+                audit_path.write_text(json.dumps(audit), encoding="utf-8")
+                binding = self.semantic_window_binding()
+                manifest = self.write_inventory_authority(
+                    handoff, provider, binding
+                )
+                if drift_after_manifest:
+                    audit["deadline_ms"] = 119000
+                    audit_path.write_text(json.dumps(audit), encoding="utf-8")
+                    before = self.tree_snapshot(handoff.audit_root)
+                    with self.assertRaises(SemanticHandoffError):
+                        handoff.install_global_authority(
+                            provider,
+                            inventory_authority_file=manifest,
+                            window_binding=binding,
+                        )
+                    self.assertEqual(
+                        self.tree_snapshot(handoff.audit_root), before
+                    )
+                    self.assertFalse(
+                        (
+                            handoff.audit_root / "semantic_global_authority"
+                        ).exists()
+                    )
+                else:
+                    grant = handoff.install_global_authority(
+                        provider,
+                        inventory_authority_file=manifest,
+                        window_binding=binding,
+                    )
+                    self.assertEqual(
+                        grant["legacy_attempt_inventory_count"], 1
+                    )
+
     def test_global_authority_requires_exact_approved_historical_version_set(
         self,
     ) -> None:
@@ -6268,7 +6373,9 @@ class SemanticHandoffTest(unittest.TestCase):
             "audit-protocol",
             "audit-deadline",
             "audit-input",
+            "run-deadline",
             "result-provider",
+            "result-deadline",
             "result-cleanup",
             "result-phase",
         ):
@@ -6300,13 +6407,36 @@ class SemanticHandoffTest(unittest.TestCase):
                     }[attack]
                     audit[field] = value
                     audit_path.write_text(json.dumps(audit), encoding="utf-8")
-                elif attack in {"result-provider", "result-cleanup"}:
+                elif attack == "run-deadline":
+                    receipt_path = legacy_run / "run-receipt.json"
+                    receipt = json.loads(
+                        receipt_path.read_text(encoding="utf-8")
+                    )
+                    receipt["execution_deadline_ms"] = 120000
+                    receipt.pop("run_receipt_fingerprint")
+                    receipt.pop("contract_fingerprint")
+                    receipt["contract_fingerprint"] = (
+                        handoff_module._fingerprint(receipt)
+                    )
+                    receipt["run_receipt_fingerprint"] = (
+                        handoff_module._fingerprint(receipt)
+                    )
+                    receipt_path.write_text(
+                        json.dumps(receipt), encoding="utf-8"
+                    )
+                elif attack in {
+                    "result-provider",
+                    "result-deadline",
+                    "result-cleanup",
+                }:
                     result = legacy_run / "results" / "batch_0001"
                     receipt_path = result / "result-receipt.json"
                     receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
                     record = receipt["execution_record"]
                     if attack == "result-provider":
                         record["provider_version"] = "0.145.0"
+                    elif attack == "result-deadline":
+                        record["deadline_ms"] = 120000
                     else:
                         record["process_cleanup_status"] = "failed"
                     receipt.pop("result_receipt_fingerprint")

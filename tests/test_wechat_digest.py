@@ -1305,10 +1305,17 @@ class WechatDigestTests(unittest.TestCase):
     def test_active_v2_upgrade_accepts_nine_current_and_thirty_one_historical_profiles(
         self,
     ) -> None:
-        messages = [
-            message(index, conversation=f"conversation_{index}")
-            for index in range(1, 41)
-        ]
+        messages = []
+        message_number = 1
+        for conversation_index in range(1, 41):
+            for _ in range(41 if conversation_index <= 9 else 1):
+                messages.append(
+                    message(
+                        message_number,
+                        conversation=f"conversation_{conversation_index}",
+                    )
+                )
+                message_number += 1
         service, semantic, run_id = self._make_active_v2_processed_run(
             mode="all_residue",
             messages=messages,
@@ -1321,18 +1328,27 @@ class WechatDigestTests(unittest.TestCase):
         )
         packages = sorted(path for path in package_root.iterdir() if path.is_dir())
         self.assertEqual(len(packages), 40)
-        for package in packages[9:]:
+        audit_by_package: dict[str, list[tuple[Path, dict[str, object]]]] = {}
+        for audit_path in audit_root.glob("*/processing-run-audit.json"):
+            audit = json.loads(audit_path.read_text(encoding="utf-8"))
+            audit_by_package.setdefault(
+                str(audit["package_fingerprint"]), []
+            ).append((audit_path, audit))
+        self.assertEqual(sum(map(len, audit_by_package.values())), 49)
+        historical_packages = [
+            package
+            for package in packages
+            if len(audit_by_package[_package_fingerprint(package)]) == 1
+        ]
+        self.assertEqual(len(historical_packages), 31)
+        for package in historical_packages:
             old_fingerprint = _package_fingerprint(package)
             manifest_path = package / "manifest.json"
             manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
             manifest["provider"]["provider_version"] = "0.146.0"
             manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
             new_fingerprint = _package_fingerprint(package)
-            matching = []
-            for audit_path in audit_root.glob("*/processing-run-audit.json"):
-                audit = json.loads(audit_path.read_text(encoding="utf-8"))
-                if audit.get("package_fingerprint") == old_fingerprint:
-                    matching.append((audit_path, audit))
+            matching = audit_by_package[old_fingerprint]
             self.assertEqual(len(matching), 1)
             audit_path, audit = matching[0]
             audit["provider_version"] = "0.146.0"
