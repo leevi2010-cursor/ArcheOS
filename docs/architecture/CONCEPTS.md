@@ -530,6 +530,7 @@ ArcheOS 使用一个 canonical 概念体系。别名只帮助识别**已经存�
 | Name | Label、Display Name、名称 | 都不承担 Object 身份 |
 | Atomic Information | Atomic Note、Note、Durable Atomic Information、已确认 Semantic Unit | 都收敛为长期 Information 层的 Atomic Information；新代码不建立 Note 模型 |
 | Claim | Assertion、Statement Attribution、声明 | 表示某主体 / 来源对 Atomic Information statement 的声明立场；不建立独立事实层 |
+| Hypothesis | Assumption、Theory、Guess、工作假设 | 仅当其语义确实是可被后续 Evidence / Feedback 支持或反对的可检验命题时收敛为 Hypothesis；普通 UI / Prompt 临时字段仍可保持临时，不建立平行 Core |
 | Atomic Information Candidate | Atomic Information Unit Candidate、Semantic Unit Candidate | 表示尚处于 Processing 的原子信息候选 |
 | Evidence | Evidence Ref、Citation | 作为来源依据；精确片段使用 Evidence Fragment |
 | Structured World Model | Core、World Model、长期结构化认知 | 都指 Object / Name / Role / Lifecycle / Relationship 的组合，不是新 Object |
