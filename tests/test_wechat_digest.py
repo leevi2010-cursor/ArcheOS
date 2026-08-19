@@ -817,6 +817,98 @@ class WechatDigestTests(unittest.TestCase):
         )
         return service, capture, provider, run_id, item_id
 
+    def maintenance_continuation_failed_state_fixture(self):
+        self.create_object()
+        ordered_conversations = sorted(
+            (f"maintenance-stage-{index}" for index in range(6)),
+            key=lambda value: hashlib.sha256(value.encode()).hexdigest(),
+        )
+        messages = [message(1, conversation=ordered_conversations[0])]
+        messages.extend(
+            message(index, conversation=ordered_conversations[1])
+            for index in range(2, 12)
+        )
+        messages.extend(
+            message(index, conversation=conversation)
+            for index, conversation in enumerate(
+                ordered_conversations[2:], start=12
+            )
+        )
+        capture = SyntheticCaptureProvider(messages)
+        provider = TimeoutOnFourthTurnProvider()
+        service = WechatDigestService(
+            workspace=self.workspace,
+            capture_provider=capture,
+            semantic_handoff_factory=lambda: self.semantic,
+            interpretation_provider=provider,
+        )
+        self.semantic.failures_remaining = 1
+        with self.assertRaises(WechatDigestError):
+            service.run(all_history=True)
+        service.install_semantic_authority(
+            inventory_authority_file=Path("/private/authority-a.json")
+        )
+        prepared = service.prepare_next_semantic()
+        status = service.run_store.status(prepared.run_id)
+        item_id = next(
+            key
+            for key, item in status["items"].items()
+            if item.get("representation_id") == prepared.representation_id
+        )
+        manifest_path = self.workspace / "private-unknown-authority.json"
+        manifest_path.write_text(
+            json.dumps({"digest": {"item_id": item_id}}), encoding="utf-8"
+        )
+        os.chmod(manifest_path, 0o600)
+        service.resolve_semantic_unknown(
+            authority_manifest_file=manifest_path
+        )
+        with self.assertRaises(WechatDigestError):
+            service.run()
+        service.seal_governance_timeout()
+        service.prepare_next_semantic()
+        run_id = service.run_store.active_run_id()
+        assert run_id is not None
+        pre_failure_status = service.run_store.status(run_id)
+        pre_failure_counts = Counter(
+            item["state"]
+            for item in pre_failure_status["items"].values()
+        )
+        self.assertEqual(pre_failure_counts["represented"], 1)
+        self.assertEqual(pre_failure_counts["planned"], 3, pre_failure_counts)
+        self.semantic.reviewed_git_head = "9" * 40
+        semantic_calls = self.semantic.provider.calls
+        governance_calls = provider.calls
+
+        with patch.object(
+            service,
+            "_govern",
+            side_effect=WechatDigestError("synthetic pre-Provider failure"),
+        ):
+            with self.assertRaises(WechatDigestError):
+                service.run()
+
+        run_id = service.run_store.active_run_id()
+        assert run_id is not None
+        status = service.run_store.status(run_id)
+        counts = Counter(item["state"] for item in status["items"].values())
+        failure_variants = Counter(
+            "semantic"
+            if item.get("semantic_failure") is not None
+            else "governance"
+            for item in status["items"].values()
+            if item["state"] == "failed_closed"
+        )
+        self.assertEqual(status["state"], "failed")
+        self.assertEqual(status["failure_category"], "WechatDigestError")
+        self.assertFalse(status["checkpoint_published"])
+        self.assertEqual(counts["represented"], 1)
+        self.assertEqual(counts["planned"], 3, counts)
+        self.assertEqual(failure_variants, {"semantic": 1, "governance": 1})
+        self.assertEqual(self.semantic.provider.calls, semantic_calls)
+        self.assertEqual(provider.calls, governance_calls)
+        return service, provider, run_id
+
     def assert_governance_timeout_seal_rejected(self, mutate) -> None:
         service, _capture, provider, run_id, item_id = (
             self.governance_timeout_fixture(include_next=False)
@@ -1195,6 +1287,121 @@ class WechatDigestTests(unittest.TestCase):
             service.install_semantic_maintenance_continuation(
                 authority_ref=authority_ref.replace("1234567890", "1234567891")
             )
+
+    def test_maintenance_continuation_accepts_exact_failed_state_zero_calls(
+        self,
+    ) -> None:
+        service, provider, run_id = (
+            self.maintenance_continuation_failed_state_fixture()
+        )
+        authority_ref = (
+            "https://github.com/leevi2010-cursor/ArcheOS/issues/127"
+            "#issuecomment-1234567890"
+        )
+        status_path = service.run_store.runs_root / run_id / "status.json"
+        status_before = status_path.read_bytes()
+        semantic_calls = self.semantic.provider.calls
+        governance_calls = provider.calls
+
+        continuation = service.install_semantic_maintenance_continuation(
+            authority_ref=authority_ref
+        )
+
+        self.assertEqual(continuation["activation_total"], 176)
+        self.assertEqual(continuation["activation_unknown_count"], 0)
+        self.assertEqual(continuation["next_global_ordinal"], 177)
+        self.assertEqual(continuation["absolute_cap"], 1000)
+        self.assertEqual(status_path.read_bytes(), status_before)
+        self.assertEqual(self.semantic.provider.calls, semantic_calls)
+        self.assertEqual(provider.calls, governance_calls)
+
+    def test_maintenance_continuation_rejects_other_run_state_pairs(
+        self,
+    ) -> None:
+        service, provider, run_id = (
+            self.maintenance_continuation_failed_state_fixture()
+        )
+        authority_ref = (
+            "https://github.com/leevi2010-cursor/ArcheOS/issues/127"
+            "#issuecomment-1234567890"
+        )
+        valid_status = service.run_store.status(run_id)
+        semantic_calls = self.semantic.provider.calls
+        governance_calls = provider.calls
+
+        for state, failure_category in (
+            ("processing", "WechatDigestError"),
+            ("failed", None),
+            ("failed", "RuntimeError"),
+            ("completed", None),
+        ):
+            invalid_status = {
+                **valid_status,
+                "state": state,
+                "failure_category": failure_category,
+            }
+            service.run_store.update_status(run_id, invalid_status)
+            status_path = service.run_store.runs_root / run_id / "status.json"
+            status_before = status_path.read_bytes()
+
+            with self.assertRaisesRegex(
+                WechatDigestError, "active run 状态不匹配"
+            ):
+                service.install_semantic_maintenance_continuation(
+                    authority_ref=authority_ref
+                )
+
+            self.assertEqual(status_path.read_bytes(), status_before)
+            self.assertIsNone(
+                self.semantic.installed_maintenance_continuation
+            )
+            self.assertEqual(self.semantic.provider.calls, semantic_calls)
+            self.assertEqual(provider.calls, governance_calls)
+
+        service.run_store.update_status(run_id, valid_status)
+
+    def test_maintenance_continuation_failed_state_requires_both_failures(
+        self,
+    ) -> None:
+        service, provider, run_id = (
+            self.maintenance_continuation_failed_state_fixture()
+        )
+        authority_ref = (
+            "https://github.com/leevi2010-cursor/ArcheOS/issues/127"
+            "#issuecomment-1234567890"
+        )
+        valid_status = service.run_store.status(run_id)
+        semantic_calls = self.semantic.provider.calls
+        governance_calls = provider.calls
+
+        for failure_key in ("semantic_failure", "governance_failure"):
+            invalid_status = json.loads(json.dumps(valid_status))
+            item = next(
+                candidate
+                for candidate in invalid_status["items"].values()
+                if candidate.get(failure_key) is not None
+            )
+            item["state"] = "unsupported"
+            item[failure_key] = None
+            service.run_store.update_status(run_id, invalid_status)
+            status_path = service.run_store.runs_root / run_id / "status.json"
+            status_before = status_path.read_bytes()
+
+            with self.assertRaisesRegex(
+                WechatDigestError, "active item 边界不匹配"
+            ):
+                service.install_semantic_maintenance_continuation(
+                    authority_ref=authority_ref
+                )
+
+            self.assertEqual(status_path.read_bytes(), status_before)
+            self.assertIsNone(
+                self.semantic.installed_maintenance_continuation
+            )
+            self.assertEqual(self.semantic.provider.calls, semantic_calls)
+            self.assertEqual(provider.calls, governance_calls)
+
+        service.run_store.update_status(run_id, valid_status)
 
     def test_governance_timeout_seal_recovers_after_status_write_interruption(
         self,

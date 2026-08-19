@@ -1955,9 +1955,16 @@ class WechatDigestService:
             self._verify_capture_against_plan(capture, plan)
             status = self.run_store.status(run_id)
             self._verify_plan_and_status(run_id, capture, plan, status)
+            processing_pre_state = (
+                status.get("state") == "processing"
+                and status.get("failure_category") is None
+            )
+            failed_pre_state = (
+                status.get("state") == "failed"
+                and status.get("failure_category") == "WechatDigestError"
+            )
             if (
-                status.get("state") != "processing"
-                or status.get("failure_category") is not None
+                not (processing_pre_state or failed_pre_state)
                 or status.get("checkpoint_published") is not False
             ):
                 raise WechatDigestError(
@@ -1967,6 +1974,8 @@ class WechatDigestService:
             if not isinstance(items, dict):
                 raise WechatDigestError("微信运行状态 items 损坏。")
             state_counts: dict[str, int] = {}
+            semantic_failed_closed = 0
+            governance_failed_closed = 0
             for value in items.values():
                 if not isinstance(value, dict) or not isinstance(
                     value.get("state"), str
@@ -1978,11 +1987,22 @@ class WechatDigestService:
                     raise WechatDigestError(
                         "Semantic maintenance continuation 存在未收敛 item。"
                     )
-                if value.get("governance_failure") is not None:
-                    self._verify_governance_failed_closed_item(value)
+                if state == "failed_closed":
+                    if value.get("governance_failure") is not None:
+                        self._verify_governance_failed_closed_item(value)
+                        governance_failed_closed += 1
+                    if value.get("semantic_failure") is not None:
+                        semantic_failed_closed += 1
             if (
                 state_counts.get("represented") != 1
                 or state_counts.get("planned") != 3
+                or (
+                    failed_pre_state
+                    and (
+                        semantic_failed_closed != 1
+                        or governance_failed_closed != 1
+                    )
+                )
             ):
                 raise WechatDigestError(
                     "Semantic maintenance continuation active item 边界不匹配。"
