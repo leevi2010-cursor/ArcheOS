@@ -28,6 +28,10 @@ class CodexInterpretationTimeout(RuntimeError):
     """The current governance turn did not reach a terminal result in time."""
 
 
+class _DeadlineExpired(BaseException):
+    """Escape synchronous SDK transport without leaving a Python worker behind."""
+
+
 def interpretation_schema() -> dict[str, object]:
     nullable_string = {"type": ["string", "null"]}
     operation_properties = {
@@ -267,7 +271,7 @@ class CodexAtomicInformationInterpretationProvider:
             yield self
         finally:
             try:
-                self._close_session()
+                self._close_session_bounded(self.interrupt_grace_seconds)
             except Exception as exc:
                 self._metric_events.append(("failure", 0, "cleanup"))
                 raise RuntimeError("Codex interpretation session cleanup failed") from exc
@@ -315,7 +319,7 @@ class CodexAtomicInformationInterpretationProvider:
         if not self._session_failed:
             self._metric_events.append(("failure", 0, failure_category))
         self._session_failed = True
-        self._close_session()
+        self._close_session_bounded(self.interrupt_grace_seconds)
 
     def interpret(
         self,
@@ -332,45 +336,41 @@ class CodexAtomicInformationInterpretationProvider:
         assert self._deny_all is not None
         assert self._read_only is not None
         with tempfile.TemporaryDirectory(prefix="archeos-digestion-") as temp_dir:
+            turn: object | None = None
+            started = self.monotonic_ns()
             try:
-                thread = self._codex.thread_start(  # type: ignore[attr-defined]
-                    approval_mode=self._deny_all,
-                    cwd=str(Path(temp_dir)),
-                    developer_instructions=(
-                        "Do not call tools. Return only the requested structured interpretation."
-                    ),
-                    ephemeral=True,
-                    sandbox=self._read_only,
-                )
-                self._metric_events.append(("thread", 0, None))
-                turn = thread.turn(
-                    _prompt(atomic_information, current_world_state),
-                    output_schema=interpretation_schema(),
-                    sandbox=self._read_only,
-                )
-                started = self.monotonic_ns()
-                try:
-                    result = self._run_turn_with_deadline(turn)
-                except Exception as exc:
-                    category = (
-                        "timeout"
-                        if isinstance(exc, CodexInterpretationTimeout)
-                        else "transport"
+                with self._deadline(self.timeout_seconds):
+                    thread = self._codex.thread_start(  # type: ignore[attr-defined]
+                        approval_mode=self._deny_all,
+                        cwd=str(Path(temp_dir)),
+                        developer_instructions=(
+                            "Do not call tools. Return only the requested structured interpretation."
+                        ),
+                        ephemeral=True,
+                        sandbox=self._read_only,
                     )
-                    self._metric_events.append(
-                        ("turn", self._elapsed_ms(started), category)
+                    self._metric_events.append(("thread", 0, None))
+                    turn = thread.turn(
+                        _prompt(atomic_information, current_world_state),
+                        output_schema=interpretation_schema(),
+                        sandbox=self._read_only,
                     )
-                    self._session_failed = True
-                    self._close_session()
-                    raise
+                    result = turn.run()  # type: ignore[attr-defined]
                 self._metric_events.append(("turn", self._elapsed_ms(started), None))
+            except _DeadlineExpired:
+                self._metric_events.append(
+                    ("turn", self._elapsed_ms(started), "timeout")
+                )
+                self._session_failed = True
+                self._interrupt_and_destroy(turn)
+                raise CodexInterpretationTimeout(
+                    "Codex app-server interpretation timed out before a structured result"
+                ) from None
             except Exception as exc:
                 if not self._session_failed:
                     self._metric_events.append(("failure", 0, "transport"))
                     self._session_failed = True
-                    self._close_session()
-                if isinstance(exc, CodexInterpretationTimeout):
-                    raise
+                    self._close_session_bounded(self.interrupt_grace_seconds)
                 raise RuntimeError(
                     "Codex app-server interpretation failed before a structured result"
                 ) from exc
@@ -403,55 +403,93 @@ class CodexAtomicInformationInterpretationProvider:
                 ("startup", self._elapsed_ms(started), "startup")
             )
             self._session_failed = True
-            self._close_session()
+            self._close_session_bounded(self.interrupt_grace_seconds)
             raise RuntimeError(
                 "Codex app-server interpretation startup failed"
             ) from None
         self._metric_events.append(("startup", self._elapsed_ms(started), None))
 
-    def _run_turn_with_deadline(self, turn: object) -> object:
-        completed = threading.Event()
-        outcome: dict[str, object] = {}
-
-        def collect() -> None:
-            try:
-                outcome["result"] = turn.run()  # type: ignore[attr-defined]
-            except Exception as exc:  # noqa: BLE001 - SDK errors cross this boundary.
-                outcome["error"] = exc
-            finally:
-                completed.set()
-
-        worker = threading.Thread(target=collect, daemon=True)
-        worker.start()
-        if not completed.wait(self.timeout_seconds):
-            try:
-                turn.interrupt()  # type: ignore[attr-defined]
-            except Exception:  # noqa: BLE001, S110 - cleanup remains best effort.
-                pass
-            completed.wait(self.interrupt_grace_seconds)
-            raise CodexInterpretationTimeout(
-                "Codex app-server interpretation timed out before a structured result"
+    @contextmanager
+    def _deadline(self, seconds: float) -> Iterator[None]:
+        if threading.current_thread() is not threading.main_thread():
+            raise RuntimeError(
+                "Codex interpretation deadline requires the process main thread"
             )
-        error = outcome.get("error")
-        if isinstance(error, Exception):
-            raise error
-        if "result" not in outcome:
-            raise RuntimeError("Codex app-server returned no turn result")
-        return outcome["result"]
+        previous_handler = signal.getsignal(signal.SIGALRM)
+        previous_timer = signal.getitimer(signal.ITIMER_REAL)
+
+        def expire(_signum: int, _frame: object) -> None:
+            raise _DeadlineExpired
+
+        signal.signal(signal.SIGALRM, expire)
+        signal.setitimer(signal.ITIMER_REAL, seconds)
+        try:
+            yield
+        finally:
+            signal.setitimer(signal.ITIMER_REAL, 0)
+            signal.signal(signal.SIGALRM, previous_handler)
+            if previous_timer[0] > 0:
+                signal.setitimer(signal.ITIMER_REAL, *previous_timer)
+
+    def _interrupt_and_destroy(self, turn: object | None) -> None:
+        cleanup_started = time.monotonic()
+        interrupt_budget = self.interrupt_grace_seconds / 2
+        if turn is not None:
+            try:
+                with self._deadline(interrupt_budget):
+                    turn.interrupt()  # type: ignore[attr-defined]
+            except (Exception, _DeadlineExpired):  # noqa: BLE001, S110
+                pass
+        remaining = max(
+            0.001,
+            self.interrupt_grace_seconds - (time.monotonic() - cleanup_started),
+        )
+        try:
+            self._close_session_bounded(remaining)
+        except Exception:  # noqa: BLE001 - cleanup failure is recorded by category.
+            self._metric_events.append(("failure", 0, "cleanup"))
 
     def _fail_schema(self) -> None:
         self._metric_events.append(("failure", 0, "schema"))
         self._session_failed = True
-        self._close_session()
+        self._close_session_bounded(self.interrupt_grace_seconds)
 
-    def _close_session(self) -> None:
+    def _close_session_bounded(self, timeout_seconds: float) -> None:
         manager = self._codex_manager
         self._codex_manager = None
         self._codex = None
         self._deny_all = None
         self._read_only = None
-        if manager is not None:
-            manager.__exit__(None, None, None)  # type: ignore[attr-defined]
+        if manager is None:
+            return
+        process = self._sdk_process(manager)
+        try:
+            with self._deadline(timeout_seconds):
+                manager.__exit__(None, None, None)  # type: ignore[attr-defined]
+        except _DeadlineExpired as exc:
+            self._force_kill(process)
+            raise RuntimeError("Codex app-server cleanup exceeded its deadline") from exc
+        except Exception:
+            self._force_kill(process)
+            raise
+        poll = getattr(process, "poll", None)
+        if callable(poll) and poll() is None:
+            self._force_kill(process)
+            raise RuntimeError("Codex app-server cleanup did not terminate its process")
+
+    @staticmethod
+    def _sdk_process(manager: object) -> object | None:
+        client = getattr(manager, "_client", None)
+        return getattr(client, "_proc", None)
+
+    @staticmethod
+    def _force_kill(process: object | None) -> None:
+        if process is None:
+            return
+        try:
+            process.kill()  # type: ignore[attr-defined]
+        except Exception:  # noqa: BLE001, S110 - process may already be gone.
+            pass
 
     def _elapsed_ms(self, started: int) -> int:
         return max(0, (self.monotonic_ns() - started) // 1_000_000)

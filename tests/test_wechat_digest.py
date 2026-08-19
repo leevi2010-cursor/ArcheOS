@@ -591,6 +591,17 @@ class FailAfterGovernanceOnceService(WechatDigestService):
         return super()._update_item(run_id, status, item_id, **changes)
 
 
+class FailAfterProviderOnceService(WechatDigestService):
+    fail_after_provider = True
+
+    def _govern(self, atomic_ids):
+        result = super()._govern(atomic_ids)
+        if self.fail_after_provider:
+            self.fail_after_provider = False
+            raise RuntimeError("synthetic crash before governance receipt completion")
+        return result
+
+
 class FailSecondGovernanceOnceService(WechatDigestService):
     governance_calls = 0
     failed = False
@@ -795,6 +806,110 @@ class WechatDigestTests(unittest.TestCase):
             if isinstance(item, dict) and "governance_metrics" in item
         )
         self.assertEqual(item_metrics["failure_categories"], {"schema": 1})
+
+    def test_completed_governance_receipt_recovery_makes_zero_provider_calls(
+        self,
+    ) -> None:
+        self.create_object()
+        provider = SerialSessionProvider()
+        capture = SyntheticCaptureProvider([message(1)])
+        service = FailAfterGovernanceOnceService(
+            workspace=self.workspace,
+            capture_provider=capture,
+            semantic_handoff_factory=lambda: self.semantic,
+            interpretation_provider=provider,
+        )
+
+        with self.assertRaises(WechatDigestError):
+            service.run(all_history=True)
+        self.assertEqual(provider.calls, 1)
+        run_id = service.run_store.active_run_id()
+        assert run_id is not None
+        receipt = next(
+            item["governance_receipt"]
+            for item in service.run_store.status(run_id)["items"].values()
+            if isinstance(item, dict) and "governance_receipt" in item
+        )
+        self.assertEqual(receipt["phase"], "completed")
+
+        result = service.run()
+
+        self.assertTrue(result.replayed)
+        self.assertTrue(result.checkpoint_published)
+        self.assertEqual(provider.calls, 1)
+
+    def test_unknown_governance_receipt_recovery_fails_closed_zero_calls(
+        self,
+    ) -> None:
+        self.create_object()
+        provider = SerialSessionProvider()
+        capture = SyntheticCaptureProvider([message(1)])
+        service = FailAfterProviderOnceService(
+            workspace=self.workspace,
+            capture_provider=capture,
+            semantic_handoff_factory=lambda: self.semantic,
+            interpretation_provider=provider,
+        )
+
+        with self.assertRaises(WechatDigestError):
+            service.run(all_history=True)
+        self.assertEqual(provider.calls, 1)
+        run_id = service.run_store.active_run_id()
+        assert run_id is not None
+        receipt = next(
+            item["governance_receipt"]
+            for item in service.run_store.status(run_id)["items"].values()
+            if isinstance(item, dict) and "governance_receipt" in item
+        )
+        self.assertEqual(receipt["phase"], "started")
+
+        with self.assertRaisesRegex(WechatDigestError, "completion 未知"):
+            service.run()
+
+        self.assertEqual(provider.calls, 1)
+        self.assertIsNone(service.run_store.checkpoint())
+        self.assertEqual(service.run_store.active_run_id(), run_id)
+
+    def test_session_cleanup_failure_prevents_checkpoint_and_next_run(self) -> None:
+        self.create_object()
+
+        class CleanupFailureProvider(SerialSessionProvider):
+            @contextmanager
+            def session(self):
+                self.session_entries += 1
+                try:
+                    yield self
+                finally:
+                    self.session_exits += 1
+                    raise RuntimeError("synthetic session cleanup failure")
+
+        provider = CleanupFailureProvider()
+        service = WechatDigestService(
+            workspace=self.workspace,
+            capture_provider=SyntheticCaptureProvider([message(1)]),
+            semantic_handoff_factory=lambda: self.semantic,
+            interpretation_provider=provider,
+        )
+
+        with self.assertRaises(WechatDigestError):
+            service.run(all_history=True)
+
+        run_id = service.run_store.active_run_id()
+        assert run_id is not None
+        status = service.run_store.status(run_id)
+        self.assertEqual(status["failure_category"], "governance_session_cleanup")
+        self.assertFalse(status["checkpoint_published"])
+        self.assertIsNone(service.run_store.checkpoint())
+        self.assertEqual(provider.calls, 1)
+        self.assertEqual(provider.session_entries, 1)
+        self.assertEqual(provider.session_exits, 1)
+
+        with self.assertRaisesRegex(WechatDigestError, "cleanup 失败"):
+            service.run()
+
+        self.assertEqual(provider.calls, 1)
+        self.assertEqual(provider.session_entries, 1)
+        self.assertEqual(service.run_store.active_run_id(), run_id)
 
     def test_from_now_bootstrap_does_not_read_existing_message_bodies(self) -> None:
         capture = SyntheticCaptureProvider([message(1)])

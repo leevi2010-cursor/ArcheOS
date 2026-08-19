@@ -6,6 +6,7 @@ import json
 import signal
 import tempfile
 import threading
+import time
 import unittest
 from dataclasses import replace
 from pathlib import Path
@@ -1489,6 +1490,126 @@ class CodexDigestionProviderTest(unittest.TestCase):
         metrics = provider.metrics_since(0)
         self.assertEqual(metrics["timeout_count"], 1)
         self.assertEqual(metrics["failure_categories"], {"timeout": 1})
+
+    def test_deadline_covers_blocking_turn_transport_without_worker(self) -> None:
+        class Thread:
+            turn_active = False
+
+            def turn(self, *_args, **_kwargs):
+                self.__class__.turn_active = True
+                try:
+                    threading.Event().wait()
+                finally:
+                    self.__class__.turn_active = False
+
+        class Codex:
+            instance = None
+
+            def __init__(self):
+                self.closed = False
+                self.thread_starts = 0
+                self.__class__.instance = self
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                self.closed = True
+
+            def thread_start(self, **_kwargs):
+                self.thread_starts += 1
+                return Thread()
+
+        provider = CodexAtomicInformationInterpretationProvider(
+            sdk_loader=lambda: (Codex, "deny-all", "read-only"),
+            timeout_seconds=0.02,
+            interrupt_grace_seconds=0.02,
+        )
+        item = atomic_information("atomic-blocking-turn", "Turn", strict_identity=True)
+        started = time.monotonic()
+        with provider.session():
+            with self.assertRaises(CodexInterpretationTimeout):
+                provider.interpret(item, DigestionWorldState((), (), ()))
+            with self.assertRaisesRegex(RuntimeError, "cannot be reused"):
+                provider.interpret(item, DigestionWorldState((), (), ()))
+
+        self.assertLess(time.monotonic() - started, 0.2)
+        assert Codex.instance is not None
+        self.assertTrue(Codex.instance.closed)
+        self.assertEqual(Codex.instance.thread_starts, 1)
+        self.assertFalse(Thread.turn_active)
+
+    def test_timeout_bounds_interrupt_failures_and_leaves_no_turn_worker(self) -> None:
+        for mode in ("blocking", "throwing", "ignored"):
+            with self.subTest(mode=mode):
+                class Turn:
+                    behavior = mode
+                    run_active = False
+                    interrupt_active = False
+                    interrupt_calls = 0
+
+                    def run(self):
+                        self.__class__.run_active = True
+                        try:
+                            threading.Event().wait()
+                        finally:
+                            self.__class__.run_active = False
+
+                    def interrupt(self):
+                        self.__class__.interrupt_calls += 1
+                        if self.behavior == "blocking":
+                            self.__class__.interrupt_active = True
+                            try:
+                                threading.Event().wait()
+                            finally:
+                                self.__class__.interrupt_active = False
+                        if self.behavior == "throwing":
+                            raise RuntimeError("synthetic interrupt failure")
+
+                class Thread:
+                    def turn(self, *_args, **_kwargs):
+                        return Turn()
+
+                class Codex:
+                    instance = None
+
+                    def __init__(self):
+                        self.closed = False
+                        self.thread_starts = 0
+                        self.__class__.instance = self
+
+                    def __enter__(self):
+                        return self
+
+                    def __exit__(self, *_args):
+                        self.closed = True
+
+                    def thread_start(self, **_kwargs):
+                        self.thread_starts += 1
+                        return Thread()
+
+                provider = CodexAtomicInformationInterpretationProvider(
+                    sdk_loader=lambda: (Codex, "deny-all", "read-only"),
+                    timeout_seconds=0.02,
+                    interrupt_grace_seconds=0.04,
+                )
+                item = atomic_information(
+                    f"atomic-{mode}", mode, strict_identity=True
+                )
+                started = time.monotonic()
+                with provider.session():
+                    with self.assertRaises(CodexInterpretationTimeout):
+                        provider.interpret(item, DigestionWorldState((), (), ()))
+                    with self.assertRaisesRegex(RuntimeError, "cannot be reused"):
+                        provider.interpret(item, DigestionWorldState((), (), ()))
+
+                self.assertLess(time.monotonic() - started, 0.2)
+                assert Codex.instance is not None
+                self.assertTrue(Codex.instance.closed)
+                self.assertEqual(Codex.instance.thread_starts, 1)
+                self.assertEqual(Turn.interrupt_calls, 1)
+                self.assertFalse(Turn.run_active)
+                self.assertFalse(Turn.interrupt_active)
 
     def test_sigterm_closes_session_and_restores_previous_handler(self) -> None:
         class Codex:
