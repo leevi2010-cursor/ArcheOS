@@ -323,7 +323,7 @@ Handoff Marker 只提供可选外部交接说明，不改变 Managed Source、Ev
 - TOS 只作为 storage adapter / replica；
 - 不引入 Source version graph、`supersedes` 或 `version_of`。
 
-### 横向能力：Human View / Frontend（已规划，后置，不启动）
+### 横向能力：Human View / Frontend（已规划；受限 mock 探索待批准）
 
 Human View 是人类理解和治理 ArcheOS 的 Presentation 层，不是新的业务 truth，也不是当前 Stage 1 信息消化主线的前置条件。
 
@@ -362,7 +362,25 @@ Canonical State
   → Presentation
 ```
 
-**当前不创建 Frontend 实现 Issue，不启动开发。** 只有当真实使用反复证明“人类理解 / 审核成为主要瓶颈”，或 Product Roadmap 进入需要 Human View 的阶段后，再由 ChatGPT Product / Technical Lead 根据当时的 canonical read contracts 创建最小 Human View Issue。
+#### 决策工作台 v0.1 受限探索
+
+2026-08-19，Product Owner 已批准把“企业经营负责人能否通过图形 Human View 更容易理解资产、关系、推进状态与依据”作为有限、并行的产品探索。该探索由 Issue #114 先关闭 Product Brief、PRD、Frontend Architecture 与本 Roadmap 边界；Issue #114 不包含前端代码。
+
+Issue #114 合并并获得独立 Product / Architecture / Concept Review 后，才可以另建一个最小 Frontend 实现 Issue。实现边界必须同时满足：
+
+- 只使用独立 React mock data，不接 ArcheOS backend、Context Builder、MCP、HTTP、SQLite 或 JSONL；
+- 不写真实 Workspace / Source / World Model / Decision 数据，不部署；
+- 默认用户是企业经营负责人，默认 mock Workspace 是“笃善科技”；
+- 入口保持资产浏览 + 左侧推进栏；向阳总图节点可以进入理念、财务、人脉、组织与治理等专属 View；
+- 页面不展示设计 rationale、Concept mapping、Stage Gate 或实现术语；
+- 所有专属图都是 View / Projection，不建立第二份 truth；
+- 推进 ownership 继续保持 `Workspace → Roadmap → Milestone → Issue → Todo` 与 `Project → Milestone → Issue → Todo`；Business Line 只显示相关推进 View，Project 不拥有 Roadmap；
+- Project / Business Line 在第一版共用 Presentation 组件；新增 mock 条目默认 `Project + bounded`，只有用户明确指定或持续经营责任无法定义可信完成条件时才使用 `Business Line + ongoing`，且不人为制造 ongoing fixture；
+- Decision / Evidence / Source 只通过渐进披露的业务链接追溯；
+- 旧 `sunward-operating-system` 只复用 React Flow 交互与视觉经验，不继承旧数据模型和 API；
+- 该探索不作为 Stage 1 Gate 通过证据，不改变 #32 / #33 / #34 等真实数据主线依赖。
+
+如果 mock 产品验证不能减少经营负责人理解关系、定位事项或追溯依据的成本，应通过 Roadmap Feedback 缩小、重构或停止 Human View，而不是继续建设 backend 或完整平台。
 
 ### M2-D — Migration Readiness & Clean-cut Plan
 
