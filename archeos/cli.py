@@ -562,6 +562,13 @@ def build_parser() -> argparse.ArgumentParser:
         "--batch-size", type=int, default=DEFAULT_EXTERNAL_AGENT_BATCH_SIZE
     )
     wechat_digest.add_argument(
+        "--semantic-concurrency",
+        type=int,
+        choices=(1, 2),
+        default=1,
+        help="Semantic 结果准备并发数（默认 1，最大 2）。",
+    )
+    wechat_digest.add_argument(
         "--prepare-next-semantic",
         action="store_true",
         help="仅准备下一 semantic batch；不新增 Semantic Handoff 调用。",
@@ -1050,6 +1057,7 @@ def _wechat_product_command(args: argparse.Namespace) -> int:
             semantic_handoff_factory=semantic_handoff,
             interpretation_provider=CodexAtomicInformationInterpretationProvider(),
             semantic_batch_size=args.batch_size,
+            semantic_concurrency=args.semantic_concurrency,
         )
         if args.prepare_next_semantic:
             prepared = service.prepare_next_semantic(batch_size=args.batch_size)
@@ -1151,6 +1159,8 @@ def _wechat_product_command(args: argparse.Namespace) -> int:
     print(f"暂不支持：{result.unsupported}")
     print(f"待你判断：{result.pending_human}")
     print(f"更新了 {result.context_objects} 个长期对象的 Context")
+    print(f"Semantic 耗时：{result.semantic_elapsed_ms} ms")
+    print(f"Governance 耗时：{result.governance_elapsed_ms} ms")
     print(f"checkpoint：{checkpoint}")
     return 0
 

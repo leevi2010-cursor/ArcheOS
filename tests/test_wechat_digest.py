@@ -239,6 +239,9 @@ class SyntheticSemanticHandoff:
         self.installed_extension = None
         self.campaign_binding = None
         self.authority_bindings = []
+        self.prepare_waves: list[tuple[str, ...]] = []
+        self.execute_order: list[str] = []
+        self.prepare_failures_remaining = 0
 
     def execute(
         self,
@@ -247,6 +250,7 @@ class SyntheticSemanticHandoff:
         privacy_binding=None,
         authority_binding=None,
     ):
+        self.execute_order.append(representation_id)
         if privacy_binding is not None:
             assert privacy_binding.route == "approved"
             assert authority_binding is not None
@@ -287,6 +291,18 @@ class SyntheticSemanticHandoff:
         ingestion = ingest_processing_package(package, store)
         self._write_success_audits(package, representation_id)
         return SimpleNamespace(ingestion=ingestion)
+
+    def prepare_results(self, requests, *, concurrency):
+        assert concurrency in {1, 2}
+        representation_ids = tuple(
+            request.representation_id for request in requests
+        )
+        assert len(representation_ids) == len(set(representation_ids))
+        self.prepare_waves.append(representation_ids)
+        if self.prepare_failures_remaining:
+            self.prepare_failures_remaining -= 1
+            raise RuntimeError("synthetic concurrent result failure")
+        return {representation_id: 7 for representation_id in representation_ids}
 
     def install_global_authority(
         self,
@@ -546,6 +562,7 @@ class WechatDigestTests(unittest.TestCase):
         *,
         service_type=WechatDigestService,
         run_store: WechatDigestRunStore | None = None,
+        semantic_concurrency: int = 1,
     ) -> WechatDigestService:
         return service_type(
             workspace=self.workspace,
@@ -553,6 +570,7 @@ class WechatDigestTests(unittest.TestCase):
             semantic_handoff_factory=lambda: self.semantic,
             interpretation_provider=NoStructuralChangeProvider(),
             run_store=run_store,
+            semantic_concurrency=semantic_concurrency,
         )
 
     def create_object(self, name: str = "Synthetic Project") -> str:
@@ -587,6 +605,57 @@ class WechatDigestTests(unittest.TestCase):
         self.assertEqual(second.new_messages, 0)
         self.assertEqual(second.durable_information, 0)
         self.assertEqual(self.source_count(), 1)
+
+    def test_semantic_concurrency_two_prepares_distinct_representations_then_commits_in_order(
+        self,
+    ) -> None:
+        self.create_object()
+        capture = SyntheticCaptureProvider(
+            [
+                message(1, conversation="conversation_a"),
+                message(2, conversation="conversation_b"),
+            ]
+        )
+        result = self.service(capture, semantic_concurrency=2).run(
+            since="2023-01-01"
+        )
+        self.assertEqual(len(self.semantic.prepare_waves), 1)
+        self.assertEqual(len(self.semantic.prepare_waves[0]), 2)
+        self.assertEqual(
+            tuple(self.semantic.execute_order), self.semantic.prepare_waves[0]
+        )
+        self.assertEqual(result.durable_information, 2)
+        self.assertGreaterEqual(result.semantic_elapsed_ms, 14)
+        self.assertTrue(result.checkpoint_published)
+
+    def test_default_semantic_concurrency_preserves_serial_path(self) -> None:
+        self.create_object()
+        result = self.service(
+            SyntheticCaptureProvider([message(1), message(2)])
+        ).run(since="2023-01-01")
+        self.assertEqual(self.semantic.prepare_waves, [])
+        self.assertEqual(result.durable_information, 2)
+
+    def test_semantic_concurrency_failure_does_not_commit_or_checkpoint(self) -> None:
+        self.create_object()
+        self.semantic.prepare_failures_remaining = 1
+        service = self.service(
+            SyntheticCaptureProvider(
+                [
+                    message(1, conversation="conversation_a"),
+                    message(2, conversation="conversation_b"),
+                ]
+            ),
+            semantic_concurrency=2,
+        )
+        with self.assertRaisesRegex(WechatDigestError, "安全完成"):
+            service.run(since="2023-01-01")
+        self.assertEqual(len(self.semantic.prepare_waves[0]), 2)
+        self.assertEqual(self.semantic.execute_order, [])
+        self.assertIsNone(service.run_store.checkpoint())
+        run_id = service.run_store.active_run_id()
+        assert run_id is not None
+        self.assertEqual(service.run_store.status(run_id)["state"], "failed")
 
     def test_from_now_bootstrap_does_not_read_existing_message_bodies(self) -> None:
         capture = SyntheticCaptureProvider([message(1)])

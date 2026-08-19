@@ -56,6 +56,7 @@ from archeos.semantic_handoff import (
     SemanticCompletedWindowBinding,
     SemanticHandoffError,
     SemanticPrivacyBinding,
+    SemanticResultOnlyRequest,
     SemanticWindowAuthorityBinding,
     _package_fingerprint,
     validate_completed_published_audits,
@@ -9458,6 +9459,139 @@ print("passed")
             )
         self.assertEqual(blocked_runner.calls, [])
         self.assertEqual(self.tree_snapshot(shared / "audits"), before)
+
+    def test_result_only_concurrency_overlaps_distinct_representations_and_replays_zero_call(
+        self,
+    ) -> None:
+        root = self.root / "result-only-concurrency"
+        root.mkdir(parents=True)
+        source_ids = iter(("src_" + "1" * 32, "src_" + "2" * 32))
+        sources = LocalManagedSourceRepository(
+            root / "managed",
+            id_factory=lambda: next(source_ids),
+            clock=lambda: "2026-08-20T00:00:00.000Z",
+        )
+        representations = LocalRepresentationRepository(root / "representations")
+        representation_service = RepresentationService(sources, representations)
+        built = []
+        for index in (1, 2):
+            external = root / f"synthetic-{index}.txt"
+            external.write_text(f"synthetic-{index}", encoding="utf-8")
+            source = sources.admit(
+                external, metadata={"media_type": "application/synthetic"}
+            ).source
+            built.append(
+                representation_service.build(
+                    source.source_id, JsonAdapter(blocks=2)
+                ).representation
+            )
+        information_service = RepresentationInformationService(
+            sources,
+            representations,
+            root / "information",
+            batch_size=1,
+            clock=lambda: "2026-08-20T00:00:00.000Z",
+        )
+        handoff = ExternalAgentSemanticHandoffService(
+            information_service,
+            JsonlAtomicInformationStore(root / "atomic.jsonl"),
+            root / "audits",
+        )
+
+        barrier = threading.Barrier(2)
+        state_lock = threading.Lock()
+        active = 0
+        maximum_active = 0
+
+        class BlockingRunner(FakeRunner):
+            def __call__(self, command, **kwargs):
+                inner = super().__call__(command, **kwargs)
+
+                class BlockingProcess:
+                    pid = inner.pid
+
+                    @property
+                    def returncode(self):
+                        return inner.returncode
+
+                    def communicate(self, **communicate_kwargs):
+                        nonlocal active, maximum_active
+                        with state_lock:
+                            active += 1
+                            maximum_active = max(maximum_active, active)
+                        try:
+                            barrier.wait(timeout=5)
+                            return inner.communicate(**communicate_kwargs)
+                        finally:
+                            with state_lock:
+                                active -= 1
+
+                return BlockingProcess()
+
+        runners = (BlockingRunner(), BlockingRunner())
+        providers = tuple(
+            CodexCliRepresentationAnalysisProvider(
+                provider_version="0.147.0",
+                timeout_seconds=300,
+                runner=runner,
+            )
+            for runner in runners
+        )
+        binding = self.semantic_window_binding(batch_size=1)
+        self.install_authority(handoff, providers[0], binding)
+        requests = tuple(
+            SemanticResultOnlyRequest(
+                representation.representation_id,
+                self.privacy_binding(),
+                binding,
+            )
+            for representation in built
+        )
+
+        elapsed = handoff.prepare_results(
+            requests,
+            providers,
+            concurrency=2,
+        )
+
+        self.assertEqual(maximum_active, 2)
+        self.assertEqual([len(runner.calls) for runner in runners], [2, 2])
+        self.assertEqual(set(elapsed), {item.representation_id for item in built})
+        self.assertFalse((root / "information").exists())
+        self.assertFalse((root / "atomic.jsonl").exists())
+        attempts = sorted(
+            (
+                json.loads(path.read_text(encoding="utf-8"))
+                for path in (root / "audits").glob(
+                    "semantic_run_*/attempts/*.json"
+                )
+            ),
+            key=lambda item: item["global_ordinal"],
+        )
+        self.assertEqual(
+            sorted(item["global_ordinal"] for item in attempts), [81, 82, 83, 84]
+        )
+
+        replay_runners = (FakeRunner(), FakeRunner())
+        for representation, runner in zip(built, replay_runners, strict=True):
+            handoff.execute(
+                representation.representation_id,
+                CodexCliRepresentationAnalysisProvider(
+                    provider_version="0.147.0",
+                    timeout_seconds=300,
+                    runner=runner,
+                ),
+                privacy_binding=self.privacy_binding(),
+                authority_binding=binding,
+            )
+            self.assertEqual(runner.calls, [])
+        self.assertEqual(
+            len(
+                JsonlAtomicInformationStore(root / "atomic.jsonl")
+                .list_atomic_information()
+            ),
+            4,
+        )
 
 
 if __name__ == "__main__":

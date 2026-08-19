@@ -10,8 +10,10 @@ import re
 import secrets
 import stat
 import tempfile
+import time
 from collections import Counter
 from collections.abc import Mapping, Sequence
+from concurrent.futures import ThreadPoolExecutor, wait
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -83,6 +85,15 @@ class SemanticRecoveryPreflight:
     required_new_calls: int
     conservatively_counted_attempts: int
     historical_counted_attempts: int = 0
+
+
+@dataclass(frozen=True)
+class SemanticResultOnlyRequest:
+    """One Representation whose strict Semantic results may be prepared only."""
+
+    representation_id: str
+    privacy_binding: SemanticPrivacyBinding
+    authority_binding: SemanticWindowAuthorityBinding
 
 
 @dataclass(frozen=True)
@@ -4169,99 +4180,128 @@ class _SemanticGlobalAuthority:
                 "Semantic global authority committed phase 损坏。"
             )
 
-    @contextmanager
-    def execution_guard(
+    def _validate_execution_capacity_locked(
         self,
         *,
         window: SemanticWindowAuthorityBinding,
         provider: CodexCliRepresentationAnalysisProvider,
         required_new_calls: int,
-    ):
+    ) -> dict[str, object]:
         if (
             isinstance(required_new_calls, bool)
             or not isinstance(required_new_calls, int)
             or required_new_calls < 0
         ):
             raise SemanticHandoffError("Semantic global authority required calls 无效。")
-        with self._locked():
-            grant = self._load_grant(window, provider)
-            attempts, unknown = self._global_attempts(grant)
-            current_window = _authority_window_payload(window)
-            if attempts:
-                last_window = attempts[-1]["window"]
-                assert isinstance(last_window, dict)
-                if current_window["window_run_id"] == last_window.get(
-                    "window_run_id"
-                ):
-                    valid_window = _payloads_exactly_equal(
-                        current_window, last_window
-                    )
-                else:
-                    valid_window = _window_history_extends(
-                        last_window, current_window
-                    )
+        grant = self._load_grant(window, provider)
+        attempts, unknown = self._global_attempts(grant)
+        current_window = _authority_window_payload(window)
+        if attempts:
+            last_window = attempts[-1]["window"]
+            assert isinstance(last_window, dict)
+            if current_window["window_run_id"] == last_window.get(
+                "window_run_id"
+            ):
+                valid_window = _payloads_exactly_equal(
+                    current_window, last_window
+                )
             else:
-                initial_window = grant.get("initial_window")
-                valid_window = isinstance(initial_window, dict) and (
-                    _payloads_exactly_equal(current_window, initial_window)
-                    or _window_history_extends(initial_window, current_window)
+                valid_window = _window_history_extends(
+                    last_window, current_window
                 )
-            if not valid_window:
-                raise SemanticHandoffError(
-                    "Semantic global authority current window 不连续。"
-                )
-            remaining = int(grant["absolute_cap"]) - (
-                int(grant["baseline_total"]) + len(attempts)
+        else:
+            initial_window = grant.get("initial_window")
+            valid_window = isinstance(initial_window, dict) and (
+                _payloads_exactly_equal(current_window, initial_window)
+                or _window_history_extends(initial_window, current_window)
             )
+        if not valid_window:
+            raise SemanticHandoffError(
+                "Semantic global authority current window 不连续。"
+            )
+        remaining = int(grant["absolute_cap"]) - (
+            int(grant["baseline_total"]) + len(attempts)
+        )
+        if unknown:
+            raise SemanticHandoffError(
+                "Semantic global authority 存在 outcome unknown；LEAD_DECISION_REQUIRED。"
+            )
+        if required_new_calls > remaining:
+            raise SemanticHandoffError(
+                "Semantic global authority 剩余调用额度不足。"
+            )
+        return grant
+
+    def validate_execution_capacity(
+        self,
+        *,
+        window: SemanticWindowAuthorityBinding,
+        provider: CodexCliRepresentationAnalysisProvider,
+        required_new_calls: int,
+    ) -> dict[str, object]:
+        with self._locked():
+            return self._validate_execution_capacity_locked(
+                window=window,
+                provider=provider,
+                required_new_calls=required_new_calls,
+            )
+
+    def publish_attempts(
+        self,
+        entries: Sequence[
+            tuple[
+                _SemanticRecoveryRun,
+                int,
+                SemanticWindowAuthorityBinding,
+                CodexCliRepresentationAnalysisProvider,
+            ]
+        ],
+    ) -> tuple[dict[str, object], ...]:
+        """Allocate one bounded wave under the global lock, then release it."""
+
+        if not entries:
+            return ()
+        with self._locked():
+            first_window = entries[0][2]
+            first_provider = entries[0][3]
+            grant = self._validate_execution_capacity_locked(
+                window=first_window,
+                provider=first_provider,
+                required_new_calls=len(entries),
+            )
+            attempts, unknown = self._global_attempts(grant)
             if unknown:
                 raise SemanticHandoffError(
                     "Semantic global authority 存在 outcome unknown；LEAD_DECISION_REQUIRED。"
                 )
-            if required_new_calls > remaining:
-                raise SemanticHandoffError(
-                    "Semantic global authority 剩余调用额度不足。"
+            next_ordinal = int(grant["baseline_total"]) + len(attempts) + 1
+            published: list[dict[str, object]] = []
+            for recovery, ordinal, window, provider in entries:
+                observed = self._load_grant(window, provider)
+                if not _payloads_exactly_equal(observed, grant):
+                    raise SemanticHandoffError(
+                        "Semantic global authority grant 发生漂移。"
+                    )
+                published.append(
+                    recovery.publish_global_attempt(
+                        ordinal,
+                        grant=grant,
+                        global_ordinal=next_ordinal,
+                        window=window,
+                    )
                 )
-            self._guard_grant = grant
-            self._guard_next_ordinal = (
-                int(grant["baseline_total"]) + len(attempts) + 1
-            )
-            try:
-                yield grant
-            finally:
-                self._guard_grant = None
-                self._guard_next_ordinal = None
+                next_ordinal += 1
+            return tuple(published)
 
     def publish_attempt(
         self,
         recovery: _SemanticRecoveryRun,
         ordinal: int,
         *,
-        grant: Mapping[str, object],
         window: SemanticWindowAuthorityBinding,
         provider: CodexCliRepresentationAnalysisProvider,
     ) -> dict[str, object]:
-        current = self._guard_grant
-        global_ordinal = self._guard_next_ordinal
-        if (
-            current is None
-            or global_ordinal is None
-            or not _payloads_exactly_equal(current, grant)
-            or current.get("contract") != self._contract_payload(provider)
-            or current.get("reviewed_git_head") != window.reviewed_git_head
-        ):
-            raise SemanticHandoffError("Semantic global authority grant 发生漂移。")
-        if global_ordinal > int(current["absolute_cap"]):
-            raise SemanticHandoffError(
-                "Semantic global authority 已达到 absolute cap。"
-            )
-        published = recovery.publish_global_attempt(
-            ordinal,
-            grant=current,
-            global_ordinal=global_ordinal,
-            window=window,
-        )
-        self._guard_next_ordinal = global_ordinal + 1
-        return published
+        return self.publish_attempts(((recovery, ordinal, window, provider),))[0]
 
 
 class _RecoveryAwareProvider:
@@ -4298,26 +4338,19 @@ class _RecoveryAwareProvider:
         ] | None = None
 
     def _enter_authority_guard(self) -> None:
-        if self._authority_guard is not None:
-            return
         if self.global_authority is None or self.window_binding is None:
             raise SemanticHandoffError(
                 "Semantic global authority 未安装；不得启动新 Provider call。"
             )
-        guard = self.global_authority.execution_guard(
+        self.global_authority.validate_execution_capacity(
             window=self.window_binding,
             provider=self.provider,
             required_new_calls=self.required_new_calls,
         )
-        self._global_grant = guard.__enter__()
-        self._authority_guard = guard
 
     def _close_authority_guard(self) -> None:
-        guard = self._authority_guard
         self._authority_guard = None
         self._global_grant = None
-        if guard is not None:
-            guard.__exit__(None, None, None)
 
     @contextmanager
     def finalize_results(
@@ -4421,19 +4454,24 @@ class _RecoveryAwareProvider:
             self.records.append(record)
             return result
         try:
-            self._enter_authority_guard()
-            assert (
-                self._global_grant is not None
-                and self.global_authority is not None
-                and self.window_binding is not None
-            )
+            assert self.global_authority is not None and self.window_binding is not None
             self.global_authority.publish_attempt(
                 self.recovery,
                 self._ordinal,
-                grant=self._global_grant,
                 window=self.window_binding,
                 provider=self.provider,
             )
+            return self._analyze_reserved(batch)
+        except Exception:
+            self._close_authority_guard()
+            raise
+
+    def _analyze_reserved(
+        self, batch: RepresentationAnalysisBatch
+    ) -> RepresentationAnalysisResult:
+        """Run one Provider call whose durable attempt was already published."""
+
+        try:
             self.new_calls += 1
             record_offset = len(self.provider.execution_records)
             result_offset = len(self.provider._successful_results)
@@ -4460,12 +4498,36 @@ class _RecoveryAwareProvider:
             assert self._loaded_results is not None
             self._loaded_results[self._ordinal - 1] = (loaded_result, record)
             self.records.append(record)
-            if self.new_calls == self.required_new_calls:
-                self._close_authority_guard()
             return loaded_result
         except Exception:
             self._close_authority_guard()
             raise
+
+    def analyze_pre_reserved(
+        self,
+        batch: RepresentationAnalysisBatch,
+        *,
+        ordinal: int,
+    ) -> RepresentationAnalysisResult:
+        """Execute a wave-reserved batch without allocating a second attempt."""
+
+        if ordinal < 1 or ordinal > len(self.recovery.batches):
+            raise SemanticHandoffError("Semantic recovery batch 超出 canonical plan。")
+        expected = self.recovery.batches[ordinal - 1]
+        if batch != expected:
+            raise SemanticHandoffError("Semantic recovery batch boundary 漂移。")
+        loaded, unknown = self.recovery.inspect()
+        if unknown:
+            # The just-reserved attempts are intentionally visible without
+            # results.  Validate this batch directly through its exact receipt.
+            attempt = self.recovery._load_attempt(ordinal)
+            if attempt.get("batch_ordinal") != ordinal:
+                raise SemanticHandoffError("Semantic recovery attempt 绑定漂移。")
+        if loaded[ordinal - 1] is not None:
+            raise SemanticHandoffError("Semantic recovery batch 已有 strict result。")
+        self._ordinal = ordinal
+        self._loaded_results = list(loaded)
+        return self._analyze_reserved(batch)
 
 
 _COMPLETED_AUDIT_BASE_FIELDS = {
@@ -5760,29 +5822,19 @@ class ExternalAgentSemanticHandoffService:
                 raise SemanticHandoffError(
                     "Semantic global authority 未安装；不得启动新 Provider call。"
                 )
-            authority_guard = None
-            global_grant = None
             if preflight.required_new_calls:
-                authority_guard = global_authority.execution_guard(
+                global_authority.validate_execution_capacity(
                     window=authority_binding,
                     provider=provider,
                     required_new_calls=preflight.required_new_calls,
                 )
-                global_grant = authority_guard.__enter__()
-            try:
-                recovery.ensure_run_receipt()
-            except BaseException:
-                if authority_guard is not None:
-                    authority_guard.__exit__(None, None, None)
-                raise
+            recovery.ensure_run_receipt()
             analysis_provider = _RecoveryAwareProvider(
                 provider,
                 recovery,
                 global_authority if authority_binding is not None else None,
                 authority_binding,
                 preflight.required_new_calls,
-                authority_guard=authority_guard,
-                global_grant=global_grant,
             )
 
         audit_paths: tuple[Path, ...] = ()
@@ -5942,6 +5994,164 @@ class ExternalAgentSemanticHandoffService:
             ),
             window_binding=authority_binding,
         ).preflight()
+
+    def prepare_results(
+        self,
+        requests: Sequence[SemanticResultOnlyRequest],
+        providers: Sequence[CodexCliRepresentationAnalysisProvider],
+        *,
+        concurrency: int,
+    ) -> dict[str, int]:
+        """Persist strict results only; package and Information writes stay serial."""
+
+        if concurrency not in {1, 2}:
+            raise SemanticHandoffError("semantic concurrency 只允许 1 或 2。")
+        if len(requests) != len(providers):
+            raise SemanticHandoffError("Semantic result-only Provider 数量不匹配。")
+        representation_ids = [request.representation_id for request in requests]
+        if len(set(representation_ids)) != len(representation_ids):
+            raise SemanticHandoffError(
+                "Semantic result-only 不得并行同一 Representation。"
+            )
+        if len(requests) > concurrency:
+            raise SemanticHandoffError("Semantic result-only wave 超出并发上限。")
+
+        authority = _SemanticGlobalAuthority(self.audit_root)
+        work: list[
+            tuple[
+                SemanticResultOnlyRequest,
+                _SemanticRecoveryRun,
+                _RecoveryAwareProvider,
+            ]
+        ] = []
+        elapsed = {representation_id: 0 for representation_id in representation_ids}
+        required_total = 0
+        for request, provider in zip(requests, providers, strict=True):
+            package = self.representation_service.output_root / request.representation_id
+            if os.path.lexists(package):
+                self._verify_replay_input(request.representation_id, package)
+                continue
+            recovery = _SemanticRecoveryRun(
+                self.representation_service,
+                self.audit_root,
+                request.representation_id,
+                provider,
+                request.privacy_binding,
+                global_authority=authority,
+                window_binding=request.authority_binding,
+            )
+            preflight = recovery.preflight()
+            if preflight.conservatively_counted_attempts:
+                raise SemanticHandoffError(
+                    "Semantic recovery 存在 outcome 不确定的 attempt；LEAD_DECISION_REQUIRED。"
+                )
+            required_total += preflight.required_new_calls
+            recovery.ensure_run_receipt()
+            work.append(
+                (
+                    request,
+                    recovery,
+                    _RecoveryAwareProvider(
+                        provider,
+                        recovery,
+                        authority,
+                        request.authority_binding,
+                        preflight.required_new_calls,
+                    ),
+                )
+            )
+
+        if required_total:
+            first_request, _first_recovery, first_wrapper = work[0]
+            validated_grant = authority.validate_execution_capacity(
+                window=first_request.authority_binding,
+                provider=first_wrapper.provider,
+                required_new_calls=required_total,
+            )
+            for _request, recovery, _wrapper in work:
+                recovery._validated_global_grant = validated_grant
+
+        while True:
+            wave: list[
+                tuple[
+                    SemanticResultOnlyRequest,
+                    _SemanticRecoveryRun,
+                    _RecoveryAwareProvider,
+                    int,
+                    RepresentationAnalysisBatch,
+                ]
+            ] = []
+            for request, recovery, wrapper in work:
+                loaded, unknown = recovery.inspect()
+                if unknown:
+                    raise SemanticHandoffError(
+                        "Semantic recovery 存在 outcome 不确定的 attempt；LEAD_DECISION_REQUIRED。"
+                    )
+                missing = next(
+                    (index for index, item in enumerate(loaded, start=1) if item is None),
+                    None,
+                )
+                if missing is not None:
+                    wave.append(
+                        (
+                            request,
+                            recovery,
+                            wrapper,
+                            missing,
+                            recovery.batches[missing - 1],
+                        )
+                    )
+                if len(wave) == concurrency:
+                    break
+            if not wave:
+                break
+
+            authority.publish_attempts(
+                tuple(
+                    (recovery, ordinal, request.authority_binding, wrapper.provider)
+                    for request, recovery, wrapper, ordinal, _batch in wave
+                )
+            )
+
+            failures: list[BaseException] = []
+
+            def run_one(
+                request: SemanticResultOnlyRequest,
+                wrapper: _RecoveryAwareProvider,
+                ordinal: int,
+                batch: RepresentationAnalysisBatch,
+            ) -> tuple[str, int]:
+                started = time.monotonic()
+                wrapper.analyze_pre_reserved(batch, ordinal=ordinal)
+                return (
+                    request.representation_id,
+                    max(0, round((time.monotonic() - started) * 1000)),
+                )
+
+            with ThreadPoolExecutor(max_workers=len(wave)) as executor:
+                futures = [
+                    executor.submit(run_one, request, wrapper, ordinal, batch)
+                    for request, _recovery, wrapper, ordinal, batch in wave
+                ]
+                wait(futures)
+                for future in futures:
+                    try:
+                        representation_id, duration = future.result()
+                        elapsed[representation_id] += duration
+                    except BaseException as exc:  # noqa: BLE001 - finish the wave first.
+                        failures.append(exc)
+            if failures:
+                raise SemanticHandoffError(
+                    "Semantic result-only wave 失败；已停止新调度。"
+                ) from failures[0]
+
+        for _request, recovery, _wrapper in work:
+            loaded, unknown = recovery.inspect()
+            if unknown or any(item is None for item in loaded):
+                raise SemanticHandoffError(
+                    "Semantic result-only 未完成 strict convergence。"
+                )
+        return elapsed
 
     def _resume_recovery_package(
         self,

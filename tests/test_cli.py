@@ -68,6 +68,59 @@ class CliTest(unittest.TestCase):
     @patch("archeos.cli.WechatDigestService")
     @patch("archeos.cli.WechatCliCaptureProvider")
     @patch("archeos.cli.require_workspace")
+    def test_wechat_digest_wires_bounded_semantic_concurrency(
+        self,
+        require_workspace: Mock,
+        capture_provider: Mock,
+        digest_service: Mock,
+    ) -> None:
+        require_workspace.return_value = WorkspaceConfig(
+            Path("/workspace"), Path("/config")
+        )
+        digest_service.return_value.run.return_value = WechatDigestResult(
+            run_id="run_" + "a" * 32,
+            new_messages=0,
+            new_attachments=0,
+            durable_information=0,
+            local_only=0,
+            unsupported=0,
+            pending_human=0,
+            context_objects=0,
+            checkpoint_published=True,
+            replayed=False,
+        )
+        with redirect_stdout(StringIO()):
+            self.assertEqual(
+                main(
+                    [
+                        "wechat",
+                        "digest",
+                        "--from-now",
+                        "--semantic-concurrency",
+                        "2",
+                    ]
+                ),
+                0,
+            )
+        self.assertEqual(
+            digest_service.call_args.kwargs["semantic_concurrency"], 2
+        )
+
+    def test_wechat_digest_rejects_unbounded_semantic_concurrency(self) -> None:
+        with redirect_stderr(StringIO()), self.assertRaises(SystemExit):
+            main(
+                [
+                    "wechat",
+                    "digest",
+                    "--from-now",
+                    "--semantic-concurrency",
+                    "3",
+                ]
+            )
+
+    @patch("archeos.cli.WechatDigestService")
+    @patch("archeos.cli.WechatCliCaptureProvider")
+    @patch("archeos.cli.require_workspace")
     def test_wechat_digest_prepares_without_running_digest(self, require_workspace: Mock, capture_provider: Mock, digest_service: Mock) -> None:
         require_workspace.return_value = WorkspaceConfig(Path("/workspace"), Path("/config"))
         digest_service.return_value.prepare_next_semantic.return_value = WechatSemanticPreparation("run_" + "a" * 32, "repr_" + "b" * 32, ("unit_" + "c" * 64,))

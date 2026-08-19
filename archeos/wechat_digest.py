@@ -15,6 +15,7 @@ import os
 import re
 import subprocess
 import tempfile
+import time
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass
@@ -58,6 +59,7 @@ from .semantic_handoff import (
     SemanticCompletedWindowBinding,
     SemanticHandoffError,
     SemanticPrivacyBinding,
+    SemanticResultOnlyRequest,
     SemanticWindowAuthorityBinding,
     _package_fingerprint,
     validate_completed_published_audits,
@@ -205,6 +207,13 @@ class SemanticHandoffPort(Protocol):
         privacy_binding: SemanticPrivacyBinding,
         authority_binding: SemanticWindowAuthorityBinding,
     ): ...
+
+    def prepare_results(
+        self,
+        requests: Sequence[SemanticResultOnlyRequest],
+        *,
+        concurrency: int,
+    ) -> dict[str, int]: ...
 
     def install_global_authority(
         self,
@@ -989,14 +998,20 @@ class ExistingSemanticHandoff:
             information_store,
             audit_root,
         )
-        self.provider = CodexCliRepresentationAnalysisProvider(
-            codex_binary=codex_binary,
-            provider_version=provider_version,
-            model=model,
-            reasoning_effort=reasoning_effort,
-            timeout_seconds=timeout_seconds,
-        )
+        self._provider_configuration = {
+            "codex_binary": codex_binary,
+            "provider_version": provider_version,
+            "model": model,
+            "reasoning_effort": reasoning_effort,
+            "timeout_seconds": timeout_seconds,
+        }
+        self.provider = self._new_provider()
         self.reviewed_git_head = reviewed_git_head or detect_clean_git_head()
+
+    def _new_provider(self) -> CodexCliRepresentationAnalysisProvider:
+        return CodexCliRepresentationAnalysisProvider(
+            **self._provider_configuration,
+        )
 
     def execute(
         self,
@@ -1010,6 +1025,19 @@ class ExistingSemanticHandoff:
             self.provider,
             privacy_binding=privacy_binding,
             authority_binding=authority_binding,
+        )
+
+    def prepare_results(
+        self,
+        requests: Sequence[SemanticResultOnlyRequest],
+        *,
+        concurrency: int,
+    ) -> dict[str, int]:
+        providers = tuple(self._new_provider() for _request in requests)
+        return self.service.prepare_results(
+            requests,
+            providers,
+            concurrency=concurrency,
         )
 
     def install_global_authority(
@@ -1054,6 +1082,8 @@ class WechatDigestResult:
     checkpoint_published: bool
     replayed: bool
     context_object_ids: tuple[str, ...] = ()
+    semantic_elapsed_ms: int = 0
+    governance_elapsed_ms: int = 0
 
 
 def _capture_fingerprint(capture: WechatCapture) -> str:
@@ -1346,6 +1376,7 @@ class WechatDigestService:
         privacy_gate: DeterministicPrivacyGate | None = None,
         run_store: WechatDigestRunStore | None = None,
         semantic_batch_size: int = DEFAULT_EXTERNAL_AGENT_BATCH_SIZE,
+        semantic_concurrency: int = 1,
         clock: Callable[[], str] = _utc_now,
     ) -> None:
         self.workspace = Path(workspace)
@@ -1381,6 +1412,9 @@ class WechatDigestService:
         if isinstance(semantic_batch_size, bool) or not isinstance(semantic_batch_size, int) or semantic_batch_size < 1:
             raise ValueError("semantic batch size must be positive")
         self.semantic_batch_size = semantic_batch_size
+        if semantic_concurrency not in {1, 2}:
+            raise ValueError("semantic concurrency must be 1 or 2")
+        self.semantic_concurrency = semantic_concurrency
 
     @staticmethod
     def _cursor_tuple(cursor: WechatCursor) -> tuple[int, str, str]:
@@ -2494,40 +2528,51 @@ class WechatDigestService:
             for attachment in message.attachments
         }
 
-        for attachment_plan in attachment_plans:
-            item_id = f"attachment:{attachment_plan['attachment_key']}"
-            item = self._item(items, item_id)
-            if self._terminal_item_valid(item):
-                continue
-            if attachment_plan["status"] != "available":
-                self._update_item(run_id, status, item_id, state="unsupported")
-                continue
-            captured = by_attachment.get(str(attachment_plan["attachment_key"]))
-            if captured is None or captured.path is None:
-                raise WechatDigestError("微信附件重放无法精确定位。")
-            self._process_attachment(
-                run_id, status, item_id, attachment_plan, captured
-            )
+        if self.semantic_concurrency == 1:
+            for attachment_plan in attachment_plans:
+                item_id = f"attachment:{attachment_plan['attachment_key']}"
+                item = self._item(items, item_id)
+                if self._terminal_item_valid(item):
+                    continue
+                if attachment_plan["status"] != "available":
+                    self._update_item(run_id, status, item_id, state="unsupported")
+                    continue
+                captured = by_attachment.get(str(attachment_plan["attachment_key"]))
+                if captured is None or captured.path is None:
+                    raise WechatDigestError("微信附件重放无法精确定位。")
+                self._process_attachment(
+                    run_id, status, item_id, attachment_plan, captured
+                )
 
-        for conversation_plan in _plan_sequence(
-            plan.get("conversations"), "conversations"
-        ):
-            item_id = f"conversation:{conversation_plan['conversation_key']}"
-            item = self._item(items, item_id)
-            if self._terminal_item_valid(item):
-                continue
-            payload = _conversation_source_payload(
-                capture,
-                str(conversation_plan["conversation_key"]),
-                attachment_source_ids,
-            )
-            if (
-                _sha256_bytes(payload) != conversation_plan["content_hash"]
-                or len(payload) != conversation_plan["size_bytes"]
+            for conversation_plan in _plan_sequence(
+                plan.get("conversations"), "conversations"
             ):
-                raise WechatDigestError("微信 Conversation Source 重放不一致。")
-            self._process_conversation(
-                run_id, status, item_id, conversation_plan, payload
+                item_id = f"conversation:{conversation_plan['conversation_key']}"
+                item = self._item(items, item_id)
+                if self._terminal_item_valid(item):
+                    continue
+                payload = _conversation_source_payload(
+                    capture,
+                    str(conversation_plan["conversation_key"]),
+                    attachment_source_ids,
+                )
+                if (
+                    _sha256_bytes(payload) != conversation_plan["content_hash"]
+                    or len(payload) != conversation_plan["size_bytes"]
+                ):
+                    raise WechatDigestError("微信 Conversation Source 重放不一致。")
+                self._process_conversation(
+                    run_id, status, item_id, conversation_plan, payload
+                )
+        else:
+            self._process_semantic_waves(
+                run_id=run_id,
+                capture=capture,
+                plan=plan,
+                status=status,
+                attachment_plans=attachment_plans,
+                attachment_source_ids=attachment_source_ids,
+                by_attachment=by_attachment,
             )
 
         current_status = self.run_store.status(run_id)
@@ -2553,6 +2598,160 @@ class WechatDigestService:
         if all_history_upper is None or upper == all_history_upper:
             self.run_store.clear_active()
         return self._result(run_id, converged, replayed=replayed)
+
+    def _process_semantic_waves(
+        self,
+        *,
+        run_id: str,
+        capture: WechatCapture,
+        plan: Mapping[str, object],
+        status: dict[str, object],
+        attachment_plans: Sequence[dict[str, object]],
+        attachment_source_ids: Mapping[str, str | None],
+        by_attachment: Mapping[str, CapturedAttachment],
+    ) -> None:
+        """Prepare at most two strict results, then commit in canonical order."""
+
+        descriptors: list[tuple[str, str, Mapping[str, object], object]] = []
+        for item_plan in attachment_plans:
+            item_id = f"attachment:{item_plan['attachment_key']}"
+            captured = by_attachment.get(str(item_plan["attachment_key"]))
+            descriptors.append(("attachment", item_id, item_plan, captured))
+        for item_plan in _plan_sequence(plan.get("conversations"), "conversations"):
+            item_id = f"conversation:{item_plan['conversation_key']}"
+            payload = _conversation_source_payload(
+                capture,
+                str(item_plan["conversation_key"]),
+                attachment_source_ids,
+            )
+            if (
+                _sha256_bytes(payload) != item_plan["content_hash"]
+                or len(payload) != item_plan["size_bytes"]
+            ):
+                raise WechatDigestError("微信 Conversation Source 重放不一致。")
+            descriptors.append(("conversation", item_id, item_plan, payload))
+
+        while True:
+            current = self.run_store.status(run_id)
+            current_items = current.get("items")
+            if not isinstance(current_items, dict):
+                raise WechatDigestError("微信运行状态 items 损坏。")
+            wave: list[
+                tuple[
+                    str,
+                    str,
+                    Mapping[str, object],
+                    object,
+                    str,
+                    PrivacyDecision,
+                ]
+            ] = []
+            seen_representations: set[str] = set()
+            progressed = False
+            for kind, item_id, item_plan, input_value in descriptors:
+                if self._terminal_item_valid(self._item(current_items, item_id)):
+                    continue
+                if kind == "attachment":
+                    if item_plan["status"] != "available":
+                        self._update_item(run_id, status, item_id, state="unsupported")
+                        progressed = True
+                        continue
+                    if not isinstance(input_value, CapturedAttachment) or input_value.path is None:
+                        raise WechatDigestError("微信附件重放无法精确定位。")
+                    representation_id = self._process_attachment(
+                        run_id,
+                        status,
+                        item_id,
+                        item_plan,
+                        input_value,
+                        result_only_preparation=True,
+                    )
+                else:
+                    assert isinstance(input_value, bytes)
+                    representation_id = self._process_conversation(
+                        run_id,
+                        status,
+                        item_id,
+                        item_plan,
+                        input_value,
+                        result_only_preparation=True,
+                    )
+                progressed = True
+                if representation_id is None:
+                    continue
+                if representation_id in seen_representations:
+                    break
+                representation = self.representation_repository.get(representation_id)
+                privacy = self.privacy_gate.evaluate(
+                    self._representation_texts(representation_id),
+                    semantic_completeness_known=(
+                        representation.status == "complete"
+                        and representation.completeness == 1.0
+                        and not representation.warnings
+                    ),
+                )
+                if privacy.route != "approved":
+                    raise WechatDigestError("Semantic result-only 隐私路由发生漂移。")
+                wave.append(
+                    (
+                        kind,
+                        item_id,
+                        item_plan,
+                        input_value,
+                        representation_id,
+                        privacy,
+                    )
+                )
+                seen_representations.add(representation_id)
+                if len(wave) == self.semantic_concurrency:
+                    break
+
+            if not wave:
+                if all(
+                    self._terminal_item_valid(self._item(current_items, item_id))
+                    for _kind, item_id, _item_plan, _input_value in descriptors
+                ):
+                    return
+                if progressed:
+                    continue
+                raise WechatDigestError("Semantic 并发协调未取得进展。")
+
+            requests = tuple(
+                SemanticResultOnlyRequest(
+                    representation_id=representation_id,
+                    privacy_binding=self._semantic_privacy_binding(
+                        representation_id, privacy
+                    ),
+                    authority_binding=self._semantic_authority_binding(run_id),
+                )
+                for _kind, _item_id, _item_plan, _input_value, representation_id, privacy in wave
+            )
+            elapsed = self._semantic_port().prepare_results(
+                requests,
+                concurrency=self.semantic_concurrency,
+            )
+            for kind, item_id, item_plan, input_value, representation_id, _privacy in wave:
+                prepared_elapsed = elapsed.get(representation_id, 0)
+                if kind == "attachment":
+                    assert isinstance(input_value, CapturedAttachment)
+                    self._process_attachment(
+                        run_id,
+                        status,
+                        item_id,
+                        item_plan,
+                        input_value,
+                        prepared_semantic_elapsed_ms=prepared_elapsed,
+                    )
+                else:
+                    assert isinstance(input_value, bytes)
+                    self._process_conversation(
+                        run_id,
+                        status,
+                        item_id,
+                        item_plan,
+                        input_value,
+                        prepared_semantic_elapsed_ms=prepared_elapsed,
+                    )
 
     @staticmethod
     def _item(items: dict[object, object], item_id: str) -> dict[str, object]:
@@ -2706,7 +2905,10 @@ class WechatDigestService:
         item_id: str,
         plan: Mapping[str, object],
         attachment: CapturedAttachment,
-        *, prepare_only: bool = False,
+        *,
+        prepare_only: bool = False,
+        result_only_preparation: bool = False,
+        prepared_semantic_elapsed_ms: int = 0,
     ) -> str | None:
         source_id = str(plan["source_id"])
         assert attachment.content_hash is not None and attachment.size_bytes is not None
@@ -2782,12 +2984,19 @@ class WechatDigestService:
                 privacy_categories=[],
             )
             return None
-        if prepare_only and not self._existing_semantic_package(
-            representation.representation_id
+        if result_only_preparation or (
+            prepare_only
+            and not self._existing_semantic_package(representation.representation_id)
         ):
             return representation.representation_id
-        atomic_ids = self._semantic(run_id, representation.representation_id, privacy)
+        atomic_ids, semantic_elapsed_ms = self._semantic(
+            run_id, representation.representation_id, privacy
+        )
+        governance_started = time.monotonic()
         pending, object_ids = self._govern(atomic_ids)
+        governance_elapsed_ms = max(
+            0, round((time.monotonic() - governance_started) * 1000)
+        )
         self._update_item(
             run_id,
             status,
@@ -2798,6 +3007,8 @@ class WechatDigestService:
             atomic_information_ids=list(atomic_ids),
             pending_human=pending,
             context_object_ids=list(object_ids),
+            semantic_elapsed_ms=prepared_semantic_elapsed_ms + semantic_elapsed_ms,
+            governance_elapsed_ms=governance_elapsed_ms,
         )
         return None
 
@@ -2810,6 +3021,8 @@ class WechatDigestService:
         payload: bytes,
         *,
         prepare_only: bool = False,
+        result_only_preparation: bool = False,
+        prepared_semantic_elapsed_ms: int = 0,
     ) -> str | None:
         source_id = str(plan["source_id"])
         self._ensure_source_bytes(
@@ -2860,12 +3073,19 @@ class WechatDigestService:
                 privacy_categories=[],
             )
             return None
-        if prepare_only and not self._existing_semantic_package(
-            representation.representation_id
+        if result_only_preparation or (
+            prepare_only
+            and not self._existing_semantic_package(representation.representation_id)
         ):
             return representation.representation_id
-        atomic_ids = self._semantic(run_id, representation.representation_id, privacy)
+        atomic_ids, semantic_elapsed_ms = self._semantic(
+            run_id, representation.representation_id, privacy
+        )
+        governance_started = time.monotonic()
         pending, object_ids = self._govern(atomic_ids)
+        governance_elapsed_ms = max(
+            0, round((time.monotonic() - governance_started) * 1000)
+        )
         self._update_item(
             run_id,
             status,
@@ -2876,6 +3096,8 @@ class WechatDigestService:
             atomic_information_ids=list(atomic_ids),
             pending_human=pending,
             context_object_ids=list(object_ids),
+            semantic_elapsed_ms=prepared_semantic_elapsed_ms + semantic_elapsed_ms,
+            governance_elapsed_ms=governance_elapsed_ms,
         )
         return None
 
@@ -2899,7 +3121,24 @@ class WechatDigestService:
 
     def _semantic(
         self, run_id: str, representation_id: str, privacy: PrivacyDecision
-    ) -> tuple[str, ...]:
+    ) -> tuple[tuple[str, ...], int]:
+        privacy_binding = self._semantic_privacy_binding(
+            representation_id, privacy
+        )
+        started = time.monotonic()
+        result = self._semantic_port().execute(
+            representation_id,
+            privacy_binding=privacy_binding,
+            authority_binding=self._semantic_authority_binding(run_id),
+        )
+        atomic_ids = tuple(result.ingestion.atomic_information_ids)
+        for atomic_id in atomic_ids:
+            self.information_store.get_current(atomic_id)
+        return atomic_ids, max(0, round((time.monotonic() - started) * 1000))
+
+    def _semantic_privacy_binding(
+        self, representation_id: str, privacy: PrivacyDecision
+    ) -> SemanticPrivacyBinding:
         representation = self.representation_repository.get(representation_id)
         privacy_payload = {
             "policy": SEMANTIC_PRIVACY_POLICY,
@@ -2911,21 +3150,12 @@ class WechatDigestService:
                 _canonical_json(representation.to_manifest_dict()).encode("utf-8")
             ),
         }
-        privacy_binding = SemanticPrivacyBinding(
+        return SemanticPrivacyBinding(
             policy=SEMANTIC_PRIVACY_POLICY,
             policy_version=SEMANTIC_PRIVACY_POLICY_VERSION,
             route=privacy.route,
             receipt_fingerprint=_sha256_bytes(_canonical_json(privacy_payload).encode()),
         )
-        result = self._semantic_port().execute(
-            representation_id,
-            privacy_binding=privacy_binding,
-            authority_binding=self._semantic_authority_binding(run_id),
-        )
-        atomic_ids = tuple(result.ingestion.atomic_information_ids)
-        for atomic_id in atomic_ids:
-            self.information_store.get_current(atomic_id)
-        return atomic_ids
 
     def _semantic_port(self) -> SemanticHandoffPort:
         if self._semantic_handoff is None:
@@ -3059,6 +3289,10 @@ class WechatDigestService:
             ),
             replayed=any(result.replayed for result in results),
             context_object_ids=context_object_ids,
+            semantic_elapsed_ms=sum(result.semantic_elapsed_ms for result in results),
+            governance_elapsed_ms=sum(
+                result.governance_elapsed_ms for result in results
+            ),
         )
 
     @staticmethod
@@ -3097,4 +3331,10 @@ class WechatDigestService:
             checkpoint_published=bool(status.get("checkpoint_published")),
             replayed=replayed,
             context_object_ids=tuple(sorted(object_ids)),
+            semantic_elapsed_ms=sum(
+                int(item.get("semantic_elapsed_ms", 0)) for item in values
+            ),
+            governance_elapsed_ms=sum(
+                int(item.get("governance_elapsed_ms", 0)) for item in values
+            ),
         )
