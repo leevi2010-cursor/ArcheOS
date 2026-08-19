@@ -587,9 +587,19 @@ def build_parser() -> argparse.ArgumentParser:
         help="零 Provider 安装已批准的 append-only cap-1000 Semantic 扩权。",
     )
     wechat_digest.add_argument(
+        "--resolve-semantic-unknown",
+        action="store_true",
+        help="零 Provider 把已批准的 Semantic unknown 收敛为 failed_closed。",
+    )
+    wechat_digest.add_argument(
         "--inventory-authority-file",
         type=Path,
         help="Private 0600 Lead-approved historical inventory authority manifest.",
+    )
+    wechat_digest.add_argument(
+        "--semantic-unknown-authority-file",
+        type=Path,
+        help="Private 0600 Lead-approved ordinal-166 resolution authority manifest.",
     )
     return parser
 
@@ -996,6 +1006,7 @@ def _wechat_product_command(args: argparse.Namespace) -> int:
             args.upgrade_active_v2_all_history,
             args.install_semantic_authority,
             args.install_semantic_authority_extension,
+            args.resolve_semantic_unknown,
         )
     )
     if maintenance_count > 1 or (
@@ -1010,6 +1021,13 @@ def _wechat_product_command(args: argparse.Namespace) -> int:
             return 2
     elif args.inventory_authority_file is not None:
         print("error: inventory authority file 只能与安装入口一起使用。")
+        return 2
+    if args.resolve_semantic_unknown:
+        if args.semantic_unknown_authority_file is None:
+            print("error: 恢复 Semantic unknown 必须指定私有 authority file。")
+            return 2
+    elif args.semantic_unknown_authority_file is not None:
+        print("error: Semantic unknown authority file 只能与恢复入口一起使用。")
         return 2
     try:
         workspace = require_workspace(args.config).workspace
@@ -1128,6 +1146,34 @@ def _wechat_product_command(args: argparse.Namespace) -> int:
                 )
             )
             return 0
+        if args.resolve_semantic_unknown:
+            resolution = service.resolve_semantic_unknown(
+                authority_manifest_file=args.semantic_unknown_authority_file,
+            )
+            continuation = resolution["continuation"]
+            print(
+                json.dumps(
+                    {
+                        "semantic_provider_calls": 0,
+                        "governance_provider_calls": 0,
+                        "global_attempt_total": 166,
+                        "global_unknown": 0,
+                        "absolute_cap": 1000,
+                        "remaining": 834,
+                        "next_global_ordinal": continuation[
+                            "next_global_ordinal"
+                        ],
+                        "failed_closed": 1,
+                        "preserved_but_unabsorbed": 1,
+                        "resolution_receipt_fingerprint": resolution[
+                            "resolution_receipt_fingerprint"
+                        ],
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                )
+            )
+            return 0
         result = service.run(
             since=args.since,
             from_now=args.from_now,
@@ -1150,6 +1196,7 @@ def _wechat_product_command(args: argparse.Namespace) -> int:
     print(f"本地保留（隐私）：{result.local_only}")
     print(f"暂不支持：{result.unsupported}")
     print(f"待你判断：{result.pending_human}")
+    print(f"已保留但未吸收：{result.failed_closed}")
     print(f"更新了 {result.context_objects} 个长期对象的 Context")
     print(f"治理 app-server 启动：{result.governance_app_server_starts}")
     print(f"治理 thread / turn：{result.governance_threads} / {result.governance_turns}")
