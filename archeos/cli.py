@@ -587,6 +587,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="零 Provider 安装已批准的 append-only cap-1000 Semantic 扩权。",
     )
     wechat_digest.add_argument(
+        "--install-semantic-maintenance-continuation",
+        action="store_true",
+        help="零 Provider 安装一次性已批准维护版本续接。",
+    )
+    wechat_digest.add_argument(
         "--resolve-semantic-unknown",
         action="store_true",
         help="零 Provider 把已批准的 Semantic unknown 收敛为 failed_closed。",
@@ -605,6 +610,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--semantic-unknown-authority-file",
         type=Path,
         help="Private 0600 Lead-approved ordinal-166 resolution authority manifest.",
+    )
+    wechat_digest.add_argument(
+        "--authority-ref",
+        help="Lead-approved GitHub Issue comment reference.",
     )
     return parser
 
@@ -1011,6 +1020,7 @@ def _wechat_product_command(args: argparse.Namespace) -> int:
             args.upgrade_active_v2_all_history,
             args.install_semantic_authority,
             args.install_semantic_authority_extension,
+            args.install_semantic_maintenance_continuation,
             args.resolve_semantic_unknown,
             args.seal_governance_timeout,
         )
@@ -1034,6 +1044,13 @@ def _wechat_product_command(args: argparse.Namespace) -> int:
             return 2
     elif args.semantic_unknown_authority_file is not None:
         print("error: Semantic unknown authority file 只能与恢复入口一起使用。")
+        return 2
+    if args.install_semantic_maintenance_continuation:
+        if args.authority_ref is None:
+            print("error: 安装 Semantic maintenance continuation 必须指定 authority ref。")
+            return 2
+    elif args.authority_ref is not None:
+        print("error: authority ref 只能与 maintenance continuation 入口一起使用。")
         return 2
     try:
         workspace = require_workspace(args.config).workspace
@@ -1145,6 +1162,40 @@ def _wechat_product_command(args: argparse.Namespace) -> int:
                         ],
                         "extension_fingerprint": extension[
                             "extension_fingerprint"
+                        ],
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                )
+            )
+            return 0
+        if args.install_semantic_maintenance_continuation:
+            continuation = service.install_semantic_maintenance_continuation(
+                authority_ref=args.authority_ref,
+            )
+            print(
+                json.dumps(
+                    {
+                        "semantic_provider_calls": 0,
+                        "governance_provider_calls": 0,
+                        "global_attempt_total": continuation[
+                            "activation_total"
+                        ],
+                        "global_unknown": continuation[
+                            "activation_unknown_count"
+                        ],
+                        "next_global_ordinal": continuation[
+                            "next_global_ordinal"
+                        ],
+                        "absolute_cap": continuation["absolute_cap"],
+                        "previous_reviewed_git_head": continuation[
+                            "previous_reviewed_git_head"
+                        ],
+                        "reviewed_git_head": continuation[
+                            "reviewed_git_head"
+                        ],
+                        "continuation_fingerprint": continuation[
+                            "continuation_fingerprint"
                         ],
                     },
                     ensure_ascii=False,

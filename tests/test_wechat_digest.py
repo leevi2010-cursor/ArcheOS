@@ -9,6 +9,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from collections import Counter
 from contextlib import contextmanager
 from dataclasses import replace
 from pathlib import Path
@@ -246,6 +247,7 @@ class SyntheticSemanticHandoff:
         self.reviewed_git_head = "6" * 40
         self.installed_grant = None
         self.installed_extension = None
+        self.installed_maintenance_continuation = None
         self.unknown_resolution = None
         self.before_unknown_commit = None
         self.campaign_binding = None
@@ -354,6 +356,51 @@ class SyntheticSemanticHandoff:
         if self.installed_extension is not None and self.installed_extension != expected:
             raise RuntimeError("synthetic authority extension drift")
         self.installed_extension = expected
+        self.campaign_binding = SimpleNamespace(
+            created_at=self.campaign_binding.created_at,
+            lower_cursor=self.campaign_binding.lower_cursor,
+            frozen_global_upper_cursor=(
+                self.campaign_binding.frozen_global_upper_cursor
+            ),
+            capture_provider_version=self.campaign_binding.capture_provider_version,
+            semantic_batch_size=self.campaign_binding.semantic_batch_size,
+            reviewed_git_head=self.reviewed_git_head,
+        )
+        return expected
+
+    def install_maintenance_continuation(
+        self,
+        *,
+        window_binding,
+        authority_ref,
+    ):
+        assert self.campaign_binding is not None
+        assert window_binding.reviewed_git_head in {
+            self.campaign_binding.reviewed_git_head,
+            self.reviewed_git_head,
+        }
+        expected = {
+            "authority_ref": authority_ref,
+            "previous_reviewed_git_head": "6" * 40,
+            "reviewed_git_head": self.reviewed_git_head,
+            "previous_execution_contract": {"profile": "unchanged"},
+            "execution_contract": {"profile": "unchanged"},
+            "campaign": {"synthetic": True},
+            "window": {"synthetic": True},
+            "activation_total": 176,
+            "activation_unknown_count": 0,
+            "activation_last_global_ordinal": 176,
+            "activation_attempt_inventory_fingerprint": "sha256:" + "a" * 64,
+            "next_global_ordinal": 177,
+            "absolute_cap": 1000,
+            "continuation_fingerprint": "sha256:" + "b" * 64,
+        }
+        if (
+            self.installed_maintenance_continuation is not None
+            and self.installed_maintenance_continuation != expected
+        ):
+            raise RuntimeError("synthetic maintenance continuation drift")
+        self.installed_maintenance_continuation = expected
         self.campaign_binding = SimpleNamespace(
             created_at=self.campaign_binding.created_at,
             lower_cursor=self.campaign_binding.lower_cursor,
@@ -1077,6 +1124,77 @@ class WechatDigestTests(unittest.TestCase):
         final_item = service.run_store.status(run_id)["items"][item_id]
         self.assertEqual(final_item, sealed_item)
         self.assertIsNone(service.run_store.active_run_id())
+
+    def test_maintenance_continuation_binds_exact_active_state_zero_calls(
+        self,
+    ) -> None:
+        self.create_object()
+        messages = [
+            message(index, conversation="failed") for index in range(1, 11)
+        ]
+        messages.extend(
+            message(10 + index, conversation=conversation)
+            for index, conversation in enumerate(
+                ("later-3", "later-5", "later-6", "later-7"), start=1
+            )
+        )
+        capture = SyntheticCaptureProvider(messages)
+        provider = TimeoutOnFourthTurnProvider()
+        service = WechatDigestService(
+            workspace=self.workspace,
+            capture_provider=capture,
+            semantic_handoff_factory=lambda: self.semantic,
+            interpretation_provider=provider,
+        )
+        with self.assertRaises(WechatDigestError):
+            service.run(all_history=True)
+        service.install_semantic_authority(
+            inventory_authority_file=Path("/private/authority-a.json")
+        )
+        service.seal_governance_timeout()
+        service.prepare_next_semantic()
+        run_id = service.run_store.active_run_id()
+        assert run_id is not None
+        status = service.run_store.status(run_id)
+        counts = Counter(
+            item["state"] for item in status["items"].values()
+        )
+        self.assertEqual(counts["represented"], 1)
+        self.assertEqual(counts["planned"], 3)
+        self.semantic.reviewed_git_head = "9" * 40
+        authority_ref = (
+            "https://github.com/leevi2010-cursor/ArcheOS/issues/127"
+            "#issuecomment-1234567890"
+        )
+        status_before = (
+            service.run_store.runs_root / run_id / "status.json"
+        ).read_bytes()
+        semantic_calls = self.semantic.provider.calls
+        governance_calls = provider.calls
+
+        continuation = service.install_semantic_maintenance_continuation(
+            authority_ref=authority_ref
+        )
+
+        self.assertEqual(continuation["activation_total"], 176)
+        self.assertEqual(continuation["next_global_ordinal"], 177)
+        self.assertEqual(continuation["authority_ref"], authority_ref)
+        self.assertEqual(self.semantic.provider.calls, semantic_calls)
+        self.assertEqual(provider.calls, governance_calls)
+        self.assertEqual(
+            (service.run_store.runs_root / run_id / "status.json").read_bytes(),
+            status_before,
+        )
+        self.assertEqual(
+            service.install_semantic_maintenance_continuation(
+                authority_ref=authority_ref
+            ),
+            continuation,
+        )
+        with self.assertRaises(RuntimeError):
+            service.install_semantic_maintenance_continuation(
+                authority_ref=authority_ref.replace("1234567890", "1234567891")
+            )
 
     def test_governance_timeout_seal_recovers_after_status_write_interruption(
         self,

@@ -234,6 +234,13 @@ class SemanticHandoffPort(Protocol):
         window_binding: SemanticWindowAuthorityBinding,
     ) -> dict[str, object]: ...
 
+    def install_maintenance_continuation(
+        self,
+        *,
+        window_binding: SemanticWindowAuthorityBinding,
+        authority_ref: str,
+    ) -> dict[str, object]: ...
+
     def resolve_unknown(
         self,
         *,
@@ -1074,6 +1081,19 @@ class ExistingSemanticHandoff:
             reviewed_git_head=self.reviewed_git_head,
         )
 
+    def install_maintenance_continuation(
+        self,
+        *,
+        window_binding: SemanticWindowAuthorityBinding,
+        authority_ref: str,
+    ) -> dict[str, object]:
+        return self.service.install_maintenance_continuation(
+            self.provider,
+            window_binding=window_binding,
+            reviewed_git_head=self.reviewed_git_head,
+            authority_ref=authority_ref,
+        )
+
     def resolve_unknown(
         self,
         *,
@@ -1903,6 +1923,81 @@ class WechatDigestService:
                     "Semantic authority extension 安装读回失败。"
                 )
             return extension
+
+    def install_semantic_maintenance_continuation(
+        self, *, authority_ref: str
+    ) -> dict[str, object]:
+        """Install the single reviewed-head continuation with zero Providers."""
+
+        with self.run_store.lock():
+            run_id = self.run_store.active_run_id()
+            if run_id is None:
+                raise WechatDigestError(
+                    "不存在可绑定 Semantic maintenance continuation 的 active run。"
+                )
+            plan = self.run_store.plan(run_id)
+            if self._plan_all_history_upper(plan) is None:
+                raise WechatDigestError(
+                    "Semantic maintenance continuation 只能绑定 frozen campaign。"
+                )
+            after = WechatCursor.from_dict(
+                plan.get("after_cursor"), "plan.after_cursor"
+            )
+            upper = WechatCursor.from_dict(
+                plan.get("upper_bound"), "plan.upper_bound"
+            )
+            checkpoint = self.run_store.checkpoint()
+            if checkpoint is not None and checkpoint != after:
+                raise WechatDigestError(
+                    "Semantic maintenance continuation checkpoint binding 不一致。"
+                )
+            capture = self.capture_provider.capture(after, upper_bound=upper)
+            self._verify_capture_against_plan(capture, plan)
+            status = self.run_store.status(run_id)
+            self._verify_plan_and_status(run_id, capture, plan, status)
+            if (
+                status.get("state") != "processing"
+                or status.get("failure_category") is not None
+                or status.get("checkpoint_published") is not False
+            ):
+                raise WechatDigestError(
+                    "Semantic maintenance continuation active run 状态不匹配。"
+                )
+            items = status.get("items")
+            if not isinstance(items, dict):
+                raise WechatDigestError("微信运行状态 items 损坏。")
+            state_counts: dict[str, int] = {}
+            for value in items.values():
+                if not isinstance(value, dict) or not isinstance(
+                    value.get("state"), str
+                ):
+                    raise WechatDigestError("微信运行状态 items 损坏。")
+                state = str(value["state"])
+                state_counts[state] = state_counts.get(state, 0) + 1
+                if state not in TERMINAL_ITEM_STATES | {"represented", "planned"}:
+                    raise WechatDigestError(
+                        "Semantic maintenance continuation 存在未收敛 item。"
+                    )
+                if value.get("governance_failure") is not None:
+                    self._verify_governance_failed_closed_item(value)
+            if (
+                state_counts.get("represented") != 1
+                or state_counts.get("planned") != 3
+            ):
+                raise WechatDigestError(
+                    "Semantic maintenance continuation active item 边界不匹配。"
+                )
+            continuation = self._semantic_port().install_maintenance_continuation(
+                window_binding=self._semantic_authority_binding(
+                    run_id, allow_reviewed_head_extension=True
+                ),
+                authority_ref=authority_ref,
+            )
+            if continuation.get("continuation_fingerprint") is None:
+                raise WechatDigestError(
+                    "Semantic maintenance continuation 安装读回失败。"
+                )
+            return continuation
 
     def _unknown_resolution_digest_binding(
         self,
