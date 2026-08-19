@@ -2412,12 +2412,44 @@ class SemanticHandoffTest(unittest.TestCase):
                     CodexCliRepresentationAnalysisProvider(
                         provider_version="0.999.0",
                         reasoning_effort="high",
+                        timeout_seconds=17,
                         runner=replay_runner,
                     ),
                 )
                 self.assertTrue(replay.replayed_existing_package)
                 self.assertEqual(replay.ingestion.existing, 1)
                 self.assertEqual(replay_runner.calls, [])
+                for invalid_deadline in (299000, 1):
+                    with self.subTest(
+                        protocol=protocol,
+                        invalid_deadline=invalid_deadline,
+                    ):
+                        audit_path = first.audit_paths[0]
+                        tampered = json.loads(
+                            audit_path.read_text(encoding="utf-8")
+                        )
+                        tampered["deadline_ms"] = invalid_deadline
+                        audit_path.write_text(
+                            json.dumps(tampered), encoding="utf-8"
+                        )
+                        rejected_runner = FakeRunner()
+                        with self.assertRaisesRegex(
+                            Exception, "未能安全重放"
+                        ):
+                            handoff.execute(
+                                representation.representation_id,
+                                CodexCliRepresentationAnalysisProvider(
+                                    provider_version="0.999.0",
+                                    reasoning_effort="high",
+                                    timeout_seconds=17,
+                                    runner=rejected_runner,
+                                ),
+                            )
+                        self.assertEqual(rejected_runner.calls, [])
+                        tampered["deadline_ms"] = 300000
+                        audit_path.write_text(
+                            json.dumps(tampered), encoding="utf-8"
+                        )
 
     def test_name_only_v1_multibatch_requires_one_historical_provider_version(
         self,

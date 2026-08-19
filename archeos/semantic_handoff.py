@@ -5078,7 +5078,7 @@ def _validate_versioned_published_audits(
                 or int(audit["elapsed_ms"]) < 0
                 or isinstance(audit.get("deadline_ms"), bool)
                 or not isinstance(audit.get("deadline_ms"), int)
-                or int(audit["deadline_ms"]) <= 0
+                or audit.get("deadline_ms") != 300000
                 or audit.get("exit_code") != 0
                 or audit.get("termination_signal") is not None
                 or audit.get("timeout_phase") is not None
