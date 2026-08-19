@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import signal
 import subprocess
 import sys
 import tempfile
@@ -11,6 +12,7 @@ from contextlib import contextmanager
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from archeos.atomic_information import (
     JsonlAtomicInformationStore,
@@ -910,6 +912,125 @@ class WechatDigestTests(unittest.TestCase):
         self.assertEqual(provider.calls, 1)
         self.assertEqual(provider.session_entries, 1)
         self.assertEqual(service.run_store.active_run_id(), run_id)
+
+        semantic_calls = self.semantic.provider.calls
+        with self.assertRaisesRegex(WechatDigestError, "cleanup 失败"):
+            service.prepare_next_semantic()
+
+        self.assertEqual(provider.calls, 1)
+        self.assertEqual(provider.session_entries, 1)
+        self.assertEqual(self.semantic.provider.calls, semantic_calls)
+
+    def test_sigterm_during_sdk_exit_force_kills_and_blocks_recovery(self) -> None:
+        self.create_object()
+        operation = {
+            "kind": "no_structural_change",
+            "target_object_id": None,
+            "secondary_object_id": None,
+            "name": None,
+            "role": None,
+            "relation": None,
+            "relationship_id": None,
+            "lifecycle_state": None,
+            "start_at": None,
+            "actual_end_at": None,
+            "target_end_at": None,
+            "completion_condition": None,
+        }
+        response = json.dumps(
+            {
+                "operations": [operation],
+                "rationale": "Synthetic cleanup termination.",
+                "evidence_sufficient": True,
+                "conflict": False,
+                "ambiguous": False,
+                "claim": None,
+            }
+        )
+        handlers = {
+            signal.SIGTERM: signal.SIG_DFL,
+            signal.SIGALRM: signal.SIG_DFL,
+        }
+
+        def getsignal(signum):
+            return handlers[signum]
+
+        def install_signal(signum, handler):
+            previous = handlers[signum]
+            handlers[signum] = handler
+            return previous
+
+        class Process:
+            def __init__(self):
+                self.killed = False
+
+            def kill(self):
+                self.killed = True
+
+        class Turn:
+            def run(self):
+                return SimpleNamespace(final_response=response)
+
+            def interrupt(self):
+                raise AssertionError("successful turn must not interrupt")
+
+        class Thread:
+            def turn(self, *_args, **_kwargs):
+                return Turn()
+
+        class Codex:
+            instance = None
+
+            def __init__(self):
+                self._client = SimpleNamespace(_proc=Process())
+                self.__class__.instance = self
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                handler = handlers[signal.SIGTERM]
+                assert callable(handler)
+                handler(signal.SIGTERM, None)
+
+            def thread_start(self, **_kwargs):
+                return Thread()
+
+        provider = CodexAtomicInformationInterpretationProvider(
+            sdk_loader=lambda: (Codex, "deny-all", "read-only")
+        )
+        service = WechatDigestService(
+            workspace=self.workspace,
+            capture_provider=SyntheticCaptureProvider([message(1)]),
+            semantic_handoff_factory=lambda: self.semantic,
+            interpretation_provider=provider,
+        )
+
+        with (
+            patch(
+                "archeos.digestion.providers.signal.getsignal",
+                side_effect=getsignal,
+            ),
+            patch(
+                "archeos.digestion.providers.signal.signal",
+                side_effect=install_signal,
+            ),
+            self.assertRaises(SystemExit),
+        ):
+            service.run(all_history=True)
+
+        assert Codex.instance is not None
+        self.assertTrue(Codex.instance._client._proc.killed)
+        self.assertIs(handlers[signal.SIGTERM], signal.SIG_DFL)
+        self.assertEqual(
+            provider.metrics_since(0)["failure_categories"], {"cleanup": 1}
+        )
+        run_id = service.run_store.active_run_id()
+        assert run_id is not None
+        status = service.run_store.status(run_id)
+        self.assertEqual(status["failure_category"], "governance_session_cleanup")
+        self.assertFalse(status["checkpoint_published"])
+        self.assertIsNone(service.run_store.checkpoint())
 
     def test_from_now_bootstrap_does_not_read_existing_message_bodies(self) -> None:
         capture = SyntheticCaptureProvider([message(1)])

@@ -1868,13 +1868,13 @@ class WechatDigestService:
                         from_now = False
                         all_history = False
                     session_body_completed = True
-            except WechatDigestError:
+            except BaseException as exc:
                 if session_body_completed and pending_final_run_id is not None:
                     self._record_cleanup_failure(pending_final_run_id)
-                raise
-            except Exception as exc:
-                if session_body_completed and pending_final_run_id is not None:
-                    self._record_cleanup_failure(pending_final_run_id)
+                if not isinstance(exc, Exception) or isinstance(
+                    exc, WechatDigestError
+                ):
+                    raise
                 raise WechatDigestError(
                     "微信信息消化未安全完成；checkpoint 未推进。"
                 ) from exc
@@ -1946,33 +1946,39 @@ class WechatDigestService:
             or batch_size < 1
         ):
             raise WechatDigestError("semantic batch size 必须是正整数。")
-        session_factory = getattr(self.interpretation_provider, "session", None)
-        session = session_factory() if callable(session_factory) else nullcontext()
-        with session, self.run_store.lock():
-            run_id = self.run_store.active_run_id()
-            if run_id is None:
-                raise WechatDigestError("不存在可恢复的微信运行；未创建新 capture。")
-            plan = self.run_store.plan(run_id)
-            effective_batch_size = self._plan_batch_size(plan)
-            if batch_size != effective_batch_size:
-                raise WechatDigestError("semantic batch size 与 durable run 不一致。")
-            capture = self.capture_provider.capture(
-                WechatCursor.from_dict(plan["after_cursor"], "plan.after_cursor"),
-                upper_bound=WechatCursor.from_dict(
-                    plan["upper_bound"], "plan.upper_bound"
-                ),
-            )
-            self._verify_capture_against_plan(capture, plan)
-            self._verify_plan_and_status(
-                run_id, capture, plan, self.run_store.status(run_id)
-            )
-            return self._prepare_next_semantic_locked(
-                run_id,
-                capture,
-                plan,
-                self.run_store.status(run_id),
-                batch_size=effective_batch_size,
-            )
+        with self.run_store.lock():
+            self._reject_cleanup_failed_active_run()
+            session_factory = getattr(self.interpretation_provider, "session", None)
+            session = session_factory() if callable(session_factory) else nullcontext()
+            with session:
+                run_id = self.run_store.active_run_id()
+                if run_id is None:
+                    raise WechatDigestError(
+                        "不存在可恢复的微信运行；未创建新 capture。"
+                    )
+                plan = self.run_store.plan(run_id)
+                effective_batch_size = self._plan_batch_size(plan)
+                if batch_size != effective_batch_size:
+                    raise WechatDigestError("semantic batch size 与 durable run 不一致。")
+                capture = self.capture_provider.capture(
+                    WechatCursor.from_dict(
+                        plan["after_cursor"], "plan.after_cursor"
+                    ),
+                    upper_bound=WechatCursor.from_dict(
+                        plan["upper_bound"], "plan.upper_bound"
+                    ),
+                )
+                self._verify_capture_against_plan(capture, plan)
+                self._verify_plan_and_status(
+                    run_id, capture, plan, self.run_store.status(run_id)
+                )
+                return self._prepare_next_semantic_locked(
+                    run_id,
+                    capture,
+                    plan,
+                    self.run_store.status(run_id),
+                    batch_size=effective_batch_size,
+                )
 
     def upgrade_active_v1(self) -> str:
         """Explicit, audited, zero-Provider upgrade for the active legacy run only."""

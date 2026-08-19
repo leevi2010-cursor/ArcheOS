@@ -272,8 +272,10 @@ class CodexAtomicInformationInterpretationProvider:
         finally:
             try:
                 self._close_session_bounded(self.interrupt_grace_seconds)
-            except Exception as exc:
+            except BaseException as exc:
                 self._metric_events.append(("failure", 0, "cleanup"))
+                if not isinstance(exc, Exception):
+                    raise
                 raise RuntimeError("Codex interpretation session cleanup failed") from exc
             finally:
                 self._restore_sigterm_handler(previous_sigterm, sigterm_handler)
@@ -469,7 +471,7 @@ class CodexAtomicInformationInterpretationProvider:
         except _DeadlineExpired as exc:
             self._force_kill(process)
             raise RuntimeError("Codex app-server cleanup exceeded its deadline") from exc
-        except Exception:
+        except BaseException:
             self._force_kill(process)
             raise
         poll = getattr(process, "poll", None)
