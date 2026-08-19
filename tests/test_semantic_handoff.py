@@ -1573,7 +1573,6 @@ class SemanticHandoffTest(unittest.TestCase):
                 manifest=manifest,
                 audit_root=audit_root,
                 package_fingerprint=_package_fingerprint(result.package),
-                provider=provider,
             ),
             result.audit_paths,
         )
@@ -2072,9 +2071,53 @@ class SemanticHandoffTest(unittest.TestCase):
             reasoning_effort="high",
             runner=changed_runner,
         )
-        with self.assertRaisesRegex(Exception, "未能安全重放"):
-            handoff.execute(representation.representation_id, changed_profile)
+        changed = handoff.execute(
+            representation.representation_id, changed_profile
+        )
+        self.assertTrue(changed.replayed_existing_package)
+        self.assertEqual(changed.ingestion.existing, 1)
         self.assertEqual(changed_runner.calls, [])
+
+    def test_new_publish_rejects_package_provider_mismatch_before_ingestion(
+        self,
+    ) -> None:
+        import archeos.representation_information as information_module
+
+        representation, service = self.build_service()
+        audit_root = self.root / "new-provider-mismatch-audits"
+        store_path = self.root / "new-provider-mismatch-atomic.jsonl"
+        provider = CodexCliRepresentationAnalysisProvider(
+            provider_version="0.147.0", runner=FakeRunner()
+        )
+        handoff = ExternalAgentSemanticHandoffService(
+            service, JsonlAtomicInformationStore(store_path), audit_root
+        )
+        mismatched = {
+            "name": provider.name,
+            "provider_version": provider.provider_version,
+            "model": provider.model,
+            "reasoning_effort": "high",
+            "fallback_policy": provider.fallback_policy,
+        }
+        with (
+            patch.object(
+                information_module,
+                "_provider_manifest",
+                return_value=mismatched,
+            ),
+            self.assertRaisesRegex(Exception, "审计无法安全保存"),
+        ):
+            self.execute_with_global_authority(
+                handoff,
+                representation.representation_id,
+                provider,
+                privacy_binding=self.privacy_binding(),
+                new_call_authority=1,
+            )
+        self.assertFalse(store_path.exists())
+        self.assertEqual(
+            tuple(audit_root.glob("run_*/processing-run-audit.json")), ()
+        )
 
     def test_v1_package_and_audit_replay_without_a_provider_call(self) -> None:
         representation, service = self.build_service()
@@ -2309,6 +2352,193 @@ class SemanticHandoffTest(unittest.TestCase):
         self.assertEqual(replay.ingestion.existing, 1)
         self.assertEqual(replay_runner.calls, [])
 
+    def test_profiled_historical_packages_replay_with_changed_current_profile(
+        self,
+    ) -> None:
+        protocols = (
+            EXTERNAL_AGENT_PROTOCOL_V3_1,
+            EXTERNAL_AGENT_PROTOCOL_V3_2,
+            EXTERNAL_AGENT_PROTOCOL_V3_3,
+            EXTERNAL_AGENT_PROTOCOL_V3_4,
+        )
+        for protocol in protocols:
+            with self.subTest(protocol=protocol):
+                root = self.root / protocol.replace("/", "-")
+                representation, service = self.build_service(root=root)
+                audit_root = root / "audits"
+                handoff = ExternalAgentSemanticHandoffService(
+                    service,
+                    JsonlAtomicInformationStore(root / "atomic.jsonl"),
+                    audit_root,
+                )
+                first = self.execute_with_global_authority(
+                    handoff,
+                    representation.representation_id,
+                    CodexCliRepresentationAnalysisProvider(
+                        provider_version="0.147.0", runner=FakeRunner()
+                    ),
+                    privacy_binding=self.privacy_binding(),
+                    new_call_authority=1,
+                )
+                if protocol != EXTERNAL_AGENT_PROTOCOL_V3_4:
+                    batch = _analysis_batches(
+                        _units_from_representation(
+                            representation,
+                            service.representation_repository,
+                        ),
+                        service.batch_size,
+                    )[0]
+                    _, fingerprint = _external_agent_request(
+                        batch, protocol_version=protocol
+                    )
+                    audit_path = first.audit_paths[0]
+                    historical = json.loads(
+                        audit_path.read_text(encoding="utf-8")
+                    )
+                    historical["protocol_version"] = protocol
+                    historical["input_fingerprint"] = fingerprint
+                    historical["diagnostic_schema_version"] = (
+                        "external-agent-diagnostics/2.0"
+                    )
+                    for field in _GROUPING_DIAGNOSTIC_FIELDS:
+                        historical.pop(field)
+                    audit_path.write_text(
+                        json.dumps(historical), encoding="utf-8"
+                    )
+
+                replay_runner = FakeRunner()
+                replay = handoff.execute(
+                    representation.representation_id,
+                    CodexCliRepresentationAnalysisProvider(
+                        provider_version="0.999.0",
+                        reasoning_effort="high",
+                        runner=replay_runner,
+                    ),
+                )
+                self.assertTrue(replay.replayed_existing_package)
+                self.assertEqual(replay.ingestion.existing, 1)
+                self.assertEqual(replay_runner.calls, [])
+
+    def test_name_only_v1_multibatch_requires_one_historical_provider_version(
+        self,
+    ) -> None:
+        representation, service = self.build_service(blocks=41)
+        audit_root = self.root / "v1-split-audits"
+        handoff = ExternalAgentSemanticHandoffService(
+            service,
+            JsonlAtomicInformationStore(self.root / "v1-split-atomic.jsonl"),
+            audit_root,
+        )
+        first = self.execute_with_global_authority(
+            handoff,
+            representation.representation_id,
+            CodexCliRepresentationAnalysisProvider(
+                provider_version="0.147.0", runner=FakeRunner()
+            ),
+            privacy_binding=self.privacy_binding(),
+            new_call_authority=2,
+        )
+        manifest_path = first.package / "manifest.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest["provider"] = {"name": "external-agent-codex-cli"}
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+        package_fingerprint = _package_fingerprint(first.package)
+        batches = _analysis_batches(
+            _units_from_representation(
+                representation, service.representation_repository
+            ),
+            service.batch_size,
+        )
+        fingerprints = {
+            tuple(unit.unit_id for unit in batch.anchor_units):
+            _external_agent_request(
+                batch, protocol_version=EXTERNAL_AGENT_PROTOCOL_V1
+            )[1]
+            for batch in batches
+        }
+        for index, audit_path in enumerate(first.audit_paths):
+            historical = json.loads(audit_path.read_text(encoding="utf-8"))
+            historical["protocol_version"] = EXTERNAL_AGENT_PROTOCOL_V1
+            historical["input_fingerprint"] = fingerprints[
+                tuple(historical["anchor_unit_ids"])
+            ]
+            historical["provider_version"] = f"0.14{7 + index}.0"
+            historical["package_fingerprint"] = package_fingerprint
+            for field in (
+                "contract_failure_detail",
+                "model",
+                "reasoning_effort",
+                "fallback_policy",
+                "diagnostic_schema_version",
+                "elapsed_ms",
+                "deadline_ms",
+                "exit_code",
+                "termination_signal",
+                "timeout_phase",
+                "provider_error_category",
+                "result_file_present",
+                "result_size_bytes",
+                "stdout_bytes",
+                "stderr_bytes",
+                "process_cleanup_status",
+                *_CONTRACT_DIAGNOSTIC_FIELDS,
+                *_GROUPING_DIAGNOSTIC_FIELDS,
+            ):
+                historical.pop(field)
+            audit_path.write_text(json.dumps(historical), encoding="utf-8")
+
+        replay_runner = FakeRunner()
+        with self.assertRaisesRegex(Exception, "未能安全重放"):
+            handoff.execute(
+                representation.representation_id,
+                CodexCliRepresentationAnalysisProvider(
+                    provider_version="0.999.0", runner=replay_runner
+                ),
+            )
+        self.assertEqual(replay_runner.calls, [])
+
+    def test_historical_profiled_package_rejects_package_audit_profile_drift(
+        self,
+    ) -> None:
+        representation, service = self.build_service()
+        audit_root = self.root / "historical-profile-drift-audits"
+        handoff = ExternalAgentSemanticHandoffService(
+            service,
+            JsonlAtomicInformationStore(
+                self.root / "historical-profile-drift-atomic.jsonl"
+            ),
+            audit_root,
+        )
+        first = self.execute_with_global_authority(
+            handoff,
+            representation.representation_id,
+            CodexCliRepresentationAnalysisProvider(
+                provider_version="0.147.0", runner=FakeRunner()
+            ),
+            privacy_binding=self.privacy_binding(),
+            new_call_authority=1,
+        )
+        manifest_path = first.package / "manifest.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest["provider"]["reasoning_effort"] = "high"
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+        package_fingerprint = _package_fingerprint(first.package)
+        audit = json.loads(first.audit_paths[0].read_text(encoding="utf-8"))
+        audit["package_fingerprint"] = package_fingerprint
+        first.audit_paths[0].write_text(json.dumps(audit), encoding="utf-8")
+
+        replay_runner = FakeRunner()
+        with self.assertRaisesRegex(Exception, "未能安全重放"):
+            handoff.execute(
+                representation.representation_id,
+                CodexCliRepresentationAnalysisProvider(
+                    provider_version="0.147.0",
+                    reasoning_effort="high",
+                    runner=replay_runner,
+                ),
+            )
+        self.assertEqual(replay_runner.calls, [])
+
     def test_replay_accepts_literal_name_only_prediagnostics_v1_package(self) -> None:
         representation, service = self.build_service()
         audit_root = self.root / "audits"
@@ -2378,13 +2608,14 @@ class SemanticHandoffTest(unittest.TestCase):
         self.assertEqual(replay_provider.execution_records, [])
 
         changed_runner = FakeRunner()
-        with self.assertRaisesRegex(Exception, "未能安全重放"):
-            handoff.execute(
-                representation.representation_id,
-                CodexCliRepresentationAnalysisProvider(
-                    provider_version="0.148.0", runner=changed_runner
-                ),
-            )
+        changed = handoff.execute(
+            representation.representation_id,
+            CodexCliRepresentationAnalysisProvider(
+                provider_version="0.148.0", runner=changed_runner
+            ),
+        )
+        self.assertTrue(changed.replayed_existing_package)
+        self.assertEqual(changed.ingestion.existing, 1)
         self.assertEqual(changed_runner.calls, [])
 
     def test_wechat_representation_uses_the_production_handoff_and_exact_replay(self) -> None:
@@ -8003,6 +8234,53 @@ print("passed")
         self.assertEqual(replay_runner.calls, [])
         self.assertTrue(replay.replayed_existing_package)
         self.assertEqual(replay.ingestion.created, 3)
+
+    def test_recovery_publish_rejects_package_provider_mismatch(self) -> None:
+        representation, service = self.build_service(blocks=2)
+        audit_root = self.root / "recovery-provider-mismatch-audits"
+        store_path = self.root / "recovery-provider-mismatch-atomic.jsonl"
+        handoff = ExternalAgentSemanticHandoffService(
+            service, JsonlAtomicInformationStore(store_path), audit_root
+        )
+        provider = CodexCliRepresentationAnalysisProvider(
+            provider_version="0.147.0", timeout_seconds=300, runner=FakeRunner()
+        )
+        with (
+            patch.object(
+                ExternalAgentSemanticHandoffService,
+                "_persist_audits",
+                side_effect=OSError("synthetic pre-audit crash"),
+            ),
+            self.assertRaises(OSError),
+        ):
+            self.execute_with_global_authority(
+                handoff,
+                representation.representation_id,
+                provider,
+                privacy_binding=self.privacy_binding(),
+                new_call_authority=1,
+            )
+        package = service.output_root / representation.representation_id
+        manifest_path = package / "manifest.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest["provider"]["reasoning_effort"] = "high"
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+        replay_runner = FakeRunner()
+        with self.assertRaisesRegex(Exception, "未能安全收敛"):
+            self.execute_with_global_authority(
+                handoff,
+                representation.representation_id,
+                CodexCliRepresentationAnalysisProvider(
+                    provider_version="0.147.0",
+                    timeout_seconds=300,
+                    runner=replay_runner,
+                ),
+                privacy_binding=self.privacy_binding(),
+                new_call_authority=0,
+            )
+        self.assertEqual(replay_runner.calls, [])
+        self.assertFalse(store_path.exists())
 
     def test_historical_package_replay_ignores_absent_recovery_receipts(self) -> None:
         representation, service = self.build_service(blocks=2)

@@ -4893,8 +4893,7 @@ def _validate_versioned_processing_run_audit(
 def _versioned_audit_contract(
     protocol_version: str,
     package_provider: object,
-    provider: CodexCliRepresentationAnalysisProvider,
-) -> tuple[frozenset[frozenset[str]], str, bool, str]:
+) -> tuple[frozenset[frozenset[str]], str, bool, str | None]:
     if not isinstance(package_provider, dict) or frozenset(
         package_provider
     ) not in {
@@ -4905,16 +4904,8 @@ def _versioned_audit_contract(
             "已发布的信息包 Provider binding 不可读。"
         )
     profiled = set(package_provider) == _COMPLETED_AUDIT_PROFILE_FIELDS
-    current_provider_version = getattr(provider, "provider_version", None)
     if (
         package_provider.get("name") != "external-agent-codex-cli"
-        or getattr(provider, "name", None) != package_provider.get("name")
-        or not isinstance(current_provider_version, str)
-        or re.fullmatch(
-            r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}",
-            current_provider_version,
-        )
-        is None
     ):
         raise SemanticHandoffError(
             "已发布的信息包缺少唯一 Provider execution binding。"
@@ -4928,20 +4919,7 @@ def _versioned_audit_contract(
             _unprofiled_v1_audit_shapes(),
             DIAGNOSTIC_SCHEMA_V1,
             False,
-            current_provider_version,
-        )
-    if (
-        protocol_version
-        in {
-            EXTERNAL_AGENT_PROTOCOL_V3_1,
-            EXTERNAL_AGENT_PROTOCOL_V3_2,
-            EXTERNAL_AGENT_PROTOCOL_V3_3,
-            EXTERNAL_AGENT_PROTOCOL_V3_4,
-        }
-        and package_provider != _provider_manifest(provider)
-    ):
-        raise SemanticHandoffError(
-            "已发布的信息包 Provider execution profile 已漂移。"
+            None,
         )
     if (
         any(
@@ -4975,7 +4953,6 @@ def _validate_versioned_published_audits(
     expected: dict[tuple[str, ...], str],
     protocol_version: str,
     package_provider: object,
-    provider: CodexCliRepresentationAnalysisProvider,
     package_fingerprint: str,
     completed_only: bool,
 ) -> None:
@@ -4989,16 +4966,35 @@ def _validate_versioned_published_audits(
         profiled,
         expected_provider_version,
     ) = _versioned_audit_contract(
-        protocol_version, package_provider, provider
+        protocol_version, package_provider
     )
     if len(paths) != len(expected):
         raise SemanticHandoffError("已发布的信息包审计集合不完整。")
-    observed: set[tuple[str, ...]] = set()
-    for path in paths:
-        audit = _validate_versioned_processing_run_audit(
+    validated = tuple(
+        (
             path,
-            require_verified_readback=False,
+            _validate_versioned_processing_run_audit(
+                path,
+                require_verified_readback=False,
+            ),
         )
+        for path in paths
+    )
+    if expected_provider_version is None:
+        provider_versions = {
+            audit.get("provider_version") for _, audit in validated
+        }
+        if (
+            len(provider_versions) != 1
+            or not _safe_execution_label(next(iter(provider_versions), None))
+        ):
+            raise SemanticHandoffError(
+                "已发布的信息包缺少唯一 Provider execution binding。"
+            )
+        expected_provider_version = next(iter(provider_versions))
+        assert isinstance(expected_provider_version, str)
+    observed: set[tuple[str, ...]] = set()
+    for path, audit in validated:
         if frozenset(audit) not in expected_shapes:
             raise SemanticHandoffError("已发布的信息包审计字段不精确。")
         has_diagnostics = _AUDIT_DIAGNOSTIC_FIELDS.issubset(audit)
@@ -5143,7 +5139,6 @@ def validate_completed_published_audits(
     manifest: dict[str, object],
     audit_root: Path,
     package_fingerprint: str,
-    provider: CodexCliRepresentationAnalysisProvider,
 ) -> tuple[Path, ...]:
     """Read-only exact validation for completed historical External Agent runs."""
     paths: list[Path] = []
@@ -5212,7 +5207,6 @@ def validate_completed_published_audits(
         expected=expected,
         protocol_version=protocol_version,
         package_provider=manifest.get("provider"),
-        provider=provider,
         package_fingerprint=package_fingerprint,
         completed_only=True,
     )
@@ -5279,14 +5273,12 @@ class ExternalAgentSemanticHandoffService:
                 expected_batches = self._expected_batch_contracts(
                     representation_id,
                     manifest,
-                    provider,
                     protocol_version=protocol_version,
                 )
                 self._validate_replay_audits(
                     audit_paths,
                     expected_batches,
                     manifest,
-                    provider,
                     package_fingerprint,
                     protocol_version=protocol_version,
                 )
@@ -5390,6 +5382,10 @@ class ExternalAgentSemanticHandoffService:
                 if isinstance(analysis_provider, _RecoveryAwareProvider):
                     analysis_provider._close_authority_guard()
             manifest = self._verify_replay_input(representation_id, package)
+            if manifest.get("provider") != _provider_manifest(provider):
+                raise SemanticHandoffError(
+                    "当前信息包 Provider execution profile 不匹配。"
+                )
             package_fingerprint = _package_fingerprint(package)
             records = (
                 analysis_provider.records  # type: ignore[attr-defined]
@@ -5399,7 +5395,6 @@ class ExternalAgentSemanticHandoffService:
             expected_batches = self._expected_batch_contracts(
                 representation_id,
                 manifest,
-                provider,
                 protocol_version=EXTERNAL_AGENT_PROTOCOL_VERSION,
             )
             self._validate_execution_records(records, expected_batches, provider)
@@ -5524,11 +5519,14 @@ class ExternalAgentSemanticHandoffService:
                 )
             records = [item[1] for item in loaded if item is not None]
             manifest = self._verify_replay_input(representation_id, package)
+            if manifest.get("provider") != _provider_manifest(provider):
+                raise SemanticHandoffError(
+                    "当前 recovery 信息包 Provider execution profile 不匹配。"
+                )
             package_fingerprint = _package_fingerprint(package)
             expected_batches = self._expected_batch_contracts(
                 representation_id,
                 manifest,
-                provider,
                 protocol_version=EXTERNAL_AGENT_PROTOCOL_VERSION,
             )
             self._validate_execution_records(records, expected_batches, provider)
@@ -5538,7 +5536,6 @@ class ExternalAgentSemanticHandoffService:
                     audit_paths,
                     expected_batches,
                     manifest,
-                    provider,
                     package_fingerprint,
                     protocol_version=EXTERNAL_AGENT_PROTOCOL_VERSION,
                 )
@@ -5732,7 +5729,6 @@ class ExternalAgentSemanticHandoffService:
         self,
         representation_id: str,
         manifest: dict[str, object],
-        provider: CodexCliRepresentationAnalysisProvider,
         *,
         protocol_version: str,
     ) -> tuple[tuple[tuple[str, ...], str], ...]:
@@ -5740,7 +5736,6 @@ class ExternalAgentSemanticHandoffService:
         _versioned_audit_contract(
             protocol_version,
             package_provider,
-            provider,
         )
         manifest_batches = manifest.get("batches")
         if not isinstance(manifest_batches, list):
@@ -5839,7 +5834,6 @@ class ExternalAgentSemanticHandoffService:
         paths: tuple[Path, ...],
         expected_batches: tuple[tuple[tuple[str, ...], str], ...],
         manifest: dict[str, object],
-        provider: CodexCliRepresentationAnalysisProvider,
         package_fingerprint: str,
         *,
         protocol_version: str,
@@ -5849,7 +5843,6 @@ class ExternalAgentSemanticHandoffService:
             expected=dict(expected_batches),
             protocol_version=protocol_version,
             package_provider=manifest.get("provider"),
-            provider=provider,
             package_fingerprint=package_fingerprint,
             completed_only=False,
         )

@@ -1302,6 +1302,47 @@ class WechatDigestTests(unittest.TestCase):
                 )
                 self.assertEqual(semantic.provider.calls, calls)
 
+    def test_active_v2_upgrade_accepts_nine_current_and_thirty_one_historical_profiles(
+        self,
+    ) -> None:
+        messages = [
+            message(index, conversation=f"conversation_{index}")
+            for index in range(1, 41)
+        ]
+        service, semantic, run_id = self._make_active_v2_processed_run(
+            mode="all_residue",
+            messages=messages,
+            suffix="nine_current_thirty_one_historical",
+            protocol_version=EXTERNAL_AGENT_PROTOCOL_V3_4,
+        )
+        package_root = service.workspace / "02_processing" / "information"
+        audit_root = (
+            service.workspace / "02_processing" / "semantic_handoff_runs"
+        )
+        packages = sorted(path for path in package_root.iterdir() if path.is_dir())
+        self.assertEqual(len(packages), 40)
+        for package in packages[9:]:
+            old_fingerprint = _package_fingerprint(package)
+            manifest_path = package / "manifest.json"
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            manifest["provider"]["provider_version"] = "0.146.0"
+            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+            new_fingerprint = _package_fingerprint(package)
+            matching = []
+            for audit_path in audit_root.glob("*/processing-run-audit.json"):
+                audit = json.loads(audit_path.read_text(encoding="utf-8"))
+                if audit.get("package_fingerprint") == old_fingerprint:
+                    matching.append((audit_path, audit))
+            self.assertEqual(len(matching), 1)
+            audit_path, audit = matching[0]
+            audit["provider_version"] = "0.146.0"
+            audit["package_fingerprint"] = new_fingerprint
+            audit_path.write_text(json.dumps(audit), encoding="utf-8")
+
+        calls = semantic.provider.calls
+        self.assertEqual(service.upgrade_active_v2_all_history(), run_id)
+        self.assertEqual(semantic.provider.calls, calls)
+
     def test_active_v2_upgrade_accepts_pre_diagnostics_v1_audit(self) -> None:
         service, semantic, run_id = self._make_active_v2_processed_run(
             mode="all_candidate",
@@ -1431,7 +1472,11 @@ class WechatDigestTests(unittest.TestCase):
                     protocol_version=(
                         EXTERNAL_AGENT_PROTOCOL_V3_1
                         if case
-                        in {"missing_contract_field", "provider_profile"}
+                        in {
+                            "missing_contract_field",
+                            "provider_profile",
+                            "provider_version",
+                        }
                         else EXTERNAL_AGENT_PROTOCOL_V1
                     ),
                 )

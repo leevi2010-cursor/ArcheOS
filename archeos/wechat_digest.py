@@ -2236,7 +2236,6 @@ class WechatDigestService:
                     / "semantic_handoff_runs"
                 ),
                 package_fingerprint=_package_fingerprint(package),
-                provider=self._semantic_port().provider,
             )
             observed = item.get("atomic_information_ids")
             if (
