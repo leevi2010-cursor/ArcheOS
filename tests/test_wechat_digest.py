@@ -935,8 +935,49 @@ class FailAfterPersistedBatchProgressOnceService(WechatDigestService):
         return result
 
 
+class FailBeforePersistedBatchProgressOnceService(WechatDigestService):
+    fail_progress = True
+
+    def _update_item(self, run_id, status, item_id, **changes):
+        receipt = changes.get("governance_receipt")
+        if (
+            self.fail_progress
+            and isinstance(receipt, dict)
+            and receipt.get("phase") == "applying"
+            and receipt.get("next_index") == 1
+            and receipt.get("in_flight_index") is None
+        ):
+            self.fail_progress = False
+            raise OSError("synthetic pre-persist progress interruption")
+        return super()._update_item(run_id, status, item_id, **changes)
+
+
 class SharedObjectInterruptedBatchService(
     FailAfterPersistedBatchProgressOnceService
+):
+    shared_bindings_installed = False
+    shared_object_id: str
+
+    def _govern(self, atomic_ids):
+        if not self.shared_bindings_installed:
+            self.shared_bindings_installed = True
+            for atomic_id in atomic_ids:
+                current = self.information_store.get_current(atomic_id)
+                next_revision = current.revision_number + 1
+                self.information_store.append_revision(
+                    replace(
+                        current,
+                        revision_number=next_revision,
+                        revision_id=f"{atomic_id}-r{next_revision:04d}",
+                        related_object_ids=(self.shared_object_id,),
+                        revision_reason="synthetic_shared_object_binding",
+                    )
+                )
+        return super()._govern(atomic_ids)
+
+
+class SharedObjectPreCursorBatchService(
+    FailBeforePersistedBatchProgressOnceService
 ):
     shared_bindings_installed = False
     shared_object_id: str
@@ -1059,6 +1100,38 @@ class WechatDigestTests(unittest.TestCase):
         self.assertEqual(provider.calls, 1)
         return service, provider, receipt, object_id
 
+    def interrupted_shared_object_batch_before_cursor(
+        self,
+    ) -> tuple[
+        WechatDigestService,
+        SharedObjectBatchProvider,
+        dict[str, object],
+        str,
+    ]:
+        object_id = self.create_object()
+        provider = SharedObjectBatchProvider(object_id)
+        service = SharedObjectPreCursorBatchService(
+            workspace=self.workspace,
+            capture_provider=SyntheticCaptureProvider([message(1), message(2)]),
+            semantic_handoff_factory=lambda: self.semantic,
+            interpretation_provider=provider,
+        )
+        service.shared_object_id = object_id
+        with self.assertRaises(WechatDigestError):
+            service.run(all_history=True)
+        run_id = service.run_store.active_run_id()
+        assert run_id is not None
+        receipt = next(
+            item["governance_receipt"]
+            for item in service.run_store.status(run_id)["items"].values()
+            if isinstance(item, dict) and "governance_receipt" in item
+        )
+        self.assertEqual(receipt["phase"], "applying")
+        self.assertEqual(receipt["next_index"], 0)
+        self.assertEqual(receipt["in_flight_index"], 0)
+        self.assertEqual(provider.calls, 1)
+        return service, provider, receipt, object_id
+
     @staticmethod
     def append_information_drift(
         service: WechatDigestService, atomic_information_id: str
@@ -1075,6 +1148,42 @@ class WechatDigestTests(unittest.TestCase):
                 revision_reason="synthetic_resume_drift",
             )
         )
+
+    @staticmethod
+    def governance_business_state(service: WechatDigestService):
+        information = tuple(
+            revision
+            for current in service.information_store.list_atomic_information()
+            for revision in service.information_store.list_revisions(
+                current.atomic_information_id
+            )
+        )
+        with SQLiteWorldModelRepository(service.database) as repository:
+            objects = repository.list_objects()
+            return (
+                information,
+                service.proposal_store.list_history(),
+                service.journal.list_changes(),
+                objects,
+                tuple(
+                    item
+                    for record in objects
+                    for item in repository.list_names(record.object_id)
+                ),
+                tuple(
+                    item
+                    for record in objects
+                    for item in repository.list_roles(record.object_id)
+                ),
+                tuple(
+                    item
+                    for record in objects
+                    for item in repository.list_lifecycles(record.object_id)
+                ),
+                repository.list_relationships(active_only=False),
+                repository.list_external_identity_mappings(),
+                repository.list_apply_receipts(),
+            )
 
     def source_count(self) -> int:
         return len(
@@ -1782,6 +1891,41 @@ class WechatDigestTests(unittest.TestCase):
             service.run()
 
         self.assertEqual(provider.calls, 1)
+
+    def test_pre_cursor_recovery_converges_from_durable_apply_receipt(
+        self,
+    ) -> None:
+        service, provider, _receipt, _object_id = (
+            self.interrupted_shared_object_batch_before_cursor()
+        )
+        business_before = self.governance_business_state(service)
+
+        result = service.run()
+
+        self.assertTrue(result.replayed)
+        self.assertTrue(result.checkpoint_published)
+        self.assertEqual(provider.calls, 1)
+        self.assertEqual(
+            self.governance_business_state(service), business_before
+        )
+
+    def test_pre_cursor_recovery_rejects_unproven_extra_drift_before_write(
+        self,
+    ) -> None:
+        service, provider, _receipt, object_id = (
+            self.interrupted_shared_object_batch_before_cursor()
+        )
+        with SQLiteWorldModelRepository(service.database) as repository:
+            repository.add_role(object_id, "brand")
+        business_before = self.governance_business_state(service)
+
+        with self.assertRaisesRegex(WechatDigestError, "effect/cursor"):
+            service.run()
+
+        self.assertEqual(provider.calls, 1)
+        self.assertEqual(
+            self.governance_business_state(service), business_before
+        )
 
     def test_mid_apply_recovery_rejects_applied_prefix_drift_without_provider(
         self,

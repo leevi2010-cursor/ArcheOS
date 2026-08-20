@@ -1429,7 +1429,9 @@ def _validated_governance_receipt(value: object) -> dict[str, object]:
             "next_index",
             "baseline_effect_fingerprints",
             "cursor_effect_fingerprints",
+            "cursor_effect_snapshots",
             "applied_effect_fingerprints",
+            "in_flight_index",
             "pending_human",
             "context_object_ids",
         }
@@ -1457,7 +1459,9 @@ def _validated_governance_receipt(value: object) -> dict[str, object]:
     next_index = value.get("next_index")
     baseline_effect_fingerprints = value.get("baseline_effect_fingerprints")
     cursor_effect_fingerprints = value.get("cursor_effect_fingerprints")
+    cursor_effect_snapshots = value.get("cursor_effect_snapshots")
     applied_effect_fingerprints = value.get("applied_effect_fingerprints")
+    in_flight_index = value.get("in_flight_index")
     batch_fingerprint = value.get("batch_fingerprint")
     if (
         not isinstance(atomic_ids, list)
@@ -1479,10 +1483,27 @@ def _validated_governance_receipt(value: object) -> dict[str, object]:
         or any(
             not _sha256_value(item) for item in cursor_effect_fingerprints
         )
+        or not isinstance(cursor_effect_snapshots, list)
+        or len(cursor_effect_snapshots) != len(atomic_ids)
+        or any(not isinstance(item, dict) for item in cursor_effect_snapshots)
+        or [
+            _sha256_bytes(_canonical_json(item).encode("utf-8"))
+            for item in cursor_effect_snapshots
+        ]
+        != cursor_effect_fingerprints
         or not isinstance(applied_effect_fingerprints, list)
         or len(applied_effect_fingerprints) != next_index
         or any(
             not _sha256_value(item) for item in applied_effect_fingerprints
+        )
+        or (
+            in_flight_index is not None
+            and (
+                isinstance(in_flight_index, bool)
+                or not isinstance(in_flight_index, int)
+                or in_flight_index != next_index
+                or not 0 <= in_flight_index < len(atomic_ids)
+            )
         )
         or not isinstance(value.get("pending_human"), bool)
         or not isinstance(object_ids, list)
@@ -1502,7 +1523,9 @@ def _validated_governance_receipt(value: object) -> dict[str, object]:
         atomic_ids, interpretations
     ):
         raise WechatDigestError("微信 Governance receipt batch binding 不一致。")
-    if phase == "interpreted" and next_index != 0:
+    if phase == "interpreted" and (
+        next_index != 0 or in_flight_index is not None
+    ):
         raise WechatDigestError("微信 Governance receipt 进度损坏。")
     if (
         next_index == 0
@@ -1511,9 +1534,14 @@ def _validated_governance_receipt(value: object) -> dict[str, object]:
         raise WechatDigestError("微信 Governance receipt effect cursor 损坏。")
     if applied_effect_fingerprints != cursor_effect_fingerprints[:next_index]:
         raise WechatDigestError("微信 Governance receipt effect cursor 损坏。")
-    if phase == "applying" and not 0 < next_index < len(atomic_ids):
+    if phase == "applying" and not (
+        0 <= next_index < len(atomic_ids)
+        and (next_index > 0 or in_flight_index == 0)
+    ):
         raise WechatDigestError("微信 Governance receipt 进度损坏。")
-    if phase in {"applied", "completed"} and next_index != len(atomic_ids):
+    if phase in {"applied", "completed"} and (
+        next_index != len(atomic_ids) or in_flight_index is not None
+    ):
         raise WechatDigestError("微信 Governance receipt 进度损坏。")
     return dict(value)
 
@@ -2130,12 +2158,13 @@ class WechatDigestService:
                 tuple[InterpretationResult, ...],
                 bool,
                 tuple[str, ...],
-                tuple[str, ...],
+                tuple[dict[str, object], ...],
             ],
             None,
         ] | None = None
+        self._before_governance_application: Callable[[int], None] | None = None
         self._after_governance_application: Callable[
-            [int, bool, tuple[str, ...], tuple[str, ...]], None
+            [int, bool, tuple[str, ...], tuple[dict[str, object], ...]], None
         ] | None = None
         if isinstance(semantic_batch_size, bool) or not isinstance(semantic_batch_size, int) or semantic_batch_size < 1:
             raise ValueError("semantic batch size must be positive")
@@ -2561,7 +2590,7 @@ class WechatDigestService:
                 matched.append(asdict(receipt))
         return tuple(matched)
 
-    def _governance_effect_binding(
+    def _governance_effect_snapshot(
         self,
         repository: SQLiteWorldModelRepository,
         atomic_id: str,
@@ -2639,6 +2668,19 @@ class WechatDigestService:
             "apply_receipts": apply_receipts,
             "world_projection": world_projection,
         }
+        return payload
+
+    def _governance_effect_binding(
+        self,
+        repository: SQLiteWorldModelRepository,
+        atomic_id: str,
+    ) -> dict[str, object]:
+        payload = self._governance_effect_snapshot(repository, atomic_id)
+        revisions = tuple(payload["revisions"])
+        proposals = tuple(payload["proposal_history"])
+        journal = tuple(payload["journal"])
+        apply_receipts = tuple(payload["apply_receipts"])
+        world_projection = payload["world_projection"]
         return {
             "atomic_information_id": atomic_id,
             "current_revision_fingerprint": _sha256_bytes(
@@ -2668,6 +2710,25 @@ class WechatDigestService:
             ),
         }
 
+    def _governance_effect_snapshots(
+        self,
+        repository: SQLiteWorldModelRepository,
+        atomic_ids: Sequence[str],
+    ) -> tuple[dict[str, object], ...]:
+        return tuple(
+            self._governance_effect_snapshot(repository, atomic_id)
+            for atomic_id in atomic_ids
+        )
+
+    @staticmethod
+    def _governance_snapshot_fingerprints(
+        snapshots: Sequence[Mapping[str, object]],
+    ) -> tuple[str, ...]:
+        return tuple(
+            _sha256_bytes(_canonical_json(snapshot).encode("utf-8"))
+            for snapshot in snapshots
+        )
+
     def _governance_effect_fingerprints(
         self,
         repository: SQLiteWorldModelRepository,
@@ -2693,11 +2754,352 @@ class WechatDigestService:
         batch_ids = tuple(receipt["batch_atomic_information_ids"])
         expected = tuple(receipt["cursor_effect_fingerprints"])
         with SQLiteWorldModelRepository(self.database) as repository:
-            current = self._governance_effect_fingerprints(repository, batch_ids)
-        if current != expected:
+            current_snapshots = self._governance_effect_snapshots(
+                repository, batch_ids
+            )
+        current = self._governance_snapshot_fingerprints(current_snapshots)
+        if current == expected:
+            return
+        if not self._governance_in_flight_effect_is_proven(
+            receipt, current_snapshots
+        ):
             raise WechatDigestError(
                 "微信 Governance receipt effect/cursor binding 漂移。"
             )
+
+    @staticmethod
+    def _snapshot_sequence(value: object) -> tuple[dict[str, object], ...]:
+        if not isinstance(value, (list, tuple)) or any(
+            not isinstance(item, dict) for item in value
+        ):
+            raise WechatDigestError("微信 Governance recovery evidence 损坏。")
+        return tuple(dict(item) for item in value)
+
+    @staticmethod
+    def _snapshot_world_rows(
+        snapshots: Sequence[Mapping[str, object]],
+    ) -> dict[str, dict[str, dict[str, object]]]:
+        keys = {
+            "objects": "object_id",
+            "names": "name_assignment_id",
+            "roles": "role_assignment_id",
+            "lifecycles": "lifecycle_record_id",
+            "relationships": "relationship_id",
+            "external_identity_mappings": "identity_key",
+        }
+        collected = {name: {} for name in keys}
+        for snapshot in snapshots:
+            projection = snapshot.get("world_projection")
+            if not isinstance(projection, dict):
+                raise WechatDigestError(
+                    "微信 Governance recovery evidence 损坏。"
+                )
+            for name, key in keys.items():
+                rows = projection.get(name)
+                if not isinstance(rows, (list, tuple)):
+                    raise WechatDigestError(
+                        "微信 Governance recovery evidence 损坏。"
+                    )
+                for raw in rows:
+                    if not isinstance(raw, dict) or not isinstance(
+                        raw.get(key), str
+                    ):
+                        raise WechatDigestError(
+                            "微信 Governance recovery evidence 损坏。"
+                        )
+                    identity = str(raw[key])
+                    row = dict(raw)
+                    existing = collected[name].get(identity)
+                    if existing is not None and existing != row:
+                        raise WechatDigestError(
+                            "微信 Governance recovery evidence 冲突。"
+                        )
+                    collected[name][identity] = row
+        return collected
+
+    def _governance_in_flight_effect_is_proven(
+        self,
+        receipt: Mapping[str, object],
+        current_snapshots: Sequence[Mapping[str, object]],
+    ) -> bool:
+        # A cursor may lag one committed item; accept only receipt-proven deltas.
+        in_flight_index = receipt.get("in_flight_index")
+        if not isinstance(in_flight_index, int) or isinstance(
+            in_flight_index, bool
+        ):
+            return False
+        baseline_snapshots = receipt.get("cursor_effect_snapshots")
+        batch_ids = receipt.get("batch_atomic_information_ids")
+        interpretations = receipt.get("interpretations")
+        if (
+            not isinstance(baseline_snapshots, list)
+            or not isinstance(batch_ids, list)
+            or not isinstance(interpretations, list)
+            or len(baseline_snapshots) != len(current_snapshots)
+            or not 0 <= in_flight_index < len(batch_ids)
+        ):
+            return False
+        atomic_id = batch_ids[in_flight_index]
+        if not isinstance(atomic_id, str):
+            return False
+        try:
+            interpretation = parse_interpretation(
+                interpretations[in_flight_index]
+            )
+            interpretation_fingerprint = (
+                AtomicInformationDigestionService._interpretation_fingerprint(
+                    interpretation
+                )
+            )
+            baseline = tuple(
+                dict(snapshot) for snapshot in baseline_snapshots
+            )
+            current = tuple(
+                json.loads(_canonical_json(snapshot))
+                for snapshot in current_snapshots
+            )
+            for index, (before, after) in enumerate(
+                zip(baseline, current, strict=True)
+            ):
+                for name in (
+                    "revisions",
+                    "proposal_history",
+                    "journal",
+                    "apply_receipts",
+                ):
+                    before_rows = self._snapshot_sequence(before.get(name))
+                    after_rows = self._snapshot_sequence(after.get(name))
+                    if after_rows[: len(before_rows)] != before_rows:
+                        return False
+                    if index != in_flight_index and after_rows != before_rows:
+                        return False
+
+            before_in_flight = baseline[in_flight_index]
+            after_in_flight = current[in_flight_index]
+            before_receipts = self._snapshot_sequence(
+                before_in_flight.get("apply_receipts")
+            )
+            after_receipts = self._snapshot_sequence(
+                after_in_flight.get("apply_receipts")
+            )
+            added_receipts = after_receipts[len(before_receipts) :]
+            if not added_receipts:
+                return False
+
+            receipt_records: list[dict[str, object]] = []
+            created_object_ids: set[str] = set()
+            for apply_receipt in added_receipts:
+                payload = json.loads(str(apply_receipt.get("payload")))
+                records = payload.get("records")
+                created = payload.get("created_object_ids")
+                if (
+                    not isinstance(records, list)
+                    or not records
+                    or not isinstance(created, list)
+                    or any(not isinstance(item, str) for item in created)
+                    or any(
+                        not isinstance(record, dict)
+                        or record.get("atomic_information_id") != atomic_id
+                        for record in records
+                    )
+                ):
+                    return False
+                receipt_records.extend(dict(record) for record in records)
+                created_object_ids.update(created)
+
+            interpretation_operations = {
+                operation.kind for operation in interpretation.operations
+            }
+            identity_operations = {"bind_existing", "create_minimal"}
+            if any(
+                record.get("operation") not in (
+                    interpretation_operations | identity_operations
+                )
+                or (
+                    record.get("operation") not in identity_operations
+                    and record.get("interpretation_fingerprint")
+                    != interpretation_fingerprint
+                )
+                for record in receipt_records
+            ):
+                return False
+
+            before_journal = self._snapshot_sequence(
+                before_in_flight.get("journal")
+            )
+            after_journal = self._snapshot_sequence(
+                after_in_flight.get("journal")
+            )
+            added_journal = after_journal[len(before_journal) :]
+            receipt_change_ids = {
+                record.get("change_id") for record in receipt_records
+            }
+            if any(
+                record.get("atomic_information_id") != atomic_id
+                or (
+                    record.get("change_id") not in receipt_change_ids
+                    and not (
+                        record.get("operation") == "bind_atomic_information"
+                        and record.get("interpretation_fingerprint")
+                        == interpretation_fingerprint
+                    )
+                )
+                for record in added_journal
+            ):
+                return False
+            if not receipt_change_ids.issubset(
+                {record.get("change_id") for record in added_journal}
+            ):
+                return False
+
+            before_revisions = self._snapshot_sequence(
+                before_in_flight.get("revisions")
+            )
+            after_revisions = self._snapshot_sequence(
+                after_in_flight.get("revisions")
+            )
+            allowed_revision_reasons = {
+                "identity_gate_bind_existing",
+                "identity_gate_create_minimal",
+                "object_binding",
+                "claim_enrichment",
+                "claim_enrichment_and_object_binding",
+            }
+            if any(
+                revision.get("atomic_information_id") != atomic_id
+                or revision.get("revision_reason")
+                not in allowed_revision_reasons
+                for revision in after_revisions[len(before_revisions) :]
+            ):
+                return False
+            if self._snapshot_sequence(
+                after_in_flight.get("proposal_history")
+            ) != self._snapshot_sequence(
+                before_in_flight.get("proposal_history")
+            ):
+                return False
+
+            before_world = self._snapshot_world_rows(baseline)
+            after_world = self._snapshot_world_rows(current)
+            operation_by_kind = {
+                operation.kind: operation for operation in interpretation.operations
+            }
+            for collection, before_rows in before_world.items():
+                after_rows = after_world[collection]
+                if any(identity not in after_rows for identity in before_rows):
+                    return False
+                changed = {
+                    identity: row
+                    for identity, row in after_rows.items()
+                    if before_rows.get(identity) != row
+                }
+                for identity, row in changed.items():
+                    previous = before_rows.get(identity)
+                    if collection == "roles":
+                        add = operation_by_kind.get("add_role")
+                        end = operation_by_kind.get("end_role")
+                        if previous is None:
+                            if (
+                                add is None
+                                or row.get("object_id") != add.target_object_id
+                                or row.get("role") != add.role
+                                or row.get("source_atomic_information_id")
+                                != atomic_id
+                            ):
+                                return False
+                        elif (
+                            end is None
+                            or row.get("object_id") != end.target_object_id
+                            or row.get("role") != end.role
+                            or previous.get("valid_to") is not None
+                            or row.get("valid_to") is None
+                        ):
+                            return False
+                    elif collection == "objects":
+                        delete = operation_by_kind.get("delete_object")
+                        if previous is None:
+                            if identity not in created_object_ids:
+                                return False
+                        elif delete is not None and identity == delete.target_object_id:
+                            if row.get("status") != "deleted":
+                                return False
+                        else:
+                            affected_object_ids = {
+                                candidate
+                                for operation in interpretation.operations
+                                for candidate in (
+                                    operation.target_object_id,
+                                    operation.secondary_object_id,
+                                )
+                                if candidate is not None
+                            }
+                            stable_before = dict(previous)
+                            stable_after = dict(row)
+                            stable_before.pop("updated_at", None)
+                            stable_after.pop("updated_at", None)
+                            if (
+                                identity not in affected_object_ids
+                                or stable_before != stable_after
+                            ):
+                                return False
+                    elif collection == "names":
+                        rename = operation_by_kind.get("rename")
+                        if previous is None:
+                            if (
+                                row.get("object_id") not in created_object_ids
+                                and (
+                                    rename is None
+                                    or row.get("object_id")
+                                    != rename.target_object_id
+                                    or row.get("name") != rename.name
+                                )
+                            ):
+                                return False
+                        elif (
+                            rename is None
+                            or row.get("object_id") != rename.target_object_id
+                            or previous.get("valid_to") is not None
+                            or row.get("valid_to") is None
+                        ):
+                            return False
+                    elif collection == "lifecycles":
+                        lifecycle = operation_by_kind.get("set_lifecycle")
+                        if (
+                            lifecycle is None
+                            or row.get("object_id")
+                            != lifecycle.target_object_id
+                        ):
+                            return False
+                    elif collection == "relationships":
+                        create = operation_by_kind.get("create_relationship")
+                        end = operation_by_kind.get("end_relationship")
+                        if previous is None:
+                            if (
+                                create is None
+                                or row.get("from_object_id")
+                                != create.target_object_id
+                                or row.get("to_object_id")
+                                != create.secondary_object_id
+                                or row.get("relation") != create.relation
+                                or row.get("source_atomic_information_id")
+                                != atomic_id
+                            ):
+                                return False
+                        elif (
+                            end is None
+                            or identity != end.relationship_id
+                            or previous.get("valid_to") is not None
+                            or row.get("valid_to") is None
+                        ):
+                            return False
+                    elif collection == "external_identity_mappings":
+                        if previous is not None or row.get(
+                            "object_id"
+                        ) not in created_object_ids:
+                            return False
+            return True
+        except (KeyError, TypeError, ValueError, WechatDigestError):
+            return False
 
     def _governance_business_tree_fingerprint(
         self, repository: SQLiteWorldModelRepository
@@ -5740,7 +6142,7 @@ class WechatDigestService:
                         interpretations,
                         pending,
                         tuple(sorted(affected)),
-                        self._governance_effect_fingerprints(
+                        self._governance_effect_snapshots(
                             repository, batch_ids
                         ),
                     )
@@ -5765,6 +6167,8 @@ class WechatDigestService:
             )
             retriever = BoundedInformationCandidateRetriever()
             for index in range(start_index, len(batch_ids)):
+                if self._before_governance_application is not None:
+                    self._before_governance_application(index)
                 atomic_id = batch_ids[index]
                 identity_pending = False
                 current = self.information_store.get_current(atomic_id)
@@ -5812,7 +6216,7 @@ class WechatDigestService:
                             index + 1,
                             pending,
                             tuple(sorted(affected)),
-                            self._governance_effect_fingerprints(
+                            self._governance_effect_snapshots(
                                 repository, batch_ids
                             ),
                         )
@@ -5828,7 +6232,7 @@ class WechatDigestService:
                         index + 1,
                         pending,
                         tuple(sorted(affected)),
-                        self._governance_effect_fingerprints(
+                        self._governance_effect_snapshots(
                             repository, batch_ids
                         ),
                     )
@@ -5978,9 +6382,17 @@ class WechatDigestService:
             interpretations: tuple[InterpretationResult, ...],
             pending: bool,
             object_ids: tuple[str, ...],
-            baseline_effect_fingerprints: tuple[str, ...],
+            baseline_effect_snapshots: tuple[dict[str, object], ...],
         ) -> None:
             nonlocal batch_persisted, latest_batch_receipt
+            baseline_effect_fingerprints = (
+                self._governance_snapshot_fingerprints(
+                    baseline_effect_snapshots
+                )
+            )
+            serialized_effect_snapshots = json.loads(
+                _canonical_json(baseline_effect_snapshots)
+            )
             serialized = [
                 interpretation_to_dict(interpretation)
                 for interpretation in interpretations
@@ -6001,7 +6413,9 @@ class WechatDigestService:
                 "cursor_effect_fingerprints": list(
                     baseline_effect_fingerprints
                 ),
+                "cursor_effect_snapshots": serialized_effect_snapshots,
                 "applied_effect_fingerprints": [],
+                "in_flight_index": None,
                 "pending_human": pending,
                 "context_object_ids": sorted(set(object_ids)),
             }
@@ -6013,11 +6427,37 @@ class WechatDigestService:
             )
             batch_persisted = True
 
+        def persist_application_intent(index: int) -> None:
+            nonlocal latest_batch_receipt
+            if latest_batch_receipt is None:
+                raise WechatDigestError(
+                    "微信 Governance batch result 尚未持久化。"
+                )
+            if (
+                latest_batch_receipt["next_index"] != index
+                or latest_batch_receipt["in_flight_index"] not in {None, index}
+            ):
+                raise WechatDigestError(
+                    "微信 Governance apply intent cursor 不一致。"
+                )
+            latest_batch_receipt = {
+                **latest_batch_receipt,
+                "phase": "applying",
+                "in_flight_index": index,
+            }
+            _validated_governance_receipt(latest_batch_receipt)
+            self._update_item(
+                run_id,
+                status,
+                item_id,
+                governance_receipt=latest_batch_receipt,
+            )
+
         def persist_application_progress(
             next_index: int,
             pending: bool,
             object_ids: tuple[str, ...],
-            cursor_effect_fingerprints: tuple[str, ...],
+            cursor_effect_snapshots: tuple[dict[str, object], ...],
         ) -> None:
             nonlocal latest_batch_receipt
             if latest_batch_receipt is None:
@@ -6025,12 +6465,21 @@ class WechatDigestService:
                     "微信 Governance batch result 尚未持久化。"
                 )
             batch_ids = latest_batch_receipt["batch_atomic_information_ids"]
+            cursor_effect_fingerprints = (
+                self._governance_snapshot_fingerprints(
+                    cursor_effect_snapshots
+                )
+            )
+            serialized_effect_snapshots = json.loads(
+                _canonical_json(cursor_effect_snapshots)
+            )
             previous_effects = latest_batch_receipt[
                 "applied_effect_fingerprints"
             ]
             if (
                 len(previous_effects) != next_index - 1
                 or len(cursor_effect_fingerprints) != len(batch_ids)
+                or latest_batch_receipt["in_flight_index"] != next_index - 1
             ):
                 raise WechatDigestError(
                     "微信 Governance apply effect cursor 不一致。"
@@ -6046,6 +6495,8 @@ class WechatDigestService:
                 "cursor_effect_fingerprints": list(
                     cursor_effect_fingerprints
                 ),
+                "cursor_effect_snapshots": serialized_effect_snapshots,
+                "in_flight_index": None,
                 "pending_human": pending,
                 "context_object_ids": sorted(set(object_ids)),
             }
@@ -6068,11 +6519,13 @@ class WechatDigestService:
         previous_resume_state = self._governance_resume_state
         previous_migration_state = self._governance_migration_state
         previous_batch_hook = self._after_governance_batch_interpretation
+        previous_intent_hook = self._before_governance_application
         previous_progress_hook = self._after_governance_application
         self._before_governance_provider_call = mark_provider_started
         self._governance_resume_state = resume_state
         self._governance_migration_state = migration_state
         self._after_governance_batch_interpretation = persist_batch_interpretation
+        self._before_governance_application = persist_application_intent
         self._after_governance_application = persist_application_progress
         try:
             outcome = self._govern(atomic_ids)
@@ -6093,6 +6546,7 @@ class WechatDigestService:
             self._governance_resume_state = previous_resume_state
             self._governance_migration_state = previous_migration_state
             self._after_governance_batch_interpretation = previous_batch_hook
+            self._before_governance_application = previous_intent_hook
             self._after_governance_application = previous_progress_hook
             elapsed_ms = max(0, (time.monotonic_ns() - started) // 1_000_000)
             metrics = (
