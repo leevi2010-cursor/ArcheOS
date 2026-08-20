@@ -111,6 +111,48 @@ class CliTest(unittest.TestCase):
     @patch("archeos.cli.WechatDigestService")
     @patch("archeos.cli.WechatCliCaptureProvider")
     @patch("archeos.cli.require_workspace")
+    def test_wechat_digest_resolves_timeout_212_with_zero_call_summary(
+        self,
+        require_workspace: Mock,
+        capture_provider: Mock,
+        digest_service: Mock,
+    ) -> None:
+        require_workspace.return_value = WorkspaceConfig(
+            Path("/workspace"), Path("/config")
+        )
+        digest_service.return_value.resolve_semantic_timeout_212.return_value = {
+            "continuation": {"next_global_ordinal": 213},
+            "resolution_receipt_fingerprint": "sha256:" + "f" * 64,
+        }
+        authority = Path("/private/timeout-212-authority.json")
+        output = StringIO()
+        with redirect_stdout(output):
+            result = main(
+                [
+                    "wechat",
+                    "digest",
+                    "--resolve-semantic-timeout-212",
+                    "--semantic-timeout-212-authority-file",
+                    str(authority),
+                ]
+            )
+        self.assertEqual(result, 0)
+        payload = json.loads(output.getvalue())
+        self.assertEqual(payload["semantic_provider_calls"], 0)
+        self.assertEqual(payload["governance_provider_calls"], 0)
+        self.assertEqual(payload["global_attempt_total"], 212)
+        self.assertEqual(payload["global_unknown"], 0)
+        self.assertEqual(payload["next_global_ordinal"], 213)
+        self.assertEqual(payload["remaining"], 788)
+        digest_service.return_value.resolve_semantic_timeout_212.assert_called_once_with(
+            authority_manifest_file=authority
+        )
+        digest_service.return_value.run.assert_not_called()
+        capture_provider.assert_called_once()
+
+    @patch("archeos.cli.WechatDigestService")
+    @patch("archeos.cli.WechatCliCaptureProvider")
+    @patch("archeos.cli.require_workspace")
     def test_wechat_digest_seals_governance_timeout_with_zero_call_summary(
         self,
         require_workspace: Mock,

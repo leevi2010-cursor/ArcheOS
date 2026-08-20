@@ -2215,6 +2215,251 @@ class SemanticHandoffTest(unittest.TestCase):
             manifest_path,
         )
 
+    def build_ordinal_212_timeout_fixture(self, root: Path):
+        import archeos.semantic_handoff as handoff_module
+
+        (
+            failed,
+            _provider,
+            window_166,
+            _failed_representation,
+            digest_166,
+            manifest_166,
+        ) = self.build_ordinal_166_unknown_fixture(root)
+        provider = CodexCliRepresentationAnalysisProvider(
+            provider_version="0.147.0",
+            timeout_seconds=300,
+            runner=FakeRunner(),
+        )
+        failed.resolve_unknown(
+            provider,
+            authority_manifest_file=manifest_166,
+            reviewed_git_head="8" * 40,
+            digest_binding=digest_166,
+            commit_failed_closed_status=lambda _resolution_id: (
+                "sha256:" + "a" * 64,
+                digest_166,
+            ),
+        )
+        window_167 = replace(window_166, reviewed_git_head="8" * 40)
+        latest = failed
+        for ordinal in range(167, 177):
+            item_root = root / f"ordinal-{ordinal:04d}"
+            representation, service = self.build_service(
+                root=item_root,
+                source_id=f"src_{ordinal:032x}",
+            )
+            latest = ExternalAgentSemanticHandoffService(
+                service,
+                JsonlAtomicInformationStore(item_root / "atomic.jsonl"),
+                failed.audit_root,
+            )
+            latest.execute(
+                representation.representation_id,
+                CodexCliRepresentationAnalysisProvider(
+                    provider_version="0.147.0",
+                    timeout_seconds=300,
+                    runner=FakeRunner(),
+                ),
+                privacy_binding=self.privacy_binding(),
+                authority_binding=window_167,
+            )
+        maintenance = latest.install_maintenance_continuation(
+            provider,
+            window_binding=window_167,
+            reviewed_git_head="9" * 40,
+            authority_ref=(
+                "https://github.com/leevi2010-cursor/ArcheOS/issues/127"
+                "#issuecomment-1234567890"
+            ),
+        )
+        window_177 = replace(window_167, reviewed_git_head="9" * 40)
+        timeout_handoff = None
+        timeout_representation = None
+        timeout_provider = None
+        for ordinal in range(177, 213):
+            item_root = root / f"ordinal-{ordinal:04d}"
+            representation, service = self.build_service(
+                root=item_root,
+                source_id=f"src_{ordinal:032x}",
+                blocks=3 if ordinal == 212 else 1,
+            )
+            runner = FakeRunner("timeout" if ordinal == 212 else "valid")
+            candidate = ExternalAgentSemanticHandoffService(
+                service,
+                JsonlAtomicInformationStore(item_root / "atomic.jsonl"),
+                failed.audit_root,
+            )
+            call_provider = CodexCliRepresentationAnalysisProvider(
+                provider_version="0.147.0",
+                timeout_seconds=300,
+                runner=runner,
+            )
+            if ordinal == 212:
+                with self.assertRaises(SemanticHandoffError):
+                    candidate.execute(
+                        representation.representation_id,
+                        call_provider,
+                        privacy_binding=self.privacy_binding(),
+                        authority_binding=window_177,
+                    )
+                timeout_handoff = candidate
+                timeout_representation = representation
+                timeout_provider = call_provider
+            else:
+                candidate.execute(
+                    representation.representation_id,
+                    call_provider,
+                    privacy_binding=self.privacy_binding(),
+                    authority_binding=window_177,
+                )
+        assert (
+            timeout_handoff is not None
+            and timeout_representation is not None
+            and timeout_provider is not None
+        )
+        authority = handoff_module._SemanticGlobalAuthority(
+            timeout_handoff.audit_root
+        )
+        base = authority._read_base_grant()
+        extension = authority._read_extension(base)
+        resolution = authority._read_unknown_resolution()
+        continuation = authority._read_maintenance_continuation(
+            base, extension, resolution
+        )
+        previous = authority._effective_authority(
+            base, extension, resolution, continuation
+        )
+        attempts, unknown = authority._global_attempts(previous)
+        self.assertTrue(unknown)
+        self.assertEqual(attempts[-1]["global_ordinal"], 212)
+        attempt = attempts[-1]
+        run_payload = json.loads(
+            (
+                timeout_handoff.audit_root
+                / attempt["semantic_run_id"]
+                / "run-receipt.json"
+            ).read_text(encoding="utf-8")
+        )
+        batch = run_payload["batches"][attempt["batch_ordinal"] - 1]
+        audit_path, audit = authority._matching_timeout_212_audit(
+            run_payload=run_payload,
+            batch_receipt=batch,
+        )
+        diagnostic_path = (
+            timeout_provider.diagnostic_root
+            / audit["processing_run_id"]
+            / "metadata.json"
+        )
+        digest = {
+            "run_id": attempt["window"]["window_run_id"],
+            "plan_fingerprint": attempt["window"][
+                "window_plan_fingerprint"
+            ],
+            "plan_receipt_fingerprint": attempt["window"][
+                "window_plan_receipt_fingerprint"
+            ],
+            "item_id": "conversation:synthetic-212",
+            "source_id": timeout_representation.source_id,
+            "representation_id": timeout_representation.representation_id,
+            "representation_manifest": (
+                timeout_representation.to_manifest_dict()
+            ),
+            "representation_artifact_inventory_fingerprint": (
+                _canonical_fingerprint(
+                    [
+                        {
+                            "artifact_id": artifact.artifact_id,
+                            "content_hash": artifact.content_hash,
+                        }
+                        for artifact in timeout_representation.artifacts
+                    ]
+                )
+            ),
+        }
+        payload = {
+            "schema_version": (
+                "semantic-handoff-timeout-212-resolution-authority/1.0"
+            ),
+            "artifact_kind": (
+                "semantic_handoff_timeout_212_resolution_authority"
+            ),
+            "authority_ref": (
+                "https://github.com/leevi2010-cursor/ArcheOS/issues/133"
+                "#issuecomment-1234567890"
+            ),
+            "current_global_authority_fingerprint": maintenance[
+                "continuation_fingerprint"
+            ],
+            "global_ordinal": 212,
+            "activation_total": 212,
+            "activation_unknown_count": 1,
+            "activation_last_global_ordinal": 212,
+            "activation_attempt_inventory_fingerprint": (
+                _canonical_fingerprint(attempts)
+            ),
+            "window": attempt["window"],
+            "semantic_attempt": {
+                key: attempt[key]
+                for key in (
+                    "semantic_run_id",
+                    "run_contract_fingerprint",
+                    "batch_ordinal",
+                    "batch_contract_fingerprint",
+                    "input_fingerprint",
+                    "attempt_id",
+                    "attempt_nonce",
+                    "attempt_receipt_fingerprint",
+                )
+            },
+            "failure_audit": {
+                "processing_run_id": audit["processing_run_id"],
+                "relative_path": audit_path.relative_to(
+                    timeout_handoff.audit_root
+                ).as_posix(),
+                "audit_fingerprint": "sha256:"
+                + hashlib.sha256(audit_path.read_bytes()).hexdigest(),
+                "failure_category": "timeout",
+                "timeout_phase": "initial_communicate",
+                "result_file_present": False,
+                "process_cleanup_status": "verified",
+                "audit_readback_status": "verified",
+            },
+            "diagnostic_metadata": {
+                "processing_run_id": audit["processing_run_id"],
+                "metadata_fingerprint": "sha256:"
+                + hashlib.sha256(diagnostic_path.read_bytes()).hexdigest(),
+            },
+            "digest": digest,
+            "continuation": {
+                "previous_reviewed_git_head": "9" * 40,
+                "previous_execution_contract": maintenance[
+                    "execution_contract"
+                ],
+                "reviewed_git_head": "a" * 40,
+                "execution_contract": maintenance["execution_contract"],
+                "next_global_ordinal": 213,
+                "absolute_cap": 1000,
+            },
+        }
+        manifest = {
+            **payload,
+            "payload_fingerprint": _canonical_fingerprint(payload),
+        }
+        manifest_path = root / "timeout-212-authority.json"
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+        manifest_path.chmod(0o600)
+        return (
+            timeout_handoff,
+            timeout_provider,
+            window_177,
+            timeout_representation,
+            digest,
+            manifest_path,
+            audit_path,
+            diagnostic_path,
+        )
+
     @staticmethod
     def historical_provider_versions(audit_root: Path) -> tuple[str, ...]:
         versions: set[str] = set()
@@ -10727,6 +10972,228 @@ print("passed")
         self.assertEqual(
             attempt_177["global_authority_fingerprint"],
             continuation["continuation_fingerprint"],
+        )
+
+    def test_timeout_212_resolution_is_zero_call_and_continues_at_213(
+        self,
+    ) -> None:
+        import archeos.semantic_handoff as handoff_module
+
+        root = self.root / "timeout-212"
+        (
+            handoff,
+            timeout_provider,
+            previous_window,
+            representation,
+            digest,
+            manifest_path,
+            audit_path,
+            diagnostic_path,
+        ) = self.build_ordinal_212_timeout_fixture(root)
+        authority_root = handoff.audit_root / "semantic_global_authority"
+        protected = {
+            path.relative_to(handoff.audit_root).as_posix(): path.read_bytes()
+            for path in (
+                authority_root / "grant.json",
+                authority_root / "extension-cap-1000.json",
+                authority_root / "unknown-resolution-ordinal-0166.json",
+                authority_root / "maintenance-continuation.json",
+                *sorted(handoff.audit_root.glob("semantic_run_*/attempts/*.json")),
+                *sorted(
+                    handoff.audit_root.glob(
+                        "semantic_run_*/results/*/result-receipt.json"
+                    )
+                ),
+            )
+        }
+        next_runner = FakeRunner()
+        next_provider = CodexCliRepresentationAnalysisProvider(
+            provider_version="0.147.0",
+            timeout_seconds=300,
+            runner=next_runner,
+            diagnostic_root=timeout_provider.diagnostic_root,
+        )
+        status_path = root / "failed-closed-status.json"
+        calls: list[str] = []
+
+        def commit(resolution_id: str):
+            calls.append(resolution_id)
+            status = {"resolution_id": resolution_id, "state": "failed_closed"}
+            if status_path.exists():
+                self.assertEqual(
+                    json.loads(status_path.read_text(encoding="utf-8")),
+                    status,
+                )
+            else:
+                status_path.write_text(json.dumps(status), encoding="utf-8")
+                status_path.chmod(0o600)
+            return "sha256:" + "b" * 64, digest
+
+        original_metadata = diagnostic_path.read_bytes()
+        diagnostic_path.write_text("{}", encoding="utf-8")
+        before_drift = self.tree_snapshot(handoff.audit_root)
+        with self.assertRaises(SemanticHandoffError):
+            handoff.resolve_timeout_212(
+                next_provider,
+                authority_manifest_file=manifest_path,
+                reviewed_git_head="a" * 40,
+                digest_binding=digest,
+                commit_failed_closed_status=commit,
+            )
+        self.assertEqual(self.tree_snapshot(handoff.audit_root), before_drift)
+        self.assertFalse(status_path.exists())
+        self.assertEqual(calls, [])
+        diagnostic_path.write_bytes(original_metadata)
+
+        original_audit = audit_path.read_bytes()
+        audit = json.loads(original_audit)
+        audit["process_cleanup_status"] = "failed"
+        audit_path.write_text(json.dumps(audit), encoding="utf-8")
+        with self.assertRaises(SemanticHandoffError):
+            handoff.resolve_timeout_212(
+                next_provider,
+                authority_manifest_file=manifest_path,
+                reviewed_git_head="a" * 40,
+                digest_binding=digest,
+                commit_failed_closed_status=commit,
+            )
+        self.assertFalse(status_path.exists())
+        audit_path.write_bytes(original_audit)
+
+        original_publish = handoff_module._publish_private_json_marker
+
+        def interrupt_receipt(path, payload):
+            if path.name == "unknown-resolution-ordinal-0212.json":
+                raise OSError("synthetic receipt interruption")
+            return original_publish(path, payload)
+
+        with (
+            patch.object(
+                handoff_module,
+                "_publish_private_json_marker",
+                interrupt_receipt,
+            ),
+            self.assertRaisesRegex(OSError, "receipt interruption"),
+        ):
+            handoff.resolve_timeout_212(
+                next_provider,
+                authority_manifest_file=manifest_path,
+                reviewed_git_head="a" * 40,
+                digest_binding=digest,
+                commit_failed_closed_status=commit,
+            )
+        self.assertTrue(status_path.is_file())
+        self.assertFalse(
+            (authority_root / "unknown-resolution-ordinal-0212.json").exists()
+        )
+
+        receipt = handoff.resolve_timeout_212(
+            next_provider,
+            authority_manifest_file=manifest_path,
+            reviewed_git_head="a" * 40,
+            digest_binding=digest,
+            commit_failed_closed_status=commit,
+        )
+        self.assertEqual(next_runner.calls, [])
+        self.assertEqual(receipt["global_ordinal"], 212)
+        self.assertEqual(receipt["activation_total"], 212)
+        self.assertEqual(receipt["activation_unknown_count"], 1)
+        self.assertEqual(receipt["continuation"]["next_global_ordinal"], 213)
+        self.assertTrue(receipt["preserved_but_unabsorbed"])
+        self.assertEqual(
+            handoff.resolve_timeout_212(
+                next_provider,
+                authority_manifest_file=manifest_path,
+                reviewed_git_head="a" * 40,
+                digest_binding=digest,
+                commit_failed_closed_status=commit,
+            ),
+            receipt,
+        )
+        handoff.validate_timeout_212_resolution_digest(
+            digest_binding=digest,
+            failed_closed_status_fingerprint="sha256:" + "b" * 64,
+            resolution_id=receipt["resolution_id"],
+        )
+        self.assertEqual(
+            {
+                path.relative_to(handoff.audit_root).as_posix(): path.read_bytes()
+                for path in (
+                    authority_root / "grant.json",
+                    authority_root / "extension-cap-1000.json",
+                    authority_root / "unknown-resolution-ordinal-0166.json",
+                    authority_root / "maintenance-continuation.json",
+                    *sorted(
+                        handoff.audit_root.glob(
+                            "semantic_run_*/attempts/*.json"
+                        )
+                    ),
+                    *sorted(
+                        handoff.audit_root.glob(
+                            "semantic_run_*/results/*/result-receipt.json"
+                        )
+                    ),
+                )
+            },
+            protected,
+        )
+        self.assertFalse(
+            (
+                handoff.representation_service.output_root
+                / representation.representation_id
+            ).exists()
+        )
+
+        next_root = root / "ordinal-0213"
+        next_representation, next_service = self.build_service(
+            root=next_root,
+            source_id="src_" + "f" * 32,
+        )
+        next_handoff = ExternalAgentSemanticHandoffService(
+            next_service,
+            JsonlAtomicInformationStore(next_root / "atomic.jsonl"),
+            handoff.audit_root,
+        )
+        old_head_runner = FakeRunner()
+        with self.assertRaises(SemanticHandoffError):
+            next_handoff.execute(
+                next_representation.representation_id,
+                CodexCliRepresentationAnalysisProvider(
+                    provider_version="0.147.0",
+                    timeout_seconds=300,
+                    runner=old_head_runner,
+                ),
+                privacy_binding=self.privacy_binding(),
+                authority_binding=previous_window,
+            )
+        self.assertEqual(old_head_runner.calls, [])
+        runner_213 = FakeRunner()
+        next_handoff.execute(
+            next_representation.representation_id,
+            CodexCliRepresentationAnalysisProvider(
+                provider_version="0.147.0",
+                timeout_seconds=300,
+                runner=runner_213,
+            ),
+            privacy_binding=self.privacy_binding(),
+            authority_binding=replace(
+                previous_window, reviewed_git_head="a" * 40
+            ),
+        )
+        self.assertEqual(len(runner_213.calls), 1)
+        attempt_213 = next(
+            json.loads(path.read_text(encoding="utf-8"))
+            for path in handoff.audit_root.glob(
+                "semantic_run_*/attempts/*.json"
+            )
+            if json.loads(path.read_text(encoding="utf-8")).get(
+                "global_ordinal"
+            )
+            == 213
+        )
+        self.assertEqual(
+            attempt_213["global_authority_fingerprint"],
+            receipt["resolution_receipt_fingerprint"],
         )
 
 

@@ -597,6 +597,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="零 Provider 把已批准的 Semantic unknown 收敛为 failed_closed。",
     )
     wechat_digest.add_argument(
+        "--resolve-semantic-timeout-212",
+        action="store_true",
+        help="零 Provider 把已批准的 ordinal212 timeout 收敛为 failed_closed。",
+    )
+    wechat_digest.add_argument(
         "--seal-governance-timeout",
         action="store_true",
         help="零 Provider 封存 Governance timeout 并允许后续项目继续。",
@@ -610,6 +615,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--semantic-unknown-authority-file",
         type=Path,
         help="Private 0600 Lead-approved ordinal-166 resolution authority manifest.",
+    )
+    wechat_digest.add_argument(
+        "--semantic-timeout-212-authority-file",
+        type=Path,
+        help="Private 0600 Lead-approved ordinal-212 resolution authority manifest.",
     )
     wechat_digest.add_argument(
         "--authority-ref",
@@ -1022,6 +1032,7 @@ def _wechat_product_command(args: argparse.Namespace) -> int:
             args.install_semantic_authority_extension,
             args.install_semantic_maintenance_continuation,
             args.resolve_semantic_unknown,
+            args.resolve_semantic_timeout_212,
             args.seal_governance_timeout,
         )
     )
@@ -1044,6 +1055,13 @@ def _wechat_product_command(args: argparse.Namespace) -> int:
             return 2
     elif args.semantic_unknown_authority_file is not None:
         print("error: Semantic unknown authority file 只能与恢复入口一起使用。")
+        return 2
+    if args.resolve_semantic_timeout_212:
+        if args.semantic_timeout_212_authority_file is None:
+            print("error: 恢复 Semantic ordinal212 必须指定私有 authority file。")
+            return 2
+    elif args.semantic_timeout_212_authority_file is not None:
+        print("error: Semantic ordinal212 authority file 只能与恢复入口一起使用。")
         return 2
     if args.install_semantic_maintenance_continuation:
         if args.authority_ref is None:
@@ -1217,6 +1235,36 @@ def _wechat_product_command(args: argparse.Namespace) -> int:
                         "global_unknown": 0,
                         "absolute_cap": 1000,
                         "remaining": 834,
+                        "next_global_ordinal": continuation[
+                            "next_global_ordinal"
+                        ],
+                        "failed_closed": 1,
+                        "preserved_but_unabsorbed": 1,
+                        "resolution_receipt_fingerprint": resolution[
+                            "resolution_receipt_fingerprint"
+                        ],
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                )
+            )
+            return 0
+        if args.resolve_semantic_timeout_212:
+            resolution = service.resolve_semantic_timeout_212(
+                authority_manifest_file=(
+                    args.semantic_timeout_212_authority_file
+                ),
+            )
+            continuation = resolution["continuation"]
+            print(
+                json.dumps(
+                    {
+                        "semantic_provider_calls": 0,
+                        "governance_provider_calls": 0,
+                        "global_attempt_total": 212,
+                        "global_unknown": 0,
+                        "absolute_cap": 1000,
+                        "remaining": 788,
                         "next_global_ordinal": continuation[
                             "next_global_ordinal"
                         ],

@@ -249,6 +249,7 @@ class SyntheticSemanticHandoff:
         self.installed_extension = None
         self.installed_maintenance_continuation = None
         self.unknown_resolution = None
+        self.timeout_212_resolution = None
         self.before_unknown_commit = None
         self.campaign_binding = None
         self.authority_bindings = []
@@ -472,6 +473,53 @@ class SyntheticSemanticHandoff:
             "failed_closed_status_fingerprint": failed_closed_status_fingerprint,
         }
         return self.unknown_resolution
+
+    def resolve_timeout_212(
+        self,
+        *,
+        authority_manifest_file,
+        digest_binding,
+        commit_failed_closed_status,
+    ):
+        manifest = json.loads(Path(authority_manifest_file).read_text("utf-8"))
+        assert manifest["digest"]["item_id"] == digest_binding["item_id"]
+        resolution_id = "unknown_resolution_212_" + "b" * 32
+        if self.before_unknown_commit is not None:
+            self.before_unknown_commit()
+        status_fingerprint, final_digest_binding = (
+            commit_failed_closed_status(resolution_id)
+        )
+        assert final_digest_binding == digest_binding
+        expected = {
+            "global_ordinal": 212,
+            "resolution_id": resolution_id,
+            "preserved_but_unabsorbed": True,
+            "digest": {
+                **dict(digest_binding),
+                "failed_closed_status_fingerprint": status_fingerprint,
+            },
+            "continuation": {"next_global_ordinal": 213},
+            "resolution_receipt_fingerprint": "sha256:" + "e" * 64,
+        }
+        if self.timeout_212_resolution is not None:
+            assert self.timeout_212_resolution == expected
+        self.timeout_212_resolution = expected
+        return expected
+
+    def validate_timeout_212_resolution_digest(
+        self,
+        *,
+        digest_binding,
+        failed_closed_status_fingerprint,
+        resolution_id,
+    ):
+        assert self.timeout_212_resolution is not None
+        assert self.timeout_212_resolution["resolution_id"] == resolution_id
+        assert self.timeout_212_resolution["digest"] == {
+            **dict(digest_binding),
+            "failed_closed_status_fingerprint": failed_closed_status_fingerprint,
+        }
+        return self.timeout_212_resolution
 
     def _write_success_audits(
         self, package: Path, representation_id: str
@@ -2302,6 +2350,61 @@ class WechatDigestTests(unittest.TestCase):
                 )
                 self.assertIsNone(self.semantic.unknown_resolution)
                 self.assertEqual(self.semantic.provider.calls, provider_calls)
+
+    def test_timeout_212_resolution_marks_item_preserved_without_provider(
+        self,
+    ) -> None:
+        capture = SyntheticCaptureProvider(
+            [message(1, conversation="timeout-212")]
+        )
+        service = self.service(capture)
+        self.semantic.failures_remaining = 1
+        with self.assertRaises(WechatDigestError):
+            service.run(all_history=True)
+        prepared = service.prepare_next_semantic()
+        status = service.run_store.status(prepared.run_id)
+        item_id = next(
+            key
+            for key, value in status["items"].items()
+            if value.get("representation_id") == prepared.representation_id
+        )
+        manifest_path = self.workspace / "private-timeout-212-authority.json"
+        manifest_path.write_text(
+            json.dumps({"digest": {"item_id": item_id}}),
+            encoding="utf-8",
+        )
+        manifest_path.chmod(0o600)
+        provider_calls = self.semantic.provider.calls
+        resolution = service.resolve_semantic_timeout_212(
+            authority_manifest_file=manifest_path
+        )
+        self.assertEqual(self.semantic.provider.calls, provider_calls)
+        self.assertEqual(resolution["global_ordinal"], 212)
+        failed_item = service.run_store.status(prepared.run_id)["items"][
+            item_id
+        ]
+        self.assertEqual(failed_item["state"], "failed_closed")
+        self.assertEqual(
+            failed_item["semantic_failure"]["failure_category"], "timeout"
+        )
+        self.assertEqual(failed_item["atomic_information_ids"], [])
+        self.assertFalse(failed_item["pending_human"])
+        self.assertEqual(failed_item["context_object_ids"], [])
+        self.assertFalse(
+            (
+                self.workspace
+                / "02_processing"
+                / "information"
+                / prepared.representation_id
+            ).exists()
+        )
+        self.assertEqual(
+            service.resolve_semantic_timeout_212(
+                authority_manifest_file=manifest_path
+            ),
+            resolution,
+        )
+        self.assertEqual(self.semantic.provider.calls, provider_calls)
 
     def test_prepare_replays_existing_package_without_provider(self) -> None:
         self.create_object()
