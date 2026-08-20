@@ -4588,12 +4588,22 @@ class _SemanticGlobalAuthority:
             raise SemanticHandoffError(
                 "Semantic unknown resolution receipt 缺失。"
             )
+        batch_governance_continuation = (
+            self._read_batch_governance_continuation(
+                grant,
+                extension,
+                resolution,
+                continuation,
+                timeout_resolution,
+            )
+        )
         effective = self._effective_authority(
             grant,
             extension,
             resolution,
             continuation,
             timeout_resolution,
+            batch_governance_continuation,
         )
         attempts, unknown = self._global_attempts(effective)
         digest = resolution.get("digest")
@@ -5292,12 +5302,22 @@ class _SemanticGlobalAuthority:
             raise SemanticHandoffError(
                 "Semantic ordinal212 resolution receipt 缺失。"
             )
+        batch_governance_continuation = (
+            self._read_batch_governance_continuation(
+                base,
+                extension,
+                resolution,
+                maintenance,
+                timeout_resolution,
+            )
+        )
         effective = self._effective_authority(
             base,
             extension,
             resolution,
             maintenance,
             timeout_resolution,
+            batch_governance_continuation,
         )
         attempts, unknown = self._global_attempts(effective)
         digest = timeout_resolution.get("digest")
