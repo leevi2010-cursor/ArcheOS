@@ -6241,7 +6241,12 @@ class WechatDigestService:
         result = self._semantic_port().execute(
             representation_id,
             privacy_binding=privacy_binding,
-            authority_binding=self._semantic_authority_binding(run_id),
+            authority_binding=self._semantic_authority_binding(
+                run_id,
+                allow_reviewed_head_extension=self._existing_semantic_package(
+                    representation_id
+                ),
+            ),
         )
         atomic_ids = tuple(result.ingestion.atomic_information_ids)
         for atomic_id in atomic_ids:
