@@ -878,22 +878,6 @@ class FailAfterProviderOnceService(WechatDigestService):
         return result
 
 
-class FailFirstBatchProgressOnceService(WechatDigestService):
-    fail_progress = True
-
-    def _update_item(self, run_id, status, item_id, **changes):
-        receipt = changes.get("governance_receipt")
-        if (
-            self.fail_progress
-            and isinstance(receipt, dict)
-            and receipt.get("phase") == "applying"
-            and receipt.get("next_index") == 1
-        ):
-            self.fail_progress = False
-            raise OSError("synthetic progress persistence interruption")
-        return super()._update_item(run_id, status, item_id, **changes)
-
-
 class FailAfterPersistedBatchProgressOnceService(WechatDigestService):
     fail_progress = True
 
@@ -954,6 +938,48 @@ class WechatDigestTests(unittest.TestCase):
             self.workspace / "04_core" / "archeos.sqlite3"
         ) as repository:
             return repository.create_object(name).object_id
+
+    def interrupted_batch_cursor_one(
+        self,
+    ) -> tuple[WechatDigestService, BatchOnceProvider, dict[str, object]]:
+        self.create_object()
+        provider = BatchOnceProvider()
+        service = FailAfterPersistedBatchProgressOnceService(
+            workspace=self.workspace,
+            capture_provider=SyntheticCaptureProvider([message(1), message(2)]),
+            semantic_handoff_factory=lambda: self.semantic,
+            interpretation_provider=provider,
+        )
+        with self.assertRaises(WechatDigestError):
+            service.run(all_history=True)
+        run_id = service.run_store.active_run_id()
+        assert run_id is not None
+        receipt = next(
+            item["governance_receipt"]
+            for item in service.run_store.status(run_id)["items"].values()
+            if isinstance(item, dict) and "governance_receipt" in item
+        )
+        self.assertEqual(receipt["phase"], "applying")
+        self.assertEqual(receipt["next_index"], 1)
+        self.assertEqual(provider.calls, 1)
+        return service, provider, receipt
+
+    @staticmethod
+    def append_information_drift(
+        service: WechatDigestService, atomic_information_id: str
+    ) -> None:
+        current = service.information_store.get_current(atomic_information_id)
+        next_revision = current.revision_number + 1
+        service.information_store.append_revision(
+            replace(
+                current,
+                revision_number=next_revision,
+                revision_id=(
+                    f"{current.atomic_information_id}-r{next_revision:04d}"
+                ),
+                revision_reason="synthetic_resume_drift",
+            )
+        )
 
     def source_count(self) -> int:
         return len(
@@ -1623,33 +1649,68 @@ class WechatDigestTests(unittest.TestCase):
         self.assertEqual(provider.calls, 1)
 
     def test_mid_apply_recovery_reuses_persisted_batch_result(self) -> None:
-        self.create_object()
-        provider = BatchOnceProvider()
-        capture = SyntheticCaptureProvider([message(1), message(2)])
-        service = FailFirstBatchProgressOnceService(
-            workspace=self.workspace,
-            capture_provider=capture,
-            semantic_handoff_factory=lambda: self.semantic,
-            interpretation_provider=provider,
-        )
-
-        with self.assertRaises(WechatDigestError):
-            service.run(all_history=True)
-        run_id = service.run_store.active_run_id()
-        assert run_id is not None
-        interrupted_receipt = next(
-            item["governance_receipt"]
-            for item in service.run_store.status(run_id)["items"].values()
-            if isinstance(item, dict) and "governance_receipt" in item
-        )
-        self.assertEqual(interrupted_receipt["phase"], "interpreted")
-        self.assertEqual(interrupted_receipt["next_index"], 0)
-        self.assertEqual(provider.calls, 1)
+        service, provider, _receipt = self.interrupted_batch_cursor_one()
 
         result = service.run()
 
         self.assertTrue(result.replayed)
         self.assertTrue(result.checkpoint_published)
+        self.assertEqual(provider.calls, 1)
+
+    def test_mid_apply_recovery_rejects_applied_prefix_drift_without_provider(
+        self,
+    ) -> None:
+        service, provider, receipt = self.interrupted_batch_cursor_one()
+        self.append_information_drift(
+            service, receipt["batch_atomic_information_ids"][0]
+        )
+
+        with self.assertRaisesRegex(WechatDigestError, "effect/cursor"):
+            service.run()
+
+        self.assertEqual(provider.calls, 1)
+
+    def test_mid_apply_recovery_rejects_unapplied_suffix_drift_without_provider(
+        self,
+    ) -> None:
+        service, provider, receipt = self.interrupted_batch_cursor_one()
+        self.append_information_drift(
+            service, receipt["batch_atomic_information_ids"][1]
+        )
+
+        with self.assertRaisesRegex(WechatDigestError, "effect/cursor"):
+            service.run()
+
+        self.assertEqual(provider.calls, 1)
+
+    def test_completed_receipt_readback_rejects_effect_drift_without_provider(
+        self,
+    ) -> None:
+        self.create_object()
+        provider = BatchOnceProvider()
+        service = FailAfterGovernanceOnceService(
+            workspace=self.workspace,
+            capture_provider=SyntheticCaptureProvider([message(1)]),
+            semantic_handoff_factory=lambda: self.semantic,
+            interpretation_provider=provider,
+        )
+        with self.assertRaises(WechatDigestError):
+            service.run(all_history=True)
+        run_id = service.run_store.active_run_id()
+        assert run_id is not None
+        receipt = next(
+            item["governance_receipt"]
+            for item in service.run_store.status(run_id)["items"].values()
+            if isinstance(item, dict) and "governance_receipt" in item
+        )
+        self.assertEqual(receipt["phase"], "completed")
+        self.append_information_drift(
+            service, receipt["batch_atomic_information_ids"][0]
+        )
+
+        with self.assertRaisesRegex(WechatDigestError, "effect/cursor"):
+            service.run()
+
         self.assertEqual(provider.calls, 1)
 
     def test_persisted_batch_result_recovers_after_apply_without_provider_call(

@@ -1427,6 +1427,7 @@ def _validated_governance_receipt(value: object) -> dict[str, object]:
             "batch_fingerprint",
             "interpretations",
             "next_index",
+            "baseline_effect_fingerprints",
             "applied_effect_fingerprints",
             "pending_human",
             "context_object_ids",
@@ -1453,6 +1454,7 @@ def _validated_governance_receipt(value: object) -> dict[str, object]:
     raw_interpretations = value.get("interpretations")
     object_ids = value.get("context_object_ids")
     next_index = value.get("next_index")
+    baseline_effect_fingerprints = value.get("baseline_effect_fingerprints")
     applied_effect_fingerprints = value.get("applied_effect_fingerprints")
     batch_fingerprint = value.get("batch_fingerprint")
     if (
@@ -1465,6 +1467,11 @@ def _validated_governance_receipt(value: object) -> dict[str, object]:
         or isinstance(next_index, bool)
         or not isinstance(next_index, int)
         or not 0 <= next_index <= len(atomic_ids)
+        or not isinstance(baseline_effect_fingerprints, list)
+        or len(baseline_effect_fingerprints) != len(atomic_ids)
+        or any(
+            not _sha256_value(item) for item in baseline_effect_fingerprints
+        )
         or not isinstance(applied_effect_fingerprints, list)
         or len(applied_effect_fingerprints) != next_index
         or any(
@@ -2104,11 +2111,17 @@ class WechatDigestService:
         self._governance_resume_state: dict[str, object] | None = None
         self._governance_migration_state: dict[str, object] | None = None
         self._after_governance_batch_interpretation: Callable[
-            [tuple[str, ...], tuple[InterpretationResult, ...], bool, tuple[str, ...]],
+            [
+                tuple[str, ...],
+                tuple[InterpretationResult, ...],
+                bool,
+                tuple[str, ...],
+                tuple[str, ...],
+            ],
             None,
         ] | None = None
         self._after_governance_application: Callable[
-            [int, bool, tuple[str, ...], str], None
+            [int, bool, tuple[str, ...], tuple[str, ...]], None
         ] | None = None
         if isinstance(semantic_batch_size, bool) or not isinstance(semantic_batch_size, int) or semantic_batch_size < 1:
             raise ValueError("semantic batch size must be positive")
@@ -2640,6 +2653,40 @@ class WechatDigestService:
                 _canonical_json(payload).encode("utf-8")
             ),
         }
+
+    def _governance_effect_fingerprints(
+        self,
+        repository: SQLiteWorldModelRepository,
+        atomic_ids: Sequence[str],
+    ) -> tuple[str, ...]:
+        return tuple(
+            str(
+                self._governance_effect_binding(repository, atomic_id)[
+                    "effect_fingerprint"
+                ]
+            )
+            for atomic_id in atomic_ids
+        )
+
+    def _verify_governance_receipt_effects(
+        self, receipt: Mapping[str, object]
+    ) -> None:
+        if (
+            receipt.get("schema_version") != GOVERNANCE_RECEIPT_SCHEMA_VERSION
+            or receipt.get("phase") == "started"
+        ):
+            return
+        batch_ids = tuple(receipt["batch_atomic_information_ids"])
+        next_index = int(receipt["next_index"])
+        expected = tuple(receipt["applied_effect_fingerprints"]) + tuple(
+            receipt["baseline_effect_fingerprints"][next_index:]
+        )
+        with SQLiteWorldModelRepository(self.database) as repository:
+            current = self._governance_effect_fingerprints(repository, batch_ids)
+        if current != expected:
+            raise WechatDigestError(
+                "微信 Governance receipt effect/cursor binding 漂移。"
+            )
 
     def _governance_business_tree_fingerprint(
         self, repository: SQLiteWorldModelRepository
@@ -5682,6 +5729,9 @@ class WechatDigestService:
                         interpretations,
                         pending,
                         tuple(sorted(affected)),
+                        self._governance_effect_fingerprints(
+                            repository, batch_ids
+                        ),
                     )
                 start_index = 0
             else:
@@ -5751,9 +5801,9 @@ class WechatDigestService:
                             index + 1,
                             pending,
                             tuple(sorted(affected)),
-                            self._governance_effect_binding(
-                                repository, atomic_id
-                            )["effect_fingerprint"],
+                            self._governance_effect_fingerprints(
+                                repository, batch_ids[: index + 1]
+                            ),
                         )
                     continue
                 digest_result = digestion.apply_interpretation(
@@ -5767,9 +5817,9 @@ class WechatDigestService:
                         index + 1,
                         pending,
                         tuple(sorted(affected)),
-                        self._governance_effect_binding(
-                            repository, atomic_id
-                        )["effect_fingerprint"],
+                        self._governance_effect_fingerprints(
+                            repository, batch_ids[: index + 1]
+                        ),
                     )
 
             builder = ContextBuilder(
@@ -5859,6 +5909,7 @@ class WechatDigestService:
                 raise WechatDigestError(
                     "微信 Governance migration batch binding 漂移。"
                 )
+            self._verify_governance_receipt_effects(receipt)
             if receipt["phase"] == "completed":
                 return bool(receipt["pending_human"]), tuple(
                     str(object_id) for object_id in receipt["context_object_ids"]
@@ -5916,6 +5967,7 @@ class WechatDigestService:
             interpretations: tuple[InterpretationResult, ...],
             pending: bool,
             object_ids: tuple[str, ...],
+            baseline_effect_fingerprints: tuple[str, ...],
         ) -> None:
             nonlocal batch_persisted, latest_batch_receipt
             serialized = [
@@ -5932,6 +5984,9 @@ class WechatDigestService:
                 ),
                 "interpretations": serialized,
                 "next_index": 0,
+                "baseline_effect_fingerprints": list(
+                    baseline_effect_fingerprints
+                ),
                 "applied_effect_fingerprints": [],
                 "pending_human": pending,
                 "context_object_ids": sorted(set(object_ids)),
@@ -5948,7 +6003,7 @@ class WechatDigestService:
             next_index: int,
             pending: bool,
             object_ids: tuple[str, ...],
-            effect_fingerprint: str,
+            applied_effect_fingerprints: tuple[str, ...],
         ) -> None:
             nonlocal latest_batch_receipt
             if latest_batch_receipt is None:
@@ -5956,20 +6011,24 @@ class WechatDigestService:
                     "微信 Governance batch result 尚未持久化。"
                 )
             batch_ids = latest_batch_receipt["batch_atomic_information_ids"]
-            effects = list(
-                latest_batch_receipt["applied_effect_fingerprints"]
-            )
-            if len(effects) != next_index - 1:
+            previous_effects = latest_batch_receipt[
+                "applied_effect_fingerprints"
+            ]
+            if (
+                len(previous_effects) != next_index - 1
+                or len(applied_effect_fingerprints) != next_index
+            ):
                 raise WechatDigestError(
                     "微信 Governance apply effect cursor 不一致。"
                 )
-            effects.append(effect_fingerprint)
             phase = "applied" if next_index == len(batch_ids) else "applying"
             latest_batch_receipt = {
                 **latest_batch_receipt,
                 "phase": phase,
                 "next_index": next_index,
-                "applied_effect_fingerprints": effects,
+                "applied_effect_fingerprints": list(
+                    applied_effect_fingerprints
+                ),
                 "pending_human": pending,
                 "context_object_ids": sorted(set(object_ids)),
             }
