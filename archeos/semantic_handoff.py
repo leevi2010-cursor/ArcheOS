@@ -45,6 +45,7 @@ from .representation_information import (
     _analysis_batches_for_anchor_unit_ids,
     _external_agent_prompt,
     _external_agent_request,
+    _diagnostic_root_is_safe,
     _ExternalAgentSuccessfulResult,
     _InternalAnalysisFinalization,
     _parse_external_agent_result,
@@ -149,12 +150,19 @@ _UNKNOWN_RESOLUTION_MANIFEST_SCHEMA = (
     "semantic-handoff-unknown-resolution-authority/1.0"
 )
 _UNKNOWN_RESOLUTION_SCHEMA = "semantic-handoff-unknown-resolution/1.0"
+_TIMEOUT_212_RESOLUTION_MANIFEST_SCHEMA = (
+    "semantic-handoff-timeout-212-resolution-authority/1.0"
+)
+_TIMEOUT_212_RESOLUTION_SCHEMA = (
+    "semantic-handoff-timeout-212-resolution/1.0"
+)
 _INVENTORY_AUTHORITY_SCHEMA = "semantic-handoff-inventory-authority/1.0"
 _GLOBAL_AUTHORITY_DIRECTORY = "semantic_global_authority"
 _GLOBAL_AUTHORITY_GRANT = "grant.json"
 _GLOBAL_AUTHORITY_EXTENSION = "extension-cap-1000.json"
 _MAINTENANCE_CONTINUATION_RECEIPT = "maintenance-continuation.json"
 _UNKNOWN_RESOLUTION_RECEIPT = "unknown-resolution-ordinal-0166.json"
+_TIMEOUT_212_RESOLUTION_RECEIPT = "unknown-resolution-ordinal-0212.json"
 _GLOBAL_AUTHORITY_LOCK = "authority.lock"
 _GLOBAL_AUTHORITY_EXTENSION_DECISION = (
     "https://github.com/leevi2010-cursor/ArcheOS/issues/107"
@@ -443,6 +451,7 @@ def _validate_global_authority_directory(path: Path) -> None:
         _GLOBAL_AUTHORITY_EXTENSION,
         _MAINTENANCE_CONTINUATION_RECEIPT,
         _UNKNOWN_RESOLUTION_RECEIPT,
+        _TIMEOUT_212_RESOLUTION_RECEIPT,
     }:
         raise SemanticHandoffError("Semantic global authority inventory 损坏。")
     lock_path = children.get(_GLOBAL_AUTHORITY_LOCK)
@@ -461,6 +470,9 @@ def _validate_global_authority_directory(path: Path) -> None:
     resolution_path = children.get(_UNKNOWN_RESOLUTION_RECEIPT)
     if resolution_path is not None:
         _require_private_file(resolution_path)
+    timeout_resolution_path = children.get(_TIMEOUT_212_RESOLUTION_RECEIPT)
+    if timeout_resolution_path is not None:
+        _require_private_file(timeout_resolution_path)
 
 
 def _validate_shared_recovery_root(root: Path, *, create: bool) -> bool:
@@ -1244,14 +1256,21 @@ class _SemanticRecoveryRun:
                     self.audit_root
                 )
                 base = global_authority._read_base_grant()
+                extension = global_authority._read_extension(base)
+                resolution = global_authority._read_unknown_resolution()
+                maintenance = global_authority._read_maintenance_continuation(
+                    base, extension, resolution
+                )
                 effective = global_authority._effective_authority(
                     base,
-                    global_authority._read_extension(base),
-                    global_authority._read_unknown_resolution(),
-                    global_authority._read_maintenance_continuation(
+                    extension,
+                    resolution,
+                    maintenance,
+                    global_authority._read_timeout_212_resolution(
                         base,
-                        global_authority._read_extension(base),
-                        global_authority._read_unknown_resolution(),
+                        extension,
+                        resolution,
+                        maintenance,
                     ),
                 )
                 attempts, _unknown = global_authority._global_attempts(effective)
@@ -2308,6 +2327,9 @@ class _SemanticGlobalAuthority:
             self.root / _MAINTENANCE_CONTINUATION_RECEIPT
         )
         self.unknown_resolution_path = self.root / _UNKNOWN_RESOLUTION_RECEIPT
+        self.timeout_212_resolution_path = (
+            self.root / _TIMEOUT_212_RESOLUTION_RECEIPT
+        )
         self.lock_path = self.root / _GLOBAL_AUTHORITY_LOCK
         self._guard_grant: dict[str, object] | None = None
         self._guard_next_ordinal: int | None = None
@@ -2326,8 +2348,15 @@ class _SemanticGlobalAuthority:
         continuation = self._read_maintenance_continuation(
             grant, extension, resolution
         )
-        effective = self._effective_authority(
+        timeout_resolution = self._read_timeout_212_resolution(
             grant, extension, resolution, continuation
+        )
+        effective = self._effective_authority(
+            grant,
+            extension,
+            resolution,
+            continuation,
+            timeout_resolution,
         )
         self._global_attempts(effective)
         campaign = grant.get("campaign")
@@ -3582,6 +3611,28 @@ class _SemanticGlobalAuthority:
         )
 
     @staticmethod
+    def _window_matches_timeout_212_continuation(
+        previous: Mapping[str, object],
+        current: Mapping[str, object],
+        resolution: Mapping[str, object] | None,
+    ) -> bool:
+        if resolution is None:
+            return False
+        continuation = resolution.get("continuation")
+        if not isinstance(continuation, dict):
+            return False
+        previous_without_head = dict(previous)
+        current_without_head = dict(current)
+        previous_head = previous_without_head.pop("reviewed_git_head", None)
+        current_head = current_without_head.pop("reviewed_git_head", None)
+        return (
+            _payloads_exactly_equal(previous_without_head, current_without_head)
+            and previous_head
+            == continuation.get("previous_reviewed_git_head")
+            and current_head == continuation.get("reviewed_git_head")
+        )
+
+    @staticmethod
     def _provider_label_semver(label: str) -> str:
         match = re.fullmatch(
             r"(?:codex-cli-)?([0-9]+\.[0-9]+\.[0-9]+(?:[-+][A-Za-z0-9._-]+)?)",
@@ -4242,8 +4293,15 @@ class _SemanticGlobalAuthority:
             continuation = self._read_maintenance_continuation(
                 grant, extension, existing
             )
-            effective = self._effective_authority(
+            timeout_resolution = self._read_timeout_212_resolution(
                 grant, extension, existing, continuation
+            )
+            effective = self._effective_authority(
+                grant,
+                extension,
+                existing,
+                continuation,
+                timeout_resolution,
             )
             attempts, unknown = self._global_attempts(effective)
             if existing is None and not unknown:
@@ -4472,12 +4530,19 @@ class _SemanticGlobalAuthority:
         continuation = self._read_maintenance_continuation(
             grant, extension, resolution
         )
+        timeout_resolution = self._read_timeout_212_resolution(
+            grant, extension, resolution, continuation
+        )
         if extension is None or resolution is None:
             raise SemanticHandoffError(
                 "Semantic unknown resolution receipt 缺失。"
             )
         effective = self._effective_authority(
-            grant, extension, resolution, continuation
+            grant,
+            extension,
+            resolution,
+            continuation,
+            timeout_resolution,
         )
         attempts, unknown = self._global_attempts(effective)
         digest = resolution.get("digest")
@@ -4498,6 +4563,710 @@ class _SemanticGlobalAuthority:
                 "Semantic unknown resolution digest binding 损坏。"
             )
         return resolution
+
+    def _matching_timeout_212_audit(
+        self,
+        *,
+        run_payload: Mapping[str, object],
+        batch_receipt: Mapping[str, object],
+    ) -> tuple[Path, dict[str, object]]:
+        matches: list[tuple[Path, dict[str, object]]] = []
+        for path in sorted(self.audit_root.glob("run_*/processing-run-audit.json")):
+            audit = _validate_versioned_processing_run_audit(path)
+            if self._audit_matches_attempt_contract(
+                audit, run_payload, batch_receipt
+            ):
+                matches.append((path, audit))
+        if len(matches) != 1:
+            raise SemanticHandoffError(
+                "Semantic ordinal212 timeout audit 无法唯一绑定。"
+            )
+        path, audit = matches[0]
+        if (
+            audit.get("failure_category") != "timeout"
+            or audit.get("execution_status") != "failed"
+            or audit.get("timeout_phase") != "initial_communicate"
+            or audit.get("result_file_present") is not False
+            or audit.get("result_size_bytes") != 0
+            or audit.get("result_fingerprint") is not None
+            or audit.get("stdout_bytes") != 0
+            or audit.get("process_cleanup_status") != "verified"
+            or audit.get("result_readback_status") != "not_applicable"
+            or audit.get("audit_readback_status") != "verified"
+            or audit.get("package_published") is not False
+            or audit.get("information_ingested") is not False
+            or audit.get("durable_ingestion_status")
+            != "ingestion_not_completed"
+            or audit.get("handoff_status") != "failed"
+        ):
+            raise SemanticHandoffError(
+                "Semantic ordinal212 timeout audit 状态不匹配。"
+            )
+        return path, audit
+
+    @staticmethod
+    def _validate_timeout_212_diagnostic(
+        provider: CodexCliRepresentationAnalysisProvider,
+        audit: Mapping[str, object],
+    ) -> tuple[Path, dict[str, object], str]:
+        run_id = audit.get("processing_run_id")
+        if not isinstance(run_id, str):
+            raise SemanticHandoffError(
+                "Semantic ordinal212 diagnostic identity 损坏。"
+            )
+        root = provider.diagnostic_root
+        path = root / run_id / "metadata.json"
+        if (
+            not _diagnostic_root_is_safe(root)
+            or not path.is_file()
+            or path.is_symlink()
+            or stat.S_IMODE(path.stat().st_mode) != 0o600
+        ):
+            raise SemanticHandoffError(
+                "Semantic ordinal212 diagnostic metadata 不可验证。"
+            )
+        raw = _private_bytes_read(path)
+        try:
+            metadata = json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise SemanticHandoffError(
+                "Semantic ordinal212 diagnostic metadata 损坏。"
+            ) from exc
+        if (
+            not isinstance(metadata, dict)
+            or metadata.get("failure_category") != "timeout"
+            or metadata.get("timeout_phase") != "initial_communicate"
+            or metadata.get("process_cleanup_status") != "verified"
+            or metadata.get("result_file_present") is not False
+            or metadata.get("result_size_bytes") != 0
+            or metadata.get("stdout_bytes") != 0
+            or metadata.get("eligible_units") != audit.get("eligible_units")
+            or metadata.get("covered_units") != audit.get("covered_units")
+            or metadata.get("provider_version") != audit.get("provider_version")
+            or metadata.get("protocol_version") != audit.get("protocol_version")
+            or metadata.get("deadline_ms") != audit.get("deadline_ms")
+        ):
+            raise SemanticHandoffError(
+                "Semantic ordinal212 diagnostic metadata binding 损坏。"
+            )
+        return path, metadata, _bytes_fingerprint(raw)
+
+    def _timeout_212_resolution_evidence(
+        self,
+        *,
+        authority: Mapping[str, object],
+        attempts: Sequence[Mapping[str, object]],
+        provider: CodexCliRepresentationAnalysisProvider,
+    ) -> tuple[
+        dict[str, object],
+        dict[str, object],
+        Path,
+        dict[str, object],
+        Path,
+        dict[str, object],
+        str,
+    ]:
+        if (
+            len(attempts) != 132
+            or attempts[-1].get("global_ordinal") != 212
+        ):
+            raise SemanticHandoffError(
+                "Semantic ordinal212 resolution activation ledger 不匹配。"
+            )
+        missing: list[tuple[Mapping[str, object], Path]] = []
+        for attempt in attempts:
+            run_name = attempt.get("semantic_run_id")
+            batch_ordinal = attempt.get("batch_ordinal")
+            if not isinstance(run_name, str) or not isinstance(batch_ordinal, int):
+                raise SemanticHandoffError(
+                    "Semantic ordinal212 attempt binding 损坏。"
+                )
+            result_path = (
+                self.audit_root
+                / run_name
+                / "results"
+                / f"batch_{batch_ordinal:04d}"
+            )
+            if not os.path.lexists(result_path):
+                if attempt.get("global_ordinal") == 166:
+                    continue
+                missing.append((attempt, result_path))
+        if (
+            len(missing) != 1
+            or missing[0][0].get("global_ordinal") != 212
+        ):
+            raise SemanticHandoffError(
+                "Semantic ordinal212 resolution 要求唯一 unknown。"
+            )
+        attempt = dict(missing[0][0])
+        if attempt.get("global_authority_fingerprint") != authority.get(
+            "global_authority_fingerprint"
+        ):
+            raise SemanticHandoffError(
+                "Semantic ordinal212 attempt authority 损坏。"
+            )
+        run_path = self.audit_root / str(attempt["semantic_run_id"])
+        run_payload = _private_json_exact(run_path / "run-receipt.json")
+        batches = run_payload.get("batches")
+        batch_ordinal = int(attempt["batch_ordinal"])
+        batch_receipt = (
+            batches[batch_ordinal - 1]
+            if isinstance(batches, list)
+            and 1 <= batch_ordinal <= len(batches)
+            else None
+        )
+        if not isinstance(batch_receipt, dict):
+            raise SemanticHandoffError(
+                "Semantic ordinal212 batch binding 损坏。"
+            )
+        audit_path, audit = self._matching_timeout_212_audit(
+            run_payload=run_payload,
+            batch_receipt=batch_receipt,
+        )
+        diagnostic_path, diagnostic, diagnostic_fingerprint = (
+            self._validate_timeout_212_diagnostic(provider, audit)
+        )
+        return (
+            attempt,
+            run_payload,
+            audit_path,
+            audit,
+            diagnostic_path,
+            diagnostic,
+            diagnostic_fingerprint,
+        )
+
+    def _validate_timeout_212_resolution_against_attempts(
+        self,
+        *,
+        receipt: Mapping[str, object],
+        previous_authority: Mapping[str, object],
+        attempts: Sequence[Mapping[str, object]],
+    ) -> None:
+        matches = [
+            attempt
+            for attempt in attempts
+            if attempt.get("global_ordinal") == 212
+        ]
+        if len(matches) != 1:
+            raise SemanticHandoffError(
+                "Semantic ordinal212 resolution ordinal binding 损坏。"
+            )
+        attempt = matches[0]
+        run_name = attempt.get("semantic_run_id")
+        batch_ordinal = attempt.get("batch_ordinal")
+        if not isinstance(run_name, str) or not isinstance(batch_ordinal, int):
+            raise SemanticHandoffError(
+                "Semantic ordinal212 resolution attempt binding 损坏。"
+            )
+        result_path = (
+            self.audit_root
+            / run_name
+            / "results"
+            / f"batch_{batch_ordinal:04d}"
+        )
+        run_payload = _private_json_exact(
+            self.audit_root / run_name / "run-receipt.json"
+        )
+        batches = run_payload.get("batches")
+        batch_receipt = (
+            batches[batch_ordinal - 1]
+            if isinstance(batches, list)
+            and 1 <= batch_ordinal <= len(batches)
+            else None
+        )
+        semantic_attempt = receipt.get("semantic_attempt")
+        if (
+            os.path.lexists(result_path)
+            or not isinstance(batch_receipt, dict)
+            or semantic_attempt
+            != {
+                "semantic_run_id": run_name,
+                "run_contract_fingerprint": attempt.get(
+                    "run_contract_fingerprint"
+                ),
+                "batch_ordinal": batch_ordinal,
+                "batch_contract_fingerprint": attempt.get(
+                    "batch_contract_fingerprint"
+                ),
+                "input_fingerprint": attempt.get("input_fingerprint"),
+                "attempt_id": attempt.get("attempt_id"),
+                "attempt_nonce": attempt.get("attempt_nonce"),
+                "attempt_receipt_fingerprint": attempt.get(
+                    "attempt_receipt_fingerprint"
+                ),
+                "result_present": False,
+            }
+            or receipt.get("previous_global_authority_fingerprint")
+            != previous_authority.get("global_authority_fingerprint")
+            or receipt.get("activation_attempt_inventory_fingerprint")
+            != _fingerprint(list(attempts[:132]))
+        ):
+            raise SemanticHandoffError(
+                "Semantic ordinal212 resolution attempt/continuation binding 损坏。"
+            )
+        audit_path, audit = self._matching_timeout_212_audit(
+            run_payload=run_payload,
+            batch_receipt=batch_receipt,
+        )
+        failure_audit = receipt.get("failure_audit")
+        if (
+            not isinstance(failure_audit, dict)
+            or failure_audit.get("processing_run_id")
+            != audit.get("processing_run_id")
+            or failure_audit.get("relative_path")
+            != audit_path.relative_to(self.audit_root).as_posix()
+            or failure_audit.get("audit_fingerprint")
+            != _bytes_fingerprint(_private_bytes_read(audit_path))
+        ):
+            raise SemanticHandoffError(
+                "Semantic ordinal212 resolution audit receipt binding 损坏。"
+            )
+
+    def _validate_timeout_212_resolution_manifest(
+        self,
+        path: Path,
+        *,
+        authority: Mapping[str, object],
+        attempts: Sequence[Mapping[str, object]],
+        attempt: Mapping[str, object],
+        run_payload: Mapping[str, object],
+        audit_path: Path,
+        audit: Mapping[str, object],
+        diagnostic_fingerprint: str,
+        digest_binding: Mapping[str, object],
+        reviewed_git_head: str,
+        provider: CodexCliRepresentationAnalysisProvider,
+    ) -> dict[str, object]:
+        manifest = _private_json_exact(Path(path))
+        projected = dict(manifest)
+        fingerprint = projected.pop("payload_fingerprint", None)
+        batch_ordinal = attempt.get("batch_ordinal")
+        batches = run_payload.get("batches")
+        batch_receipt = (
+            batches[batch_ordinal - 1]
+            if isinstance(batches, list)
+            and isinstance(batch_ordinal, int)
+            and 1 <= batch_ordinal <= len(batches)
+            else None
+        )
+        continuation = manifest.get("continuation")
+        window = attempt.get("window")
+        if (
+            set(manifest)
+            != {
+                "schema_version",
+                "artifact_kind",
+                "authority_ref",
+                "current_global_authority_fingerprint",
+                "global_ordinal",
+                "activation_total",
+                "activation_unknown_count",
+                "activation_last_global_ordinal",
+                "activation_attempt_inventory_fingerprint",
+                "window",
+                "semantic_attempt",
+                "failure_audit",
+                "diagnostic_metadata",
+                "digest",
+                "continuation",
+                "payload_fingerprint",
+            }
+            or manifest.get("schema_version")
+            != _TIMEOUT_212_RESOLUTION_MANIFEST_SCHEMA
+            or manifest.get("artifact_kind")
+            != "semantic_handoff_timeout_212_resolution_authority"
+            or re.fullmatch(
+                r"https://github\.com/leevi2010-cursor/ArcheOS/issues/133"
+                r"#issuecomment-\d+",
+                str(manifest.get("authority_ref")),
+            )
+            is None
+            or manifest.get("current_global_authority_fingerprint")
+            != authority.get("global_authority_fingerprint")
+            or manifest.get("global_ordinal") != 212
+            or manifest.get("activation_total") != 212
+            or manifest.get("activation_unknown_count") != 1
+            or manifest.get("activation_last_global_ordinal") != 212
+            or manifest.get("activation_attempt_inventory_fingerprint")
+            != _fingerprint(list(attempts))
+            or manifest.get("window") != window
+            or manifest.get("semantic_attempt")
+            != {
+                key: attempt.get(key)
+                for key in (
+                    "semantic_run_id",
+                    "run_contract_fingerprint",
+                    "batch_ordinal",
+                    "batch_contract_fingerprint",
+                    "input_fingerprint",
+                    "attempt_id",
+                    "attempt_nonce",
+                    "attempt_receipt_fingerprint",
+                )
+            }
+            or not isinstance(batch_receipt, dict)
+            or manifest.get("failure_audit")
+            != {
+                "processing_run_id": audit.get("processing_run_id"),
+                "relative_path": audit_path.relative_to(
+                    self.audit_root
+                ).as_posix(),
+                "audit_fingerprint": _bytes_fingerprint(
+                    _private_bytes_read(audit_path)
+                ),
+                "failure_category": "timeout",
+                "timeout_phase": "initial_communicate",
+                "result_file_present": False,
+                "process_cleanup_status": "verified",
+                "audit_readback_status": "verified",
+            }
+            or manifest.get("diagnostic_metadata")
+            != {
+                "processing_run_id": audit.get("processing_run_id"),
+                "metadata_fingerprint": diagnostic_fingerprint,
+            }
+            or manifest.get("digest") != dict(digest_binding)
+            or continuation
+            != {
+                "previous_reviewed_git_head": authority.get(
+                    "reviewed_git_head"
+                ),
+                "previous_execution_contract": authority.get("contract"),
+                "reviewed_git_head": reviewed_git_head,
+                "execution_contract": self._contract_payload(provider),
+                "next_global_ordinal": 213,
+                "absolute_cap": 1000,
+            }
+            or continuation.get("execution_contract")
+            != continuation.get("previous_execution_contract")
+            or re.fullmatch(r"[0-9a-f]{40}", reviewed_git_head) is None
+            or reviewed_git_head == authority.get("reviewed_git_head")
+            or not _sha256_fingerprint(fingerprint)
+            or fingerprint != _fingerprint(projected)
+        ):
+            raise SemanticHandoffError(
+                "Semantic ordinal212 resolution authority manifest binding 损坏。"
+            )
+        return manifest
+
+    def resolve_timeout_212(
+        self,
+        *,
+        authority_manifest_file: Path,
+        provider: CodexCliRepresentationAnalysisProvider,
+        reviewed_git_head: str,
+        digest_binding: Mapping[str, object],
+        commit_failed_closed_status: Callable[
+            [str], tuple[str, Mapping[str, object]]
+        ],
+    ) -> dict[str, object]:
+        """Resolve only ordinal 212 and continue at 213 without Providers."""
+
+        def validate_locked_state(
+            current_digest_binding: Mapping[str, object],
+        ) -> tuple[
+            dict[str, object],
+            dict[str, object],
+            dict[str, object],
+            dict[str, object],
+            dict[str, object] | None,
+            list[dict[str, object]],
+            dict[str, object],
+            dict[str, object],
+            Path,
+            dict[str, object],
+            str,
+            dict[str, object],
+        ]:
+            grant = self._read_base_grant()
+            extension = self._read_extension(grant)
+            resolution = self._read_unknown_resolution()
+            maintenance = self._read_maintenance_continuation(
+                grant, extension, resolution
+            )
+            if extension is None or resolution is None or maintenance is None:
+                raise SemanticHandoffError(
+                    "Semantic ordinal212 resolution 缺少前序 authority。"
+                )
+            previous = self._effective_authority(
+                grant, extension, resolution, maintenance
+            )
+            existing = self._read_timeout_212_resolution(
+                grant, extension, resolution, maintenance
+            )
+            effective = self._effective_authority(
+                grant, extension, resolution, maintenance, existing
+            )
+            attempts, unknown = self._global_attempts(effective)
+            if existing is None and not unknown:
+                raise SemanticHandoffError(
+                    "Semantic ordinal212 resolution 未发现唯一 unknown。"
+                )
+            if existing is not None and unknown:
+                raise SemanticHandoffError(
+                    "Semantic ordinal212 resolution receipt 未收敛。"
+                )
+            (
+                attempt,
+                run_payload,
+                audit_path,
+                audit,
+                _diagnostic_path,
+                _diagnostic,
+                diagnostic_fingerprint,
+            ) = self._timeout_212_resolution_evidence(
+                authority=previous,
+                attempts=attempts,
+                provider=provider,
+            )
+            manifest = self._validate_timeout_212_resolution_manifest(
+                authority_manifest_file,
+                authority=previous,
+                attempts=attempts,
+                attempt=attempt,
+                run_payload=run_payload,
+                audit_path=audit_path,
+                audit=audit,
+                diagnostic_fingerprint=diagnostic_fingerprint,
+                digest_binding=current_digest_binding,
+                reviewed_git_head=reviewed_git_head,
+                provider=provider,
+            )
+            return (
+                grant,
+                dict(extension),
+                dict(resolution),
+                dict(maintenance),
+                existing,
+                attempts,
+                attempt,
+                run_payload,
+                audit_path,
+                audit,
+                diagnostic_fingerprint,
+                manifest,
+            )
+
+        preflight = validate_locked_state(digest_binding)
+        with self._locked():
+            locked = validate_locked_state(digest_binding)
+            if (
+                preflight[8] != locked[8]
+                or not _payloads_exactly_equal(
+                    [*preflight[:8], *preflight[9:]],
+                    [*locked[:8], *locked[9:]],
+                )
+            ):
+                raise SemanticHandoffError(
+                    "Semantic ordinal212 resolution preflight 发生漂移。"
+                )
+            (
+                _grant,
+                _extension,
+                _resolution,
+                _maintenance,
+                existing,
+                attempts,
+                attempt,
+                _run_payload,
+                audit_path,
+                audit,
+                diagnostic_fingerprint,
+                manifest,
+            ) = locked
+            manifest_fingerprint = manifest["payload_fingerprint"]
+            resolution_id = (
+                "unknown_resolution_212_"
+                + str(manifest_fingerprint).removeprefix("sha256:")[:32]
+            )
+            status_fingerprint, final_digest_binding = (
+                commit_failed_closed_status(resolution_id)
+            )
+            if (
+                not _sha256_fingerprint(status_fingerprint)
+                or not isinstance(final_digest_binding, Mapping)
+            ):
+                raise SemanticHandoffError(
+                    "Semantic ordinal212 failed_closed status 读回失败。"
+                )
+            final = validate_locked_state(final_digest_binding)
+            if (
+                locked[8] != final[8]
+                or not _payloads_exactly_equal(
+                    [*locked[:8], *locked[9:]],
+                    [*final[:8], *final[9:]],
+                )
+            ):
+                raise SemanticHandoffError(
+                    "Semantic ordinal212 status 后 replay 发生漂移。"
+                )
+            if existing is not None:
+                digest = existing.get("digest")
+                if (
+                    existing.get("authority_manifest_fingerprint")
+                    != manifest_fingerprint
+                    or existing.get("resolution_id") != resolution_id
+                    or not isinstance(digest, dict)
+                    or digest.get("failed_closed_status_fingerprint")
+                    != status_fingerprint
+                ):
+                    raise SemanticHandoffError(
+                        "Semantic ordinal212 resolution 已存在且不匹配。"
+                    )
+                return dict(existing)
+            without_fingerprint: dict[str, object] = {
+                "schema_version": _TIMEOUT_212_RESOLUTION_SCHEMA,
+                "artifact_kind": "semantic_handoff_timeout_212_resolution",
+                "authority_ref": manifest["authority_ref"],
+                "authority_manifest_fingerprint": manifest_fingerprint,
+                "previous_global_authority_fingerprint": attempt[
+                    "global_authority_fingerprint"
+                ],
+                "resolution_id": resolution_id,
+                "global_ordinal": 212,
+                "outcome": "known_consumed_timeout",
+                "semantic_attempt": {
+                    **{
+                        key: attempt[key]
+                        for key in (
+                            "semantic_run_id",
+                            "run_contract_fingerprint",
+                            "batch_ordinal",
+                            "batch_contract_fingerprint",
+                            "input_fingerprint",
+                            "attempt_id",
+                            "attempt_nonce",
+                            "attempt_receipt_fingerprint",
+                        )
+                    },
+                    "result_present": False,
+                },
+                "failure_audit": {
+                    "processing_run_id": audit["processing_run_id"],
+                    "relative_path": audit_path.relative_to(
+                        self.audit_root
+                    ).as_posix(),
+                    "audit_fingerprint": _bytes_fingerprint(
+                        _private_bytes_read(audit_path)
+                    ),
+                    "failure_category": "timeout",
+                    "timeout_phase": "initial_communicate",
+                    "process_cleanup_status": "verified",
+                    "audit_readback_status": "verified",
+                },
+                "diagnostic_metadata": {
+                    "processing_run_id": audit["processing_run_id"],
+                    "metadata_fingerprint": diagnostic_fingerprint,
+                },
+                "digest": {
+                    **dict(final_digest_binding),
+                    "failed_closed_status_fingerprint": status_fingerprint,
+                },
+                "activation_total": 212,
+                "activation_unknown_count": 1,
+                "activation_last_global_ordinal": 212,
+                "activation_attempt_inventory_fingerprint": _fingerprint(
+                    attempts
+                ),
+                "preserved_but_unabsorbed": True,
+                "continuation": manifest["continuation"],
+            }
+            receipt = {
+                **without_fingerprint,
+                "resolution_receipt_fingerprint": _fingerprint(
+                    without_fingerprint
+                ),
+            }
+            _publish_private_json_marker(
+                self.timeout_212_resolution_path, receipt
+            )
+            _refsync_and_readback(
+                files=(
+                    self.grant_path,
+                    self.extension_path,
+                    self.unknown_resolution_path,
+                    self.maintenance_continuation_path,
+                    self.timeout_212_resolution_path,
+                    self.lock_path,
+                ),
+                directories=(self.root, self.audit_root),
+            )
+            base = self._read_base_grant()
+            extension = self._read_extension(base)
+            resolution = self._read_unknown_resolution()
+            maintenance = self._read_maintenance_continuation(
+                base, extension, resolution
+            )
+            observed = self._read_timeout_212_resolution(
+                base, extension, resolution, maintenance
+            )
+            if observed is None or not _payloads_exactly_equal(
+                observed, receipt
+            ):
+                raise SemanticHandoffError(
+                    "Semantic ordinal212 resolution 安装读回失败。"
+                )
+            effective = self._effective_authority(
+                base, extension, resolution, maintenance, observed
+            )
+            final_attempts, unknown = self._global_attempts(effective)
+            if (
+                unknown
+                or len(final_attempts) != 132
+                or final_attempts[-1].get("global_ordinal") != 212
+            ):
+                raise SemanticHandoffError(
+                    "Semantic ordinal212 resolution ledger 读回失败。"
+                )
+            return observed
+
+    def validate_timeout_212_resolution_digest(
+        self,
+        *,
+        digest_binding: Mapping[str, object],
+        failed_closed_status_fingerprint: str,
+        resolution_id: str,
+    ) -> dict[str, object]:
+        base = self._read_base_grant()
+        extension = self._read_extension(base)
+        resolution = self._read_unknown_resolution()
+        maintenance = self._read_maintenance_continuation(
+            base, extension, resolution
+        )
+        timeout_resolution = self._read_timeout_212_resolution(
+            base, extension, resolution, maintenance
+        )
+        if timeout_resolution is None:
+            raise SemanticHandoffError(
+                "Semantic ordinal212 resolution receipt 缺失。"
+            )
+        effective = self._effective_authority(
+            base,
+            extension,
+            resolution,
+            maintenance,
+            timeout_resolution,
+        )
+        attempts, unknown = self._global_attempts(effective)
+        digest = timeout_resolution.get("digest")
+        if (
+            unknown
+            or len(attempts) < 132
+            or timeout_resolution.get("resolution_id") != resolution_id
+            or not isinstance(digest, dict)
+            or digest
+            != {
+                **dict(digest_binding),
+                "failed_closed_status_fingerprint": (
+                    failed_closed_status_fingerprint
+                ),
+            }
+        ):
+            raise SemanticHandoffError(
+                "Semantic ordinal212 resolution digest binding 损坏。"
+            )
+        return timeout_resolution
 
     def _read_base_grant(self) -> dict[str, object]:
         if not self.exists:
@@ -4762,6 +5531,182 @@ class _SemanticGlobalAuthority:
             )
         return receipt
 
+    def _read_timeout_212_resolution(
+        self,
+        grant: Mapping[str, object],
+        extension: Mapping[str, object] | None,
+        resolution: Mapping[str, object] | None,
+        maintenance_continuation: Mapping[str, object] | None,
+    ) -> dict[str, object] | None:
+        """Read the fixed ordinal-212 timeout resolution and head continuation."""
+
+        if not os.path.lexists(self.timeout_212_resolution_path):
+            return None
+        if (
+            extension is None
+            or resolution is None
+            or maintenance_continuation is None
+        ):
+            raise SemanticHandoffError(
+                "Semantic ordinal212 resolution 缺少前序 authority。"
+            )
+        receipt = _private_json_exact(self.timeout_212_resolution_path)
+        projected = dict(receipt)
+        fingerprint = projected.pop("resolution_receipt_fingerprint", None)
+        previous = self._effective_authority(
+            grant, extension, resolution, maintenance_continuation
+        )
+        attempt = receipt.get("semantic_attempt")
+        audit = receipt.get("failure_audit")
+        diagnostic = receipt.get("diagnostic_metadata")
+        digest = receipt.get("digest")
+        continuation = receipt.get("continuation")
+        if (
+            set(receipt)
+            != {
+                "schema_version",
+                "artifact_kind",
+                "authority_ref",
+                "authority_manifest_fingerprint",
+                "previous_global_authority_fingerprint",
+                "resolution_id",
+                "global_ordinal",
+                "outcome",
+                "semantic_attempt",
+                "failure_audit",
+                "diagnostic_metadata",
+                "digest",
+                "activation_total",
+                "activation_unknown_count",
+                "activation_last_global_ordinal",
+                "activation_attempt_inventory_fingerprint",
+                "preserved_but_unabsorbed",
+                "continuation",
+                "resolution_receipt_fingerprint",
+            }
+            or receipt.get("schema_version")
+            != _TIMEOUT_212_RESOLUTION_SCHEMA
+            or receipt.get("artifact_kind")
+            != "semantic_handoff_timeout_212_resolution"
+            or re.fullmatch(
+                r"https://github\.com/leevi2010-cursor/ArcheOS/issues/133"
+                r"#issuecomment-\d+",
+                str(receipt.get("authority_ref")),
+            )
+            is None
+            or not _sha256_fingerprint(
+                receipt.get("authority_manifest_fingerprint")
+            )
+            or receipt.get("previous_global_authority_fingerprint")
+            != previous.get("global_authority_fingerprint")
+            or re.fullmatch(
+                r"unknown_resolution_212_[0-9a-f]{32}",
+                str(receipt.get("resolution_id")),
+            )
+            is None
+            or receipt.get("global_ordinal") != 212
+            or receipt.get("outcome") != "known_consumed_timeout"
+            or not isinstance(attempt, dict)
+            or set(attempt)
+            != {
+                "semantic_run_id",
+                "run_contract_fingerprint",
+                "batch_ordinal",
+                "batch_contract_fingerprint",
+                "input_fingerprint",
+                "attempt_id",
+                "attempt_nonce",
+                "attempt_receipt_fingerprint",
+                "result_present",
+            }
+            or attempt.get("result_present") is not False
+            or not isinstance(audit, dict)
+            or set(audit)
+            != {
+                "processing_run_id",
+                "relative_path",
+                "audit_fingerprint",
+                "failure_category",
+                "timeout_phase",
+                "process_cleanup_status",
+                "audit_readback_status",
+            }
+            or audit.get("failure_category") != "timeout"
+            or audit.get("timeout_phase") != "initial_communicate"
+            or audit.get("process_cleanup_status") != "verified"
+            or audit.get("audit_readback_status") != "verified"
+            or not _sha256_fingerprint(audit.get("audit_fingerprint"))
+            or not isinstance(diagnostic, dict)
+            or set(diagnostic)
+            != {
+                "processing_run_id",
+                "metadata_fingerprint",
+            }
+            or diagnostic.get("processing_run_id")
+            != audit.get("processing_run_id")
+            or not _sha256_fingerprint(
+                diagnostic.get("metadata_fingerprint")
+            )
+            or not isinstance(digest, dict)
+            or set(digest)
+            != {
+                "run_id",
+                "plan_fingerprint",
+                "plan_receipt_fingerprint",
+                "item_id",
+                "source_id",
+                "representation_id",
+                "representation_manifest",
+                "representation_artifact_inventory_fingerprint",
+                "failed_closed_status_fingerprint",
+            }
+            or not isinstance(digest.get("representation_manifest"), dict)
+            or not _sha256_fingerprint(
+                digest.get("representation_artifact_inventory_fingerprint")
+            )
+            or not _sha256_fingerprint(
+                digest.get("failed_closed_status_fingerprint")
+            )
+            or receipt.get("activation_total") != 212
+            or receipt.get("activation_unknown_count") != 1
+            or receipt.get("activation_last_global_ordinal") != 212
+            or not _sha256_fingerprint(
+                receipt.get("activation_attempt_inventory_fingerprint")
+            )
+            or receipt.get("preserved_but_unabsorbed") is not True
+            or not isinstance(continuation, dict)
+            or set(continuation)
+            != {
+                "previous_reviewed_git_head",
+                "previous_execution_contract",
+                "reviewed_git_head",
+                "execution_contract",
+                "next_global_ordinal",
+                "absolute_cap",
+            }
+            or continuation.get("previous_reviewed_git_head")
+            != previous.get("reviewed_git_head")
+            or continuation.get("previous_execution_contract")
+            != previous.get("contract")
+            or continuation.get("execution_contract")
+            != previous.get("contract")
+            or continuation.get("reviewed_git_head")
+            == continuation.get("previous_reviewed_git_head")
+            or re.fullmatch(
+                r"[0-9a-f]{40}",
+                str(continuation.get("reviewed_git_head")),
+            )
+            is None
+            or continuation.get("next_global_ordinal") != 213
+            or continuation.get("absolute_cap") != 1000
+            or not _sha256_fingerprint(fingerprint)
+            or fingerprint != _fingerprint(projected)
+        ):
+            raise SemanticHandoffError(
+                "Semantic ordinal212 resolution receipt binding 损坏。"
+            )
+        return receipt
+
     @staticmethod
     def _window_continues_attempts(
         window: Mapping[str, object],
@@ -4980,6 +5925,7 @@ class _SemanticGlobalAuthority:
         extension: Mapping[str, object] | None,
         resolution: Mapping[str, object] | None = None,
         maintenance_continuation: Mapping[str, object] | None = None,
+        timeout_212_resolution: Mapping[str, object] | None = None,
     ) -> dict[str, object]:
         effective = _SemanticGlobalAuthority._effective_authority_before_resolution(
             grant, extension
@@ -5004,6 +5950,18 @@ class _SemanticGlobalAuthority:
                 "reviewed_git_head"
             ]
             effective["contract"] = maintenance_continuation[
+                "execution_contract"
+            ]
+        if timeout_212_resolution is not None:
+            timeout_continuation = timeout_212_resolution["continuation"]
+            assert isinstance(timeout_continuation, dict)
+            effective["global_authority_fingerprint"] = (
+                timeout_212_resolution["resolution_receipt_fingerprint"]
+            )
+            effective["reviewed_git_head"] = timeout_continuation[
+                "reviewed_git_head"
+            ]
+            effective["contract"] = timeout_continuation[
                 "execution_contract"
             ]
         return effective
@@ -5045,8 +6003,15 @@ class _SemanticGlobalAuthority:
         continuation = self._read_maintenance_continuation(
             grant, extension, resolution
         )
-        effective = self._effective_authority(
+        timeout_resolution = self._read_timeout_212_resolution(
             grant, extension, resolution, continuation
+        )
+        effective = self._effective_authority(
+            grant,
+            extension,
+            resolution,
+            continuation,
+            timeout_resolution,
         )
         window_payload = _authority_window_payload(window)
         self._validate_effective_window(window_payload, grant, effective)
@@ -5075,6 +6040,12 @@ class _SemanticGlobalAuthority:
         maintenance_continuation = self._read_maintenance_continuation(
             base_grant, extension, resolution
         )
+        timeout_212_resolution = self._read_timeout_212_resolution(
+            base_grant,
+            extension,
+            resolution,
+            maintenance_continuation,
+        )
         previous_authority = self._effective_authority_before_resolution(
             base_grant, extension
         )
@@ -5082,7 +6053,11 @@ class _SemanticGlobalAuthority:
             base_grant, extension, resolution
         )
         expected_effective = self._effective_authority(
-            base_grant, extension, resolution, maintenance_continuation
+            base_grant,
+            extension,
+            resolution,
+            maintenance_continuation,
+            timeout_212_resolution,
         )
         if not _payloads_exactly_equal(grant, expected_effective):
             raise SemanticHandoffError(
@@ -5102,6 +6077,11 @@ class _SemanticGlobalAuthority:
         continuation_fingerprint = (
             maintenance_continuation.get("continuation_fingerprint")
             if maintenance_continuation is not None
+            else None
+        )
+        timeout_212_fingerprint = (
+            timeout_212_resolution.get("resolution_receipt_fingerprint")
+            if timeout_212_resolution is not None
             else None
         )
         attempts: list[dict[str, object]] = []
@@ -5189,14 +6169,34 @@ class _SemanticGlobalAuthority:
                     maintenance_continuation is not None
                     and authority_fingerprint == continuation_fingerprint
                 ):
+                    authority = self._effective_authority(
+                        base_grant,
+                        extension,
+                        resolution,
+                        maintenance_continuation,
+                    )
+                    if (
+                        isinstance(global_ordinal, bool)
+                        or not isinstance(global_ordinal, int)
+                        or not 177
+                        <= global_ordinal
+                        <= (212 if timeout_212_resolution is not None else 1000)
+                    ):
+                        raise SemanticHandoffError(
+                            "Semantic maintenance continuation ordinal 损坏。"
+                        )
+                elif (
+                    timeout_212_resolution is not None
+                    and authority_fingerprint == timeout_212_fingerprint
+                ):
                     authority = expected_effective
                     if (
                         isinstance(global_ordinal, bool)
                         or not isinstance(global_ordinal, int)
-                        or not 177 <= global_ordinal <= 1000
+                        or not 213 <= global_ordinal <= 1000
                     ):
                         raise SemanticHandoffError(
-                            "Semantic maintenance continuation ordinal 损坏。"
+                            "Semantic ordinal212 continuation ordinal 损坏。"
                         )
                 else:
                     raise SemanticHandoffError(
@@ -5276,6 +6276,11 @@ class _SemanticGlobalAuthority:
                         and payload.get("global_ordinal") == 166
                     ):
                         continue
+                    if (
+                        timeout_212_resolution is not None
+                        and payload.get("global_ordinal") == 212
+                    ):
+                        continue
                     unknown = True
                 else:
                     self._validate_global_result(
@@ -5327,6 +6332,17 @@ class _SemanticGlobalAuthority:
                 raise SemanticHandoffError(
                     "Semantic maintenance continuation activation 漂移。"
                 )
+        if timeout_212_resolution is not None:
+            self._validate_timeout_212_resolution_against_attempts(
+                receipt=timeout_212_resolution,
+                previous_authority=self._effective_authority(
+                    base_grant,
+                    extension,
+                    resolution,
+                    maintenance_continuation,
+                ),
+                attempts=attempts,
+            )
         previous_window: dict[str, object] | None = None
         for attempt in attempts:
             window = attempt.get("window")
@@ -5353,6 +6369,8 @@ class _SemanticGlobalAuthority:
                     previous_window, window, resolution
                 ) and not self._window_matches_maintenance_continuation(
                     previous_window, window, maintenance_continuation
+                ) and not self._window_matches_timeout_212_continuation(
+                    previous_window, window, timeout_212_resolution
                 ):
                     raise SemanticHandoffError(
                         "Semantic global authority current window 漂移。"
@@ -5530,6 +6548,19 @@ class _SemanticGlobalAuthority:
                             self._read_base_grant(),
                             self._read_extension(self._read_base_grant()),
                             self._read_unknown_resolution(),
+                        ),
+                    ) or self._window_matches_timeout_212_continuation(
+                        last_window,
+                        current_window,
+                        self._read_timeout_212_resolution(
+                            self._read_base_grant(),
+                            self._read_extension(self._read_base_grant()),
+                            self._read_unknown_resolution(),
+                            self._read_maintenance_continuation(
+                                self._read_base_grant(),
+                                self._read_extension(self._read_base_grant()),
+                                self._read_unknown_resolution(),
+                            ),
                         ),
                     )
                 else:
@@ -7306,6 +8337,42 @@ class ExternalAgentSemanticHandoffService:
             resolution_id=resolution_id,
         )
 
+    def resolve_timeout_212(
+        self,
+        provider: CodexCliRepresentationAnalysisProvider,
+        *,
+        authority_manifest_file: Path,
+        reviewed_git_head: str,
+        digest_binding: Mapping[str, object],
+        commit_failed_closed_status: Callable[
+            [str], tuple[str, Mapping[str, object]]
+        ],
+    ) -> dict[str, object]:
+        """Resolve the approved ordinal-212 timeout without a Provider call."""
+
+        return _SemanticGlobalAuthority(self.audit_root).resolve_timeout_212(
+            authority_manifest_file=authority_manifest_file,
+            provider=provider,
+            reviewed_git_head=reviewed_git_head,
+            digest_binding=digest_binding,
+            commit_failed_closed_status=commit_failed_closed_status,
+        )
+
+    def validate_timeout_212_resolution_digest(
+        self,
+        *,
+        digest_binding: Mapping[str, object],
+        failed_closed_status_fingerprint: str,
+        resolution_id: str,
+    ) -> dict[str, object]:
+        return _SemanticGlobalAuthority(
+            self.audit_root
+        ).validate_timeout_212_resolution_digest(
+            digest_binding=digest_binding,
+            failed_closed_status_fingerprint=failed_closed_status_fingerprint,
+            resolution_id=resolution_id,
+        )
+
     def global_campaign_binding(
         self,
     ) -> SemanticCampaignAuthorityBinding | None:
@@ -7325,14 +8392,21 @@ class ExternalAgentSemanticHandoffService:
             raise SemanticHandoffError("Semantic global authority 未安装。")
         with authority._locked(blocking=False):
             base = authority._read_base_grant()
+            extension = authority._read_extension(base)
+            resolution = authority._read_unknown_resolution()
+            maintenance = authority._read_maintenance_continuation(
+                base, extension, resolution
+            )
             effective = authority._effective_authority(
                 base,
-                authority._read_extension(base),
-                authority._read_unknown_resolution(),
-                authority._read_maintenance_continuation(
+                extension,
+                resolution,
+                maintenance,
+                authority._read_timeout_212_resolution(
                     base,
-                    authority._read_extension(base),
-                    authority._read_unknown_resolution(),
+                    extension,
+                    resolution,
+                    maintenance,
                 ),
             )
             attempts, unknown = authority._global_attempts(effective)
