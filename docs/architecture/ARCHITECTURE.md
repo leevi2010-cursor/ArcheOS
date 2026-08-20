@@ -187,16 +187,34 @@ Atomic Information 与 World Model 之间存在独立的信息消化与治理边
 - 决定是安全自动执行还是请求人类判断；
 - 在执行后保留来源、Evidence、Claim、Hypothesis 与历史。
 
+该边界的默认执行单位是同一 Source / Representation 边界内的相关 Atomic Information 批次，而不是一条 Atomic Information 对应一次模型调用：
+
+```text
+Bounded ordered Atomic Information batch
+                 ↓ one interpretation call
+Validated ordered interpretation result
+                 ↓ durable Processing receipt
+Sequential idempotent World Model application
+                 ↓ exception only
+Existing Human Judgment / Change Proposal
+```
+
+Provider 只负责一次性形成整批有序判断，不能直接写 Store。系统在任何 World Model 写入前保存并绑定输入顺序、结果与指纹；应用阶段逐条、幂等、可恢复。应用中断只恢复尚未完成的顺序写入，不再次请求模型。缺失、重复、乱序、未知 ID 或不完整结果必须在长期写入前 fail closed。
+
+该批量边界复用现有 Processing / Audit、Information Governance 与 Change Proposal，不建立 Batch、Governance Job、Exception Queue 或 Agent Session 等新的 Core / Store。单条兼容入口可以存在，但生产多条入口不得静默退化为逐条 Provider 调用。
+
 架构位置：
 
 ```text
-Atomic Information + Claim + Hypothesis + Evidence
-                     ↓
-          Interpretation + Governance
-                     ↓
-           World Model Change Service
-                     ↓
-           WorldModelRepository
+Ordered Atomic Information + Claim + Hypothesis + Evidence batch
+                              ↓
+               Batch Interpretation + Governance
+                              ↓
+          Durable result → sequential application
+                              ↓
+                  World Model Change Service
+                              ↓
+                  WorldModelRepository
 ```
 
 **业务规则不写在 Repository 内。**
