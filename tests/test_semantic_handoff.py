@@ -11350,6 +11350,45 @@ print("passed")
             continuation,
         )
 
+        gate_c_head = "c" * 40
+        gate_c_authority_ref = (
+            "https://github.com/leevi2010-cursor/ArcheOS/issues/146"
+            "#issuecomment-5356000000"
+        )
+        gate_c_runner = FakeRunner()
+        gate_c_continuation = latest_handoff.install_gate_c_continuation(
+            CodexCliRepresentationAnalysisProvider(
+                provider_version="0.147.0",
+                timeout_seconds=300,
+                runner=gate_c_runner,
+                diagnostic_root=timeout_provider.diagnostic_root,
+            ),
+            window_binding=replace(
+                active_window, reviewed_git_head=new_head
+            ),
+            reviewed_git_head=gate_c_head,
+            authority_ref=gate_c_authority_ref,
+        )
+        self.assertEqual(gate_c_runner.calls, [])
+        self.assertEqual(gate_c_continuation["activation_total"], 220)
+        self.assertEqual(gate_c_continuation["next_global_ordinal"], 221)
+        self.assertEqual(
+            latest_handoff.install_gate_c_continuation(
+                CodexCliRepresentationAnalysisProvider(
+                    provider_version="0.147.0",
+                    timeout_seconds=300,
+                    runner=FakeRunner(),
+                    diagnostic_root=timeout_provider.diagnostic_root,
+                ),
+                window_binding=replace(
+                    active_window, reviewed_git_head=gate_c_head
+                ),
+                reviewed_git_head=gate_c_head,
+                authority_ref=gate_c_authority_ref,
+            ),
+            gate_c_continuation,
+        )
+
         next_root = root / "ordinal-0221"
         next_representation, next_service = self.build_service(
             root=next_root,
@@ -11371,7 +11410,9 @@ print("passed")
                     diagnostic_root=timeout_provider.diagnostic_root,
                 ),
                 privacy_binding=self.privacy_binding(),
-                authority_binding=active_window,
+                authority_binding=replace(
+                    active_window, reviewed_git_head=new_head
+                ),
             )
         self.assertEqual(old_runner.calls, [])
         runner_221 = FakeRunner()
@@ -11385,7 +11426,7 @@ print("passed")
             ),
             privacy_binding=self.privacy_binding(),
             authority_binding=replace(
-                active_window, reviewed_git_head=new_head
+                active_window, reviewed_git_head=gate_c_head
             ),
         )
         self.assertEqual(len(runner_221.calls), 1)
@@ -11401,7 +11442,7 @@ print("passed")
         )
         self.assertEqual(
             attempt_221["global_authority_fingerprint"],
-            continuation["continuation_fingerprint"],
+            gate_c_continuation["continuation_fingerprint"],
         )
 
 
