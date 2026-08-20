@@ -31,9 +31,11 @@ from .digestion import (
     AtomicInformationDigestionService,
     AtomicInformationInterpretationProvider,
     BusinessLanguageHumanJudgmentPort,
+    InterpretationResult,
     JsonlChangeJournal,
     JsonlChangeProposalStore,
 )
+from .digestion.providers import interpretation_to_dict, parse_interpretation
 from .emergence import IdentityEvidence, IdentityGateService
 from .representation import (
     LocalRepresentationRepository,
@@ -74,7 +76,9 @@ LEGACY_RUN_PLAN_SCHEMA_VERSION = "wechat-digest-run-plan/1.0"
 RUN_STATUS_SCHEMA_VERSION = "wechat-digest-run-status/1.0"
 RUN_PLAN_RECEIPT_SCHEMA_VERSION = "wechat-digest-run-plan-receipt/2.0"
 LEGACY_RUN_PLAN_RECEIPT_SCHEMA_VERSION = "wechat-digest-run-plan-receipt/1.0"
-GOVERNANCE_RECEIPT_SCHEMA_VERSION = "wechat-governance-receipt/1.0"
+GOVERNANCE_RECEIPT_SCHEMA_VERSION = "wechat-governance-receipt/2.0"
+LEGACY_GOVERNANCE_RECEIPT_SCHEMA_VERSION = "wechat-governance-receipt/1.0"
+GOVERNANCE_MIGRATION_SCHEMA_VERSION = "wechat-governance-migration/1.0"
 CAPTURE_SCHEMA_VERSION = "wechat-cli-capture/1.0"
 SUPPORTED_WECHAT_CLI_VERSION = "0.5.0"
 DEFAULT_CAPTURE_WINDOW_DAYS = 30
@@ -235,6 +239,13 @@ class SemanticHandoffPort(Protocol):
     ) -> dict[str, object]: ...
 
     def install_maintenance_continuation(
+        self,
+        *,
+        window_binding: SemanticWindowAuthorityBinding,
+        authority_ref: str,
+    ) -> dict[str, object]: ...
+
+    def install_batch_governance_continuation(
         self,
         *,
         window_binding: SemanticWindowAuthorityBinding,
@@ -1112,6 +1123,19 @@ class ExistingSemanticHandoff:
             authority_ref=authority_ref,
         )
 
+    def install_batch_governance_continuation(
+        self,
+        *,
+        window_binding: SemanticWindowAuthorityBinding,
+        authority_ref: str,
+    ) -> dict[str, object]:
+        return self.service.install_batch_governance_continuation(
+            self.provider,
+            window_binding=window_binding,
+            reviewed_git_head=self.reviewed_git_head,
+            authority_ref=authority_ref,
+        )
+
     def resolve_unknown(
         self,
         *,
@@ -1282,10 +1306,67 @@ def _governance_atomic_fingerprint(atomic_ids: Sequence[str]) -> str:
     )
 
 
+def _governance_batch_fingerprint(
+    atomic_ids: Sequence[str], interpretations: Sequence[InterpretationResult]
+) -> str:
+    if (
+        not atomic_ids
+        or len(atomic_ids) != len(set(atomic_ids))
+        or len(atomic_ids) != len(interpretations)
+    ):
+        raise WechatDigestError("微信 Governance batch binding 损坏。")
+    payload = [
+        {
+            "atomic_information_id": atomic_id,
+            "interpretation": interpretation_to_dict(interpretation),
+        }
+        for atomic_id, interpretation in zip(
+            atomic_ids, interpretations, strict=True
+        )
+    ]
+    return _sha256_bytes(_canonical_json(payload).encode("utf-8"))
+
+
 def _validated_governance_receipt(value: object) -> dict[str, object]:
     if not isinstance(value, dict):
         raise WechatDigestError("微信 Governance receipt 损坏。")
+    schema_version = value.get("schema_version")
     phase = value.get("phase")
+    if schema_version == LEGACY_GOVERNANCE_RECEIPT_SCHEMA_VERSION:
+        expected = (
+            {
+                "schema_version",
+                "phase",
+                "atomic_information_fingerprint",
+            }
+            if phase == "started"
+            else {
+                "schema_version",
+                "phase",
+                "atomic_information_fingerprint",
+                "pending_human",
+                "context_object_ids",
+            }
+        )
+        fingerprint = value.get("atomic_information_fingerprint")
+        if (
+            phase not in {"started", "completed"}
+            or set(value) != expected
+            or not isinstance(fingerprint, str)
+            or re.fullmatch(r"sha256:[0-9a-f]{64}", fingerprint) is None
+        ):
+            raise WechatDigestError("微信 Governance receipt 损坏。")
+        if phase == "completed":
+            object_ids = value.get("context_object_ids")
+            if (
+                not isinstance(value.get("pending_human"), bool)
+                or not isinstance(object_ids, list)
+                or any(not isinstance(object_id, str) for object_id in object_ids)
+                or object_ids != sorted(set(object_ids))
+            ):
+                raise WechatDigestError("微信 Governance receipt 损坏。")
+        return dict(value)
+
     expected = (
         {
             "schema_version",
@@ -1297,29 +1378,153 @@ def _validated_governance_receipt(value: object) -> dict[str, object]:
             "schema_version",
             "phase",
             "atomic_information_fingerprint",
+            "batch_atomic_information_ids",
+            "batch_fingerprint",
+            "interpretations",
+            "next_index",
             "pending_human",
             "context_object_ids",
         }
     )
     fingerprint = value.get("atomic_information_fingerprint")
     if (
-        value.get("schema_version") != GOVERNANCE_RECEIPT_SCHEMA_VERSION
-        or phase not in {"started", "completed"}
+        schema_version != GOVERNANCE_RECEIPT_SCHEMA_VERSION
+        or phase not in {
+            "started",
+            "interpreted",
+            "applying",
+            "applied",
+            "completed",
+        }
         or set(value) != expected
         or not isinstance(fingerprint, str)
         or re.fullmatch(r"sha256:[0-9a-f]{64}", fingerprint) is None
     ):
         raise WechatDigestError("微信 Governance receipt 损坏。")
-    if phase == "completed":
-        object_ids = value.get("context_object_ids")
-        if (
-            not isinstance(value.get("pending_human"), bool)
-            or not isinstance(object_ids, list)
-            or any(not isinstance(object_id, str) for object_id in object_ids)
-            or object_ids != sorted(set(object_ids))
-        ):
-            raise WechatDigestError("微信 Governance receipt 损坏。")
+    if phase == "started":
+        return dict(value)
+    atomic_ids = value.get("batch_atomic_information_ids")
+    raw_interpretations = value.get("interpretations")
+    object_ids = value.get("context_object_ids")
+    next_index = value.get("next_index")
+    batch_fingerprint = value.get("batch_fingerprint")
+    if (
+        not isinstance(atomic_ids, list)
+        or not atomic_ids
+        or any(not isinstance(atomic_id, str) for atomic_id in atomic_ids)
+        or len(atomic_ids) != len(set(atomic_ids))
+        or not isinstance(raw_interpretations, list)
+        or len(raw_interpretations) != len(atomic_ids)
+        or isinstance(next_index, bool)
+        or not isinstance(next_index, int)
+        or not 0 <= next_index <= len(atomic_ids)
+        or not isinstance(value.get("pending_human"), bool)
+        or not isinstance(object_ids, list)
+        or any(not isinstance(object_id, str) for object_id in object_ids)
+        or object_ids != sorted(set(object_ids))
+        or not isinstance(batch_fingerprint, str)
+        or re.fullmatch(r"sha256:[0-9a-f]{64}", batch_fingerprint) is None
+    ):
+        raise WechatDigestError("微信 Governance receipt 损坏。")
+    try:
+        interpretations = tuple(
+            parse_interpretation(item) for item in raw_interpretations
+        )
+    except (TypeError, ValueError) as exc:
+        raise WechatDigestError("微信 Governance receipt 损坏。") from exc
+    if batch_fingerprint != _governance_batch_fingerprint(
+        atomic_ids, interpretations
+    ):
+        raise WechatDigestError("微信 Governance receipt batch binding 不一致。")
+    if phase == "interpreted" and next_index != 0:
+        raise WechatDigestError("微信 Governance receipt 进度损坏。")
+    if phase == "applying" and not 0 < next_index < len(atomic_ids):
+        raise WechatDigestError("微信 Governance receipt 进度损坏。")
+    if phase in {"applied", "completed"} and next_index != len(atomic_ids):
+        raise WechatDigestError("微信 Governance receipt 进度损坏。")
     return dict(value)
+
+
+def _validated_governance_migration(value: object) -> dict[str, object]:
+    if not isinstance(value, dict):
+        raise WechatDigestError("微信 Governance migration receipt 损坏。")
+    expected = {
+        "schema_version",
+        "phase",
+        "authority_ref",
+        "legacy_governance_receipt",
+        "atomic_information_fingerprint",
+        "ordered_atomic_information_ids",
+        "completed_atomic_information_ids",
+        "remaining_atomic_information_ids",
+        "legacy_effect_fingerprint",
+        "pristine_remaining_fingerprint",
+        "pending_human",
+        "context_object_ids",
+        "semantic_continuation_fingerprint",
+        "migration_fingerprint",
+    }
+    projected = dict(value)
+    fingerprint = projected.pop("migration_fingerprint", None)
+    ordered = value.get("ordered_atomic_information_ids")
+    completed = value.get("completed_atomic_information_ids")
+    remaining = value.get("remaining_atomic_information_ids")
+    object_ids = value.get("context_object_ids")
+    legacy = value.get("legacy_governance_receipt")
+    try:
+        legacy_receipt = _validated_governance_receipt(legacy)
+    except WechatDigestError as exc:
+        raise WechatDigestError(
+            "微信 Governance migration receipt 损坏。"
+        ) from exc
+    if (
+        set(value) != expected
+        or value.get("schema_version") != GOVERNANCE_MIGRATION_SCHEMA_VERSION
+        or value.get("phase") != "activated"
+        or value.get("authority_ref")
+        != (
+            "https://github.com/leevi2010-cursor/ArcheOS/issues/135"
+            "#issuecomment-5353218136"
+        )
+        or legacy_receipt.get("schema_version")
+        != LEGACY_GOVERNANCE_RECEIPT_SCHEMA_VERSION
+        or legacy_receipt.get("phase") != "started"
+        or not isinstance(ordered, list)
+        or len(ordered) != 18
+        or any(not isinstance(item, str) for item in ordered)
+        or len(ordered) != len(set(ordered))
+        or not isinstance(completed, list)
+        or completed != ordered[:15]
+        or not isinstance(remaining, list)
+        or remaining != ordered[15:]
+        or len(remaining) != 3
+        or value.get("atomic_information_fingerprint")
+        != _governance_atomic_fingerprint(ordered)
+        or legacy_receipt.get("atomic_information_fingerprint")
+        != value.get("atomic_information_fingerprint")
+        or not _sha256_value(value.get("legacy_effect_fingerprint"))
+        or not _sha256_value(value.get("pristine_remaining_fingerprint"))
+        or not isinstance(value.get("pending_human"), bool)
+        or not isinstance(object_ids, list)
+        or any(not isinstance(object_id, str) for object_id in object_ids)
+        or object_ids != sorted(set(object_ids))
+        or not _sha256_value(
+            value.get("semantic_continuation_fingerprint")
+        )
+        or not _sha256_value(fingerprint)
+        or fingerprint != _sha256_bytes(
+            _canonical_json(projected).encode("utf-8")
+        )
+    ):
+        raise WechatDigestError("微信 Governance migration receipt 损坏。")
+    return dict(value)
+
+
+def _sha256_value(value: object) -> bool:
+    return (
+        isinstance(value, str)
+        and re.fullmatch(r"sha256:[0-9a-f]{64}", value) is not None
+    )
 
 
 def _validated_global_attempt_summary(value: object) -> dict[str, int]:
@@ -1645,6 +1850,22 @@ class _GovernanceProviderCallBoundary:
         self.before_call()
         return self.delegate.interpret(atomic_information, current_world_state)
 
+    def interpret_batch(self, items):
+        self.before_call()
+        method = getattr(self.delegate, "interpret_batch", None)
+        if not callable(method):
+            if len(items) == 1:
+                atomic_information, current_world_state = items[0]
+                return (
+                    self.delegate.interpret(
+                        atomic_information, current_world_state
+                    ),
+                )
+            raise RuntimeError(
+                "batch interpretation provider is required for multi-item digestion"
+            )
+        return method(items)
+
 
 class WechatDigestService:
     def __init__(
@@ -1690,6 +1911,15 @@ class WechatDigestService:
         )
         self._semantic_handoff: SemanticHandoffPort | None = None
         self._before_governance_provider_call: Callable[[], None] | None = None
+        self._governance_resume_state: dict[str, object] | None = None
+        self._governance_migration_state: dict[str, object] | None = None
+        self._after_governance_batch_interpretation: Callable[
+            [tuple[str, ...], tuple[InterpretationResult, ...], bool, tuple[str, ...]],
+            None,
+        ] | None = None
+        self._after_governance_application: Callable[
+            [int, bool, tuple[str, ...]], None
+        ] | None = None
         if isinstance(semantic_batch_size, bool) or not isinstance(semantic_batch_size, int) or semantic_batch_size < 1:
             raise ValueError("semantic batch size must be positive")
         self.semantic_batch_size = semantic_batch_size
@@ -2066,6 +2296,324 @@ class WechatDigestService:
                     "Semantic maintenance continuation 安装读回失败。"
                 )
             return continuation
+
+    def _governance_effect_fingerprint(
+        self, atomic_ids: Sequence[str]
+    ) -> str:
+        selected = set(atomic_ids)
+        payload = {
+            "information": [
+                asdict(self.information_store.get_current(atomic_id))
+                for atomic_id in atomic_ids
+            ],
+            "unresolved_proposals": [
+                asdict(proposal)
+                for proposal in self.proposal_store.list_unresolved()
+                if proposal.atomic_information_id in selected
+            ],
+            "journal": [
+                asdict(record)
+                for record in self.journal.list_changes()
+                if record.atomic_information_id in selected
+            ],
+        }
+        return _sha256_bytes(_canonical_json(payload).encode("utf-8"))
+
+    def activate_batch_governance(
+        self, *, authority_ref: str
+    ) -> dict[str, object]:
+        """Activate the exact Issue #135 migration without calling Providers."""
+
+        expected_authority = (
+            "https://github.com/leevi2010-cursor/ArcheOS/issues/135"
+            "#issuecomment-5353218136"
+        )
+        if authority_ref != expected_authority:
+            raise WechatDigestError(
+                "Batch Governance migration authority ref 不匹配。"
+            )
+        with self.run_store.lock():
+            run_id = self.run_store.active_run_id()
+            if run_id is None:
+                raise WechatDigestError(
+                    "不存在可迁移 Batch Governance 的 active run。"
+                )
+            plan = self.run_store.plan(run_id)
+            if self._plan_all_history_upper(plan) is None:
+                raise WechatDigestError(
+                    "Batch Governance migration 只能绑定 frozen campaign。"
+                )
+            after = WechatCursor.from_dict(
+                plan.get("after_cursor"), "plan.after_cursor"
+            )
+            upper = WechatCursor.from_dict(
+                plan.get("upper_bound"), "plan.upper_bound"
+            )
+            if self.run_store.checkpoint() not in {None, after}:
+                raise WechatDigestError(
+                    "Batch Governance migration checkpoint binding 不一致。"
+                )
+            capture = self.capture_provider.capture(after, upper_bound=upper)
+            self._verify_capture_against_plan(capture, plan)
+            status = self.run_store.status(run_id)
+            self._verify_plan_and_status(run_id, capture, plan, status)
+            if status.get("checkpoint_published") is not False:
+                raise WechatDigestError(
+                    "Batch Governance migration 不得发生在 checkpoint 推进后。"
+                )
+            items = status.get("items")
+            if not isinstance(items, dict):
+                raise WechatDigestError("微信运行状态 items 损坏。")
+            migrated = [
+                (item_id, value)
+                for item_id, value in items.items()
+                if isinstance(item_id, str)
+                and isinstance(value, dict)
+                and value.get("governance_migration") is not None
+            ]
+            if migrated:
+                if (
+                    len(migrated) != 1
+                    or status.get("state") != "processing"
+                    or status.get("failure_category") is not None
+                ):
+                    raise WechatDigestError(
+                        "Batch Governance migration 已存在但状态不一致。"
+                    )
+                item_id, item = migrated[0]
+                migration = _validated_governance_migration(
+                    item.get("governance_migration")
+                )
+                if (
+                    migration.get("authority_ref") != authority_ref
+                    or self._governance_effect_fingerprint(
+                        migration["completed_atomic_information_ids"]
+                    )
+                    != migration["legacy_effect_fingerprint"]
+                    or self._governance_effect_fingerprint(
+                        migration["remaining_atomic_information_ids"]
+                    )
+                    != migration["pristine_remaining_fingerprint"]
+                ):
+                    raise WechatDigestError(
+                        "Batch Governance migration durable state 漂移。"
+                    )
+            else:
+                if (
+                    status.get("state") != "failed"
+                    or status.get("failure_category") != "BrokenPipeError"
+                ):
+                    raise WechatDigestError(
+                        "Batch Governance migration active stop 边界不匹配。"
+                    )
+                candidates: list[tuple[str, dict[str, object]]] = []
+                for item_id, value in items.items():
+                    if not isinstance(item_id, str) or not isinstance(value, dict):
+                        raise WechatDigestError("微信运行状态 items 损坏。")
+                    receipt_value = value.get("governance_receipt")
+                    if receipt_value is None:
+                        continue
+                    receipt = _validated_governance_receipt(receipt_value)
+                    if (
+                        value.get("state") == "represented"
+                        and receipt.get("schema_version")
+                        == LEGACY_GOVERNANCE_RECEIPT_SCHEMA_VERSION
+                        and receipt.get("phase") == "started"
+                    ):
+                        candidates.append((item_id, value))
+                if len(candidates) != 1:
+                    raise WechatDigestError(
+                        "Batch Governance migration 必须唯一绑定旧 started item。"
+                    )
+                item_id, item = candidates[0]
+                representation_id = item.get("representation_id")
+                if not isinstance(representation_id, str):
+                    raise WechatDigestError(
+                        "Batch Governance migration Representation 损坏。"
+                    )
+                representation = self.representation_repository.get(
+                    representation_id
+                )
+                privacy = self.privacy_gate.evaluate(
+                    self._representation_texts(representation_id),
+                    semantic_completeness_known=(
+                        representation.status == "complete"
+                        and representation.completeness == 1.0
+                        and not representation.warnings
+                    ),
+                )
+                if privacy.route != "approved" or privacy.categories:
+                    raise WechatDigestError(
+                        "Batch Governance migration privacy binding 不允许恢复。"
+                    )
+                ordered_ids = self._verify_semantic_receipts(
+                    representation_id,
+                    item,
+                    recover_missing_item_receipt=True,
+                )
+                receipt = _validated_governance_receipt(
+                    item.get("governance_receipt")
+                )
+                metrics = _validated_governance_metrics(
+                    item.get("governance_metrics")
+                )
+                if (
+                    len(ordered_ids) != 18
+                    or item.get("atomic_information_ids") != []
+                    or receipt.get("atomic_information_fingerprint")
+                    != _governance_atomic_fingerprint(ordered_ids)
+                    or metrics.get("app_server_start_count") != 0
+                    or metrics.get("thread_count") != 15
+                    or metrics.get("turn_count") != 15
+                    or metrics.get("timeout_count") != 0
+                    or metrics.get("failure_count") != 1
+                    or metrics.get("failure_categories") != {"transport": 1}
+                ):
+                    raise WechatDigestError(
+                        "Batch Governance migration 旧15条证据不完整。"
+                    )
+                completed_ids = ordered_ids[:15]
+                remaining_ids = ordered_ids[15:]
+                unresolved = self.proposal_store.list_unresolved()
+                journal = self.journal.list_changes()
+                if any(
+                    self.information_store.get_current(atomic_id).revision_number
+                    != 1
+                    for atomic_id in remaining_ids
+                ) or any(
+                    proposal.atomic_information_id in set(remaining_ids)
+                    for proposal in unresolved
+                ) or any(
+                    record.atomic_information_id in set(remaining_ids)
+                    for record in journal
+                ):
+                    raise WechatDigestError(
+                        "Batch Governance migration 剩余3条无法唯一证明。"
+                    )
+                migration = {
+                    "schema_version": GOVERNANCE_MIGRATION_SCHEMA_VERSION,
+                    "phase": "activated",
+                    "authority_ref": authority_ref,
+                    "legacy_governance_receipt": receipt,
+                    "atomic_information_fingerprint": (
+                        _governance_atomic_fingerprint(ordered_ids)
+                    ),
+                    "ordered_atomic_information_ids": list(ordered_ids),
+                    "completed_atomic_information_ids": list(completed_ids),
+                    "remaining_atomic_information_ids": list(remaining_ids),
+                    "legacy_effect_fingerprint": (
+                        self._governance_effect_fingerprint(completed_ids)
+                    ),
+                    "pristine_remaining_fingerprint": (
+                        self._governance_effect_fingerprint(remaining_ids)
+                    ),
+                    "pending_human": any(
+                        proposal.atomic_information_id in set(completed_ids)
+                        for proposal in unresolved
+                    ),
+                    "context_object_ids": sorted(
+                        {
+                            object_id
+                            for atomic_id in completed_ids
+                            for object_id in self.information_store.get_current(
+                                atomic_id
+                            ).related_object_ids
+                        }
+                    ),
+                    "semantic_continuation_fingerprint": "",
+                }
+
+            representation_id = item.get("representation_id")
+            if not isinstance(representation_id, str):
+                raise WechatDigestError(
+                    "Batch Governance migration Representation 损坏。"
+                )
+            summary = _validated_global_attempt_summary(
+                self._semantic_port().global_attempt_summary(
+                    representation_id
+                )
+            )
+            if summary != {
+                "global_attempt_total": 220,
+                "global_unknown": 0,
+                "next_global_ordinal": 221,
+                "absolute_cap": 1000,
+            }:
+                raise WechatDigestError(
+                    "Batch Governance migration Semantic ledger 不匹配。"
+                )
+            continuation = (
+                self._semantic_port().install_batch_governance_continuation(
+                    window_binding=self._semantic_authority_binding(
+                        run_id, allow_reviewed_head_extension=True
+                    ),
+                    authority_ref=authority_ref,
+                )
+            )
+            continuation_fingerprint = continuation.get(
+                "continuation_fingerprint"
+            )
+            if (
+                not _sha256_value(continuation_fingerprint)
+                or continuation.get("activation_total") != 220
+                or continuation.get("activation_unknown_count") != 0
+                or continuation.get("next_global_ordinal") != 221
+                or continuation.get("absolute_cap") != 1000
+            ):
+                raise WechatDigestError(
+                    "Batch Governance migration Semantic continuation 读回失败。"
+                )
+            if migrated:
+                if migration.get("semantic_continuation_fingerprint") != (
+                    continuation_fingerprint
+                ):
+                    raise WechatDigestError(
+                        "Batch Governance migration authority binding 漂移。"
+                    )
+                return migration
+
+            migration["semantic_continuation_fingerprint"] = (
+                continuation_fingerprint
+            )
+            without_fingerprint = dict(migration)
+            migration["migration_fingerprint"] = _sha256_bytes(
+                _canonical_json(without_fingerprint).encode("utf-8")
+            )
+            _validated_governance_migration(migration)
+            current = self.run_store.status(run_id)
+            current_items = current.get("items")
+            if not isinstance(current_items, dict):
+                raise WechatDigestError("微信运行状态 items 损坏。")
+            updated_item = {
+                **self._item(current_items, item_id),
+                "privacy_route": "approved",
+                "privacy_categories": [],
+                "governance_migration": migration,
+            }
+            updated_items = dict(current_items)
+            updated_items[item_id] = updated_item
+            current["items"] = updated_items
+            current["state"] = "processing"
+            current["failure_category"] = None
+            current["updated_at"] = self.clock()
+            self.run_store.update_status(run_id, current)
+            observed = self.run_store.status(run_id)
+            observed_items = observed.get("items")
+            if (
+                observed.get("state") != "processing"
+                or observed.get("failure_category") is not None
+                or not isinstance(observed_items, dict)
+                or _validated_governance_migration(
+                    self._item(observed_items, item_id).get(
+                        "governance_migration"
+                    )
+                )
+                != migration
+            ):
+                raise WechatDigestError(
+                    "Batch Governance migration activation 读回失败。"
+                )
+            return migration
 
     def _unknown_resolution_digest_binding(
         self,
@@ -3310,6 +3858,8 @@ class WechatDigestService:
                 _validated_governance_metrics(item["governance_metrics"])
             if item.get("governance_receipt") is not None:
                 _validated_governance_receipt(item["governance_receipt"])
+            if item.get("governance_migration") is not None:
+                _validated_governance_migration(item["governance_migration"])
             if item.get("state") in {
                 "represented",
                 "local_only",
@@ -3910,6 +4460,20 @@ class WechatDigestService:
                 _governance_atomic_fingerprint(atomic_ids)
             ):
                 raise WechatDigestError("微信 terminal item Governance receipt 不一致。")
+        if item.get("governance_migration") is not None:
+            migration = _validated_governance_migration(
+                item["governance_migration"]
+            )
+            if atomic_ids != migration["ordered_atomic_information_ids"]:
+                raise WechatDigestError(
+                    "微信 terminal item Governance migration 不一致。"
+                )
+            if self._governance_effect_fingerprint(
+                migration["completed_atomic_information_ids"]
+            ) != migration["legacy_effect_fingerprint"]:
+                raise WechatDigestError(
+                    "微信 terminal item Governance legacy effect 漂移。"
+                )
         for atomic_id in atomic_ids:
             if not isinstance(atomic_id, str):
                 raise WechatDigestError(
@@ -4255,16 +4819,7 @@ class WechatDigestService:
     def _govern(self, atomic_ids: Sequence[str]) -> tuple[bool, tuple[str, ...]]:
         if not atomic_ids:
             return False, ()
-        pending = False
-        affected: set[str] = set()
         with SQLiteWorldModelRepository(self.database) as repository:
-            identity = IdentityGateService(
-                self.information_store,
-                repository,
-                self.proposal_store,
-                self.journal,
-                BusinessLanguageHumanJudgmentPort(),
-            )
             interpretation_provider = self.interpretation_provider
             if self._before_governance_provider_call is not None:
                 interpretation_provider = _GovernanceProviderCallBoundary(
@@ -4280,55 +4835,111 @@ class WechatDigestService:
                 self.journal,
                 BusinessLanguageHumanJudgmentPort(),
             )
-            retriever = BoundedInformationCandidateRetriever()
-            for atomic_id in atomic_ids:
-                identity_pending = False
-                current = self.information_store.get_current(atomic_id)
-                for concern in current.raw_concerns:
-                    current = self.information_store.get_current(atomic_id)
-                    exact_object_ids = {
-                        assignment.object_id
-                        for record in repository.list_objects()
-                        if record.status == "active"
-                        for assignment in repository.list_names(record.object_id)
-                        if " ".join(assignment.name.split()).casefold()
-                        == " ".join(concern.split()).casefold()
-                    }
-                    if (
-                        len(exact_object_ids) == 1
-                        and exact_object_ids.issubset(current.related_object_ids)
-                    ):
-                        affected.update(exact_object_ids)
-                        continue
-                    result = identity.process(
-                        atomic_id,
-                        IdentityEvidence(
-                            name=concern,
-                            supporting_revision_ids=(current.revision_id,),
-                            identity_bases=(),
-                        ),
-                    )
-                    if result.outcome == "human_review":
-                        identity_pending = True
-                        pending = True
-                        break
-                    if result.object_id is not None:
-                        affected.add(result.object_id)
-                current = self.information_store.get_current(atomic_id)
-                pool = self.information_store.list_atomic_information()
-                bounded_pool = pool[-512:]
-                retriever.retrieve(
-                    current,
-                    bounded_pool,
-                    pool_complete=len(pool) <= 512,
+            resume = self._governance_resume_state
+            if resume is None:
+                migration = self._governance_migration_state
+                pending = (
+                    bool(migration["pending_human"])
+                    if migration is not None
+                    else False
                 )
-                if identity_pending:
-                    affected.update(current.related_object_ids)
-                    continue
-                digest_result = digestion.digest(atomic_id)
+                affected: set[str] = (
+                    set(migration["context_object_ids"])
+                    if migration is not None
+                    else set()
+                )
+                digestable_ids: list[str] = []
+                scope_ids = (
+                    tuple(migration["remaining_atomic_information_ids"])
+                    if migration is not None
+                    else tuple(atomic_ids)
+                )
+                identity = IdentityGateService(
+                    self.information_store,
+                    repository,
+                    self.proposal_store,
+                    self.journal,
+                    BusinessLanguageHumanJudgmentPort(),
+                )
+                retriever = BoundedInformationCandidateRetriever()
+                for atomic_id in scope_ids:
+                    identity_pending = False
+                    current = self.information_store.get_current(atomic_id)
+                    for concern in current.raw_concerns:
+                        current = self.information_store.get_current(atomic_id)
+                        exact_object_ids = {
+                            assignment.object_id
+                            for record in repository.list_objects()
+                            if record.status == "active"
+                            for assignment in repository.list_names(record.object_id)
+                            if " ".join(assignment.name.split()).casefold()
+                            == " ".join(concern.split()).casefold()
+                        }
+                        if (
+                            len(exact_object_ids) == 1
+                            and exact_object_ids.issubset(current.related_object_ids)
+                        ):
+                            affected.update(exact_object_ids)
+                            continue
+                        result = identity.process(
+                            atomic_id,
+                            IdentityEvidence(
+                                name=concern,
+                                supporting_revision_ids=(current.revision_id,),
+                                identity_bases=(),
+                            ),
+                        )
+                        if result.outcome == "human_review":
+                            identity_pending = True
+                            pending = True
+                            break
+                        if result.object_id is not None:
+                            affected.add(result.object_id)
+                    current = self.information_store.get_current(atomic_id)
+                    pool = self.information_store.list_atomic_information()
+                    retriever.retrieve(
+                        current,
+                        pool[-512:],
+                        pool_complete=len(pool) <= 512,
+                    )
+                    if identity_pending:
+                        affected.update(current.related_object_ids)
+                        continue
+                    digestable_ids.append(atomic_id)
+                batch_ids = tuple(digestable_ids)
+                interpretations = (
+                    digestion.interpret_batch(batch_ids) if batch_ids else ()
+                )
+                if batch_ids and self._after_governance_batch_interpretation:
+                    self._after_governance_batch_interpretation(
+                        batch_ids,
+                        interpretations,
+                        pending,
+                        tuple(sorted(affected)),
+                    )
+                start_index = 0
+            else:
+                batch_ids = tuple(resume["batch_atomic_information_ids"])
+                interpretations = tuple(resume["interpretations"])
+                start_index = int(resume["next_index"])
+                pending = bool(resume["pending_human"])
+                affected = set(resume["context_object_ids"])
+                if not set(batch_ids).issubset(set(atomic_ids)):
+                    raise WechatDigestError(
+                        "微信 Governance resume batch 不属于当前 item。"
+                    )
+
+            for index in range(start_index, len(batch_ids)):
+                digest_result = digestion.apply_interpretation(
+                    batch_ids[index], interpretations[index]
+                )
                 if digest_result.proposal_id is not None:
                     pending = True
                 affected.update(digest_result.atomic_information.related_object_ids)
+                if self._after_governance_application is not None:
+                    self._after_governance_application(
+                        index + 1, pending, tuple(sorted(affected))
+                    )
 
             builder = ContextBuilder(
                 repository,
@@ -4361,19 +4972,97 @@ class WechatDigestService:
             raise WechatDigestError("微信运行状态 items 损坏。")
         current_item = self._item(current_items, item_id)
         existing_receipt = current_item.get("governance_receipt")
+        resume_state: dict[str, object] | None = None
+        migration_state: dict[str, object] | None = None
+        migration_binding: dict[str, object] | None = None
+        migration_value = current_item.get("governance_migration")
+        if migration_value is not None:
+            migration_binding = _validated_governance_migration(
+                migration_value
+            )
+            if (
+                migration_binding["ordered_atomic_information_ids"]
+                != list(atomic_ids)
+                or self._governance_effect_fingerprint(
+                    migration_binding["completed_atomic_information_ids"]
+                )
+                != migration_binding["legacy_effect_fingerprint"]
+            ):
+                raise WechatDigestError(
+                    "微信 Governance migration binding 漂移。"
+                )
         if existing_receipt is not None:
             receipt = _validated_governance_receipt(existing_receipt)
             if receipt["atomic_information_fingerprint"] != atomic_fingerprint:
                 raise WechatDigestError("微信 Governance receipt binding 不一致。")
             if receipt["phase"] == "started":
+                if migration_binding is None:
+                    raise WechatDigestError(
+                        "微信 Governance completion 未知；禁止再次调用 Provider。"
+                    )
+                migration_state = migration_binding
+                if (
+                    migration_state["legacy_governance_receipt"] != receipt
+                    or migration_state["ordered_atomic_information_ids"]
+                    != list(atomic_ids)
+                    or self._governance_effect_fingerprint(
+                        migration_state["completed_atomic_information_ids"]
+                    )
+                    != migration_state["legacy_effect_fingerprint"]
+                    or self._governance_effect_fingerprint(
+                        migration_state["remaining_atomic_information_ids"]
+                    )
+                    != migration_state["pristine_remaining_fingerprint"]
+                ):
+                    raise WechatDigestError(
+                        "微信 Governance migration binding 漂移。"
+                    )
+            if (
+                migration_binding is not None
+                and receipt["schema_version"]
+                == GOVERNANCE_RECEIPT_SCHEMA_VERSION
+                and receipt["phase"] != "started"
+                and receipt["batch_atomic_information_ids"]
+                != migration_binding["remaining_atomic_information_ids"]
+            ):
                 raise WechatDigestError(
-                    "微信 Governance completion 未知；禁止再次调用 Provider。"
+                    "微信 Governance migration batch binding 漂移。"
                 )
-            return bool(receipt["pending_human"]), tuple(
-                str(object_id) for object_id in receipt["context_object_ids"]
-            )
+            if receipt["phase"] == "completed":
+                return bool(receipt["pending_human"]), tuple(
+                    str(object_id) for object_id in receipt["context_object_ids"]
+                )
+            if (
+                receipt["schema_version"] != GOVERNANCE_RECEIPT_SCHEMA_VERSION
+                and migration_state is None
+            ):
+                raise WechatDigestError("微信 Governance receipt 无法恢复。")
+            if migration_state is None:
+                try:
+                    resume_state = {
+                        "batch_atomic_information_ids": tuple(
+                            receipt["batch_atomic_information_ids"]
+                        ),
+                        "interpretations": tuple(
+                            parse_interpretation(item)
+                            for item in receipt["interpretations"]
+                        ),
+                        "next_index": receipt["next_index"],
+                        "pending_human": receipt["pending_human"],
+                        "context_object_ids": tuple(
+                            receipt["context_object_ids"]
+                        ),
+                    }
+                except (TypeError, ValueError) as exc:
+                    raise WechatDigestError(
+                        "微信 Governance receipt 无法恢复。"
+                    ) from exc
 
         provider_started = False
+        batch_persisted = resume_state is not None
+        latest_batch_receipt = (
+            None if existing_receipt is None else dict(existing_receipt)
+        )
 
         def mark_provider_started() -> None:
             nonlocal provider_started
@@ -4391,6 +5080,63 @@ class WechatDigestService:
             )
             provider_started = True
 
+        def persist_batch_interpretation(
+            batch_ids: tuple[str, ...],
+            interpretations: tuple[InterpretationResult, ...],
+            pending: bool,
+            object_ids: tuple[str, ...],
+        ) -> None:
+            nonlocal batch_persisted, latest_batch_receipt
+            serialized = [
+                interpretation_to_dict(interpretation)
+                for interpretation in interpretations
+            ]
+            latest_batch_receipt = {
+                "schema_version": GOVERNANCE_RECEIPT_SCHEMA_VERSION,
+                "phase": "interpreted",
+                "atomic_information_fingerprint": atomic_fingerprint,
+                "batch_atomic_information_ids": list(batch_ids),
+                "batch_fingerprint": _governance_batch_fingerprint(
+                    batch_ids, interpretations
+                ),
+                "interpretations": serialized,
+                "next_index": 0,
+                "pending_human": pending,
+                "context_object_ids": sorted(set(object_ids)),
+            }
+            self._update_item(
+                run_id,
+                status,
+                item_id,
+                governance_receipt=latest_batch_receipt,
+            )
+            batch_persisted = True
+
+        def persist_application_progress(
+            next_index: int, pending: bool, object_ids: tuple[str, ...]
+        ) -> None:
+            nonlocal latest_batch_receipt
+            if latest_batch_receipt is None:
+                raise WechatDigestError(
+                    "微信 Governance batch result 尚未持久化。"
+                )
+            batch_ids = latest_batch_receipt["batch_atomic_information_ids"]
+            phase = "applied" if next_index == len(batch_ids) else "applying"
+            latest_batch_receipt = {
+                **latest_batch_receipt,
+                "phase": phase,
+                "next_index": next_index,
+                "pending_human": pending,
+                "context_object_ids": sorted(set(object_ids)),
+            }
+            _validated_governance_receipt(latest_batch_receipt)
+            self._update_item(
+                run_id,
+                status,
+                item_id,
+                governance_receipt=latest_batch_receipt,
+            )
+
         cursor_reader = getattr(self.interpretation_provider, "metrics_cursor", None)
         metrics_reader = getattr(self.interpretation_provider, "metrics_since", None)
         invalidator = getattr(self.interpretation_provider, "invalidate", None)
@@ -4399,7 +5145,15 @@ class WechatDigestService:
         failure: BaseException | None = None
         outcome: tuple[bool, tuple[str, ...]] | None = None
         previous_provider_hook = self._before_governance_provider_call
+        previous_resume_state = self._governance_resume_state
+        previous_migration_state = self._governance_migration_state
+        previous_batch_hook = self._after_governance_batch_interpretation
+        previous_progress_hook = self._after_governance_application
         self._before_governance_provider_call = mark_provider_started
+        self._governance_resume_state = resume_state
+        self._governance_migration_state = migration_state
+        self._after_governance_batch_interpretation = persist_batch_interpretation
+        self._after_governance_application = persist_application_progress
         try:
             outcome = self._govern(atomic_ids)
             return outcome
@@ -4416,6 +5170,10 @@ class WechatDigestService:
             raise
         finally:
             self._before_governance_provider_call = previous_provider_hook
+            self._governance_resume_state = previous_resume_state
+            self._governance_migration_state = previous_migration_state
+            self._after_governance_batch_interpretation = previous_batch_hook
+            self._after_governance_application = previous_progress_hook
             elapsed_ms = max(0, (time.monotonic_ns() - started) // 1_000_000)
             metrics = (
                 metrics_reader(cursor)
@@ -4441,13 +5199,28 @@ class WechatDigestService:
             }
             if outcome is not None:
                 pending, object_ids = outcome
-                changes["governance_receipt"] = {
-                    "schema_version": GOVERNANCE_RECEIPT_SCHEMA_VERSION,
-                    "phase": "completed",
-                    "atomic_information_fingerprint": atomic_fingerprint,
-                    "pending_human": pending,
-                    "context_object_ids": sorted(set(object_ids)),
-                }
+                if batch_persisted:
+                    if latest_batch_receipt is None:
+                        raise WechatDigestError(
+                            "微信 Governance batch receipt 丢失。"
+                        )
+                    changes["governance_receipt"] = {
+                        **latest_batch_receipt,
+                        "phase": "completed",
+                        "pending_human": pending,
+                        "context_object_ids": sorted(set(object_ids)),
+                    }
+                    _validated_governance_receipt(
+                        changes["governance_receipt"]
+                    )
+                else:
+                    changes["governance_receipt"] = {
+                        "schema_version": LEGACY_GOVERNANCE_RECEIPT_SCHEMA_VERSION,
+                        "phase": "completed",
+                        "atomic_information_fingerprint": atomic_fingerprint,
+                        "pending_human": pending,
+                        "context_object_ids": sorted(set(object_ids)),
+                    }
             self._update_item(
                 run_id,
                 status,

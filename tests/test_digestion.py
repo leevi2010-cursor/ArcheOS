@@ -35,7 +35,10 @@ from archeos.digestion import (
     JsonlChangeProposalStore,
     WorldModelOperation,
 )
-from archeos.digestion.providers import CodexInterpretationTimeout
+from archeos.digestion.providers import (
+    CodexInterpretationTimeout,
+    parse_batch_interpretations,
+)
 from archeos.world_model import (
     ALLOWED_RELATIONSHIPS,
     ObjectResolver,
@@ -58,6 +61,24 @@ class FakeInterpretationProvider:
         if isinstance(self.result, Exception):
             raise self.result
         return self.result
+
+
+class BatchInterpretationProvider:
+    name = "synthetic-batch"
+
+    def __init__(self, results) -> None:
+        self.results = tuple(results)
+        self.calls = 0
+        self.batch_ids: tuple[str, ...] = ()
+
+    def interpret(self, atomic_information, current_world_state):
+        del atomic_information, current_world_state
+        raise AssertionError("multi-item digestion must not use single interpretation")
+
+    def interpret_batch(self, items):
+        self.calls += 1
+        self.batch_ids = tuple(item.atomic_information_id for item, _ in items)
+        return self.results
 
 
 def interpretation(
@@ -249,6 +270,76 @@ class DigestionTest(unittest.TestCase):
         item = atomic_information(identifier, *concerns)
         self.atomic_store.ingest_batch((item,))
         return item
+
+    def test_batch_digestion_uses_one_provider_call_for_ten_items(self) -> None:
+        identifiers = tuple(f"atomic-batch-{index}" for index in range(10))
+        for identifier in identifiers:
+            self.ingest(identifier)
+        result = interpretation(WorldModelOperation(kind="no_structural_change"))
+        provider = BatchInterpretationProvider((result,) * len(identifiers))
+        service = AtomicInformationDigestionService(
+            self.atomic_store,
+            self.repository,
+            ObjectResolver(self.repository),
+            provider,
+            self.proposals,
+            self.journal,
+            self.human,
+        )
+
+        digested = service.digest_batch(identifiers)
+
+        self.assertEqual(provider.calls, 1)
+        self.assertEqual(provider.batch_ids, identifiers)
+        self.assertEqual(len(digested), 10)
+
+    def test_batch_result_count_fails_before_any_current_item_write(self) -> None:
+        identifiers = ("atomic-batch-a", "atomic-batch-b")
+        for identifier in identifiers:
+            self.ingest(identifier)
+        result = interpretation(WorldModelOperation(kind="no_structural_change"))
+        provider = BatchInterpretationProvider((result,))
+        service = AtomicInformationDigestionService(
+            self.atomic_store,
+            self.repository,
+            ObjectResolver(self.repository),
+            provider,
+            self.proposals,
+            self.journal,
+            self.human,
+        )
+
+        with self.assertRaisesRegex(ValueError, "count does not match"):
+            service.digest_batch(identifiers)
+
+        self.assertEqual(provider.calls, 1)
+        self.assertEqual(self.proposals.list_unresolved(), ())
+        self.assertEqual(self.journal.list_changes(), ())
+        self.assertTrue(
+            all(len(self.atomic_store.list_revisions(identifier)) == 1 for identifier in identifiers)
+        )
+
+    def test_multi_item_digestion_does_not_fallback_to_single_calls(self) -> None:
+        identifiers = ("atomic-no-fallback-a", "atomic-no-fallback-b")
+        for identifier in identifiers:
+            self.ingest(identifier)
+        provider = FakeInterpretationProvider(
+            interpretation(WorldModelOperation(kind="no_structural_change"))
+        )
+        service = AtomicInformationDigestionService(
+            self.atomic_store,
+            self.repository,
+            ObjectResolver(self.repository),
+            provider,
+            self.proposals,
+            self.journal,
+            self.human,
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "batch interpretation provider"):
+            service.digest_batch(identifiers)
+
+        self.assertEqual(provider.calls, 0)
 
     def test_legacy_atomic_information_without_claim_reads_as_none(self) -> None:
         item = atomic_information("legacy-claimless", "Legacy", strict_identity=True)
@@ -1239,6 +1330,112 @@ class DigestionTest(unittest.TestCase):
 
 
 class CodexDigestionProviderTest(unittest.TestCase):
+    def test_batch_parser_rejects_reordered_results(self) -> None:
+        operation = {
+            "kind": "no_structural_change",
+            "target_object_id": None,
+            "secondary_object_id": None,
+            "name": None,
+            "role": None,
+            "relation": None,
+            "relationship_id": None,
+            "lifecycle_state": None,
+            "start_at": None,
+            "actual_end_at": None,
+            "target_end_at": None,
+            "completion_condition": None,
+        }
+        result = {
+            "operations": [operation],
+            "rationale": "Synthetic batch result.",
+            "evidence_sufficient": True,
+            "conflict": False,
+            "ambiguous": False,
+            "claim": None,
+        }
+        with self.assertRaisesRegex(ValueError, "order does not match"):
+            parse_batch_interpretations(
+                {
+                    "results": [
+                        {"atomic_information_id": "atomic-b", **result},
+                        {"atomic_information_id": "atomic-a", **result},
+                    ]
+                },
+                ("atomic-a", "atomic-b"),
+            )
+
+    def test_codex_batch_uses_one_thread_and_one_turn(self) -> None:
+        operation = {
+            "kind": "no_structural_change",
+            "target_object_id": None,
+            "secondary_object_id": None,
+            "name": None,
+            "role": None,
+            "relation": None,
+            "relationship_id": None,
+            "lifecycle_state": None,
+            "start_at": None,
+            "actual_end_at": None,
+            "target_end_at": None,
+            "completion_condition": None,
+        }
+        first = atomic_information("batch-sdk-a", "Batch A", strict_identity=True)
+        second = atomic_information("batch-sdk-b", "Batch B", strict_identity=True)
+        response = json.dumps(
+            {
+                "results": [
+                    {
+                        "atomic_information_id": item.atomic_information_id,
+                        "operations": [operation],
+                        "rationale": "Synthetic batch result.",
+                        "evidence_sufficient": True,
+                        "conflict": False,
+                        "ambiguous": False,
+                        "claim": None,
+                    }
+                    for item in (first, second)
+                ]
+            }
+        )
+        observed: dict[str, object] = {"thread_starts": 0, "turns": 0}
+
+        class Turn:
+            def run(self):
+                return type("Result", (), {"final_response": response})()
+
+        class Thread:
+            def turn(self, prompt, **kwargs):
+                observed["prompt"] = prompt
+                observed["schema"] = kwargs["output_schema"]
+                observed["turns"] = int(observed["turns"]) + 1
+                return Turn()
+
+        class Codex:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return None
+
+            def thread_start(self, **_kwargs):
+                observed["thread_starts"] = int(observed["thread_starts"]) + 1
+                return Thread()
+
+        provider = CodexAtomicInformationInterpretationProvider(
+            sdk_loader=lambda: (Codex, "deny-all", "read-only")
+        )
+        results = provider.interpret_batch(
+            ((first, DigestionWorldState((), (), ())), (second, DigestionWorldState((), (), ())))
+        )
+
+        self.assertEqual(len(results), 2)
+        self.assertEqual(observed["thread_starts"], 1)
+        self.assertEqual(observed["turns"], 1)
+        self.assertIn(first.atomic_information_id, observed["prompt"])
+        self.assertIn(second.atomic_information_id, observed["prompt"])
+        schema = observed["schema"]
+        self.assertEqual(schema["properties"]["results"]["minItems"], 2)
+
     def test_official_sdk_adapter_is_read_only_structured_and_ephemeral(self) -> None:
         operation = {
             "kind": "no_structural_change",

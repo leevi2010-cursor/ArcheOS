@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Sequence
 from typing import Protocol
 
 from ..atomic_information import AtomicInformationRevision
@@ -19,6 +20,11 @@ class AtomicInformationInterpretationProvider(Protocol):
         atomic_information: AtomicInformationRevision,
         current_world_state: DigestionWorldState,
     ) -> InterpretationResult: ...
+
+    def interpret_batch(
+        self,
+        items: Sequence[tuple[AtomicInformationRevision, DigestionWorldState]],
+    ) -> tuple[InterpretationResult, ...]: ...
 
 
 class ChangeProposalStore(Protocol):

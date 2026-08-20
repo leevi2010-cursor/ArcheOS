@@ -58,6 +58,7 @@ from archeos.wechat_digest import (
     WechatDigestRunStore,
     WechatDigestService,
     _build_plan,
+    _governance_atomic_fingerprint,
     _plan_fingerprint,
 )
 from archeos.world_model import SQLiteWorldModelRepository
@@ -248,6 +249,7 @@ class SyntheticSemanticHandoff:
         self.installed_grant = None
         self.installed_extension = None
         self.installed_maintenance_continuation = None
+        self.installed_batch_governance_continuation = None
         self.unknown_resolution = None
         self.timeout_212_resolution = None
         self.before_unknown_commit = None
@@ -402,6 +404,50 @@ class SyntheticSemanticHandoff:
         ):
             raise RuntimeError("synthetic maintenance continuation drift")
         self.installed_maintenance_continuation = expected
+        self.campaign_binding = SimpleNamespace(
+            created_at=self.campaign_binding.created_at,
+            lower_cursor=self.campaign_binding.lower_cursor,
+            frozen_global_upper_cursor=(
+                self.campaign_binding.frozen_global_upper_cursor
+            ),
+            capture_provider_version=self.campaign_binding.capture_provider_version,
+            semantic_batch_size=self.campaign_binding.semantic_batch_size,
+            reviewed_git_head=self.reviewed_git_head,
+        )
+        return expected
+
+    def install_batch_governance_continuation(
+        self,
+        *,
+        window_binding,
+        authority_ref,
+    ):
+        if self.campaign_binding is None:
+            self.campaign_binding = SimpleNamespace(
+                created_at=window_binding.campaign_created_at,
+                lower_cursor=window_binding.campaign_lower_cursor,
+                frozen_global_upper_cursor=(
+                    window_binding.frozen_global_upper_cursor
+                ),
+                capture_provider_version=window_binding.capture_provider_version,
+                semantic_batch_size=window_binding.semantic_batch_size,
+                reviewed_git_head=window_binding.reviewed_git_head,
+            )
+        expected = {
+            "authority_ref": authority_ref,
+            "activation_total": 220,
+            "activation_unknown_count": 0,
+            "activation_last_global_ordinal": 220,
+            "next_global_ordinal": 221,
+            "absolute_cap": 1000,
+            "continuation_fingerprint": "sha256:" + "c" * 64,
+        }
+        if (
+            self.installed_batch_governance_continuation is not None
+            and self.installed_batch_governance_continuation != expected
+        ):
+            raise RuntimeError("synthetic batch governance continuation drift")
+        self.installed_batch_governance_continuation = expected
         self.campaign_binding = SimpleNamespace(
             created_at=self.campaign_binding.created_at,
             lower_cursor=self.campaign_binding.lower_cursor,
@@ -664,6 +710,39 @@ class NoStructuralChangeProvider:
             ambiguous=False,
         )
 
+    def interpret_batch(self, items):
+        return tuple(
+            self.interpret(atomic_information, current_world_state)
+            for atomic_information, current_world_state in items
+        )
+
+
+class BatchOnceProvider(NoStructuralChangeProvider):
+    name = "synthetic-batch-once"
+
+    def __init__(self) -> None:
+        self.calls = 0
+        self.batch_sizes: list[int] = []
+
+    def interpret(self, atomic_information, current_world_state):
+        del atomic_information, current_world_state
+        raise AssertionError("batch workflow must not use the single-item method")
+
+    def interpret_batch(self, items):
+        batch = tuple(items)
+        self.calls += 1
+        self.batch_sizes.append(len(batch))
+        return tuple(
+            InterpretationResult(
+                operations=(WorldModelOperation(kind="no_structural_change"),),
+                rationale="Synthetic batch governance.",
+                evidence_sufficient=True,
+                conflict=False,
+                ambiguous=False,
+            )
+            for _ in batch
+        )
+
 
 class SerialSessionProvider:
     name = "synthetic-serial-session"
@@ -733,6 +812,12 @@ class SerialSessionProvider:
             ambiguous=False,
         )
 
+    def interpret_batch(self, items):
+        return tuple(
+            self.interpret(atomic_information, current_world_state)
+            for atomic_information, current_world_state in items
+        )
+
 
 class TimeoutOnFourthTurnProvider(SerialSessionProvider):
     def metrics_since(self, cursor):
@@ -777,6 +862,22 @@ class FailAfterProviderOnceService(WechatDigestService):
             self.fail_after_provider = False
             raise RuntimeError("synthetic crash before governance receipt completion")
         return result
+
+
+class FailFirstBatchProgressOnceService(WechatDigestService):
+    fail_progress = True
+
+    def _update_item(self, run_id, status, item_id, **changes):
+        receipt = changes.get("governance_receipt")
+        if (
+            self.fail_progress
+            and isinstance(receipt, dict)
+            and receipt.get("phase") == "applying"
+            and receipt.get("next_index") == 1
+        ):
+            self.fail_progress = False
+            raise OSError("synthetic progress persistence interruption")
+        return super()._update_item(run_id, status, item_id, **changes)
 
 
 class FailSecondGovernanceOnceService(WechatDigestService):
@@ -992,7 +1093,7 @@ class WechatDigestTests(unittest.TestCase):
         self.assertEqual(second.durable_information, 0)
         self.assertEqual(self.source_count(), 1)
 
-    def test_governance_session_is_serial_and_rebuilds_world_state_per_atomic(
+    def test_governance_batch_uses_one_bounded_world_state_snapshot(
         self,
     ) -> None:
         self.create_object()
@@ -1010,7 +1111,7 @@ class WechatDigestTests(unittest.TestCase):
         self.assertEqual(provider.session_entries, 1)
         self.assertEqual(provider.session_exits, 1)
         self.assertEqual(provider.calls, 2)
-        self.assertEqual(provider.observed_roles, [(), ("project",)])
+        self.assertEqual(provider.observed_roles, [(), ()])
         self.assertEqual(result.governance_app_server_starts, 1)
         self.assertEqual(result.governance_threads, 2)
         self.assertEqual(result.governance_turns, 2)
@@ -1157,7 +1258,156 @@ class WechatDigestTests(unittest.TestCase):
         self.assertTrue(result.checkpoint_published)
         self.assertEqual(provider.calls, 1)
 
-    def test_unknown_governance_receipt_recovery_fails_closed_zero_calls(
+    def test_ten_atomic_information_use_one_governance_provider_call(self) -> None:
+        self.create_object()
+        provider = BatchOnceProvider()
+        service = WechatDigestService(
+            workspace=self.workspace,
+            capture_provider=SyntheticCaptureProvider(
+                [message(index) for index in range(1, 11)]
+            ),
+            semantic_handoff_factory=lambda: self.semantic,
+            interpretation_provider=provider,
+        )
+
+        result = service.run(all_history=True)
+
+        self.assertTrue(result.checkpoint_published)
+        self.assertEqual(provider.calls, 1)
+        self.assertEqual(provider.batch_sizes, [10])
+
+    def test_issue_135_migration_freezes_15_and_batches_only_remaining_3(
+        self,
+    ) -> None:
+        provider = BatchOnceProvider()
+        capture = SyntheticCaptureProvider(
+            [message(index) for index in range(1, 19)]
+        )
+        service = WechatDigestService(
+            workspace=self.workspace,
+            capture_provider=capture,
+            semantic_handoff_factory=lambda: self.semantic,
+            interpretation_provider=provider,
+        )
+        self.semantic.failures_remaining = 1
+        with self.assertRaises(WechatDigestError):
+            service.run(all_history=True)
+        prepared = service.prepare_next_semantic()
+        privacy = service.privacy_gate.evaluate(
+            service._representation_texts(prepared.representation_id),
+            semantic_completeness_known=True,
+        )
+        atomic_ids = service._semantic(
+            prepared.run_id, prepared.representation_id, privacy
+        )
+        self.assertEqual(len(atomic_ids), 18)
+
+        status = service.run_store.status(prepared.run_id)
+        item_id = next(
+            key
+            for key, item in status["items"].items()
+            if item.get("representation_id") == prepared.representation_id
+        )
+        item = status["items"][item_id]
+        item["state"] = "represented"
+        item["privacy_route"] = None
+        item["privacy_categories"] = []
+        item["atomic_information_ids"] = []
+        item["pending_human"] = False
+        item["context_object_ids"] = []
+        item["governance_receipt"] = {
+            "schema_version": "wechat-governance-receipt/1.0",
+            "phase": "started",
+            "atomic_information_fingerprint": (
+                _governance_atomic_fingerprint(atomic_ids)
+            ),
+        }
+        item["governance_metrics"] = {
+            "app_server_start_count": 0,
+            "thread_count": 15,
+            "turn_count": 15,
+            "startup_wall_ms": 0,
+            "turn_wall_ms_sum": 150,
+            "turn_wall_ms_max": 10,
+            "governance_wall_ms": 160,
+            "timeout_count": 0,
+            "failure_count": 1,
+            "failure_categories": {"transport": 1},
+        }
+        status["state"] = "failed"
+        status["failure_category"] = "BrokenPipeError"
+        service.run_store.update_status(prepared.run_id, status)
+        self.semantic.global_attempt_total = 220
+        authority_ref = (
+            "https://github.com/leevi2010-cursor/ArcheOS/issues/135"
+            "#issuecomment-5353218136"
+        )
+
+        migration = service.activate_batch_governance(
+            authority_ref=authority_ref
+        )
+
+        self.assertEqual(provider.calls, 0)
+        self.assertEqual(
+            migration["completed_atomic_information_ids"],
+            list(atomic_ids[:15]),
+        )
+        self.assertEqual(
+            migration["remaining_atomic_information_ids"],
+            list(atomic_ids[15:]),
+        )
+        self.assertEqual(
+            service.activate_batch_governance(authority_ref=authority_ref),
+            migration,
+        )
+        self.assertEqual(provider.calls, 0)
+
+        result = service.run()
+
+        self.assertTrue(result.checkpoint_published)
+        self.assertEqual(provider.calls, 1)
+        self.assertEqual(provider.batch_sizes, [3])
+        final_item = service.run_store.status(prepared.run_id)["items"][item_id]
+        self.assertEqual(final_item["atomic_information_ids"], list(atomic_ids))
+        self.assertEqual(final_item["governance_receipt"]["phase"], "completed")
+        self.assertEqual(
+            final_item["governance_migration"]["legacy_governance_receipt"][
+                "phase"
+            ],
+            "started",
+        )
+
+    def test_mid_apply_recovery_reuses_persisted_batch_result(self) -> None:
+        self.create_object()
+        provider = BatchOnceProvider()
+        capture = SyntheticCaptureProvider([message(1), message(2)])
+        service = FailFirstBatchProgressOnceService(
+            workspace=self.workspace,
+            capture_provider=capture,
+            semantic_handoff_factory=lambda: self.semantic,
+            interpretation_provider=provider,
+        )
+
+        with self.assertRaises(WechatDigestError):
+            service.run(all_history=True)
+        run_id = service.run_store.active_run_id()
+        assert run_id is not None
+        interrupted_receipt = next(
+            item["governance_receipt"]
+            for item in service.run_store.status(run_id)["items"].values()
+            if isinstance(item, dict) and "governance_receipt" in item
+        )
+        self.assertEqual(interrupted_receipt["phase"], "interpreted")
+        self.assertEqual(interrupted_receipt["next_index"], 0)
+        self.assertEqual(provider.calls, 1)
+
+        result = service.run()
+
+        self.assertTrue(result.replayed)
+        self.assertTrue(result.checkpoint_published)
+        self.assertEqual(provider.calls, 1)
+
+    def test_persisted_batch_result_recovers_after_apply_without_provider_call(
         self,
     ) -> None:
         self.create_object()
@@ -1180,14 +1430,15 @@ class WechatDigestTests(unittest.TestCase):
             for item in service.run_store.status(run_id)["items"].values()
             if isinstance(item, dict) and "governance_receipt" in item
         )
-        self.assertEqual(receipt["phase"], "started")
+        self.assertEqual(receipt["phase"], "applied")
 
-        with self.assertRaisesRegex(WechatDigestError, "completion 未知"):
-            service.run()
+        result = service.run()
 
+        self.assertTrue(result.replayed)
+        self.assertTrue(result.checkpoint_published)
         self.assertEqual(provider.calls, 1)
-        self.assertIsNone(service.run_store.checkpoint())
-        self.assertEqual(service.run_store.active_run_id(), run_id)
+        self.assertIsNotNone(service.run_store.checkpoint())
+        self.assertIsNone(service.run_store.active_run_id())
 
     def test_governance_timeout_seal_preserves_data_and_continues_next_item(
         self,
@@ -1648,16 +1899,6 @@ class WechatDigestTests(unittest.TestCase):
             "target_end_at": None,
             "completion_condition": None,
         }
-        response = json.dumps(
-            {
-                "operations": [operation],
-                "rationale": "Synthetic cleanup termination.",
-                "evidence_sufficient": True,
-                "conflict": False,
-                "ambiguous": False,
-                "claim": None,
-            }
-        )
         handlers = {
             signal.SIGTERM: signal.SIG_DFL,
             signal.SIGALRM: signal.SIG_DFL,
@@ -1679,15 +1920,39 @@ class WechatDigestTests(unittest.TestCase):
                 self.killed = True
 
         class Turn:
+            def __init__(self, response):
+                self.response = response
+
             def run(self):
-                return SimpleNamespace(final_response=response)
+                return SimpleNamespace(final_response=self.response)
 
             def interrupt(self):
                 raise AssertionError("successful turn must not interrupt")
 
         class Thread:
-            def turn(self, *_args, **_kwargs):
-                return Turn()
+            def turn(self, prompt, **_kwargs):
+                payload = json.loads(prompt.split("Input:\n", 1)[1])
+                atomic_ids = [
+                    item["atomic_information"]["atomic_information_id"]
+                    for item in payload["items"]
+                ]
+                response = json.dumps(
+                    {
+                        "results": [
+                            {
+                                "atomic_information_id": atomic_id,
+                                "operations": [operation],
+                                "rationale": "Synthetic cleanup termination.",
+                                "evidence_sufficient": True,
+                                "conflict": False,
+                                "ambiguous": False,
+                                "claim": None,
+                            }
+                            for atomic_id in atomic_ids
+                        ]
+                    }
+                )
+                return Turn(response)
 
         class Codex:
             instance = None

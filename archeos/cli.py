@@ -592,6 +592,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="零 Provider 安装一次性已批准维护版本续接。",
     )
     wechat_digest.add_argument(
+        "--activate-batch-governance",
+        action="store_true",
+        help="零 Provider 安装 Issue #135 整批治理迁移与版本续接。",
+    )
+    wechat_digest.add_argument(
         "--resolve-semantic-unknown",
         action="store_true",
         help="零 Provider 把已批准的 Semantic unknown 收敛为 failed_closed。",
@@ -1031,6 +1036,7 @@ def _wechat_product_command(args: argparse.Namespace) -> int:
             args.install_semantic_authority,
             args.install_semantic_authority_extension,
             args.install_semantic_maintenance_continuation,
+            args.activate_batch_governance,
             args.resolve_semantic_unknown,
             args.resolve_semantic_timeout_212,
             args.seal_governance_timeout,
@@ -1063,9 +1069,12 @@ def _wechat_product_command(args: argparse.Namespace) -> int:
     elif args.semantic_timeout_212_authority_file is not None:
         print("error: Semantic ordinal212 authority file 只能与恢复入口一起使用。")
         return 2
-    if args.install_semantic_maintenance_continuation:
+    if (
+        args.install_semantic_maintenance_continuation
+        or args.activate_batch_governance
+    ):
         if args.authority_ref is None:
-            print("error: 安装 Semantic maintenance continuation 必须指定 authority ref。")
+            print("error: 安装 continuation 必须指定 authority ref。")
             return 2
     elif args.authority_ref is not None:
         print("error: authority ref 只能与 maintenance continuation 入口一起使用。")
@@ -1214,6 +1223,30 @@ def _wechat_product_command(args: argparse.Namespace) -> int:
                         ],
                         "continuation_fingerprint": continuation[
                             "continuation_fingerprint"
+                        ],
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                )
+            )
+            return 0
+        if args.activate_batch_governance:
+            migration = service.activate_batch_governance(
+                authority_ref=args.authority_ref,
+            )
+            print(
+                json.dumps(
+                    {
+                        "semantic_provider_calls": 0,
+                        "governance_provider_calls": 0,
+                        "completed_legacy": len(
+                            migration["completed_atomic_information_ids"]
+                        ),
+                        "remaining_batch": len(
+                            migration["remaining_atomic_information_ids"]
+                        ),
+                        "migration_fingerprint": migration[
+                            "migration_fingerprint"
                         ],
                     },
                     ensure_ascii=False,
