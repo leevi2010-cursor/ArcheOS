@@ -1280,17 +1280,30 @@ class _SemanticRecoveryRun:
                 maintenance = global_authority._read_maintenance_continuation(
                     base, extension, resolution
                 )
-                effective = global_authority._effective_authority(
-                    base,
-                    extension,
-                    resolution,
-                    maintenance,
+                timeout_resolution = (
                     global_authority._read_timeout_212_resolution(
                         base,
                         extension,
                         resolution,
                         maintenance,
-                    ),
+                    )
+                )
+                batch_governance_continuation = (
+                    global_authority._read_batch_governance_continuation(
+                        base,
+                        extension,
+                        resolution,
+                        maintenance,
+                        timeout_resolution,
+                    )
+                )
+                effective = global_authority._effective_authority(
+                    base,
+                    extension,
+                    resolution,
+                    maintenance,
+                    timeout_resolution,
+                    batch_governance_continuation,
                 )
                 attempts, _unknown = global_authority._global_attempts(effective)
                 if not any(
