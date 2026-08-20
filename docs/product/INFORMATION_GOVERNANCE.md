@@ -107,6 +107,22 @@ Hypothesis 是 Atomic Information 的 canonical 语义形态，用于保存**尚
 
 新的 Atomic Information 涉及已有 Object 时，系统先判断业务影响：
 
+### 6.0 默认按相关批次理解
+
+当同一文档、会话或其他边界清楚的输入形成多条 Atomic Information 时，默认把这些相关信息作为一个有序批次交给同一个 Interpretation Provider 理解，而不是每条信息单独调用一次模型。
+
+批量理解必须同时满足：
+
+- 一次 Provider 调用返回与输入 `atomic_information_id` 顺序严格一致的一组判断，不得缺失、重复、乱序或混入未知 ID；
+- 整批结果完成结构校验并持久保存后，系统才按输入顺序写入长期状态；
+- 批量结果保存前的准备必须保持只读；旧收据恢复、身份归位和其他可能改变长期状态的动作统一延后到顺序应用阶段；
+- 每次顺序写入都保存恢复进度；中断后复用已经保存的批次结果继续，不得再次调用模型；
+- Provider 在完整结果保存前失败时，本批次不得产生由该结果驱动的长期写入；
+- 冲突、不确定、Evidence 不足或高影响结构变化进入现有 Human Judgment / Change Proposal 边界，不得让正常项退化为逐条模型调用；
+- 单条 API 可以继续兼容，但多条业务入口不得静默回退为 N 次单条 Provider 调用。
+
+批次、收据与恢复游标只是 Processing / Audit 技术状态，不是新的 Core concept 或第二份业务 truth。批量理解仍由单一 Agent 在同一有界上下文中完成，不以多 Agent 并行替代上下文一致性。
+
 ### 6.1 补充
 
 新信息与当前认知相容，只是增加更多事实、背景、Claim、Hypothesis 或细节。

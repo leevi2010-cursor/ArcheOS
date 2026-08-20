@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import hashlib
 import json
-from collections.abc import Callable
-from dataclasses import asdict, replace
+from collections.abc import Callable, Sequence
+from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime
 
 from ..atomic_information import (
@@ -41,6 +41,18 @@ from .serialization import (
 )
 
 MAX_RELATED_INFORMATION = 20
+
+
+@dataclass(frozen=True)
+class _PreparedDigestion:
+    atomic_information: AtomicInformationRevision
+    recovered_change_ids: tuple[str, ...]
+    resolved_ids: tuple[str, ...]
+    unmatched: tuple[str, ...]
+    ambiguous: tuple[str, ...]
+    all_related_information: tuple[AtomicInformationRevision, ...]
+    related_information: tuple[AtomicInformationRevision, ...]
+    world_state: DigestionWorldState
 
 
 def _utc_now() -> str:
@@ -81,7 +93,84 @@ class AtomicInformationDigestionService:
     def digest(self, atomic_information_id: str) -> DigestionResult:
         if self.interpretation_provider is None:
             raise RuntimeError("an interpretation provider is required for digestion")
-        recovered_change_ids = self._recover_automatic_receipts(atomic_information_id)
+        prepared = self._prepare(atomic_information_id)
+        interpretation = self.interpretation_provider.interpret(
+            prepared.atomic_information, prepared.world_state
+        )
+        return self._apply_prepared(prepared, interpretation)
+
+    def interpret_batch(
+        self, atomic_information_ids: Sequence[str]
+    ) -> tuple[InterpretationResult, ...]:
+        if self.interpretation_provider is None:
+            raise RuntimeError("an interpretation provider is required for digestion")
+        identifiers = tuple(atomic_information_ids)
+        if not identifiers or len(identifiers) != len(set(identifiers)):
+            raise ValueError("batch digestion IDs must be unique and non-empty")
+        provider_method = getattr(self.interpretation_provider, "interpret_batch", None)
+        if not callable(provider_method):
+            if len(identifiers) == 1:
+                prepared = self._prepare(
+                    identifiers[0], recover_automatic_receipts=False
+                )
+                return (
+                    self.interpretation_provider.interpret(
+                        prepared.atomic_information, prepared.world_state
+                    ),
+                )
+            raise RuntimeError(
+                "batch interpretation provider is required for multi-item digestion"
+            )
+        prepared = tuple(
+            self._prepare(identifier, recover_automatic_receipts=False)
+            for identifier in identifiers
+        )
+        results = tuple(
+            provider_method(
+                tuple((item.atomic_information, item.world_state) for item in prepared)
+            )
+        )
+        if len(results) != len(prepared):
+            raise ValueError("batch interpretation result count does not match input")
+        for item, interpretation in zip(prepared, results, strict=True):
+            self._validate_interpretation(interpretation)
+            self._validate_claim_enrichment(
+                interpretation.claim, item.atomic_information, item.resolved_ids
+            )
+        return results
+
+    def apply_interpretation(
+        self,
+        atomic_information_id: str,
+        interpretation: InterpretationResult,
+    ) -> DigestionResult:
+        return self._apply_prepared(
+            self._prepare(atomic_information_id), interpretation
+        )
+
+    def digest_batch(
+        self, atomic_information_ids: Sequence[str]
+    ) -> tuple[DigestionResult, ...]:
+        identifiers = tuple(atomic_information_ids)
+        interpretations = self.interpret_batch(identifiers)
+        return tuple(
+            self.apply_interpretation(identifier, interpretation)
+            for identifier, interpretation in zip(
+                identifiers, interpretations, strict=True
+            )
+        )
+
+    def _prepare(
+        self,
+        atomic_information_id: str,
+        *,
+        recover_automatic_receipts: bool = True,
+    ) -> _PreparedDigestion:
+        recovered_change_ids = (
+            self._recover_automatic_receipts(atomic_information_id)
+            if recover_automatic_receipts
+            else ()
+        )
         atomic_information = self.atomic_information_store.get_current(
             atomic_information_id
         )
@@ -100,9 +189,29 @@ class AtomicInformationDigestionService:
             ambiguous_concerns=ambiguous,
             related_atomic_information=related_information,
         )
-        interpretation = self.interpretation_provider.interpret(
-            atomic_information, world_state
+        return _PreparedDigestion(
+            atomic_information=atomic_information,
+            recovered_change_ids=recovered_change_ids,
+            resolved_ids=resolved_ids,
+            unmatched=unmatched,
+            ambiguous=ambiguous,
+            all_related_information=all_related_information,
+            related_information=related_information,
+            world_state=world_state,
         )
+
+    def _apply_prepared(
+        self,
+        prepared: _PreparedDigestion,
+        interpretation: InterpretationResult,
+    ) -> DigestionResult:
+        atomic_information = prepared.atomic_information
+        recovered_change_ids = prepared.recovered_change_ids
+        resolved_ids = prepared.resolved_ids
+        unmatched = prepared.unmatched
+        ambiguous = prepared.ambiguous
+        all_related_information = prepared.all_related_information
+        related_information = prepared.related_information
         self._validate_interpretation(interpretation)
         self._validate_claim_enrichment(
             interpretation.claim, atomic_information, resolved_ids

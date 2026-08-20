@@ -17,15 +17,18 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from archeos.atomic_information import (
+    ClaimAttribution,
     JsonlAtomicInformationStore,
     ingest_processing_package,
 )
 from archeos.digestion import (
+    BusinessLanguageHumanJudgmentPort,
     CodexAtomicInformationInterpretationProvider,
     InterpretationResult,
     WorldModelOperation,
 )
 from archeos.digestion.providers import CodexInterpretationTimeout
+from archeos.emergence import IdentityEvidence, IdentityGateService
 from archeos.representation import LocalRepresentationRepository
 from archeos.representation_information import (
     EXTERNAL_AGENT_PROTOCOL_V1,
@@ -58,6 +61,7 @@ from archeos.wechat_digest import (
     WechatDigestRunStore,
     WechatDigestService,
     _build_plan,
+    _governance_atomic_fingerprint,
     _plan_fingerprint,
 )
 from archeos.world_model import SQLiteWorldModelRepository
@@ -248,6 +252,7 @@ class SyntheticSemanticHandoff:
         self.installed_grant = None
         self.installed_extension = None
         self.installed_maintenance_continuation = None
+        self.installed_batch_governance_continuation = None
         self.unknown_resolution = None
         self.timeout_212_resolution = None
         self.before_unknown_commit = None
@@ -402,6 +407,50 @@ class SyntheticSemanticHandoff:
         ):
             raise RuntimeError("synthetic maintenance continuation drift")
         self.installed_maintenance_continuation = expected
+        self.campaign_binding = SimpleNamespace(
+            created_at=self.campaign_binding.created_at,
+            lower_cursor=self.campaign_binding.lower_cursor,
+            frozen_global_upper_cursor=(
+                self.campaign_binding.frozen_global_upper_cursor
+            ),
+            capture_provider_version=self.campaign_binding.capture_provider_version,
+            semantic_batch_size=self.campaign_binding.semantic_batch_size,
+            reviewed_git_head=self.reviewed_git_head,
+        )
+        return expected
+
+    def install_batch_governance_continuation(
+        self,
+        *,
+        window_binding,
+        authority_ref,
+    ):
+        if self.campaign_binding is None:
+            self.campaign_binding = SimpleNamespace(
+                created_at=window_binding.campaign_created_at,
+                lower_cursor=window_binding.campaign_lower_cursor,
+                frozen_global_upper_cursor=(
+                    window_binding.frozen_global_upper_cursor
+                ),
+                capture_provider_version=window_binding.capture_provider_version,
+                semantic_batch_size=window_binding.semantic_batch_size,
+                reviewed_git_head=window_binding.reviewed_git_head,
+            )
+        expected = {
+            "authority_ref": authority_ref,
+            "activation_total": 220,
+            "activation_unknown_count": 0,
+            "activation_last_global_ordinal": 220,
+            "next_global_ordinal": 221,
+            "absolute_cap": 1000,
+            "continuation_fingerprint": "sha256:" + "c" * 64,
+        }
+        if (
+            self.installed_batch_governance_continuation is not None
+            and self.installed_batch_governance_continuation != expected
+        ):
+            raise RuntimeError("synthetic batch governance continuation drift")
+        self.installed_batch_governance_continuation = expected
         self.campaign_binding = SimpleNamespace(
             created_at=self.campaign_binding.created_at,
             lower_cursor=self.campaign_binding.lower_cursor,
@@ -664,6 +713,168 @@ class NoStructuralChangeProvider:
             ambiguous=False,
         )
 
+    def interpret_batch(self, items):
+        return tuple(
+            self.interpret(atomic_information, current_world_state)
+            for atomic_information, current_world_state in items
+        )
+
+
+class BatchOnceProvider(NoStructuralChangeProvider):
+    name = "synthetic-batch-once"
+
+    def __init__(self) -> None:
+        self.calls = 0
+        self.batch_sizes: list[int] = []
+
+    def interpret(self, atomic_information, current_world_state):
+        del atomic_information, current_world_state
+        raise AssertionError("batch workflow must not use the single-item method")
+
+    def interpret_batch(self, items):
+        batch = tuple(items)
+        self.calls += 1
+        self.batch_sizes.append(len(batch))
+        return tuple(
+            InterpretationResult(
+                operations=(WorldModelOperation(kind="no_structural_change"),),
+                rationale="Synthetic batch governance.",
+                evidence_sufficient=True,
+                conflict=False,
+                ambiguous=False,
+            )
+            for _ in batch
+        )
+
+
+class SharedObjectBatchProvider(NoStructuralChangeProvider):
+    name = "synthetic-shared-object-batch"
+
+    def __init__(self, object_id: str) -> None:
+        self.object_id = object_id
+        self.calls = 0
+
+    def interpret(self, atomic_information, current_world_state):
+        del atomic_information, current_world_state
+        raise AssertionError("batch workflow must not use the single-item method")
+
+    def interpret_batch(self, items):
+        batch = tuple(items)
+        if len(batch) != 2:
+            raise AssertionError("shared-object fixture requires two items")
+        self.calls += 1
+        return (
+            InterpretationResult(
+                operations=(
+                    WorldModelOperation(
+                        kind="add_role",
+                        target_object_id=self.object_id,
+                        role="project",
+                    ),
+                ),
+                rationale="Synthetic shared-object role update.",
+                evidence_sufficient=True,
+                conflict=False,
+                ambiguous=False,
+            ),
+            InterpretationResult(
+                operations=(WorldModelOperation(kind="no_structural_change"),),
+                rationale="Synthetic shared-object no-op.",
+                evidence_sufficient=True,
+                conflict=False,
+                ambiguous=False,
+            ),
+        )
+
+
+class HumanReviewBatchProvider(NoStructuralChangeProvider):
+    name = "synthetic-human-review-batch"
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def interpret(self, atomic_information, current_world_state):
+        del atomic_information, current_world_state
+        raise AssertionError("batch workflow must not use the single-item method")
+
+    def interpret_batch(self, items):
+        batch = tuple(items)
+        if len(batch) != 2:
+            raise AssertionError("human-review fixture requires two items")
+        self.calls += 1
+        return (
+            InterpretationResult(
+                operations=(WorldModelOperation(kind="conflict"),),
+                rationale="Synthetic conflict requires human review.",
+                evidence_sufficient=True,
+                conflict=True,
+                ambiguous=False,
+            ),
+            InterpretationResult(
+                operations=(WorldModelOperation(kind="no_structural_change"),),
+                rationale="Synthetic batch no-op.",
+                evidence_sufficient=True,
+                conflict=False,
+                ambiguous=False,
+            ),
+        )
+
+
+class ClaimEnrichmentBatchProvider(NoStructuralChangeProvider):
+    name = "synthetic-claim-enrichment-batch"
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def interpret(self, atomic_information, current_world_state):
+        del atomic_information, current_world_state
+        raise AssertionError("batch workflow must not use the single-item method")
+
+    def interpret_batch(self, items):
+        batch = tuple(items)
+        if len(batch) != 2:
+            raise AssertionError("claim-enrichment fixture requires two items")
+        self.calls += 1
+        first_information = batch[0][0]
+        return (
+            InterpretationResult(
+                operations=(WorldModelOperation(kind="no_structural_change"),),
+                rationale="Synthetic claim enrichment.",
+                evidence_sufficient=True,
+                conflict=False,
+                ambiguous=False,
+                claim=ClaimAttribution(
+                    claimant_object_id=None,
+                    claimant_source_id=(
+                        first_information.source_evidence[0].source_id
+                    ),
+                    claimant_label="Synthetic Sender",
+                    stance="assert",
+                    claimed_at=None,
+                    attribution_confidence=1.0,
+                ),
+            ),
+            InterpretationResult(
+                operations=(WorldModelOperation(kind="no_structural_change"),),
+                rationale="Synthetic batch no-op.",
+                evidence_sufficient=True,
+                conflict=False,
+                ambiguous=False,
+            ),
+        )
+
+
+class FailingBatchProvider(NoStructuralChangeProvider):
+    name = "synthetic-failing-batch"
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def interpret_batch(self, items):
+        tuple(items)
+        self.calls += 1
+        raise RuntimeError("synthetic batch failure")
+
 
 class SerialSessionProvider:
     name = "synthetic-serial-session"
@@ -733,6 +944,12 @@ class SerialSessionProvider:
             ambiguous=False,
         )
 
+    def interpret_batch(self, items):
+        return tuple(
+            self.interpret(atomic_information, current_world_state)
+            for atomic_information, current_world_state in items
+        )
+
 
 class TimeoutOnFourthTurnProvider(SerialSessionProvider):
     def metrics_since(self, cursor):
@@ -779,6 +996,88 @@ class FailAfterProviderOnceService(WechatDigestService):
         return result
 
 
+class FailAfterPersistedBatchProgressOnceService(WechatDigestService):
+    fail_progress = True
+
+    def _update_item(self, run_id, status, item_id, **changes):
+        result = super()._update_item(run_id, status, item_id, **changes)
+        receipt = changes.get("governance_receipt")
+        if (
+            self.fail_progress
+            and isinstance(receipt, dict)
+            and receipt.get("phase") == "applying"
+            and receipt.get("next_index") == 1
+        ):
+            self.fail_progress = False
+            raise OSError("synthetic post-persist progress interruption")
+        return result
+
+
+class FailBeforePersistedBatchProgressOnceService(WechatDigestService):
+    fail_progress = True
+
+    def _update_item(self, run_id, status, item_id, **changes):
+        receipt = changes.get("governance_receipt")
+        if (
+            self.fail_progress
+            and isinstance(receipt, dict)
+            and receipt.get("phase") == "applying"
+            and receipt.get("next_index") == 1
+            and receipt.get("in_flight_index") is None
+        ):
+            self.fail_progress = False
+            raise OSError("synthetic pre-persist progress interruption")
+        return super()._update_item(run_id, status, item_id, **changes)
+
+
+class SharedObjectInterruptedBatchService(
+    FailAfterPersistedBatchProgressOnceService
+):
+    shared_bindings_installed = False
+    shared_object_id: str
+
+    def _govern(self, atomic_ids):
+        if not self.shared_bindings_installed:
+            self.shared_bindings_installed = True
+            for atomic_id in atomic_ids:
+                current = self.information_store.get_current(atomic_id)
+                next_revision = current.revision_number + 1
+                self.information_store.append_revision(
+                    replace(
+                        current,
+                        revision_number=next_revision,
+                        revision_id=f"{atomic_id}-r{next_revision:04d}",
+                        related_object_ids=(self.shared_object_id,),
+                        revision_reason="synthetic_shared_object_binding",
+                    )
+                )
+        return super()._govern(atomic_ids)
+
+
+class SharedObjectPreCursorBatchService(
+    FailBeforePersistedBatchProgressOnceService
+):
+    shared_bindings_installed = False
+    shared_object_id: str
+
+    def _govern(self, atomic_ids):
+        if not self.shared_bindings_installed:
+            self.shared_bindings_installed = True
+            for atomic_id in atomic_ids:
+                current = self.information_store.get_current(atomic_id)
+                next_revision = current.revision_number + 1
+                self.information_store.append_revision(
+                    replace(
+                        current,
+                        revision_number=next_revision,
+                        revision_id=f"{atomic_id}-r{next_revision:04d}",
+                        related_object_ids=(self.shared_object_id,),
+                        revision_reason="synthetic_shared_object_binding",
+                    )
+                )
+        return super()._govern(atomic_ids)
+
+
 class FailSecondGovernanceOnceService(WechatDigestService):
     governance_calls = 0
     failed = False
@@ -822,6 +1121,246 @@ class WechatDigestTests(unittest.TestCase):
             self.workspace / "04_core" / "archeos.sqlite3"
         ) as repository:
             return repository.create_object(name).object_id
+
+    def interrupted_batch_cursor_one(
+        self,
+    ) -> tuple[WechatDigestService, BatchOnceProvider, dict[str, object]]:
+        self.create_object()
+        provider = BatchOnceProvider()
+        service = FailAfterPersistedBatchProgressOnceService(
+            workspace=self.workspace,
+            capture_provider=SyntheticCaptureProvider([message(1), message(2)]),
+            semantic_handoff_factory=lambda: self.semantic,
+            interpretation_provider=provider,
+        )
+        with self.assertRaises(WechatDigestError):
+            service.run(all_history=True)
+        run_id = service.run_store.active_run_id()
+        assert run_id is not None
+        receipt = next(
+            item["governance_receipt"]
+            for item in service.run_store.status(run_id)["items"].values()
+            if isinstance(item, dict) and "governance_receipt" in item
+        )
+        self.assertEqual(receipt["phase"], "applying")
+        self.assertEqual(receipt["next_index"], 1)
+        self.assertEqual(provider.calls, 1)
+        return service, provider, receipt
+
+    def interrupted_shared_object_batch_cursor_one(
+        self,
+    ) -> tuple[
+        WechatDigestService,
+        SharedObjectBatchProvider,
+        dict[str, object],
+        str,
+    ]:
+        object_id = self.create_object()
+        provider = SharedObjectBatchProvider(object_id)
+        service = SharedObjectInterruptedBatchService(
+            workspace=self.workspace,
+            capture_provider=SyntheticCaptureProvider([message(1), message(2)]),
+            semantic_handoff_factory=lambda: self.semantic,
+            interpretation_provider=provider,
+        )
+        service.shared_object_id = object_id
+        with self.assertRaises(WechatDigestError):
+            service.run(all_history=True)
+        run_id = service.run_store.active_run_id()
+        assert run_id is not None
+        receipt = next(
+            item["governance_receipt"]
+            for item in service.run_store.status(run_id)["items"].values()
+            if isinstance(item, dict) and "governance_receipt" in item
+        )
+        self.assertEqual(receipt["phase"], "applying")
+        self.assertEqual(receipt["next_index"], 1)
+        self.assertEqual(provider.calls, 1)
+        return service, provider, receipt, object_id
+
+    def interrupted_shared_object_batch_before_cursor(
+        self,
+    ) -> tuple[
+        WechatDigestService,
+        SharedObjectBatchProvider,
+        dict[str, object],
+        str,
+    ]:
+        object_id = self.create_object()
+        provider = SharedObjectBatchProvider(object_id)
+        service = SharedObjectPreCursorBatchService(
+            workspace=self.workspace,
+            capture_provider=SyntheticCaptureProvider([message(1), message(2)]),
+            semantic_handoff_factory=lambda: self.semantic,
+            interpretation_provider=provider,
+        )
+        service.shared_object_id = object_id
+        with self.assertRaises(WechatDigestError):
+            service.run(all_history=True)
+        run_id = service.run_store.active_run_id()
+        assert run_id is not None
+        receipt = next(
+            item["governance_receipt"]
+            for item in service.run_store.status(run_id)["items"].values()
+            if isinstance(item, dict) and "governance_receipt" in item
+        )
+        self.assertEqual(receipt["phase"], "applying")
+        self.assertEqual(receipt["next_index"], 0)
+        self.assertEqual(receipt["in_flight_index"], 0)
+        self.assertEqual(provider.calls, 1)
+        return service, provider, receipt, object_id
+
+    def interrupted_human_review_batch_before_cursor(
+        self,
+    ) -> tuple[WechatDigestService, HumanReviewBatchProvider]:
+        object_id = self.create_object()
+        provider = HumanReviewBatchProvider()
+        service = SharedObjectPreCursorBatchService(
+            workspace=self.workspace,
+            capture_provider=SyntheticCaptureProvider([message(1), message(2)]),
+            semantic_handoff_factory=lambda: self.semantic,
+            interpretation_provider=provider,
+        )
+        service.shared_object_id = object_id
+        with self.assertRaises(WechatDigestError):
+            service.run(all_history=True)
+        run_id = service.run_store.active_run_id()
+        assert run_id is not None
+        receipt = next(
+            item["governance_receipt"]
+            for item in service.run_store.status(run_id)["items"].values()
+            if isinstance(item, dict) and "governance_receipt" in item
+        )
+        self.assertEqual(receipt["phase"], "applying")
+        self.assertEqual(receipt["in_flight_index"], 0)
+        self.assertEqual(len(service.proposal_store.list_unresolved()), 1)
+        self.assertEqual(provider.calls, 1)
+        return service, provider
+
+    def interrupted_claim_enrichment_batch_before_cursor(
+        self,
+    ) -> tuple[WechatDigestService, ClaimEnrichmentBatchProvider, str]:
+        object_id = self.create_object()
+        provider = ClaimEnrichmentBatchProvider()
+        service = SharedObjectPreCursorBatchService(
+            workspace=self.workspace,
+            capture_provider=SyntheticCaptureProvider([message(1), message(2)]),
+            semantic_handoff_factory=lambda: self.semantic,
+            interpretation_provider=provider,
+        )
+        service.shared_object_id = object_id
+        with self.assertRaises(WechatDigestError):
+            service.run(all_history=True)
+        run_id = service.run_store.active_run_id()
+        assert run_id is not None
+        receipt = next(
+            item["governance_receipt"]
+            for item in service.run_store.status(run_id)["items"].values()
+            if isinstance(item, dict) and "governance_receipt" in item
+        )
+        atomic_id = receipt["batch_atomic_information_ids"][0]
+        self.assertEqual(receipt["phase"], "applying")
+        self.assertEqual(receipt["in_flight_index"], 0)
+        self.assertIsNotNone(
+            service.information_store.get_current(atomic_id).claim
+        )
+        self.assertEqual(provider.calls, 1)
+        return service, provider, atomic_id
+
+    def interrupted_identity_review_batch_before_cursor(
+        self,
+    ) -> tuple[WechatDigestService, BatchOnceProvider, str]:
+        self.create_object("Ambiguous Project")
+        self.create_object("Ambiguous Project")
+        provider = BatchOnceProvider()
+        service = FailBeforePersistedBatchProgressOnceService(
+            workspace=self.workspace,
+            capture_provider=SyntheticCaptureProvider(
+                [
+                    message(1, content="Ambiguous project update one."),
+                    message(2, content="Ambiguous project update two."),
+                ]
+            ),
+            semantic_handoff_factory=lambda: self.semantic,
+            interpretation_provider=provider,
+        )
+        with self.assertRaises(WechatDigestError):
+            service.run(all_history=True)
+        run_id = service.run_store.active_run_id()
+        assert run_id is not None
+        receipt = next(
+            item["governance_receipt"]
+            for item in service.run_store.status(run_id)["items"].values()
+            if isinstance(item, dict) and "governance_receipt" in item
+        )
+        self.assertEqual(receipt["phase"], "applying")
+        self.assertEqual(receipt["in_flight_index"], 0)
+        proposal = service.proposal_store.list_unresolved()[0]
+        self.assertEqual(
+            proposal.human_review.allowed_actions,
+            (
+                "bind_existing",
+                "create_minimal",
+                "edit_identity_and_create",
+                "reject",
+                "defer",
+            ),
+        )
+        self.assertEqual(provider.calls, 1)
+        return service, provider, proposal.proposal_id
+
+    @staticmethod
+    def append_information_drift(
+        service: WechatDigestService, atomic_information_id: str
+    ) -> None:
+        current = service.information_store.get_current(atomic_information_id)
+        next_revision = current.revision_number + 1
+        service.information_store.append_revision(
+            replace(
+                current,
+                revision_number=next_revision,
+                revision_id=(
+                    f"{current.atomic_information_id}-r{next_revision:04d}"
+                ),
+                revision_reason="synthetic_resume_drift",
+            )
+        )
+
+    @staticmethod
+    def governance_business_state(service: WechatDigestService):
+        information = tuple(
+            revision
+            for current in service.information_store.list_atomic_information()
+            for revision in service.information_store.list_revisions(
+                current.atomic_information_id
+            )
+        )
+        with SQLiteWorldModelRepository(service.database) as repository:
+            objects = repository.list_objects()
+            return (
+                information,
+                service.proposal_store.list_history(),
+                service.journal.list_changes(),
+                objects,
+                tuple(
+                    item
+                    for record in objects
+                    for item in repository.list_names(record.object_id)
+                ),
+                tuple(
+                    item
+                    for record in objects
+                    for item in repository.list_roles(record.object_id)
+                ),
+                tuple(
+                    item
+                    for record in objects
+                    for item in repository.list_lifecycles(record.object_id)
+                ),
+                repository.list_relationships(active_only=False),
+                repository.list_external_identity_mappings(),
+                repository.list_apply_receipts(),
+            )
 
     def source_count(self) -> int:
         return len(
@@ -992,7 +1531,7 @@ class WechatDigestTests(unittest.TestCase):
         self.assertEqual(second.durable_information, 0)
         self.assertEqual(self.source_count(), 1)
 
-    def test_governance_session_is_serial_and_rebuilds_world_state_per_atomic(
+    def test_governance_batch_uses_one_bounded_world_state_snapshot(
         self,
     ) -> None:
         self.create_object()
@@ -1010,7 +1549,7 @@ class WechatDigestTests(unittest.TestCase):
         self.assertEqual(provider.session_entries, 1)
         self.assertEqual(provider.session_exits, 1)
         self.assertEqual(provider.calls, 2)
-        self.assertEqual(provider.observed_roles, [(), ("project",)])
+        self.assertEqual(provider.observed_roles, [(), ()])
         self.assertEqual(result.governance_app_server_starts, 1)
         self.assertEqual(result.governance_threads, 2)
         self.assertEqual(result.governance_turns, 2)
@@ -1157,7 +1696,530 @@ class WechatDigestTests(unittest.TestCase):
         self.assertTrue(result.checkpoint_published)
         self.assertEqual(provider.calls, 1)
 
-    def test_unknown_governance_receipt_recovery_fails_closed_zero_calls(
+    def test_ten_atomic_information_use_one_governance_provider_call(self) -> None:
+        self.create_object()
+        provider = BatchOnceProvider()
+        service = WechatDigestService(
+            workspace=self.workspace,
+            capture_provider=SyntheticCaptureProvider(
+                [message(index) for index in range(1, 11)]
+            ),
+            semantic_handoff_factory=lambda: self.semantic,
+            interpretation_provider=provider,
+        )
+
+        result = service.run(all_history=True)
+
+        self.assertTrue(result.checkpoint_published)
+        self.assertEqual(provider.calls, 1)
+        self.assertEqual(provider.batch_sizes, [10])
+
+    def test_failed_batch_leaves_identity_and_governance_state_unmodified(
+        self,
+    ) -> None:
+        self.create_object()
+        provider = FailingBatchProvider()
+        service = WechatDigestService(
+            workspace=self.workspace,
+            capture_provider=SyntheticCaptureProvider([message(1), message(2)]),
+            semantic_handoff_factory=lambda: self.semantic,
+            interpretation_provider=provider,
+        )
+
+        with self.assertRaises(WechatDigestError):
+            service.run(all_history=True)
+
+        self.assertEqual(provider.calls, 1)
+        revisions = service.information_store.list_atomic_information()
+        self.assertEqual(len(revisions), 2)
+        self.assertTrue(
+            all(
+                item.revision_number == 1 and not item.related_object_ids
+                for item in revisions
+            )
+        )
+        self.assertEqual(service.proposal_store.list_unresolved(), ())
+        self.assertEqual(service.journal.list_changes(), ())
+
+    def test_issue_135_migration_freezes_15_and_batches_only_remaining_3(
+        self,
+    ) -> None:
+        provider = BatchOnceProvider()
+        capture = SyntheticCaptureProvider(
+            [message(index) for index in range(1, 19)]
+        )
+        service = FailAfterPersistedBatchProgressOnceService(
+            workspace=self.workspace,
+            capture_provider=capture,
+            semantic_handoff_factory=lambda: self.semantic,
+            interpretation_provider=provider,
+        )
+        self.semantic.failures_remaining = 1
+        with self.assertRaises(WechatDigestError):
+            service.run(all_history=True)
+        prepared = service.prepare_next_semantic()
+        privacy = service.privacy_gate.evaluate(
+            service._representation_texts(prepared.representation_id),
+            semantic_completeness_known=True,
+        )
+        atomic_ids = service._semantic(
+            prepared.run_id, prepared.representation_id, privacy
+        )
+        self.assertEqual(len(atomic_ids), 18)
+
+        self.create_object()
+        with SQLiteWorldModelRepository(service.database) as repository:
+            identity = IdentityGateService(
+                service.information_store,
+                repository,
+                service.proposal_store,
+                service.journal,
+                BusinessLanguageHumanJudgmentPort(),
+            )
+            for atomic_id in atomic_ids[:14]:
+                current = service.information_store.get_current(atomic_id)
+                identity.process(
+                    atomic_id,
+                    IdentityEvidence(
+                        name="Synthetic Project",
+                        supporting_revision_ids=(current.revision_id,),
+                        identity_bases=(),
+                    ),
+                )
+
+        status = service.run_store.status(prepared.run_id)
+        item_id = next(
+            key
+            for key, item in status["items"].items()
+            if item.get("representation_id") == prepared.representation_id
+        )
+        item = status["items"][item_id]
+        item["state"] = "represented"
+        item["privacy_route"] = None
+        item["privacy_categories"] = []
+        item["atomic_information_ids"] = []
+        item["pending_human"] = False
+        item["context_object_ids"] = []
+        item["governance_receipt"] = {
+            "schema_version": "wechat-governance-receipt/1.0",
+            "phase": "started",
+            "atomic_information_fingerprint": (
+                _governance_atomic_fingerprint(atomic_ids)
+            ),
+        }
+        item["governance_metrics"] = {
+            "app_server_start_count": 0,
+            "thread_count": 15,
+            "turn_count": 15,
+            "startup_wall_ms": 0,
+            "turn_wall_ms_sum": 150,
+            "turn_wall_ms_max": 10,
+            "governance_wall_ms": 160,
+            "timeout_count": 0,
+            "failure_count": 1,
+            "failure_categories": {"transport": 1},
+        }
+        status["state"] = "failed"
+        status["failure_category"] = "BrokenPipeError"
+        service.run_store.update_status(prepared.run_id, status)
+        self.semantic.global_attempt_total = 220
+        authority_ref = (
+            "https://github.com/leevi2010-cursor/ArcheOS/issues/135"
+            "#issuecomment-5353999999"
+        )
+        authority_manifest = service.build_batch_governance_authority_manifest(
+            authority_ref=authority_ref,
+            completed_atomic_information_ids=atomic_ids[:15],
+            remaining_atomic_information_ids=atomic_ids[15:],
+        )
+        authority_file = self.workspace / "issue-135-authority.json"
+        authority_file.write_text(
+            json.dumps(authority_manifest, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        authority_file.chmod(0o600)
+
+        def write_resigned_manifest(name, mutate):
+            payload = json.loads(json.dumps(authority_manifest))
+            mutate(payload)
+            payload.pop("manifest_fingerprint", None)
+            payload["manifest_fingerprint"] = "sha256:" + hashlib.sha256(
+                json.dumps(
+                    payload,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            ).hexdigest()
+            path = self.workspace / name
+            path.write_text(json.dumps(payload), encoding="utf-8")
+            path.chmod(0o600)
+            return path
+
+        tampered_files = (
+            write_resigned_manifest(
+                "issue-135-order.json",
+                lambda payload: payload[
+                    "completed_atomic_information_ids"
+                ].reverse(),
+            ),
+            write_resigned_manifest(
+                "issue-135-atomic.json",
+                lambda payload: payload["completed_effect_bindings"][0].update(
+                    {"current_revision_fingerprint": "sha256:" + "a" * 64}
+                ),
+            ),
+            write_resigned_manifest(
+                "issue-135-journal.json",
+                lambda payload: payload["completed_effect_bindings"][0].update(
+                    {"journal_fingerprint": "sha256:" + "b" * 64}
+                ),
+            ),
+            write_resigned_manifest(
+                "issue-135-proposal.json",
+                lambda payload: payload["completed_effect_bindings"][0].update(
+                    {"proposal_history_fingerprint": "sha256:" + "c" * 64}
+                ),
+            ),
+            write_resigned_manifest(
+                "issue-135-receipt.json",
+                lambda payload: payload["completed_effect_bindings"][0].update(
+                    {"apply_receipts_fingerprint": "sha256:" + "d" * 64}
+                ),
+            ),
+            write_resigned_manifest(
+                "issue-135-world.json",
+                lambda payload: payload["completed_effect_bindings"][0].update(
+                    {"world_projection_fingerprint": "sha256:" + "e" * 64}
+                ),
+            ),
+        )
+        for tampered_file in tampered_files:
+            with self.assertRaises(WechatDigestError):
+                service.activate_batch_governance(
+                    authority_ref=authority_ref,
+                    authority_manifest_file=tampered_file,
+                )
+        invalid_fingerprint_file = self.workspace / "issue-135-fingerprint.json"
+        invalid_fingerprint = json.loads(json.dumps(authority_manifest))
+        invalid_fingerprint["manifest_fingerprint"] = "sha256:" + "f" * 64
+        invalid_fingerprint_file.write_text(
+            json.dumps(invalid_fingerprint), encoding="utf-8"
+        )
+        invalid_fingerprint_file.chmod(0o600)
+        with self.assertRaises(WechatDigestError):
+            service.activate_batch_governance(
+                authority_ref=authority_ref,
+                authority_manifest_file=invalid_fingerprint_file,
+            )
+        authority_file.chmod(0o644)
+        with self.assertRaises(WechatDigestError):
+            service.activate_batch_governance(
+                authority_ref=authority_ref,
+                authority_manifest_file=authority_file,
+            )
+        authority_file.chmod(0o600)
+        authority_link = self.workspace / "issue-135-authority-link.json"
+        authority_link.symlink_to(authority_file)
+        with self.assertRaises(WechatDigestError):
+            service.activate_batch_governance(
+                authority_ref=authority_ref,
+                authority_manifest_file=authority_link,
+            )
+        self.semantic.global_attempt_total = 221
+        with self.assertRaises(WechatDigestError):
+            service.activate_batch_governance(
+                authority_ref=authority_ref,
+                authority_manifest_file=authority_file,
+            )
+        self.semantic.global_attempt_total = 220
+        self.assertEqual(
+            service.build_batch_governance_authority_manifest(
+                authority_ref=authority_ref,
+                completed_atomic_information_ids=atomic_ids[:15],
+                remaining_atomic_information_ids=atomic_ids[15:],
+            ),
+            authority_manifest,
+        )
+        completed_before = [
+            service.information_store.list_revisions(atomic_id)
+            for atomic_id in atomic_ids[:15]
+        ]
+
+        migration = service.activate_batch_governance(
+            authority_ref=authority_ref,
+            authority_manifest_file=authority_file,
+        )
+
+        self.assertEqual(provider.calls, 0)
+        self.assertEqual(
+            migration["completed_atomic_information_ids"],
+            list(atomic_ids[:15]),
+        )
+        self.assertEqual(
+            migration["remaining_atomic_information_ids"],
+            list(atomic_ids[15:]),
+        )
+        self.assertEqual(
+            service.activate_batch_governance(
+                authority_ref=authority_ref,
+                authority_manifest_file=authority_file,
+            ),
+            migration,
+        )
+        self.assertEqual(provider.calls, 0)
+
+        with self.assertRaises(WechatDigestError):
+            service.run()
+        interrupted_item = service.run_store.status(prepared.run_id)["items"][
+            item_id
+        ]
+        self.assertEqual(
+            interrupted_item["governance_receipt"]["phase"], "applying"
+        )
+        self.assertEqual(
+            interrupted_item["governance_receipt"]["next_index"], 1
+        )
+        self.assertEqual(
+            len(
+                interrupted_item["governance_receipt"][
+                    "applied_effect_fingerprints"
+                ]
+            ),
+            1,
+        )
+        self.assertEqual(provider.calls, 1)
+        self.assertEqual(
+            service.activate_batch_governance(
+                authority_ref=authority_ref,
+                authority_manifest_file=authority_file,
+            ),
+            migration,
+        )
+
+        result = service.run()
+
+        self.assertTrue(result.checkpoint_published)
+        self.assertEqual(provider.calls, 1)
+        self.assertEqual(provider.batch_sizes, [3])
+        self.assertEqual(
+            [
+                service.information_store.list_revisions(atomic_id)
+                for atomic_id in atomic_ids[:15]
+            ],
+            completed_before,
+        )
+        final_item = service.run_store.status(prepared.run_id)["items"][item_id]
+        self.assertEqual(final_item["atomic_information_ids"], list(atomic_ids))
+        self.assertEqual(final_item["governance_receipt"]["phase"], "completed")
+        self.assertEqual(
+            final_item["governance_migration"]["legacy_governance_receipt"][
+                "phase"
+            ],
+            "started",
+        )
+        self.assertEqual(
+            service.activate_batch_governance(
+                authority_ref=authority_ref,
+                authority_manifest_file=authority_file,
+            ),
+            migration,
+        )
+        replay = service.run()
+        self.assertTrue(replay.checkpoint_published)
+        self.assertEqual(provider.calls, 1)
+
+    def test_mid_apply_recovery_reuses_persisted_batch_result(self) -> None:
+        service, provider, _receipt = self.interrupted_batch_cursor_one()
+
+        result = service.run()
+
+        self.assertTrue(result.replayed)
+        self.assertTrue(result.checkpoint_published)
+        self.assertEqual(provider.calls, 1)
+
+    def test_mid_apply_recovery_accepts_persisted_shared_object_effects(
+        self,
+    ) -> None:
+        service, provider, receipt, _object_id = (
+            self.interrupted_shared_object_batch_cursor_one()
+        )
+        self.assertNotEqual(
+            receipt["baseline_effect_fingerprints"][1],
+            receipt["cursor_effect_fingerprints"][1],
+        )
+
+        result = service.run()
+
+        self.assertTrue(result.replayed)
+        self.assertTrue(result.checkpoint_published)
+        self.assertEqual(provider.calls, 1)
+
+    def test_mid_apply_recovery_rejects_post_cursor_shared_object_drift(
+        self,
+    ) -> None:
+        service, provider, _receipt, object_id = (
+            self.interrupted_shared_object_batch_cursor_one()
+        )
+        with SQLiteWorldModelRepository(service.database) as repository:
+            repository.add_role(object_id, "brand")
+
+        with self.assertRaisesRegex(WechatDigestError, "effect/cursor"):
+            service.run()
+
+        self.assertEqual(provider.calls, 1)
+
+    def test_pre_cursor_recovery_converges_from_durable_apply_receipt(
+        self,
+    ) -> None:
+        service, provider, _receipt, _object_id = (
+            self.interrupted_shared_object_batch_before_cursor()
+        )
+        business_before = self.governance_business_state(service)
+
+        result = service.run()
+
+        self.assertTrue(result.replayed)
+        self.assertTrue(result.checkpoint_published)
+        self.assertEqual(provider.calls, 1)
+        self.assertEqual(
+            self.governance_business_state(service), business_before
+        )
+
+    def test_pre_cursor_recovery_does_not_duplicate_human_review(self) -> None:
+        service, provider = self.interrupted_human_review_batch_before_cursor()
+        business_before = self.governance_business_state(service)
+
+        result = service.run()
+
+        self.assertTrue(result.replayed)
+        self.assertTrue(result.checkpoint_published)
+        self.assertEqual(provider.calls, 1)
+        self.assertEqual(
+            self.governance_business_state(service), business_before
+        )
+        self.assertEqual(len(service.proposal_store.list_unresolved()), 1)
+
+    def test_pre_cursor_recovery_does_not_duplicate_information_enrichment(
+        self,
+    ) -> None:
+        service, provider, atomic_id = (
+            self.interrupted_claim_enrichment_batch_before_cursor()
+        )
+        business_before = self.governance_business_state(service)
+        revision_count = len(
+            service.information_store.list_revisions(atomic_id)
+        )
+
+        result = service.run()
+
+        self.assertTrue(result.replayed)
+        self.assertTrue(result.checkpoint_published)
+        self.assertEqual(provider.calls, 1)
+        self.assertEqual(
+            self.governance_business_state(service), business_before
+        )
+        self.assertEqual(
+            len(service.information_store.list_revisions(atomic_id)),
+            revision_count,
+        )
+
+    def test_pre_cursor_recovery_does_not_duplicate_identity_review(
+        self,
+    ) -> None:
+        service, provider, first_proposal_id = (
+            self.interrupted_identity_review_batch_before_cursor()
+        )
+
+        result = service.run()
+
+        self.assertTrue(result.replayed)
+        self.assertTrue(result.checkpoint_published)
+        self.assertEqual(provider.calls, 1)
+        self.assertEqual(
+            sum(
+                proposal.proposal_id == first_proposal_id
+                for proposal in service.proposal_store.list_history()
+            ),
+            1,
+        )
+        self.assertEqual(len(service.proposal_store.list_unresolved()), 2)
+
+    def test_pre_cursor_recovery_rejects_unproven_extra_drift_before_write(
+        self,
+    ) -> None:
+        service, provider, _receipt, object_id = (
+            self.interrupted_shared_object_batch_before_cursor()
+        )
+        with SQLiteWorldModelRepository(service.database) as repository:
+            repository.add_role(object_id, "brand")
+        business_before = self.governance_business_state(service)
+
+        with self.assertRaisesRegex(WechatDigestError, "effect/cursor"):
+            service.run()
+
+        self.assertEqual(provider.calls, 1)
+        self.assertEqual(
+            self.governance_business_state(service), business_before
+        )
+
+    def test_mid_apply_recovery_rejects_applied_prefix_drift_without_provider(
+        self,
+    ) -> None:
+        service, provider, receipt = self.interrupted_batch_cursor_one()
+        self.append_information_drift(
+            service, receipt["batch_atomic_information_ids"][0]
+        )
+
+        with self.assertRaisesRegex(WechatDigestError, "effect/cursor"):
+            service.run()
+
+        self.assertEqual(provider.calls, 1)
+
+    def test_mid_apply_recovery_rejects_unapplied_suffix_drift_without_provider(
+        self,
+    ) -> None:
+        service, provider, receipt = self.interrupted_batch_cursor_one()
+        self.append_information_drift(
+            service, receipt["batch_atomic_information_ids"][1]
+        )
+
+        with self.assertRaisesRegex(WechatDigestError, "effect/cursor"):
+            service.run()
+
+        self.assertEqual(provider.calls, 1)
+
+    def test_completed_receipt_readback_rejects_effect_drift_without_provider(
+        self,
+    ) -> None:
+        self.create_object()
+        provider = BatchOnceProvider()
+        service = FailAfterGovernanceOnceService(
+            workspace=self.workspace,
+            capture_provider=SyntheticCaptureProvider([message(1)]),
+            semantic_handoff_factory=lambda: self.semantic,
+            interpretation_provider=provider,
+        )
+        with self.assertRaises(WechatDigestError):
+            service.run(all_history=True)
+        run_id = service.run_store.active_run_id()
+        assert run_id is not None
+        receipt = next(
+            item["governance_receipt"]
+            for item in service.run_store.status(run_id)["items"].values()
+            if isinstance(item, dict) and "governance_receipt" in item
+        )
+        self.assertEqual(receipt["phase"], "completed")
+        self.append_information_drift(
+            service, receipt["batch_atomic_information_ids"][0]
+        )
+
+        with self.assertRaisesRegex(WechatDigestError, "effect/cursor"):
+            service.run()
+
+        self.assertEqual(provider.calls, 1)
+
+    def test_persisted_batch_result_recovers_after_apply_without_provider_call(
         self,
     ) -> None:
         self.create_object()
@@ -1180,14 +2242,15 @@ class WechatDigestTests(unittest.TestCase):
             for item in service.run_store.status(run_id)["items"].values()
             if isinstance(item, dict) and "governance_receipt" in item
         )
-        self.assertEqual(receipt["phase"], "started")
+        self.assertEqual(receipt["phase"], "applied")
 
-        with self.assertRaisesRegex(WechatDigestError, "completion 未知"):
-            service.run()
+        result = service.run()
 
+        self.assertTrue(result.replayed)
+        self.assertTrue(result.checkpoint_published)
         self.assertEqual(provider.calls, 1)
-        self.assertIsNone(service.run_store.checkpoint())
-        self.assertEqual(service.run_store.active_run_id(), run_id)
+        self.assertIsNotNone(service.run_store.checkpoint())
+        self.assertIsNone(service.run_store.active_run_id())
 
     def test_governance_timeout_seal_preserves_data_and_continues_next_item(
         self,
@@ -1648,16 +2711,6 @@ class WechatDigestTests(unittest.TestCase):
             "target_end_at": None,
             "completion_condition": None,
         }
-        response = json.dumps(
-            {
-                "operations": [operation],
-                "rationale": "Synthetic cleanup termination.",
-                "evidence_sufficient": True,
-                "conflict": False,
-                "ambiguous": False,
-                "claim": None,
-            }
-        )
         handlers = {
             signal.SIGTERM: signal.SIG_DFL,
             signal.SIGALRM: signal.SIG_DFL,
@@ -1679,15 +2732,39 @@ class WechatDigestTests(unittest.TestCase):
                 self.killed = True
 
         class Turn:
+            def __init__(self, response):
+                self.response = response
+
             def run(self):
-                return SimpleNamespace(final_response=response)
+                return SimpleNamespace(final_response=self.response)
 
             def interrupt(self):
                 raise AssertionError("successful turn must not interrupt")
 
         class Thread:
-            def turn(self, *_args, **_kwargs):
-                return Turn()
+            def turn(self, prompt, **_kwargs):
+                payload = json.loads(prompt.split("Input:\n", 1)[1])
+                atomic_ids = [
+                    item["atomic_information"]["atomic_information_id"]
+                    for item in payload["items"]
+                ]
+                response = json.dumps(
+                    {
+                        "results": [
+                            {
+                                "atomic_information_id": atomic_id,
+                                "operations": [operation],
+                                "rationale": "Synthetic cleanup termination.",
+                                "evidence_sufficient": True,
+                                "conflict": False,
+                                "ambiguous": False,
+                                "claim": None,
+                            }
+                            for atomic_id in atomic_ids
+                        ]
+                    }
+                )
+                return Turn(response)
 
         class Codex:
             instance = None

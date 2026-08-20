@@ -148,6 +148,10 @@ Change Journal
 
 原则：
 
+- 同一文档、会话或其他明确相关边界内的多条 Atomic Information 默认一次批量理解；
+- 批量结果先完整校验并持久保存，再按输入顺序幂等应用；中断恢复不得重复调用 Provider；
+- 多条入口的 Provider 调用量应为 `O(批次数 + 例外次数)`，不得继续为 `O(Atomic Information 数量)`；
+- 冲突、不确定、Evidence 不足和高影响变化进入既有人工判断边界，不把整批拆回逐条模型调用；
 - safe automatic change **不创建 Proposal**；
 - Change Proposal 只为真正需要人判断的变化存在；
 - 新建 Object、删除 Object、冲突、身份/关系不确定需要人类判断；
@@ -156,6 +160,10 @@ Change Journal
 - 所有人类可见审核内容使用通俗业务语言；
 - Object 创建与删除遵守孤立对象保护；
 - 不建设 Proposal Queue、通用 Agent Contract、MCP/HTTP、Web Review Center。
+
+真实 Stage 1 运行已证明逐条 Provider 判断会产生不可接受的等待与超时恢复成本。Issue #135 是 M2-B2 的 MVP 效率修正 authority；在完成“整批一次判断、结果先保存、顺序可恢复应用”的匿名真实验证前，逐条治理不再是可接受的生产默认值。
+
+本次真实迁移只允许零 Provider 预检先冻结旧流程已完成的 15 条及其效果，再把唯一可证明未完成的 3 条组成一个批次。旧 15 条不得重新解释或回滚；新批次结果形成前不得写入长期状态。安装必须绑定最终合并版本之后由 Lead 在 Issue #135 给出的独立安装 Decision，并使用 0600 私有 manifest 精确绑定原始文件、现场状态、15/3 有序清单和既有效果；旧 Implementation Plan 评论不能代替最终安装授权。Semantic 调用链保留 81–220 的既有历史，新 reviewed head 只从 221 起生效；其余 planned item 必须等待该批次验收后恢复。
 
 ### M2-B3 — Canonical Context Builder — Object scope v1
 
