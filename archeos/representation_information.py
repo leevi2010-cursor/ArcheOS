@@ -3687,7 +3687,7 @@ def _evidence(unit_ids: Sequence[str], by_id: Mapping[str, RepresentationAnalysi
     result: list[dict[str, object]] = []
     for unit_id in unit_ids:
         unit = by_id[unit_id]
-        excerpt = unit.content if unit.content is not None else json.dumps(unit.structured_value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        excerpt = unit.content if unit.content and unit.content.strip() else json.dumps(unit.structured_value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
         result.append({"source_id": unit.source_id, "artifact": unit.artifact_locator, "segment": positions[unit_id], "speaker": None, "start": None, "end": None, "excerpt": excerpt, "representation_id": unit.representation_id, "representation_kind": unit.representation_kind, "artifact_id": unit.artifact_id, "unit_id": unit.unit_id, "locator": json.dumps(unit.locator, ensure_ascii=False, sort_keys=True, separators=(",", ":"))})
     return result
 
