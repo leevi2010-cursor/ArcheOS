@@ -1950,6 +1950,11 @@ class WechatDigestTests(unittest.TestCase):
             authority_ref=authority_ref,
             authority_manifest_file=authority_file,
         )
+        self.assertEqual(
+            self.semantic.campaign_binding.reviewed_git_head,
+            self.semantic.reviewed_git_head,
+        )
+        campaign_head = self.semantic.reviewed_git_head
 
         self.assertEqual(provider.calls, 0)
         self.assertEqual(
@@ -1968,6 +1973,7 @@ class WechatDigestTests(unittest.TestCase):
             migration,
         )
         self.assertEqual(provider.calls, 0)
+        self.semantic.reviewed_git_head = "7" * 40
 
         with self.assertRaises(WechatDigestError):
             service.run()
@@ -1989,6 +1995,7 @@ class WechatDigestTests(unittest.TestCase):
             1,
         )
         self.assertEqual(provider.calls, 1)
+        self.semantic.reviewed_git_head = campaign_head
         self.assertEqual(
             service.activate_batch_governance(
                 authority_ref=authority_ref,
@@ -1996,6 +2003,7 @@ class WechatDigestTests(unittest.TestCase):
             ),
             migration,
         )
+        self.semantic.reviewed_git_head = "7" * 40
 
         result = service.run()
 
@@ -2018,6 +2026,7 @@ class WechatDigestTests(unittest.TestCase):
             ],
             "started",
         )
+        self.semantic.reviewed_git_head = campaign_head
         self.assertEqual(
             service.activate_batch_governance(
                 authority_ref=authority_ref,
@@ -2025,9 +2034,37 @@ class WechatDigestTests(unittest.TestCase):
             ),
             migration,
         )
+        self.semantic.reviewed_git_head = "7" * 40
         replay = service.run()
         self.assertTrue(replay.checkpoint_published)
         self.assertEqual(provider.calls, 1)
+
+    def test_missing_package_still_rejects_unreviewed_runtime_head_zero_call(
+        self,
+    ) -> None:
+        capture = SyntheticCaptureProvider([message(1)])
+        service = self.service(capture)
+        self.semantic.failures_remaining = 1
+        with self.assertRaises(WechatDigestError):
+            service.run(all_history=True)
+        calls_before = self.semantic.provider.calls
+        binding = self.semantic.authority_bindings[-1]
+        self.semantic.campaign_binding = SimpleNamespace(
+            created_at=binding.campaign_created_at,
+            lower_cursor=binding.campaign_lower_cursor,
+            frozen_global_upper_cursor=binding.frozen_global_upper_cursor,
+            capture_provider_version=binding.capture_provider_version,
+            semantic_batch_size=binding.semantic_batch_size,
+            reviewed_git_head=binding.reviewed_git_head,
+        )
+        self.semantic.reviewed_git_head = "7" * 40
+
+        with self.assertRaisesRegex(
+            WechatDigestError, "frozen Semantic campaign"
+        ):
+            service.run()
+
+        self.assertEqual(self.semantic.provider.calls, calls_before)
 
     def test_mid_apply_recovery_reuses_persisted_batch_result(self) -> None:
         service, provider, _receipt = self.interrupted_batch_cursor_one()
