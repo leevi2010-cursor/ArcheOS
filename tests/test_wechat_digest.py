@@ -17,6 +17,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from archeos.atomic_information import (
+    ClaimAttribution,
     JsonlAtomicInformationStore,
     ingest_processing_package,
 )
@@ -786,6 +787,83 @@ class SharedObjectBatchProvider(NoStructuralChangeProvider):
         )
 
 
+class HumanReviewBatchProvider(NoStructuralChangeProvider):
+    name = "synthetic-human-review-batch"
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def interpret(self, atomic_information, current_world_state):
+        del atomic_information, current_world_state
+        raise AssertionError("batch workflow must not use the single-item method")
+
+    def interpret_batch(self, items):
+        batch = tuple(items)
+        if len(batch) != 2:
+            raise AssertionError("human-review fixture requires two items")
+        self.calls += 1
+        return (
+            InterpretationResult(
+                operations=(WorldModelOperation(kind="conflict"),),
+                rationale="Synthetic conflict requires human review.",
+                evidence_sufficient=True,
+                conflict=True,
+                ambiguous=False,
+            ),
+            InterpretationResult(
+                operations=(WorldModelOperation(kind="no_structural_change"),),
+                rationale="Synthetic batch no-op.",
+                evidence_sufficient=True,
+                conflict=False,
+                ambiguous=False,
+            ),
+        )
+
+
+class ClaimEnrichmentBatchProvider(NoStructuralChangeProvider):
+    name = "synthetic-claim-enrichment-batch"
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def interpret(self, atomic_information, current_world_state):
+        del atomic_information, current_world_state
+        raise AssertionError("batch workflow must not use the single-item method")
+
+    def interpret_batch(self, items):
+        batch = tuple(items)
+        if len(batch) != 2:
+            raise AssertionError("claim-enrichment fixture requires two items")
+        self.calls += 1
+        first_information = batch[0][0]
+        return (
+            InterpretationResult(
+                operations=(WorldModelOperation(kind="no_structural_change"),),
+                rationale="Synthetic claim enrichment.",
+                evidence_sufficient=True,
+                conflict=False,
+                ambiguous=False,
+                claim=ClaimAttribution(
+                    claimant_object_id=None,
+                    claimant_source_id=(
+                        first_information.source_evidence[0].source_id
+                    ),
+                    claimant_label="Synthetic Sender",
+                    stance="assert",
+                    claimed_at=None,
+                    attribution_confidence=1.0,
+                ),
+            ),
+            InterpretationResult(
+                operations=(WorldModelOperation(kind="no_structural_change"),),
+                rationale="Synthetic batch no-op.",
+                evidence_sufficient=True,
+                conflict=False,
+                ambiguous=False,
+            ),
+        )
+
+
 class FailingBatchProvider(NoStructuralChangeProvider):
     name = "synthetic-failing-batch"
 
@@ -1131,6 +1209,105 @@ class WechatDigestTests(unittest.TestCase):
         self.assertEqual(receipt["in_flight_index"], 0)
         self.assertEqual(provider.calls, 1)
         return service, provider, receipt, object_id
+
+    def interrupted_human_review_batch_before_cursor(
+        self,
+    ) -> tuple[WechatDigestService, HumanReviewBatchProvider]:
+        object_id = self.create_object()
+        provider = HumanReviewBatchProvider()
+        service = SharedObjectPreCursorBatchService(
+            workspace=self.workspace,
+            capture_provider=SyntheticCaptureProvider([message(1), message(2)]),
+            semantic_handoff_factory=lambda: self.semantic,
+            interpretation_provider=provider,
+        )
+        service.shared_object_id = object_id
+        with self.assertRaises(WechatDigestError):
+            service.run(all_history=True)
+        run_id = service.run_store.active_run_id()
+        assert run_id is not None
+        receipt = next(
+            item["governance_receipt"]
+            for item in service.run_store.status(run_id)["items"].values()
+            if isinstance(item, dict) and "governance_receipt" in item
+        )
+        self.assertEqual(receipt["phase"], "applying")
+        self.assertEqual(receipt["in_flight_index"], 0)
+        self.assertEqual(len(service.proposal_store.list_unresolved()), 1)
+        self.assertEqual(provider.calls, 1)
+        return service, provider
+
+    def interrupted_claim_enrichment_batch_before_cursor(
+        self,
+    ) -> tuple[WechatDigestService, ClaimEnrichmentBatchProvider, str]:
+        object_id = self.create_object()
+        provider = ClaimEnrichmentBatchProvider()
+        service = SharedObjectPreCursorBatchService(
+            workspace=self.workspace,
+            capture_provider=SyntheticCaptureProvider([message(1), message(2)]),
+            semantic_handoff_factory=lambda: self.semantic,
+            interpretation_provider=provider,
+        )
+        service.shared_object_id = object_id
+        with self.assertRaises(WechatDigestError):
+            service.run(all_history=True)
+        run_id = service.run_store.active_run_id()
+        assert run_id is not None
+        receipt = next(
+            item["governance_receipt"]
+            for item in service.run_store.status(run_id)["items"].values()
+            if isinstance(item, dict) and "governance_receipt" in item
+        )
+        atomic_id = receipt["batch_atomic_information_ids"][0]
+        self.assertEqual(receipt["phase"], "applying")
+        self.assertEqual(receipt["in_flight_index"], 0)
+        self.assertIsNotNone(
+            service.information_store.get_current(atomic_id).claim
+        )
+        self.assertEqual(provider.calls, 1)
+        return service, provider, atomic_id
+
+    def interrupted_identity_review_batch_before_cursor(
+        self,
+    ) -> tuple[WechatDigestService, BatchOnceProvider, str]:
+        self.create_object("Ambiguous Project")
+        self.create_object("Ambiguous Project")
+        provider = BatchOnceProvider()
+        service = FailBeforePersistedBatchProgressOnceService(
+            workspace=self.workspace,
+            capture_provider=SyntheticCaptureProvider(
+                [
+                    message(1, content="Ambiguous project update one."),
+                    message(2, content="Ambiguous project update two."),
+                ]
+            ),
+            semantic_handoff_factory=lambda: self.semantic,
+            interpretation_provider=provider,
+        )
+        with self.assertRaises(WechatDigestError):
+            service.run(all_history=True)
+        run_id = service.run_store.active_run_id()
+        assert run_id is not None
+        receipt = next(
+            item["governance_receipt"]
+            for item in service.run_store.status(run_id)["items"].values()
+            if isinstance(item, dict) and "governance_receipt" in item
+        )
+        self.assertEqual(receipt["phase"], "applying")
+        self.assertEqual(receipt["in_flight_index"], 0)
+        proposal = service.proposal_store.list_unresolved()[0]
+        self.assertEqual(
+            proposal.human_review.allowed_actions,
+            (
+                "bind_existing",
+                "create_minimal",
+                "edit_identity_and_create",
+                "reject",
+                "defer",
+            ),
+        )
+        self.assertEqual(provider.calls, 1)
+        return service, provider, proposal.proposal_id
 
     @staticmethod
     def append_information_drift(
@@ -1908,6 +2085,65 @@ class WechatDigestTests(unittest.TestCase):
         self.assertEqual(
             self.governance_business_state(service), business_before
         )
+
+    def test_pre_cursor_recovery_does_not_duplicate_human_review(self) -> None:
+        service, provider = self.interrupted_human_review_batch_before_cursor()
+        business_before = self.governance_business_state(service)
+
+        result = service.run()
+
+        self.assertTrue(result.replayed)
+        self.assertTrue(result.checkpoint_published)
+        self.assertEqual(provider.calls, 1)
+        self.assertEqual(
+            self.governance_business_state(service), business_before
+        )
+        self.assertEqual(len(service.proposal_store.list_unresolved()), 1)
+
+    def test_pre_cursor_recovery_does_not_duplicate_information_enrichment(
+        self,
+    ) -> None:
+        service, provider, atomic_id = (
+            self.interrupted_claim_enrichment_batch_before_cursor()
+        )
+        business_before = self.governance_business_state(service)
+        revision_count = len(
+            service.information_store.list_revisions(atomic_id)
+        )
+
+        result = service.run()
+
+        self.assertTrue(result.replayed)
+        self.assertTrue(result.checkpoint_published)
+        self.assertEqual(provider.calls, 1)
+        self.assertEqual(
+            self.governance_business_state(service), business_before
+        )
+        self.assertEqual(
+            len(service.information_store.list_revisions(atomic_id)),
+            revision_count,
+        )
+
+    def test_pre_cursor_recovery_does_not_duplicate_identity_review(
+        self,
+    ) -> None:
+        service, provider, first_proposal_id = (
+            self.interrupted_identity_review_batch_before_cursor()
+        )
+
+        result = service.run()
+
+        self.assertTrue(result.replayed)
+        self.assertTrue(result.checkpoint_published)
+        self.assertEqual(provider.calls, 1)
+        self.assertEqual(
+            sum(
+                proposal.proposal_id == first_proposal_id
+                for proposal in service.proposal_store.list_history()
+            ),
+            1,
+        )
+        self.assertEqual(len(service.proposal_store.list_unresolved()), 2)
 
     def test_pre_cursor_recovery_rejects_unproven_extra_drift_before_write(
         self,

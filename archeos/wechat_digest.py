@@ -35,6 +35,7 @@ from .digestion import (
     InterpretationResult,
     JsonlChangeJournal,
     JsonlChangeProposalStore,
+    WorldModelOperation,
 )
 from .digestion.providers import interpretation_to_dict, parse_interpretation
 from .emergence import IdentityEvidence, IdentityGateService
@@ -2616,6 +2617,21 @@ class WechatDigestService:
             for revision in self.information_store.list_revisions(atomic_id)
             for object_id in revision.related_object_ids
         }
+        objects = {
+            record.object_id: record for record in repository.list_objects()
+        }
+        candidate_names = {
+            " ".join(str(concern).split()).casefold()
+            for concern in revisions[-1]["raw_concerns"]
+        }
+        object_ids.update(
+            assignment.object_id
+            for record in objects.values()
+            if record.status == "active"
+            for assignment in repository.list_names(record.object_id)
+            if " ".join(assignment.name.split()).casefold()
+            in candidate_names
+        )
         for proposal in self.proposal_store.list_history():
             if proposal.atomic_information_id == atomic_id:
                 object_ids.update(proposal.resolved_object_ids)
@@ -2628,9 +2644,6 @@ class WechatDigestService:
             for record in payload.get("records", ()):
                 if isinstance(record, dict):
                     object_ids.update(record.get("resolved_object_ids", ()))
-        objects = {
-            record.object_id: record for record in repository.list_objects()
-        }
         if any(object_id not in objects for object_id in object_ids):
             raise WechatDigestError("Batch Governance World binding 缺失。")
         world_projection = {
@@ -2883,8 +2896,60 @@ class WechatDigestService:
                 after_in_flight.get("apply_receipts")
             )
             added_receipts = after_receipts[len(before_receipts) :]
-            if not added_receipts:
-                return False
+            before_proposals = self._snapshot_sequence(
+                before_in_flight.get("proposal_history")
+            )
+            after_proposals = self._snapshot_sequence(
+                after_in_flight.get("proposal_history")
+            )
+            added_proposals = after_proposals[len(before_proposals) :]
+            identity_actions = {
+                "bind_existing",
+                "create_minimal",
+                "edit_identity_and_create",
+                "reject",
+                "defer",
+            }
+            interpretation_payload = interpretation_to_dict(interpretation)
+            for proposal in added_proposals:
+                human_review = proposal.get("human_review")
+                if not isinstance(human_review, dict):
+                    return False
+                allowed_actions = set(human_review.get("allowed_actions", ()))
+                interpretation_proposal = (
+                    proposal.get("interpretation_fingerprint")
+                    == interpretation_fingerprint
+                    and proposal.get("proposed_operations")
+                    == interpretation_payload["operations"]
+                    and proposal.get("rationale") == interpretation.rationale
+                    and allowed_actions == {"approve", "reject", "defer"}
+                )
+                identity_proposal = (
+                    proposal.get("proposed_operations")
+                    == [
+                        interpretation_to_dict(
+                            InterpretationResult(
+                                operations=(
+                                    WorldModelOperation(kind="unresolved"),
+                                ),
+                                rationale="identity-proof",
+                                evidence_sufficient=False,
+                                conflict=False,
+                                ambiguous=True,
+                            )
+                        )["operations"][0]
+                    ]
+                    and proposal.get("rationale")
+                    == "Identity Gate requires a human identity decision."
+                    and allowed_actions == identity_actions
+                )
+                if (
+                    proposal.get("atomic_information_id") != atomic_id
+                    or proposal.get("status") != "pending"
+                    or proposal.get("decided_at") is not None
+                    or not (interpretation_proposal or identity_proposal)
+                ):
+                    return False
 
             receipt_records: list[dict[str, object]] = []
             created_object_ids: set[str] = set()
@@ -2931,6 +2996,16 @@ class WechatDigestService:
                 after_in_flight.get("journal")
             )
             added_journal = after_journal[len(before_journal) :]
+            before_revisions = self._snapshot_sequence(
+                before_in_flight.get("revisions")
+            )
+            after_revisions = self._snapshot_sequence(
+                after_in_flight.get("revisions")
+            )
+            added_revisions = after_revisions[len(before_revisions) :]
+            added_revision_ids = {
+                revision.get("revision_id") for revision in added_revisions
+            }
             receipt_change_ids = {
                 record.get("change_id") for record in receipt_records
             }
@@ -2942,6 +3017,8 @@ class WechatDigestService:
                         record.get("operation") == "bind_atomic_information"
                         and record.get("interpretation_fingerprint")
                         == interpretation_fingerprint
+                        and record.get("atomic_information_revision_id")
+                        in added_revision_ids
                     )
                 )
                 for record in added_journal
@@ -2952,12 +3029,6 @@ class WechatDigestService:
             ):
                 return False
 
-            before_revisions = self._snapshot_sequence(
-                before_in_flight.get("revisions")
-            )
-            after_revisions = self._snapshot_sequence(
-                after_in_flight.get("revisions")
-            )
             allowed_revision_reasons = {
                 "identity_gate_bind_existing",
                 "identity_gate_create_minimal",
@@ -2965,20 +3036,114 @@ class WechatDigestService:
                 "claim_enrichment",
                 "claim_enrichment_and_object_binding",
             }
-            if any(
-                revision.get("atomic_information_id") != atomic_id
-                or revision.get("revision_reason")
-                not in allowed_revision_reasons
-                for revision in after_revisions[len(before_revisions) :]
-            ):
-                return False
-            if self._snapshot_sequence(
-                after_in_flight.get("proposal_history")
-            ) != self._snapshot_sequence(
-                before_in_flight.get("proposal_history")
-            ):
-                return False
+            stable_revision_fields = {
+                "atomic_information_id",
+                "origin_source_id",
+                "origin_candidate_id",
+                "origin_fingerprint",
+                "statement",
+                "semantic_type",
+                "raw_concerns",
+                "source_evidence",
+                "context",
+                "confidence",
+            }
+            previous_revision = before_revisions[-1]
+            for revision in added_revisions:
+                reason = revision.get("revision_reason")
+                next_number = previous_revision.get("revision_number")
+                if not isinstance(next_number, int) or isinstance(
+                    next_number, bool
+                ):
+                    return False
+                next_number += 1
+                if (
+                    reason not in allowed_revision_reasons
+                    or revision.get("atomic_information_id") != atomic_id
+                    or revision.get("revision_number") != next_number
+                    or revision.get("revision_id")
+                    != f"{atomic_id}-r{next_number:04d}"
+                    or any(
+                        revision.get(field) != previous_revision.get(field)
+                        for field in stable_revision_fields
+                    )
+                ):
+                    return False
+                binding_changed = reason in {
+                    "identity_gate_bind_existing",
+                    "identity_gate_create_minimal",
+                    "object_binding",
+                    "claim_enrichment_and_object_binding",
+                }
+                previous_object_ids = set(
+                    previous_revision.get("related_object_ids", ())
+                )
+                revised_object_ids = set(
+                    revision.get("related_object_ids", ())
+                )
+                if binding_changed:
+                    added_object_ids = revised_object_ids - previous_object_ids
+                    if (
+                        not added_object_ids
+                        or not previous_object_ids.issubset(revised_object_ids)
+                    ):
+                        return False
+                    if reason.startswith("identity_gate_"):
+                        expected_operation = reason.removeprefix(
+                            "identity_gate_"
+                        )
+                        if not any(
+                            record.get("operation") == expected_operation
+                            and set(record.get("resolved_object_ids", ()))
+                            == added_object_ids
+                            for record in receipt_records
+                        ):
+                            return False
+                    elif not any(
+                        record.get("operation") == "bind_atomic_information"
+                        and record.get("atomic_information_revision_id")
+                        == revision.get("revision_id")
+                        and set(record.get("resolved_object_ids", ()))
+                        == revised_object_ids
+                        and record.get("interpretation_fingerprint")
+                        == interpretation_fingerprint
+                        for record in added_journal
+                    ):
+                        return False
+                elif revised_object_ids != previous_object_ids:
+                    return False
 
+                claim_changed = reason in {
+                    "claim_enrichment",
+                    "claim_enrichment_and_object_binding",
+                }
+                if claim_changed:
+                    if (
+                        previous_revision.get("claim") is not None
+                        or interpretation_payload["claim"] is None
+                        or revision.get("claim")
+                        != interpretation_payload["claim"]
+                    ):
+                        return False
+                elif revision.get("claim") != previous_revision.get("claim"):
+                    return False
+                previous_revision = revision
+            revision_ids = {
+                revision.get("revision_id") for revision in after_revisions
+            }
+            if any(
+                proposal.get("atomic_information_revision_id")
+                not in revision_ids
+                for proposal in added_proposals
+            ):
+                return False
+            if not (
+                added_receipts
+                or added_proposals
+                or added_revisions
+                or added_journal
+            ):
+                return False
             before_world = self._snapshot_world_rows(baseline)
             after_world = self._snapshot_world_rows(current)
             operation_by_kind = {
