@@ -257,6 +257,13 @@ class SemanticHandoffPort(Protocol):
         authority_ref: str,
     ) -> dict[str, object]: ...
 
+    def install_gate_c_continuation(
+        self,
+        *,
+        window_binding: SemanticWindowAuthorityBinding,
+        authority_ref: str,
+    ) -> dict[str, object]: ...
+
     def resolve_unknown(
         self,
         *,
@@ -1176,6 +1183,19 @@ class ExistingSemanticHandoff:
         authority_ref: str,
     ) -> dict[str, object]:
         return self.service.install_batch_governance_continuation(
+            self.provider,
+            window_binding=window_binding,
+            reviewed_git_head=self.reviewed_git_head,
+            authority_ref=authority_ref,
+        )
+
+    def install_gate_c_continuation(
+        self,
+        *,
+        window_binding: SemanticWindowAuthorityBinding,
+        authority_ref: str,
+    ) -> dict[str, object]:
+        return self.service.install_gate_c_continuation(
             self.provider,
             window_binding=window_binding,
             reviewed_git_head=self.reviewed_git_head,
@@ -2541,6 +2561,98 @@ class WechatDigestService:
             if continuation.get("continuation_fingerprint") is None:
                 raise WechatDigestError(
                     "Semantic maintenance continuation 安装读回失败。"
+                )
+            return continuation
+
+    def install_semantic_gate_c_continuation(
+        self, *, authority_ref: str
+    ) -> dict[str, object]:
+        """Install the fixed Gate C reviewed-head continuation, zero Provider."""
+
+        with self.run_store.lock():
+            run_id = self.run_store.active_run_id()
+            if run_id is None:
+                raise WechatDigestError(
+                    "不存在可绑定 Semantic Gate C continuation 的 active run。"
+                )
+            plan = self.run_store.plan(run_id)
+            if self._plan_all_history_upper(plan) is None:
+                raise WechatDigestError(
+                    "Semantic Gate C continuation 只能绑定 frozen campaign。"
+                )
+            after = WechatCursor.from_dict(
+                plan.get("after_cursor"), "plan.after_cursor"
+            )
+            upper = WechatCursor.from_dict(
+                plan.get("upper_bound"), "plan.upper_bound"
+            )
+            checkpoint = self.run_store.checkpoint()
+            if checkpoint is not None and checkpoint != after:
+                raise WechatDigestError(
+                    "Semantic Gate C continuation checkpoint binding 不一致。"
+                )
+            capture = self.capture_provider.capture(after, upper_bound=upper)
+            self._verify_capture_against_plan(capture, plan)
+            status = self.run_store.status(run_id)
+            self._verify_plan_and_status(run_id, capture, plan, status)
+            if (
+                status.get("state") != "processing"
+                or status.get("failure_category") is not None
+                or status.get("checkpoint_published") is not False
+            ):
+                raise WechatDigestError(
+                    "Semantic Gate C continuation active run 状态不匹配。"
+                )
+            items = status.get("items")
+            if not isinstance(items, dict) or len(items) != 134:
+                raise WechatDigestError(
+                    "Semantic Gate C continuation active items 不匹配。"
+                )
+            state_counts: dict[str, int] = {}
+            semantic_failed_closed = 0
+            governance_failed_closed = 0
+            for item in items.values():
+                if not isinstance(item, dict) or not isinstance(
+                    item.get("state"), str
+                ):
+                    raise WechatDigestError("微信运行状态 items 损坏。")
+                state = str(item["state"])
+                state_counts[state] = state_counts.get(state, 0) + 1
+                if state == "failed_closed":
+                    if item.get("semantic_failure") is not None:
+                        semantic_failed_closed += 1
+                    if item.get("governance_failure") is not None:
+                        self._verify_governance_failed_closed_item(item)
+                        governance_failed_closed += 1
+            if state_counts != {
+                "failed_closed": 2,
+                "local_only": 3,
+                "pending_human": 17,
+                "planned": 4,
+                "processed": 7,
+                "unsupported": 101,
+            } or (semantic_failed_closed, governance_failed_closed) != (1, 1):
+                raise WechatDigestError(
+                    "Semantic Gate C continuation active item 边界不匹配。"
+                )
+            continuation = self._semantic_port().install_gate_c_continuation(
+                window_binding=self._semantic_authority_binding(
+                    run_id, allow_reviewed_head_extension=True
+                ),
+                authority_ref=authority_ref,
+            )
+            if (
+                continuation.get("activation_total") != 220
+                or continuation.get("activation_unknown_count") != 0
+                or continuation.get("activation_last_global_ordinal") != 220
+                or continuation.get("next_global_ordinal") != 221
+                or continuation.get("absolute_cap") != 1000
+                or not _sha256_value(
+                    continuation.get("continuation_fingerprint")
+                )
+            ):
+                raise WechatDigestError(
+                    "Semantic Gate C continuation 安装读回失败。"
                 )
             return continuation
 

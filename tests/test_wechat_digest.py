@@ -253,6 +253,7 @@ class SyntheticSemanticHandoff:
         self.installed_extension = None
         self.installed_maintenance_continuation = None
         self.installed_batch_governance_continuation = None
+        self.installed_gate_c_continuation = None
         self.unknown_resolution = None
         self.timeout_212_resolution = None
         self.before_unknown_commit = None
@@ -452,6 +453,42 @@ class SyntheticSemanticHandoff:
         ):
             raise RuntimeError("synthetic batch governance continuation drift")
         self.installed_batch_governance_continuation = expected
+        self.campaign_binding = SimpleNamespace(
+            created_at=self.campaign_binding.created_at,
+            lower_cursor=self.campaign_binding.lower_cursor,
+            frozen_global_upper_cursor=(
+                self.campaign_binding.frozen_global_upper_cursor
+            ),
+            capture_provider_version=self.campaign_binding.capture_provider_version,
+            semantic_batch_size=self.campaign_binding.semantic_batch_size,
+            reviewed_git_head=self.reviewed_git_head,
+        )
+        return expected
+
+    def install_gate_c_continuation(
+        self,
+        *,
+        window_binding,
+        authority_ref,
+    ):
+        expected = {
+            "authority_ref": authority_ref,
+            "previous_reviewed_git_head": "b" * 40,
+            "reviewed_git_head": self.reviewed_git_head,
+            "activation_total": 220,
+            "activation_unknown_count": 0,
+            "activation_last_global_ordinal": 220,
+            "next_global_ordinal": 221,
+            "absolute_cap": 1000,
+            "continuation_fingerprint": "sha256:" + "d" * 64,
+        }
+        if (
+            self.installed_gate_c_continuation is not None
+            and self.installed_gate_c_continuation != expected
+        ):
+            raise RuntimeError("synthetic Gate C continuation drift")
+        self.installed_gate_c_continuation = expected
+        assert self.campaign_binding is not None
         self.campaign_binding = SimpleNamespace(
             created_at=self.campaign_binding.created_at,
             lower_cursor=self.campaign_binding.lower_cursor,
@@ -2460,6 +2497,69 @@ class WechatDigestTests(unittest.TestCase):
         self.assertEqual(continuation["activation_unknown_count"], 0)
         self.assertEqual(continuation["next_global_ordinal"], 177)
         self.assertEqual(continuation["absolute_cap"], 1000)
+        self.assertEqual(status_path.read_bytes(), status_before)
+        self.assertEqual(self.semantic.provider.calls, semantic_calls)
+        self.assertEqual(provider.calls, governance_calls)
+
+    def test_gate_c_continuation_accepts_exact_current_state_zero_calls(
+        self,
+    ) -> None:
+        service, provider, run_id = (
+            self.maintenance_continuation_failed_state_fixture()
+        )
+        status = json.loads(json.dumps(service.run_store.status(run_id)))
+        status["state"] = "processing"
+        status["failure_category"] = None
+        represented_id = next(
+            item_id
+            for item_id, item in status["items"].items()
+            if item["state"] == "represented"
+        )
+        status["items"][represented_id]["state"] = "pending_human"
+        additions = {
+            "planned": 1,
+            "pending_human": 16,
+            "processed": 7,
+            "local_only": 3,
+            "unsupported": 101,
+        }
+        index = 0
+        for state, count in additions.items():
+            for _ in range(count):
+                index += 1
+                status["items"][f"synthetic-gate-c-{index:03d}"] = {
+                    "state": state
+                }
+        service.run_store.update_status(run_id, status)
+        self.semantic.reviewed_git_head = "c" * 40
+        self.semantic.campaign_binding = SimpleNamespace(
+            created_at="2026-08-20T00:00:00Z",
+            lower_cursor=(0, "", ""),
+            frozen_global_upper_cursor=(999, "m", "c"),
+            capture_provider_version="0.5.0",
+            semantic_batch_size=40,
+            reviewed_git_head="b" * 40,
+        )
+        authority_ref = (
+            "https://github.com/leevi2010-cursor/ArcheOS/issues/146"
+            "#issuecomment-1234567890"
+        )
+        status_path = service.run_store.runs_root / run_id / "status.json"
+        status_before = status_path.read_bytes()
+        semantic_calls = self.semantic.provider.calls
+        governance_calls = provider.calls
+        binding = SimpleNamespace(reviewed_git_head="b" * 40)
+
+        with patch.object(service, "_verify_plan_and_status"), patch.object(
+            service, "_semantic_authority_binding", return_value=binding
+        ):
+            continuation = service.install_semantic_gate_c_continuation(
+                authority_ref=authority_ref
+            )
+
+        self.assertEqual(continuation["activation_total"], 220)
+        self.assertEqual(continuation["activation_unknown_count"], 0)
+        self.assertEqual(continuation["next_global_ordinal"], 221)
         self.assertEqual(status_path.read_bytes(), status_before)
         self.assertEqual(self.semantic.provider.calls, semantic_calls)
         self.assertEqual(provider.calls, governance_calls)

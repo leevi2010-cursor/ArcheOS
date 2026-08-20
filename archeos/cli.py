@@ -592,6 +592,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="零 Provider 安装一次性已批准维护版本续接。",
     )
     wechat_digest.add_argument(
+        "--install-semantic-gate-c-continuation",
+        action="store_true",
+        help="零 Provider 安装 Issue #146 Gate C 版本续接。",
+    )
+    wechat_digest.add_argument(
         "--activate-batch-governance",
         action="store_true",
         help="零 Provider 安装 Issue #135 整批治理迁移与版本续接。",
@@ -1041,6 +1046,7 @@ def _wechat_product_command(args: argparse.Namespace) -> int:
             args.install_semantic_authority,
             args.install_semantic_authority_extension,
             args.install_semantic_maintenance_continuation,
+            args.install_semantic_gate_c_continuation,
             args.activate_batch_governance,
             args.resolve_semantic_unknown,
             args.resolve_semantic_timeout_212,
@@ -1076,6 +1082,7 @@ def _wechat_product_command(args: argparse.Namespace) -> int:
         return 2
     if (
         args.install_semantic_maintenance_continuation
+        or args.install_semantic_gate_c_continuation
         or args.activate_batch_governance
     ):
         if args.authority_ref is None:
@@ -1210,6 +1217,40 @@ def _wechat_product_command(args: argparse.Namespace) -> int:
             return 0
         if args.install_semantic_maintenance_continuation:
             continuation = service.install_semantic_maintenance_continuation(
+                authority_ref=args.authority_ref,
+            )
+            print(
+                json.dumps(
+                    {
+                        "semantic_provider_calls": 0,
+                        "governance_provider_calls": 0,
+                        "global_attempt_total": continuation[
+                            "activation_total"
+                        ],
+                        "global_unknown": continuation[
+                            "activation_unknown_count"
+                        ],
+                        "next_global_ordinal": continuation[
+                            "next_global_ordinal"
+                        ],
+                        "absolute_cap": continuation["absolute_cap"],
+                        "previous_reviewed_git_head": continuation[
+                            "previous_reviewed_git_head"
+                        ],
+                        "reviewed_git_head": continuation[
+                            "reviewed_git_head"
+                        ],
+                        "continuation_fingerprint": continuation[
+                            "continuation_fingerprint"
+                        ],
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                )
+            )
+            return 0
+        if args.install_semantic_gate_c_continuation:
+            continuation = service.install_semantic_gate_c_continuation(
                 authority_ref=args.authority_ref,
             )
             print(
