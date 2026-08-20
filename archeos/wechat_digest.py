@@ -1428,6 +1428,7 @@ def _validated_governance_receipt(value: object) -> dict[str, object]:
             "interpretations",
             "next_index",
             "baseline_effect_fingerprints",
+            "cursor_effect_fingerprints",
             "applied_effect_fingerprints",
             "pending_human",
             "context_object_ids",
@@ -1455,6 +1456,7 @@ def _validated_governance_receipt(value: object) -> dict[str, object]:
     object_ids = value.get("context_object_ids")
     next_index = value.get("next_index")
     baseline_effect_fingerprints = value.get("baseline_effect_fingerprints")
+    cursor_effect_fingerprints = value.get("cursor_effect_fingerprints")
     applied_effect_fingerprints = value.get("applied_effect_fingerprints")
     batch_fingerprint = value.get("batch_fingerprint")
     if (
@@ -1471,6 +1473,11 @@ def _validated_governance_receipt(value: object) -> dict[str, object]:
         or len(baseline_effect_fingerprints) != len(atomic_ids)
         or any(
             not _sha256_value(item) for item in baseline_effect_fingerprints
+        )
+        or not isinstance(cursor_effect_fingerprints, list)
+        or len(cursor_effect_fingerprints) != len(atomic_ids)
+        or any(
+            not _sha256_value(item) for item in cursor_effect_fingerprints
         )
         or not isinstance(applied_effect_fingerprints, list)
         or len(applied_effect_fingerprints) != next_index
@@ -1497,6 +1504,13 @@ def _validated_governance_receipt(value: object) -> dict[str, object]:
         raise WechatDigestError("微信 Governance receipt batch binding 不一致。")
     if phase == "interpreted" and next_index != 0:
         raise WechatDigestError("微信 Governance receipt 进度损坏。")
+    if (
+        next_index == 0
+        and cursor_effect_fingerprints != baseline_effect_fingerprints
+    ):
+        raise WechatDigestError("微信 Governance receipt effect cursor 损坏。")
+    if applied_effect_fingerprints != cursor_effect_fingerprints[:next_index]:
+        raise WechatDigestError("微信 Governance receipt effect cursor 损坏。")
     if phase == "applying" and not 0 < next_index < len(atomic_ids):
         raise WechatDigestError("微信 Governance receipt 进度损坏。")
     if phase in {"applied", "completed"} and next_index != len(atomic_ids):
@@ -2677,10 +2691,7 @@ class WechatDigestService:
         ):
             return
         batch_ids = tuple(receipt["batch_atomic_information_ids"])
-        next_index = int(receipt["next_index"])
-        expected = tuple(receipt["applied_effect_fingerprints"]) + tuple(
-            receipt["baseline_effect_fingerprints"][next_index:]
-        )
+        expected = tuple(receipt["cursor_effect_fingerprints"])
         with SQLiteWorldModelRepository(self.database) as repository:
             current = self._governance_effect_fingerprints(repository, batch_ids)
         if current != expected:
@@ -5802,7 +5813,7 @@ class WechatDigestService:
                             pending,
                             tuple(sorted(affected)),
                             self._governance_effect_fingerprints(
-                                repository, batch_ids[: index + 1]
+                                repository, batch_ids
                             ),
                         )
                     continue
@@ -5818,7 +5829,7 @@ class WechatDigestService:
                         pending,
                         tuple(sorted(affected)),
                         self._governance_effect_fingerprints(
-                            repository, batch_ids[: index + 1]
+                            repository, batch_ids
                         ),
                     )
 
@@ -5987,6 +5998,9 @@ class WechatDigestService:
                 "baseline_effect_fingerprints": list(
                     baseline_effect_fingerprints
                 ),
+                "cursor_effect_fingerprints": list(
+                    baseline_effect_fingerprints
+                ),
                 "applied_effect_fingerprints": [],
                 "pending_human": pending,
                 "context_object_ids": sorted(set(object_ids)),
@@ -6003,7 +6017,7 @@ class WechatDigestService:
             next_index: int,
             pending: bool,
             object_ids: tuple[str, ...],
-            applied_effect_fingerprints: tuple[str, ...],
+            cursor_effect_fingerprints: tuple[str, ...],
         ) -> None:
             nonlocal latest_batch_receipt
             if latest_batch_receipt is None:
@@ -6016,7 +6030,7 @@ class WechatDigestService:
             ]
             if (
                 len(previous_effects) != next_index - 1
-                or len(applied_effect_fingerprints) != next_index
+                or len(cursor_effect_fingerprints) != len(batch_ids)
             ):
                 raise WechatDigestError(
                     "微信 Governance apply effect cursor 不一致。"
@@ -6027,7 +6041,10 @@ class WechatDigestService:
                 "phase": phase,
                 "next_index": next_index,
                 "applied_effect_fingerprints": list(
-                    applied_effect_fingerprints
+                    cursor_effect_fingerprints[:next_index]
+                ),
+                "cursor_effect_fingerprints": list(
+                    cursor_effect_fingerprints
                 ),
                 "pending_human": pending,
                 "context_object_ids": sorted(set(object_ids)),

@@ -746,6 +746,46 @@ class BatchOnceProvider(NoStructuralChangeProvider):
         )
 
 
+class SharedObjectBatchProvider(NoStructuralChangeProvider):
+    name = "synthetic-shared-object-batch"
+
+    def __init__(self, object_id: str) -> None:
+        self.object_id = object_id
+        self.calls = 0
+
+    def interpret(self, atomic_information, current_world_state):
+        del atomic_information, current_world_state
+        raise AssertionError("batch workflow must not use the single-item method")
+
+    def interpret_batch(self, items):
+        batch = tuple(items)
+        if len(batch) != 2:
+            raise AssertionError("shared-object fixture requires two items")
+        self.calls += 1
+        return (
+            InterpretationResult(
+                operations=(
+                    WorldModelOperation(
+                        kind="add_role",
+                        target_object_id=self.object_id,
+                        role="project",
+                    ),
+                ),
+                rationale="Synthetic shared-object role update.",
+                evidence_sufficient=True,
+                conflict=False,
+                ambiguous=False,
+            ),
+            InterpretationResult(
+                operations=(WorldModelOperation(kind="no_structural_change"),),
+                rationale="Synthetic shared-object no-op.",
+                evidence_sufficient=True,
+                conflict=False,
+                ambiguous=False,
+            ),
+        )
+
+
 class FailingBatchProvider(NoStructuralChangeProvider):
     name = "synthetic-failing-batch"
 
@@ -895,6 +935,30 @@ class FailAfterPersistedBatchProgressOnceService(WechatDigestService):
         return result
 
 
+class SharedObjectInterruptedBatchService(
+    FailAfterPersistedBatchProgressOnceService
+):
+    shared_bindings_installed = False
+    shared_object_id: str
+
+    def _govern(self, atomic_ids):
+        if not self.shared_bindings_installed:
+            self.shared_bindings_installed = True
+            for atomic_id in atomic_ids:
+                current = self.information_store.get_current(atomic_id)
+                next_revision = current.revision_number + 1
+                self.information_store.append_revision(
+                    replace(
+                        current,
+                        revision_number=next_revision,
+                        revision_id=f"{atomic_id}-r{next_revision:04d}",
+                        related_object_ids=(self.shared_object_id,),
+                        revision_reason="synthetic_shared_object_binding",
+                    )
+                )
+        return super()._govern(atomic_ids)
+
+
 class FailSecondGovernanceOnceService(WechatDigestService):
     governance_calls = 0
     failed = False
@@ -963,6 +1027,37 @@ class WechatDigestTests(unittest.TestCase):
         self.assertEqual(receipt["next_index"], 1)
         self.assertEqual(provider.calls, 1)
         return service, provider, receipt
+
+    def interrupted_shared_object_batch_cursor_one(
+        self,
+    ) -> tuple[
+        WechatDigestService,
+        SharedObjectBatchProvider,
+        dict[str, object],
+        str,
+    ]:
+        object_id = self.create_object()
+        provider = SharedObjectBatchProvider(object_id)
+        service = SharedObjectInterruptedBatchService(
+            workspace=self.workspace,
+            capture_provider=SyntheticCaptureProvider([message(1), message(2)]),
+            semantic_handoff_factory=lambda: self.semantic,
+            interpretation_provider=provider,
+        )
+        service.shared_object_id = object_id
+        with self.assertRaises(WechatDigestError):
+            service.run(all_history=True)
+        run_id = service.run_store.active_run_id()
+        assert run_id is not None
+        receipt = next(
+            item["governance_receipt"]
+            for item in service.run_store.status(run_id)["items"].values()
+            if isinstance(item, dict) and "governance_receipt" in item
+        )
+        self.assertEqual(receipt["phase"], "applying")
+        self.assertEqual(receipt["next_index"], 1)
+        self.assertEqual(provider.calls, 1)
+        return service, provider, receipt, object_id
 
     @staticmethod
     def append_information_drift(
@@ -1655,6 +1750,37 @@ class WechatDigestTests(unittest.TestCase):
 
         self.assertTrue(result.replayed)
         self.assertTrue(result.checkpoint_published)
+        self.assertEqual(provider.calls, 1)
+
+    def test_mid_apply_recovery_accepts_persisted_shared_object_effects(
+        self,
+    ) -> None:
+        service, provider, receipt, _object_id = (
+            self.interrupted_shared_object_batch_cursor_one()
+        )
+        self.assertNotEqual(
+            receipt["baseline_effect_fingerprints"][1],
+            receipt["cursor_effect_fingerprints"][1],
+        )
+
+        result = service.run()
+
+        self.assertTrue(result.replayed)
+        self.assertTrue(result.checkpoint_published)
+        self.assertEqual(provider.calls, 1)
+
+    def test_mid_apply_recovery_rejects_post_cursor_shared_object_drift(
+        self,
+    ) -> None:
+        service, provider, _receipt, object_id = (
+            self.interrupted_shared_object_batch_cursor_one()
+        )
+        with SQLiteWorldModelRepository(service.database) as repository:
+            repository.add_role(object_id, "brand")
+
+        with self.assertRaisesRegex(WechatDigestError, "effect/cursor"):
+            service.run()
+
         self.assertEqual(provider.calls, 1)
 
     def test_mid_apply_recovery_rejects_applied_prefix_drift_without_provider(
