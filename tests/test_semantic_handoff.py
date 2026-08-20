@@ -135,6 +135,43 @@ class JsonAdapter:
         )
 
 
+class XlsxJsonAdapter:
+    name = "synthetic-xlsx"
+    version = "1.0"
+    kind = "xlsx_structure"
+    supported_media_types = ("application/synthetic",)
+
+    def __init__(self, cells: list[dict[str, object]]) -> None:
+        self.cells = cells
+
+    def build(self, _source, _materialized, staging_dir, _configuration):
+        artifact = staging_dir / "artifacts" / "synthetic-xlsx.json"
+        artifact.write_text(
+            json.dumps(
+                {
+                    "sheets": [
+                        {
+                            "cells": self.cells,
+                            "embedded_media": [],
+                        }
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+        return AdapterBuildResult(
+            self.kind,
+            (
+                AdapterArtifact(
+                    "structure",
+                    "artifacts/synthetic-xlsx.json",
+                    "application/json",
+                ),
+            ),
+            1.0,
+        )
+
+
 class FakeProcess:
     def __init__(
         self,
@@ -319,6 +356,52 @@ class FakeProcess:
                 }
             for anchor_id in anchor_ids[35:]:
                 anchor_results[anchor_id]["records"] = []
+        elif mode == "xlsx_whitespace_mixed":
+            for anchor_id, unit in zip(
+                anchor_ids, request["anchor_units"], strict=True
+            ):
+                content = unit["content"]
+                cell = unit["structured_value"]["source_locator"]["cell"]
+                row = int(cell[1:])
+                if isinstance(content, str) and not content.strip():
+                    group = (row - 1) // 2 + 1
+                    anchor_results[anchor_id] = {
+                        "classification": "residue",
+                        "records": [
+                            residue(
+                                f"record_{group:032x}"
+                            )
+                            | {
+                                "reason_not_absorbed": (
+                                    f"Synthetic blank cell group {group}."
+                                )
+                            }
+                        ],
+                    }
+                elif isinstance(content, str) and content.startswith("Candidate"):
+                    anchor_results[anchor_id] = {
+                        "classification": "candidate",
+                        "records": [
+                            candidate(
+                                f"record_{row:032x}", statement=content
+                            )
+                        ],
+                    }
+                else:
+                    group = (row - 41) // 3 + 1
+                    anchor_results[anchor_id] = {
+                        "classification": "residue",
+                        "records": [
+                            residue(
+                                f"record_{(100 + group):032x}"
+                            )
+                            | {
+                                "reason_not_absorbed": (
+                                    f"Synthetic deferred cell group {group}."
+                                )
+                            }
+                        ],
+                    }
 
         raw = json.dumps(result)
         if mode in {"accounting_duplicate_key", "raw_duplicate_key"}:
@@ -2319,6 +2402,199 @@ class SemanticHandoffTest(unittest.TestCase):
         self.assertTrue(changed.replayed_existing_package)
         self.assertEqual(changed.ingestion.existing, 1)
         self.assertEqual(changed_runner.calls, [])
+
+    def test_xlsx_whitespace_cached_results_finalize_without_provider(self) -> None:
+        import archeos.representation_information as information_module
+
+        cells = [
+            {
+                "value": " ",
+                "source_locator": {"sheet": "Sheet1", "cell": f"A{row}"},
+            }
+            for row in range(1, 35)
+        ]
+        cells.extend(
+            {
+                "value": f"Candidate {(row - 35) // 2 + 1}",
+                "source_locator": {"sheet": "Sheet1", "cell": f"A{row}"},
+            }
+            for row in range(35, 41)
+        )
+        cells.extend(
+            {
+                "value": f"Deferred {(row - 41) // 3 + 1}",
+                "source_locator": {"sheet": "Sheet1", "cell": f"A{row}"},
+            }
+            for row in range(41, 59)
+        )
+        external = self.root / "synthetic-xlsx.bin"
+        external.write_text("synthetic", encoding="utf-8")
+        sources = LocalManagedSourceRepository(
+            self.root / "managed-xlsx",
+            id_factory=lambda: "src_" + "d" * 32,
+            clock=lambda: "2026-08-15T00:00:00.000Z",
+        )
+        source = sources.admit(
+            external, metadata={"media_type": "application/synthetic"}
+        ).source
+        representations = LocalRepresentationRepository(
+            self.root / "representations-xlsx"
+        )
+        representation = RepresentationService(sources, representations).build(
+            source.source_id, XlsxJsonAdapter(cells)
+        ).representation
+        service = RepresentationInformationService(
+            sources,
+            representations,
+            self.root / "information-xlsx",
+            batch_size=40,
+            clock=lambda: "2026-08-15T00:00:00.000Z",
+        )
+        audit_root = self.root / "audits-xlsx"
+        handoff = ExternalAgentSemanticHandoffService(
+            service,
+            JsonlAtomicInformationStore(self.root / "atomic-xlsx.jsonl"),
+            audit_root,
+        )
+        units = _units_from_representation(representation, representations)
+        blank_unit_ids = {
+            unit.unit_id
+            for unit in units
+            if isinstance(unit.content, str) and not unit.content.strip()
+        }
+        self.assertEqual(len(units), 58)
+        self.assertEqual(len(blank_unit_ids), 34)
+
+        current_evidence = information_module._evidence
+
+        def legacy_evidence(unit_ids, by_id, positions):
+            records = current_evidence(unit_ids, by_id, positions)
+            for record in records:
+                unit = by_id[record["unit_id"]]
+                if unit.content is not None:
+                    record["excerpt"] = unit.content
+            return records
+
+        first_runner = FakeRunner("xlsx_whitespace_mixed")
+        with (
+            patch.object(information_module, "_evidence", legacy_evidence),
+            self.assertRaises(SemanticHandoffError),
+        ):
+            self.execute_with_global_authority(
+                handoff,
+                representation.representation_id,
+                CodexCliRepresentationAnalysisProvider(
+                    provider_version="0.147.0",
+                    timeout_seconds=300,
+                    runner=first_runner,
+                ),
+                privacy_binding=self.privacy_binding(),
+                new_call_authority=2,
+            )
+        self.assertEqual(len(first_runner.calls), 2)
+        self.assertFalse(
+            (service.output_root / representation.representation_id).exists()
+        )
+        self.assertFalse((self.root / "atomic-xlsx.jsonl").exists())
+
+        blocked_runner = FakeRunner("nonzero")
+        blocked_provider = CodexCliRepresentationAnalysisProvider(
+            provider_version="0.147.0",
+            timeout_seconds=300,
+            runner=blocked_runner,
+        )
+        preflight = handoff.recovery_preflight(
+            representation.representation_id,
+            blocked_provider,
+            self.privacy_binding(),
+        )
+        self.assertEqual(preflight.replayable_batches, 2)
+        self.assertEqual(preflight.required_new_calls, 0)
+        attempts_before = tuple(audit_root.glob("semantic_run_*/attempts/*.json"))
+        self.assertEqual(len(attempts_before), 2)
+        finalized = self.execute_with_global_authority(
+            handoff,
+            representation.representation_id,
+            blocked_provider,
+            privacy_binding=self.privacy_binding(),
+            new_call_authority=0,
+        )
+        self.assertEqual(blocked_runner.calls, [])
+        self.assertEqual(
+            len(tuple(audit_root.glob("semantic_run_*/attempts/*.json"))), 2
+        )
+        manifest, candidates = validate_representation_information_package(
+            finalized.package
+        )
+        residue = [
+            json.loads(line)
+            for line in (finalized.package / "residue.jsonl")
+            .read_text(encoding="utf-8")
+            .splitlines()
+        ]
+        self.assertEqual(manifest["counts"]["atomic_information_candidates"], 3)
+        self.assertEqual(manifest["counts"]["residue_items"], 23)
+        candidate_evidence = {
+            evidence["unit_id"]
+            for item in candidates
+            for evidence in item["source_evidence"]
+        }
+        residue_evidence = {
+            evidence["unit_id"]
+            for item in residue
+            for evidence in item["source_evidence"]
+        }
+        self.assertTrue(blank_unit_ids.isdisjoint(candidate_evidence))
+        self.assertTrue(blank_unit_ids <= residue_evidence)
+        blank_excerpts = [
+            evidence["excerpt"]
+            for item in residue
+            for evidence in item["source_evidence"]
+            if evidence["unit_id"] in blank_unit_ids
+        ]
+        self.assertTrue(all(excerpt.strip() for excerpt in blank_excerpts))
+        self.assertTrue(
+            all(json.loads(excerpt)["value"] == " " for excerpt in blank_excerpts)
+        )
+        candidate_excerpts = [
+            evidence["excerpt"]
+            for item in candidates
+            for evidence in item["source_evidence"]
+        ]
+        self.assertTrue(
+            all(excerpt.startswith("Candidate") for excerpt in candidate_excerpts)
+        )
+
+        replay_runner = FakeRunner("nonzero")
+        replay = handoff.execute(
+            representation.representation_id,
+            CodexCliRepresentationAnalysisProvider(
+                provider_version="0.147.0", runner=replay_runner
+            ),
+        )
+        self.assertTrue(replay.replayed_existing_package)
+        self.assertEqual(replay.ingestion.existing, 3)
+        self.assertEqual(replay_runner.calls, [])
+        self.assertEqual(
+            len(tuple(audit_root.glob("semantic_run_*/attempts/*.json"))), 2
+        )
+
+        malformed = self.root / "malformed-xlsx-package"
+        shutil.copytree(finalized.package, malformed)
+        candidate_path = malformed / "atomic_information_candidates.jsonl"
+        malformed_candidates = [
+            json.loads(line)
+            for line in candidate_path.read_text(encoding="utf-8").splitlines()
+        ]
+        malformed_candidates[0]["source_evidence"][0]["locator"] = "not-json"
+        candidate_path.write_text(
+            "".join(json.dumps(item) + "\n" for item in malformed_candidates),
+            encoding="utf-8",
+        )
+        with self.assertRaisesRegex(
+            RepresentationInformationError, "Evidence locator is invalid"
+        ):
+            validate_representation_information_package(malformed)
 
     def test_new_publish_rejects_package_provider_mismatch_before_ingestion(
         self,
