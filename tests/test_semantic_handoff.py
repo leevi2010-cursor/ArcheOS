@@ -9165,7 +9165,7 @@ print("passed")
                 privacy_binding=self.privacy_binding(),
                 new_call_authority=1,
             )
-            self.assertEqual(len(runner.calls), 1)
+        self.assertEqual(len(runner.calls), 1)
         self.assertFalse(
             (self.root / "information" / representation.representation_id).exists()
         )
