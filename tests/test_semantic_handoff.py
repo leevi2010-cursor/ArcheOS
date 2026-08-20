@@ -11271,7 +11271,7 @@ print("passed")
         new_head = "b" * 40
         authority_ref = (
             "https://github.com/leevi2010-cursor/ArcheOS/issues/135"
-            "#issuecomment-5353218136"
+            "#issuecomment-5353999999"
         )
         continuation = latest_handoff.install_batch_governance_continuation(
             CodexCliRepresentationAnalysisProvider(

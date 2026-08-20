@@ -177,7 +177,7 @@ _GLOBAL_AUTHORITY_EXTENSION_DECISION = (
 _UNKNOWN_RESOLUTION_DECISION = (
     "https://github.com/leevi2010-cursor/ArcheOS/issues/117"
 )
-_BATCH_GOVERNANCE_CONTINUATION_DECISION = (
+_BATCH_GOVERNANCE_IMPLEMENTATION_PLAN = (
     "https://github.com/leevi2010-cursor/ArcheOS/issues/135"
     "#issuecomment-5353218136"
 )
@@ -5796,6 +5796,7 @@ class _SemanticGlobalAuthority:
             "schema_version",
             "artifact_kind",
             "authority_ref",
+            "implementation_plan_ref",
             "previous_global_authority_fingerprint",
             "previous_reviewed_git_head",
             "reviewed_git_head",
@@ -5817,8 +5818,16 @@ class _SemanticGlobalAuthority:
             != _BATCH_GOVERNANCE_CONTINUATION_SCHEMA
             or receipt.get("artifact_kind")
             != "semantic_handoff_batch_governance_continuation"
+            or re.fullmatch(
+                r"https://github\.com/leevi2010-cursor/ArcheOS/issues/135"
+                r"#issuecomment-[0-9]+",
+                str(receipt.get("authority_ref")),
+            )
+            is None
             or receipt.get("authority_ref")
-            != _BATCH_GOVERNANCE_CONTINUATION_DECISION
+            == _BATCH_GOVERNANCE_IMPLEMENTATION_PLAN
+            or receipt.get("implementation_plan_ref")
+            != _BATCH_GOVERNANCE_IMPLEMENTATION_PLAN
             or receipt.get("previous_global_authority_fingerprint")
             != previous.get("global_authority_fingerprint")
             or receipt.get("previous_reviewed_git_head")
@@ -6195,7 +6204,15 @@ class _SemanticGlobalAuthority:
             raise SemanticHandoffError(
                 "Semantic batch Governance continuation reviewed head 无效。"
             )
-        if authority_ref != _BATCH_GOVERNANCE_CONTINUATION_DECISION:
+        if (
+            re.fullmatch(
+                r"https://github\.com/leevi2010-cursor/ArcheOS/issues/135"
+                r"#issuecomment-[0-9]+",
+                authority_ref,
+            )
+            is None
+            or authority_ref == _BATCH_GOVERNANCE_IMPLEMENTATION_PLAN
+        ):
             raise SemanticHandoffError(
                 "Semantic batch Governance continuation authority ref 无效。"
             )
@@ -6205,6 +6222,9 @@ class _SemanticGlobalAuthority:
                 "semantic_handoff_batch_governance_continuation"
             ),
             "authority_ref": authority_ref,
+            "implementation_plan_ref": (
+                _BATCH_GOVERNANCE_IMPLEMENTATION_PLAN
+            ),
             "previous_global_authority_fingerprint": previous[
                 "global_authority_fingerprint"
             ],

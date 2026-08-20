@@ -627,6 +627,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Private 0600 Lead-approved ordinal-212 resolution authority manifest.",
     )
     wechat_digest.add_argument(
+        "--batch-governance-authority-file",
+        type=Path,
+        help="Private 0600 Lead-approved Issue #135 migration authority manifest.",
+    )
+    wechat_digest.add_argument(
         "--authority-ref",
         help="Lead-approved GitHub Issue comment reference.",
     )
@@ -1079,6 +1084,13 @@ def _wechat_product_command(args: argparse.Namespace) -> int:
     elif args.authority_ref is not None:
         print("error: authority ref 只能与 maintenance continuation 入口一起使用。")
         return 2
+    if args.activate_batch_governance:
+        if args.batch_governance_authority_file is None:
+            print("error: Batch Governance activation 必须指定私有 authority file。")
+            return 2
+    elif args.batch_governance_authority_file is not None:
+        print("error: Batch Governance authority file 只能与 activation 一起使用。")
+        return 2
     try:
         workspace = require_workspace(args.config).workspace
         capture = WechatCliCaptureProvider(
@@ -1233,6 +1245,7 @@ def _wechat_product_command(args: argparse.Namespace) -> int:
         if args.activate_batch_governance:
             migration = service.activate_batch_governance(
                 authority_ref=args.authority_ref,
+                authority_manifest_file=args.batch_governance_authority_file,
             )
             print(
                 json.dumps(

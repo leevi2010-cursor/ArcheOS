@@ -163,7 +163,7 @@ Change Journal
 
 真实 Stage 1 运行已证明逐条 Provider 判断会产生不可接受的等待与超时恢复成本。Issue #135 是 M2-B2 的 MVP 效率修正 authority；在完成“整批一次判断、结果先保存、顺序可恢复应用”的匿名真实验证前，逐条治理不再是可接受的生产默认值。
 
-本次真实迁移只允许零 Provider 预检先冻结旧流程已完成的 15 条及其效果，再把唯一可证明未完成的 3 条组成一个批次。旧 15 条不得重新解释或回滚；新批次结果形成前不得写入长期状态。Semantic 调用链保留 81–220 的既有历史，新 reviewed head 只从 221 起生效；其余 planned item 必须等待该批次验收后恢复。
+本次真实迁移只允许零 Provider 预检先冻结旧流程已完成的 15 条及其效果，再把唯一可证明未完成的 3 条组成一个批次。旧 15 条不得重新解释或回滚；新批次结果形成前不得写入长期状态。安装必须绑定最终合并版本之后由 Lead 在 Issue #135 给出的独立安装 Decision，并使用 0600 私有 manifest 精确绑定原始文件、现场状态、15/3 有序清单和既有效果；旧 Implementation Plan 评论不能代替最终安装授权。Semantic 调用链保留 81–220 的既有历史，新 reviewed head 只从 221 起生效；其余 planned item 必须等待该批次验收后恢复。
 
 ### M2-B3 — Canonical Context Builder — Object scope v1
 

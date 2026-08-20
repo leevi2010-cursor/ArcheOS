@@ -21,11 +21,13 @@ from archeos.atomic_information import (
     ingest_processing_package,
 )
 from archeos.digestion import (
+    BusinessLanguageHumanJudgmentPort,
     CodexAtomicInformationInterpretationProvider,
     InterpretationResult,
     WorldModelOperation,
 )
 from archeos.digestion.providers import CodexInterpretationTimeout
+from archeos.emergence import IdentityEvidence, IdentityGateService
 from archeos.representation import LocalRepresentationRepository
 from archeos.representation_information import (
     EXTERNAL_AGENT_PROTOCOL_V1,
@@ -744,6 +746,18 @@ class BatchOnceProvider(NoStructuralChangeProvider):
         )
 
 
+class FailingBatchProvider(NoStructuralChangeProvider):
+    name = "synthetic-failing-batch"
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def interpret_batch(self, items):
+        tuple(items)
+        self.calls += 1
+        raise RuntimeError("synthetic batch failure")
+
+
 class SerialSessionProvider:
     name = "synthetic-serial-session"
 
@@ -878,6 +892,23 @@ class FailFirstBatchProgressOnceService(WechatDigestService):
             self.fail_progress = False
             raise OSError("synthetic progress persistence interruption")
         return super()._update_item(run_id, status, item_id, **changes)
+
+
+class FailAfterPersistedBatchProgressOnceService(WechatDigestService):
+    fail_progress = True
+
+    def _update_item(self, run_id, status, item_id, **changes):
+        result = super()._update_item(run_id, status, item_id, **changes)
+        receipt = changes.get("governance_receipt")
+        if (
+            self.fail_progress
+            and isinstance(receipt, dict)
+            and receipt.get("phase") == "applying"
+            and receipt.get("next_index") == 1
+        ):
+            self.fail_progress = False
+            raise OSError("synthetic post-persist progress interruption")
+        return result
 
 
 class FailSecondGovernanceOnceService(WechatDigestService):
@@ -1276,6 +1307,33 @@ class WechatDigestTests(unittest.TestCase):
         self.assertEqual(provider.calls, 1)
         self.assertEqual(provider.batch_sizes, [10])
 
+    def test_failed_batch_leaves_identity_and_governance_state_unmodified(
+        self,
+    ) -> None:
+        self.create_object()
+        provider = FailingBatchProvider()
+        service = WechatDigestService(
+            workspace=self.workspace,
+            capture_provider=SyntheticCaptureProvider([message(1), message(2)]),
+            semantic_handoff_factory=lambda: self.semantic,
+            interpretation_provider=provider,
+        )
+
+        with self.assertRaises(WechatDigestError):
+            service.run(all_history=True)
+
+        self.assertEqual(provider.calls, 1)
+        revisions = service.information_store.list_atomic_information()
+        self.assertEqual(len(revisions), 2)
+        self.assertTrue(
+            all(
+                item.revision_number == 1 and not item.related_object_ids
+                for item in revisions
+            )
+        )
+        self.assertEqual(service.proposal_store.list_unresolved(), ())
+        self.assertEqual(service.journal.list_changes(), ())
+
     def test_issue_135_migration_freezes_15_and_batches_only_remaining_3(
         self,
     ) -> None:
@@ -1283,7 +1341,7 @@ class WechatDigestTests(unittest.TestCase):
         capture = SyntheticCaptureProvider(
             [message(index) for index in range(1, 19)]
         )
-        service = WechatDigestService(
+        service = FailAfterPersistedBatchProgressOnceService(
             workspace=self.workspace,
             capture_provider=capture,
             semantic_handoff_factory=lambda: self.semantic,
@@ -1301,6 +1359,26 @@ class WechatDigestTests(unittest.TestCase):
             prepared.run_id, prepared.representation_id, privacy
         )
         self.assertEqual(len(atomic_ids), 18)
+
+        self.create_object()
+        with SQLiteWorldModelRepository(service.database) as repository:
+            identity = IdentityGateService(
+                service.information_store,
+                repository,
+                service.proposal_store,
+                service.journal,
+                BusinessLanguageHumanJudgmentPort(),
+            )
+            for atomic_id in atomic_ids[:14]:
+                current = service.information_store.get_current(atomic_id)
+                identity.process(
+                    atomic_id,
+                    IdentityEvidence(
+                        name="Synthetic Project",
+                        supporting_revision_ids=(current.revision_id,),
+                        identity_bases=(),
+                    ),
+                )
 
         status = service.run_store.status(prepared.run_id)
         item_id = next(
@@ -1340,11 +1418,130 @@ class WechatDigestTests(unittest.TestCase):
         self.semantic.global_attempt_total = 220
         authority_ref = (
             "https://github.com/leevi2010-cursor/ArcheOS/issues/135"
-            "#issuecomment-5353218136"
+            "#issuecomment-5353999999"
         )
+        authority_manifest = service.build_batch_governance_authority_manifest(
+            authority_ref=authority_ref,
+            completed_atomic_information_ids=atomic_ids[:15],
+            remaining_atomic_information_ids=atomic_ids[15:],
+        )
+        authority_file = self.workspace / "issue-135-authority.json"
+        authority_file.write_text(
+            json.dumps(authority_manifest, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        authority_file.chmod(0o600)
+
+        def write_resigned_manifest(name, mutate):
+            payload = json.loads(json.dumps(authority_manifest))
+            mutate(payload)
+            payload.pop("manifest_fingerprint", None)
+            payload["manifest_fingerprint"] = "sha256:" + hashlib.sha256(
+                json.dumps(
+                    payload,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            ).hexdigest()
+            path = self.workspace / name
+            path.write_text(json.dumps(payload), encoding="utf-8")
+            path.chmod(0o600)
+            return path
+
+        tampered_files = (
+            write_resigned_manifest(
+                "issue-135-order.json",
+                lambda payload: payload[
+                    "completed_atomic_information_ids"
+                ].reverse(),
+            ),
+            write_resigned_manifest(
+                "issue-135-atomic.json",
+                lambda payload: payload["completed_effect_bindings"][0].update(
+                    {"current_revision_fingerprint": "sha256:" + "a" * 64}
+                ),
+            ),
+            write_resigned_manifest(
+                "issue-135-journal.json",
+                lambda payload: payload["completed_effect_bindings"][0].update(
+                    {"journal_fingerprint": "sha256:" + "b" * 64}
+                ),
+            ),
+            write_resigned_manifest(
+                "issue-135-proposal.json",
+                lambda payload: payload["completed_effect_bindings"][0].update(
+                    {"proposal_history_fingerprint": "sha256:" + "c" * 64}
+                ),
+            ),
+            write_resigned_manifest(
+                "issue-135-receipt.json",
+                lambda payload: payload["completed_effect_bindings"][0].update(
+                    {"apply_receipts_fingerprint": "sha256:" + "d" * 64}
+                ),
+            ),
+            write_resigned_manifest(
+                "issue-135-world.json",
+                lambda payload: payload["completed_effect_bindings"][0].update(
+                    {"world_projection_fingerprint": "sha256:" + "e" * 64}
+                ),
+            ),
+        )
+        for tampered_file in tampered_files:
+            with self.assertRaises(WechatDigestError):
+                service.activate_batch_governance(
+                    authority_ref=authority_ref,
+                    authority_manifest_file=tampered_file,
+                )
+        invalid_fingerprint_file = self.workspace / "issue-135-fingerprint.json"
+        invalid_fingerprint = json.loads(json.dumps(authority_manifest))
+        invalid_fingerprint["manifest_fingerprint"] = "sha256:" + "f" * 64
+        invalid_fingerprint_file.write_text(
+            json.dumps(invalid_fingerprint), encoding="utf-8"
+        )
+        invalid_fingerprint_file.chmod(0o600)
+        with self.assertRaises(WechatDigestError):
+            service.activate_batch_governance(
+                authority_ref=authority_ref,
+                authority_manifest_file=invalid_fingerprint_file,
+            )
+        authority_file.chmod(0o644)
+        with self.assertRaises(WechatDigestError):
+            service.activate_batch_governance(
+                authority_ref=authority_ref,
+                authority_manifest_file=authority_file,
+            )
+        authority_file.chmod(0o600)
+        authority_link = self.workspace / "issue-135-authority-link.json"
+        authority_link.symlink_to(authority_file)
+        with self.assertRaises(WechatDigestError):
+            service.activate_batch_governance(
+                authority_ref=authority_ref,
+                authority_manifest_file=authority_link,
+            )
+        self.semantic.global_attempt_total = 221
+        with self.assertRaises(WechatDigestError):
+            service.activate_batch_governance(
+                authority_ref=authority_ref,
+                authority_manifest_file=authority_file,
+            )
+        self.semantic.global_attempt_total = 220
+        self.assertEqual(
+            service.build_batch_governance_authority_manifest(
+                authority_ref=authority_ref,
+                completed_atomic_information_ids=atomic_ids[:15],
+                remaining_atomic_information_ids=atomic_ids[15:],
+            ),
+            authority_manifest,
+        )
+        completed_before = [
+            service.information_store.list_revisions(atomic_id)
+            for atomic_id in atomic_ids[:15]
+        ]
 
         migration = service.activate_batch_governance(
-            authority_ref=authority_ref
+            authority_ref=authority_ref,
+            authority_manifest_file=authority_file,
         )
 
         self.assertEqual(provider.calls, 0)
@@ -1357,16 +1554,54 @@ class WechatDigestTests(unittest.TestCase):
             list(atomic_ids[15:]),
         )
         self.assertEqual(
-            service.activate_batch_governance(authority_ref=authority_ref),
+            service.activate_batch_governance(
+                authority_ref=authority_ref,
+                authority_manifest_file=authority_file,
+            ),
             migration,
         )
         self.assertEqual(provider.calls, 0)
+
+        with self.assertRaises(WechatDigestError):
+            service.run()
+        interrupted_item = service.run_store.status(prepared.run_id)["items"][
+            item_id
+        ]
+        self.assertEqual(
+            interrupted_item["governance_receipt"]["phase"], "applying"
+        )
+        self.assertEqual(
+            interrupted_item["governance_receipt"]["next_index"], 1
+        )
+        self.assertEqual(
+            len(
+                interrupted_item["governance_receipt"][
+                    "applied_effect_fingerprints"
+                ]
+            ),
+            1,
+        )
+        self.assertEqual(provider.calls, 1)
+        self.assertEqual(
+            service.activate_batch_governance(
+                authority_ref=authority_ref,
+                authority_manifest_file=authority_file,
+            ),
+            migration,
+        )
 
         result = service.run()
 
         self.assertTrue(result.checkpoint_published)
         self.assertEqual(provider.calls, 1)
         self.assertEqual(provider.batch_sizes, [3])
+        self.assertEqual(
+            [
+                service.information_store.list_revisions(atomic_id)
+                for atomic_id in atomic_ids[:15]
+            ],
+            completed_before,
+        )
         final_item = service.run_store.status(prepared.run_id)["items"][item_id]
         self.assertEqual(final_item["atomic_information_ids"], list(atomic_ids))
         self.assertEqual(final_item["governance_receipt"]["phase"], "completed")
@@ -1376,6 +1611,16 @@ class WechatDigestTests(unittest.TestCase):
             ],
             "started",
         )
+        self.assertEqual(
+            service.activate_batch_governance(
+                authority_ref=authority_ref,
+                authority_manifest_file=authority_file,
+            ),
+            migration,
+        )
+        replay = service.run()
+        self.assertTrue(replay.checkpoint_published)
+        self.assertEqual(provider.calls, 1)
 
     def test_mid_apply_recovery_reuses_persisted_batch_result(self) -> None:
         self.create_object()

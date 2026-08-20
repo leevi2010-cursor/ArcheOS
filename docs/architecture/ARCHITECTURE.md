@@ -199,7 +199,7 @@ Sequential idempotent World Model application
 Existing Human Judgment / Change Proposal
 ```
 
-Provider 只负责一次性形成整批有序判断，不能直接写 Store。系统在任何 World Model 写入前保存并绑定输入顺序、结果与指纹；应用阶段逐条、幂等、可恢复。应用中断只恢复尚未完成的顺序写入，不再次请求模型。缺失、重复、乱序、未知 ID 或不完整结果必须在长期写入前 fail closed。
+Provider 只负责一次性形成整批有序判断，不能直接写 Store。Provider 返回并持久保存完整结果前，准备阶段保持只读，旧收据恢复与身份归位也不能提前写入。系统随后绑定输入顺序、结果与指纹；应用阶段逐条、幂等、可恢复。应用中断只恢复尚未完成的顺序写入，不再次请求模型；恢复读回按 receipt 与 cursor 的实际阶段验证已应用效果和未应用后缀。缺失、重复、乱序、未知 ID 或不完整结果必须在长期写入前 fail closed。
 
 该批量边界复用现有 Processing / Audit、Information Governance 与 Change Proposal，不建立 Batch、Governance Job、Exception Queue 或 Agent Session 等新的 Core / Store。单条兼容入口可以存在，但生产多条入口不得静默退化为逐条 Provider 调用。
 

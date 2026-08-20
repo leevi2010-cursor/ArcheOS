@@ -231,6 +231,9 @@ class FailOnceProposalStore:
     def list_unresolved(self):
         return self.inner.list_unresolved()
 
+    def list_history(self):
+        return self.inner.list_history()
+
     def update(self, proposal):
         if self.failures_remaining:
             self.failures_remaining -= 1
@@ -318,6 +321,74 @@ class DigestionTest(unittest.TestCase):
         self.assertTrue(
             all(len(self.atomic_store.list_revisions(identifier)) == 1 for identifier in identifiers)
         )
+
+    def test_failed_batch_does_not_finalize_existing_automatic_receipt(self) -> None:
+        record = self.repository.create_object("Pending Receipt Target")
+        initial = replace(
+            atomic_information("atomic-pending-receipt", "Pending Receipt Target"),
+            related_object_ids=(record.object_id,),
+        )
+        self.atomic_store.ingest_batch((initial,))
+        inner_journal = self.journal
+        self.journal = FailOnceChangeJournal(inner_journal)
+        first_service = self.service(
+            interpretation(
+                WorldModelOperation(
+                    kind="add_role",
+                    target_object_id=record.object_id,
+                    role="project",
+                )
+            )
+        )
+        with self.assertRaisesRegex(OSError, "journal write failure"):
+            first_service.digest(initial.atomic_information_id)
+
+        before_information = self.atomic_store.list_revisions(
+            initial.atomic_information_id
+        )
+        before_world = (
+            self.repository.list_objects(),
+            self.repository.list_names(record.object_id),
+            self.repository.list_roles(record.object_id),
+            self.repository.list_lifecycles(record.object_id),
+            self.repository.list_relationships(object_id=record.object_id),
+            self.repository.list_apply_receipts(),
+        )
+        before_proposals = self.proposals.list_history()
+        self.assertEqual(inner_journal.list_changes(), ())
+
+        self.journal = inner_journal
+        provider = BatchInterpretationProvider(())
+        second_service = AtomicInformationDigestionService(
+            self.atomic_store,
+            self.repository,
+            ObjectResolver(self.repository),
+            provider,
+            self.proposals,
+            self.journal,
+            self.human,
+        )
+        with self.assertRaisesRegex(ValueError, "count does not match"):
+            second_service.digest_batch((initial.atomic_information_id,))
+
+        self.assertEqual(provider.calls, 1)
+        self.assertEqual(
+            self.atomic_store.list_revisions(initial.atomic_information_id),
+            before_information,
+        )
+        self.assertEqual(
+            (
+                self.repository.list_objects(),
+                self.repository.list_names(record.object_id),
+                self.repository.list_roles(record.object_id),
+                self.repository.list_lifecycles(record.object_id),
+                self.repository.list_relationships(object_id=record.object_id),
+                self.repository.list_apply_receipts(),
+            ),
+            before_world,
+        )
+        self.assertEqual(self.proposals.list_history(), before_proposals)
+        self.assertEqual(inner_journal.list_changes(), ())
 
     def test_multi_item_digestion_does_not_fallback_to_single_calls(self) -> None:
         identifiers = ("atomic-no-fallback-a", "atomic-no-fallback-b")

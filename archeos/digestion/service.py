@@ -110,7 +110,9 @@ class AtomicInformationDigestionService:
         provider_method = getattr(self.interpretation_provider, "interpret_batch", None)
         if not callable(provider_method):
             if len(identifiers) == 1:
-                prepared = self._prepare(identifiers[0])
+                prepared = self._prepare(
+                    identifiers[0], recover_automatic_receipts=False
+                )
                 return (
                     self.interpretation_provider.interpret(
                         prepared.atomic_information, prepared.world_state
@@ -119,7 +121,10 @@ class AtomicInformationDigestionService:
             raise RuntimeError(
                 "batch interpretation provider is required for multi-item digestion"
             )
-        prepared = tuple(self._prepare(identifier) for identifier in identifiers)
+        prepared = tuple(
+            self._prepare(identifier, recover_automatic_receipts=False)
+            for identifier in identifiers
+        )
         results = tuple(
             provider_method(
                 tuple((item.atomic_information, item.world_state) for item in prepared)
@@ -155,8 +160,17 @@ class AtomicInformationDigestionService:
             )
         )
 
-    def _prepare(self, atomic_information_id: str) -> _PreparedDigestion:
-        recovered_change_ids = self._recover_automatic_receipts(atomic_information_id)
+    def _prepare(
+        self,
+        atomic_information_id: str,
+        *,
+        recover_automatic_receipts: bool = True,
+    ) -> _PreparedDigestion:
+        recovered_change_ids = (
+            self._recover_automatic_receipts(atomic_information_id)
+            if recover_automatic_receipts
+            else ()
+        )
         atomic_information = self.atomic_information_store.get_current(
             atomic_information_id
         )

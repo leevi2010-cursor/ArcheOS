@@ -13,6 +13,7 @@ import json
 import mimetypes
 import os
 import re
+import stat
 import subprocess
 import tempfile
 import time
@@ -79,6 +80,9 @@ LEGACY_RUN_PLAN_RECEIPT_SCHEMA_VERSION = "wechat-digest-run-plan-receipt/1.0"
 GOVERNANCE_RECEIPT_SCHEMA_VERSION = "wechat-governance-receipt/2.0"
 LEGACY_GOVERNANCE_RECEIPT_SCHEMA_VERSION = "wechat-governance-receipt/1.0"
 GOVERNANCE_MIGRATION_SCHEMA_VERSION = "wechat-governance-migration/1.0"
+BATCH_GOVERNANCE_AUTHORITY_SCHEMA_VERSION = (
+    "wechat-batch-governance-migration-authority/1.0"
+)
 CAPTURE_SCHEMA_VERSION = "wechat-cli-capture/1.0"
 SUPPORTED_WECHAT_CLI_VERSION = "0.5.0"
 DEFAULT_CAPTURE_WINDOW_DAYS = 30
@@ -303,6 +307,47 @@ def _canonical_json(value: object) -> str:
 
 def _sha256_bytes(value: bytes) -> str:
     return "sha256:" + hashlib.sha256(value).hexdigest()
+
+
+def _read_private_json_manifest(path: Path) -> tuple[dict[str, object], str]:
+    candidate = Path(path).expanduser()
+    try:
+        if candidate.is_symlink():
+            raise WechatDigestError("私有 authority manifest 不得使用符号链接。")
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+
+        def read_once() -> bytes:
+            descriptor = os.open(candidate, flags)
+            try:
+                metadata = os.fstat(descriptor)
+                if (
+                    not stat.S_ISREG(metadata.st_mode)
+                    or stat.S_IMODE(metadata.st_mode) != 0o600
+                ):
+                    raise WechatDigestError(
+                        "私有 authority manifest 必须是 0600 普通文件。"
+                    )
+                chunks: list[bytes] = []
+                while True:
+                    chunk = os.read(descriptor, 1024 * 1024)
+                    if not chunk:
+                        break
+                    chunks.append(chunk)
+                return b"".join(chunks)
+            finally:
+                os.close(descriptor)
+
+        raw = read_once()
+        if read_once() != raw:
+            raise WechatDigestError("私有 authority manifest 读回不一致。")
+        parsed = json.loads(raw.decode("utf-8"))
+    except WechatDigestError:
+        raise
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise WechatDigestError("私有 authority manifest 不可读。") from exc
+    if not isinstance(parsed, dict):
+        raise WechatDigestError("私有 authority manifest 结构损坏。")
+    return dict(parsed), _sha256_bytes(raw)
 
 
 def _stable_id(prefix: str, *parts: str) -> str:
@@ -1382,6 +1427,7 @@ def _validated_governance_receipt(value: object) -> dict[str, object]:
             "batch_fingerprint",
             "interpretations",
             "next_index",
+            "applied_effect_fingerprints",
             "pending_human",
             "context_object_ids",
         }
@@ -1407,6 +1453,7 @@ def _validated_governance_receipt(value: object) -> dict[str, object]:
     raw_interpretations = value.get("interpretations")
     object_ids = value.get("context_object_ids")
     next_index = value.get("next_index")
+    applied_effect_fingerprints = value.get("applied_effect_fingerprints")
     batch_fingerprint = value.get("batch_fingerprint")
     if (
         not isinstance(atomic_ids, list)
@@ -1418,6 +1465,11 @@ def _validated_governance_receipt(value: object) -> dict[str, object]:
         or isinstance(next_index, bool)
         or not isinstance(next_index, int)
         or not 0 <= next_index <= len(atomic_ids)
+        or not isinstance(applied_effect_fingerprints, list)
+        or len(applied_effect_fingerprints) != next_index
+        or any(
+            not _sha256_value(item) for item in applied_effect_fingerprints
+        )
         or not isinstance(value.get("pending_human"), bool)
         or not isinstance(object_ids, list)
         or any(not isinstance(object_id, str) for object_id in object_ids)
@@ -1452,6 +1504,9 @@ def _validated_governance_migration(value: object) -> dict[str, object]:
         "schema_version",
         "phase",
         "authority_ref",
+        "implementation_plan_ref",
+        "authority_manifest_fingerprint",
+        "authority_manifest_raw_fingerprint",
         "legacy_governance_receipt",
         "atomic_information_fingerprint",
         "ordered_atomic_information_ids",
@@ -1459,6 +1514,7 @@ def _validated_governance_migration(value: object) -> dict[str, object]:
         "remaining_atomic_information_ids",
         "legacy_effect_fingerprint",
         "pristine_remaining_fingerprint",
+        "activation_business_tree_fingerprint",
         "pending_human",
         "context_object_ids",
         "semantic_continuation_fingerprint",
@@ -1481,7 +1537,18 @@ def _validated_governance_migration(value: object) -> dict[str, object]:
         set(value) != expected
         or value.get("schema_version") != GOVERNANCE_MIGRATION_SCHEMA_VERSION
         or value.get("phase") != "activated"
+        or re.fullmatch(
+            r"https://github\.com/leevi2010-cursor/ArcheOS/issues/135"
+            r"#issuecomment-[0-9]+",
+            str(value.get("authority_ref")),
+        )
+        is None
         or value.get("authority_ref")
+        == (
+            "https://github.com/leevi2010-cursor/ArcheOS/issues/135"
+            "#issuecomment-5353218136"
+        )
+        or value.get("implementation_plan_ref")
         != (
             "https://github.com/leevi2010-cursor/ArcheOS/issues/135"
             "#issuecomment-5353218136"
@@ -1504,6 +1571,13 @@ def _validated_governance_migration(value: object) -> dict[str, object]:
         != value.get("atomic_information_fingerprint")
         or not _sha256_value(value.get("legacy_effect_fingerprint"))
         or not _sha256_value(value.get("pristine_remaining_fingerprint"))
+        or not _sha256_value(value.get("authority_manifest_fingerprint"))
+        or not _sha256_value(
+            value.get("authority_manifest_raw_fingerprint")
+        )
+        or not _sha256_value(
+            value.get("activation_business_tree_fingerprint")
+        )
         or not isinstance(value.get("pending_human"), bool)
         or not isinstance(object_ids, list)
         or any(not isinstance(object_id, str) for object_id in object_ids)
@@ -1517,6 +1591,122 @@ def _validated_governance_migration(value: object) -> dict[str, object]:
         )
     ):
         raise WechatDigestError("微信 Governance migration receipt 损坏。")
+    return dict(value)
+
+
+def _validated_batch_governance_authority_manifest(
+    value: object,
+) -> dict[str, object]:
+    if not isinstance(value, dict):
+        raise WechatDigestError("Batch Governance authority manifest 损坏。")
+    expected = {
+        "schema_version",
+        "authority_ref",
+        "implementation_plan_ref",
+        "activation_binding",
+        "completed_atomic_information_ids",
+        "remaining_atomic_information_ids",
+        "completed_effect_bindings",
+        "remaining_pristine_bindings",
+        "business_tree_fingerprint",
+        "previous_effective_head",
+        "reviewed_git_head",
+        "semantic_summary",
+        "manifest_fingerprint",
+    }
+    projected = dict(value)
+    fingerprint = projected.pop("manifest_fingerprint", None)
+    completed = value.get("completed_atomic_information_ids")
+    remaining = value.get("remaining_atomic_information_ids")
+    completed_bindings = value.get("completed_effect_bindings")
+    pristine_bindings = value.get("remaining_pristine_bindings")
+    summary = value.get("semantic_summary")
+    if (
+        set(value) != expected
+        or value.get("schema_version")
+        != BATCH_GOVERNANCE_AUTHORITY_SCHEMA_VERSION
+        or re.fullmatch(
+            r"https://github\.com/leevi2010-cursor/ArcheOS/issues/135"
+            r"#issuecomment-[0-9]+",
+            str(value.get("authority_ref")),
+        )
+        is None
+        or value.get("authority_ref")
+        == (
+            "https://github.com/leevi2010-cursor/ArcheOS/issues/135"
+            "#issuecomment-5353218136"
+        )
+        or value.get("implementation_plan_ref")
+        != (
+            "https://github.com/leevi2010-cursor/ArcheOS/issues/135"
+            "#issuecomment-5353218136"
+        )
+        or not isinstance(value.get("activation_binding"), dict)
+        or not isinstance(completed, list)
+        or len(completed) != 15
+        or any(not isinstance(item, str) for item in completed)
+        or len(completed) != len(set(completed))
+        or not isinstance(remaining, list)
+        or len(remaining) != 3
+        or any(not isinstance(item, str) for item in remaining)
+        or len(remaining) != len(set(remaining))
+        or set(completed).intersection(remaining)
+        or not isinstance(completed_bindings, list)
+        or [
+            item.get("atomic_information_id")
+            for item in completed_bindings
+            if isinstance(item, dict)
+        ]
+        != completed
+        or len(completed_bindings) != len(completed)
+        or not isinstance(pristine_bindings, list)
+        or [
+            item.get("atomic_information_id")
+            for item in pristine_bindings
+            if isinstance(item, dict)
+        ]
+        != remaining
+        or len(pristine_bindings) != len(remaining)
+        or any(
+            not isinstance(item, dict)
+            or item.get("revision_count") != 1
+            or item.get("proposal_history_count") != 0
+            or item.get("journal_count") != 0
+            or item.get("apply_receipt_count") != 0
+            for item in pristine_bindings
+        )
+        or not _sha256_value(value.get("business_tree_fingerprint"))
+        or value.get("previous_effective_head")
+        != "deaee94fe8c87ec84505a7de10d6f8d35eec87a5"
+        or re.fullmatch(r"[0-9a-f]{40}", str(value.get("reviewed_git_head")))
+        is None
+        or summary
+        != {
+            "global_attempt_total": 220,
+            "global_unknown": 0,
+            "last_global_ordinal": 220,
+            "next_global_ordinal": 221,
+            "absolute_cap": 1000,
+        }
+        or not _sha256_value(fingerprint)
+        or fingerprint
+        != _sha256_bytes(_canonical_json(projected).encode("utf-8"))
+    ):
+        raise WechatDigestError("Batch Governance authority manifest 损坏。")
+    for binding in (*completed_bindings, *pristine_bindings):
+        if not isinstance(binding, dict) or any(
+            not _sha256_value(binding.get(field))
+            for field in (
+                "current_revision_fingerprint",
+                "revision_history_fingerprint",
+                "proposal_history_fingerprint",
+                "journal_fingerprint",
+                "apply_receipts_fingerprint",
+                "world_projection_fingerprint",
+                "effect_fingerprint",
+            )
+        ):
+            raise WechatDigestError("Batch Governance authority effect 损坏。")
     return dict(value)
 
 
@@ -1918,7 +2108,7 @@ class WechatDigestService:
             None,
         ] | None = None
         self._after_governance_application: Callable[
-            [int, bool, tuple[str, ...]], None
+            [int, bool, tuple[str, ...], str], None
         ] | None = None
         if isinstance(semantic_batch_size, bool) or not isinstance(semantic_batch_size, int) or semantic_batch_size < 1:
             raise ValueError("semantic batch size must be positive")
@@ -2319,25 +2509,486 @@ class WechatDigestService:
         }
         return _sha256_bytes(_canonical_json(payload).encode("utf-8"))
 
+    @staticmethod
+    def _governance_apply_receipts(
+        repository: SQLiteWorldModelRepository,
+        atomic_ids: Sequence[str],
+    ) -> tuple[dict[str, object], ...]:
+        selected = set(atomic_ids)
+        matched: list[dict[str, object]] = []
+        for receipt in repository.list_apply_receipts():
+            try:
+                payload = json.loads(receipt.payload)
+            except json.JSONDecodeError as exc:
+                raise WechatDigestError(
+                    "Batch Governance apply receipt 损坏。"
+                ) from exc
+            records = payload.get("records") if isinstance(payload, dict) else None
+            if not isinstance(records, list):
+                raise WechatDigestError("Batch Governance apply receipt 损坏。")
+            if any(
+                isinstance(record, dict)
+                and record.get("atomic_information_id") in selected
+                for record in records
+            ):
+                matched.append(asdict(receipt))
+        return tuple(matched)
+
+    def _governance_effect_binding(
+        self,
+        repository: SQLiteWorldModelRepository,
+        atomic_id: str,
+    ) -> dict[str, object]:
+        revisions = tuple(
+            asdict(item) for item in self.information_store.list_revisions(atomic_id)
+        )
+        if not revisions:
+            raise WechatDigestError("Batch Governance Atomic Information 缺失。")
+        proposals = tuple(
+            asdict(item)
+            for item in self.proposal_store.list_history()
+            if item.atomic_information_id == atomic_id
+        )
+        journal = tuple(
+            asdict(item)
+            for item in self.journal.list_changes()
+            if item.atomic_information_id == atomic_id
+        )
+        apply_receipts = self._governance_apply_receipts(repository, (atomic_id,))
+        object_ids = {
+            object_id
+            for revision in self.information_store.list_revisions(atomic_id)
+            for object_id in revision.related_object_ids
+        }
+        for proposal in self.proposal_store.list_history():
+            if proposal.atomic_information_id == atomic_id:
+                object_ids.update(proposal.resolved_object_ids)
+        for record in self.journal.list_changes():
+            if record.atomic_information_id == atomic_id:
+                object_ids.update(record.resolved_object_ids)
+        for receipt in apply_receipts:
+            payload = json.loads(str(receipt["payload"]))
+            object_ids.update(payload.get("created_object_ids", ()))
+            for record in payload.get("records", ()):
+                if isinstance(record, dict):
+                    object_ids.update(record.get("resolved_object_ids", ()))
+        objects = {
+            record.object_id: record for record in repository.list_objects()
+        }
+        if any(object_id not in objects for object_id in object_ids):
+            raise WechatDigestError("Batch Governance World binding 缺失。")
+        world_projection = {
+            "objects": [asdict(objects[object_id]) for object_id in sorted(object_ids)],
+            "names": [
+                asdict(item)
+                for object_id in sorted(object_ids)
+                for item in repository.list_names(object_id)
+            ],
+            "roles": [
+                asdict(item)
+                for object_id in sorted(object_ids)
+                for item in repository.list_roles(object_id)
+            ],
+            "lifecycles": [
+                asdict(item)
+                for object_id in sorted(object_ids)
+                for item in repository.list_lifecycles(object_id)
+            ],
+            "relationships": [
+                asdict(item)
+                for item in repository.list_relationships(active_only=False)
+                if item.from_object_id in object_ids or item.to_object_id in object_ids
+            ],
+            "external_identity_mappings": [
+                asdict(item)
+                for item in repository.list_external_identity_mappings()
+                if item.object_id in object_ids
+            ],
+        }
+        payload = {
+            "revisions": revisions,
+            "proposal_history": proposals,
+            "journal": journal,
+            "apply_receipts": apply_receipts,
+            "world_projection": world_projection,
+        }
+        return {
+            "atomic_information_id": atomic_id,
+            "current_revision_fingerprint": _sha256_bytes(
+                _canonical_json(revisions[-1]).encode("utf-8")
+            ),
+            "revision_history_fingerprint": _sha256_bytes(
+                _canonical_json(revisions).encode("utf-8")
+            ),
+            "revision_count": len(revisions),
+            "proposal_history_fingerprint": _sha256_bytes(
+                _canonical_json(proposals).encode("utf-8")
+            ),
+            "proposal_history_count": len(proposals),
+            "journal_fingerprint": _sha256_bytes(
+                _canonical_json(journal).encode("utf-8")
+            ),
+            "journal_count": len(journal),
+            "apply_receipts_fingerprint": _sha256_bytes(
+                _canonical_json(apply_receipts).encode("utf-8")
+            ),
+            "apply_receipt_count": len(apply_receipts),
+            "world_projection_fingerprint": _sha256_bytes(
+                _canonical_json(world_projection).encode("utf-8")
+            ),
+            "effect_fingerprint": _sha256_bytes(
+                _canonical_json(payload).encode("utf-8")
+            ),
+        }
+
+    def _governance_business_tree_fingerprint(
+        self, repository: SQLiteWorldModelRepository
+    ) -> str:
+        current = self.information_store.list_atomic_information()
+        payload = {
+            "information_history": [
+                asdict(revision)
+                for item in current
+                for revision in self.information_store.list_revisions(
+                    item.atomic_information_id
+                )
+            ],
+            "proposal_history": [
+                asdict(item) for item in self.proposal_store.list_history()
+            ],
+            "journal": [asdict(item) for item in self.journal.list_changes()],
+            "world": {
+                "objects": [asdict(item) for item in repository.list_objects()],
+                "names": [
+                    asdict(name)
+                    for item in repository.list_objects()
+                    for name in repository.list_names(item.object_id)
+                ],
+                "roles": [
+                    asdict(role)
+                    for item in repository.list_objects()
+                    for role in repository.list_roles(item.object_id)
+                ],
+                "lifecycles": [
+                    asdict(lifecycle)
+                    for item in repository.list_objects()
+                    for lifecycle in repository.list_lifecycles(item.object_id)
+                ],
+                "relationships": [
+                    asdict(item)
+                    for item in repository.list_relationships(active_only=False)
+                ],
+                "external_identity_mappings": [
+                    asdict(item)
+                    for item in repository.list_external_identity_mappings()
+                ],
+                "apply_receipts": [
+                    asdict(item) for item in repository.list_apply_receipts()
+                ],
+            },
+        }
+        return _sha256_bytes(_canonical_json(payload).encode("utf-8"))
+
+    def _build_batch_governance_authority_manifest_unlocked(
+        self,
+        *,
+        authority_ref: str,
+        completed_atomic_information_ids: Sequence[str],
+        remaining_atomic_information_ids: Sequence[str],
+    ) -> dict[str, object]:
+        run_id = self.run_store.active_run_id()
+        if run_id is None:
+            raise WechatDigestError("不存在可迁移 Batch Governance 的 active run。")
+        plan = self.run_store.plan(run_id)
+        receipt = self.run_store.plan_receipt(run_id)
+        if self._plan_all_history_upper(plan) is None:
+            raise WechatDigestError(
+                "Batch Governance migration 只能绑定 frozen campaign。"
+            )
+        after = WechatCursor.from_dict(plan.get("after_cursor"), "plan.after_cursor")
+        upper = WechatCursor.from_dict(plan.get("upper_bound"), "plan.upper_bound")
+        checkpoint = self.run_store.checkpoint()
+        if checkpoint not in {None, after}:
+            raise WechatDigestError(
+                "Batch Governance migration checkpoint binding 不一致。"
+            )
+        capture = self.capture_provider.capture(after, upper_bound=upper)
+        self._verify_capture_against_plan(capture, plan)
+        status = self.run_store.status(run_id)
+        self._verify_plan_and_status(run_id, capture, plan, status)
+        if (
+            status.get("state") != "failed"
+            or status.get("failure_category") != "BrokenPipeError"
+            or status.get("checkpoint_published") is not False
+        ):
+            raise WechatDigestError(
+                "Batch Governance migration active stop 边界不匹配。"
+            )
+        items = status.get("items")
+        if not isinstance(items, dict):
+            raise WechatDigestError("微信运行状态 items 损坏。")
+        candidates: list[tuple[str, dict[str, object]]] = []
+        for item_id, value in items.items():
+            if not isinstance(item_id, str) or not isinstance(value, dict):
+                raise WechatDigestError("微信运行状态 items 损坏。")
+            receipt_value = value.get("governance_receipt")
+            if receipt_value is None:
+                continue
+            governance_receipt = _validated_governance_receipt(receipt_value)
+            if (
+                value.get("state") == "represented"
+                and governance_receipt.get("schema_version")
+                == LEGACY_GOVERNANCE_RECEIPT_SCHEMA_VERSION
+                and governance_receipt.get("phase") == "started"
+            ):
+                candidates.append((item_id, value))
+        if len(candidates) != 1:
+            raise WechatDigestError(
+                "Batch Governance migration 必须唯一绑定旧 started item。"
+            )
+        item_id, item = candidates[0]
+        representation_id = item.get("representation_id")
+        source_id = item.get("source_id")
+        if not isinstance(representation_id, str) or not isinstance(source_id, str):
+            raise WechatDigestError("Batch Governance migration item binding 损坏。")
+        representation = self.representation_repository.get(representation_id)
+        verification = self.representation_repository.verify(representation_id)
+        source = self.source_repository.get(source_id)
+        source_verification = self.source_repository.verify(source_id)
+        if (
+            not verification.verified
+            or not source_verification.verified
+            or representation.source_id != source_id
+        ):
+            raise WechatDigestError(
+                "Batch Governance Source/Representation 校验失败。"
+            )
+        ordered_ids = self._verify_semantic_receipts(
+            representation_id, item, recover_missing_item_receipt=True
+        )
+        completed_ids = tuple(completed_atomic_information_ids)
+        remaining_ids = tuple(remaining_atomic_information_ids)
+        if (
+            len(ordered_ids) != 18
+            or completed_ids != ordered_ids[:15]
+            or remaining_ids != ordered_ids[15:]
+            or len(remaining_ids) != 3
+        ):
+            raise WechatDigestError(
+                "Batch Governance authority IDs 未精确绑定 ordered18。"
+            )
+        legacy_receipt = _validated_governance_receipt(
+            item.get("governance_receipt")
+        )
+        metrics = _validated_governance_metrics(item.get("governance_metrics"))
+        if (
+            item.get("atomic_information_ids") != []
+            or legacy_receipt.get("atomic_information_fingerprint")
+            != _governance_atomic_fingerprint(ordered_ids)
+            or metrics.get("app_server_start_count") != 0
+            or metrics.get("thread_count") != 15
+            or metrics.get("turn_count") != 15
+            or metrics.get("timeout_count") != 0
+            or metrics.get("failure_count") != 1
+            or metrics.get("failure_categories") != {"transport": 1}
+        ):
+            raise WechatDigestError(
+                "Batch Governance legacy receipt binding 损坏。"
+            )
+        package = (
+            self.workspace
+            / "02_processing"
+            / "information"
+            / representation_id
+        )
+        artifact_inventory: list[dict[str, object]] = []
+        for artifact in representation.artifacts:
+            raw = self.representation_repository.read_artifact(
+                representation_id, artifact.artifact_id
+            )
+            if (
+                _sha256_bytes(raw) != artifact.content_hash
+                or len(raw) != artifact.size_bytes
+            ):
+                raise WechatDigestError(
+                    "Batch Governance Representation artifact 漂移。"
+                )
+            artifact_inventory.append(
+                {
+                    "artifact_id": artifact.artifact_id,
+                    "content_hash": artifact.content_hash,
+                    "size_bytes": artifact.size_bytes,
+                }
+            )
+        with SQLiteWorldModelRepository(self.database) as repository:
+            completed_bindings = [
+                self._governance_effect_binding(repository, atomic_id)
+                for atomic_id in completed_ids
+            ]
+            pristine_bindings = [
+                self._governance_effect_binding(repository, atomic_id)
+                for atomic_id in remaining_ids
+            ]
+            for atomic_id, binding in zip(
+                remaining_ids, pristine_bindings, strict=True
+            ):
+                current = self.information_store.get_current(atomic_id)
+                if (
+                    binding["revision_count"] != 1
+                    or binding["proposal_history_count"] != 0
+                    or binding["journal_count"] != 0
+                    or binding["apply_receipt_count"] != 0
+                    or current.related_object_ids
+                ):
+                    raise WechatDigestError(
+                        "Batch Governance remaining3 并非 pristine。"
+                    )
+            business_tree_fingerprint = (
+                self._governance_business_tree_fingerprint(repository)
+            )
+        semantic_summary = _validated_global_attempt_summary(
+            self._semantic_port().global_attempt_summary(representation_id)
+        )
+        if semantic_summary != {
+            "global_attempt_total": 220,
+            "global_unknown": 0,
+            "next_global_ordinal": 221,
+            "absolute_cap": 1000,
+        }:
+            raise WechatDigestError(
+                "Batch Governance migration Semantic ledger 不匹配。"
+            )
+        window_binding = self._semantic_authority_binding(
+            run_id, allow_reviewed_head_extension=True
+        )
+        activation_binding = {
+            "run_id": run_id,
+            "plan_fingerprint": _plan_fingerprint(plan),
+            "plan_receipt_fingerprint": _sha256_bytes(
+                _canonical_json(receipt).encode("utf-8")
+            ),
+            "status_fingerprint": _sha256_bytes(
+                _canonical_json(status).encode("utf-8")
+            ),
+            "capture_fingerprint": _capture_fingerprint(capture),
+            "checkpoint_fingerprint": _sha256_bytes(
+                _canonical_json(
+                    None if checkpoint is None else checkpoint.to_dict()
+                ).encode("utf-8")
+            ),
+            "item_id": item_id,
+            "source_id": source_id,
+            "source_manifest_fingerprint": _sha256_bytes(
+                _canonical_json(source.to_manifest_dict()).encode("utf-8")
+            ),
+            "representation_id": representation_id,
+            "representation_manifest_fingerprint": _sha256_bytes(
+                _canonical_json(representation.to_manifest_dict()).encode("utf-8")
+            ),
+            "representation_artifact_inventory_fingerprint": _sha256_bytes(
+                _canonical_json(artifact_inventory).encode("utf-8")
+            ),
+            "semantic_package_fingerprint": _package_fingerprint(package),
+            "canonical_ordered_atomic_information_ids": list(ordered_ids),
+            "legacy_started_receipt_fingerprint": _sha256_bytes(
+                _canonical_json(legacy_receipt).encode("utf-8")
+            ),
+            "legacy_metrics_fingerprint": _sha256_bytes(
+                _canonical_json(metrics).encode("utf-8")
+            ),
+            "semantic_window_binding_fingerprint": _sha256_bytes(
+                _canonical_json(asdict(window_binding)).encode("utf-8")
+            ),
+        }
+        manifest: dict[str, object] = {
+            "schema_version": BATCH_GOVERNANCE_AUTHORITY_SCHEMA_VERSION,
+            "authority_ref": authority_ref,
+            "implementation_plan_ref": (
+                "https://github.com/leevi2010-cursor/ArcheOS/issues/135"
+                "#issuecomment-5353218136"
+            ),
+            "activation_binding": activation_binding,
+            "completed_atomic_information_ids": list(completed_ids),
+            "remaining_atomic_information_ids": list(remaining_ids),
+            "completed_effect_bindings": completed_bindings,
+            "remaining_pristine_bindings": pristine_bindings,
+            "business_tree_fingerprint": business_tree_fingerprint,
+            "previous_effective_head": (
+                "deaee94fe8c87ec84505a7de10d6f8d35eec87a5"
+            ),
+            "reviewed_git_head": self._semantic_port().reviewed_git_head,
+            "semantic_summary": {
+                **semantic_summary,
+                "last_global_ordinal": 220,
+            },
+        }
+        manifest["manifest_fingerprint"] = _sha256_bytes(
+            _canonical_json(manifest).encode("utf-8")
+        )
+        return _validated_batch_governance_authority_manifest(manifest)
+
+    def build_batch_governance_authority_manifest(
+        self,
+        *,
+        authority_ref: str,
+        completed_atomic_information_ids: Sequence[str],
+        remaining_atomic_information_ids: Sequence[str],
+    ) -> dict[str, object]:
+        """Build a read-only candidate that still requires Lead approval."""
+
+        with self.run_store.lock():
+            return self._build_batch_governance_authority_manifest_unlocked(
+                authority_ref=authority_ref,
+                completed_atomic_information_ids=completed_atomic_information_ids,
+                remaining_atomic_information_ids=remaining_atomic_information_ids,
+            )
+
     def activate_batch_governance(
-        self, *, authority_ref: str
+        self, *, authority_ref: str, authority_manifest_file: Path
     ) -> dict[str, object]:
         """Activate the exact Issue #135 migration without calling Providers."""
 
-        expected_authority = (
-            "https://github.com/leevi2010-cursor/ArcheOS/issues/135"
-            "#issuecomment-5353218136"
-        )
-        if authority_ref != expected_authority:
+        if (
+            re.fullmatch(
+                r"https://github\.com/leevi2010-cursor/ArcheOS/issues/135"
+                r"#issuecomment-[0-9]+",
+                authority_ref,
+            )
+            is None
+            or authority_ref
+            == (
+                "https://github.com/leevi2010-cursor/ArcheOS/issues/135"
+                "#issuecomment-5353218136"
+            )
+        ):
             raise WechatDigestError(
                 "Batch Governance migration authority ref 不匹配。"
             )
+        (
+            authority_manifest,
+            authority_manifest_raw_fingerprint,
+        ) = _read_private_json_manifest(
+            authority_manifest_file
+        )
+        authority_manifest = _validated_batch_governance_authority_manifest(
+            authority_manifest
+        )
+        if authority_manifest["authority_ref"] != authority_ref:
+            raise WechatDigestError(
+                "Batch Governance authority manifest ref 不匹配。"
+            )
         with self.run_store.lock():
-            run_id = self.run_store.active_run_id()
-            if run_id is None:
+            activation_binding = authority_manifest["activation_binding"]
+            manifest_run_id = activation_binding.get("run_id")
+            active_run_id = self.run_store.active_run_id()
+            if (
+                not isinstance(manifest_run_id, str)
+                or (active_run_id is not None and active_run_id != manifest_run_id)
+            ):
                 raise WechatDigestError(
-                    "不存在可迁移 Batch Governance 的 active run。"
+                    "Batch Governance migration run binding 不匹配。"
                 )
+            run_id = active_run_id or manifest_run_id
             plan = self.run_store.plan(run_id)
             if self._plan_all_history_upper(plan) is None:
                 raise WechatDigestError(
@@ -2349,18 +3000,10 @@ class WechatDigestService:
             upper = WechatCursor.from_dict(
                 plan.get("upper_bound"), "plan.upper_bound"
             )
-            if self.run_store.checkpoint() not in {None, after}:
-                raise WechatDigestError(
-                    "Batch Governance migration checkpoint binding 不一致。"
-                )
             capture = self.capture_provider.capture(after, upper_bound=upper)
             self._verify_capture_against_plan(capture, plan)
             status = self.run_store.status(run_id)
             self._verify_plan_and_status(run_id, capture, plan, status)
-            if status.get("checkpoint_published") is not False:
-                raise WechatDigestError(
-                    "Batch Governance migration 不得发生在 checkpoint 推进后。"
-                )
             items = status.get("items")
             if not isinstance(items, dict):
                 raise WechatDigestError("微信运行状态 items 损坏。")
@@ -2371,12 +3014,29 @@ class WechatDigestService:
                 and isinstance(value, dict)
                 and value.get("governance_migration") is not None
             ]
-            if migrated:
+            checkpoint = self.run_store.checkpoint()
+            if not migrated:
                 if (
-                    len(migrated) != 1
-                    or status.get("state") != "processing"
-                    or status.get("failure_category") is not None
+                    active_run_id != run_id
+                    or checkpoint not in {None, after}
+                    or status.get("checkpoint_published") is not False
                 ):
+                    raise WechatDigestError(
+                        "Batch Governance migration checkpoint binding 不一致。"
+                    )
+            elif (
+                status.get("checkpoint_published") is False
+                and checkpoint not in {None, after}
+            ) or (
+                status.get("checkpoint_published") is True
+                and checkpoint != upper
+            ):
+                raise WechatDigestError(
+                    "Batch Governance migration readback checkpoint 漂移。"
+                )
+            migration_pristine_phase = False
+            if migrated:
+                if len(migrated) != 1:
                     raise WechatDigestError(
                         "Batch Governance migration 已存在但状态不一致。"
                     )
@@ -2384,21 +3044,123 @@ class WechatDigestService:
                 migration = _validated_governance_migration(
                     item.get("governance_migration")
                 )
+                governance_receipt = _validated_governance_receipt(
+                    item.get("governance_receipt")
+                )
+                clean_status = (
+                    status.get("state")
+                    in {"processing", "converged", "completed"}
+                    and status.get("failure_category") is None
+                )
+                recoverable_failed_status = (
+                    status.get("state") == "failed"
+                    and isinstance(status.get("failure_category"), str)
+                    and governance_receipt.get("schema_version")
+                    == GOVERNANCE_RECEIPT_SCHEMA_VERSION
+                    and governance_receipt.get("phase")
+                    in {"interpreted", "applying", "applied", "completed"}
+                )
+                if not (clean_status or recoverable_failed_status):
+                    raise WechatDigestError(
+                        "Batch Governance migration 已存在但状态不一致。"
+                    )
+                with SQLiteWorldModelRepository(self.database) as repository:
+                    completed_effects_match = [
+                        self._governance_effect_binding(repository, atomic_id)
+                        for atomic_id in migration[
+                            "completed_atomic_information_ids"
+                        ]
+                    ] == authority_manifest["completed_effect_bindings"]
+                    remaining_effects = [
+                        self._governance_effect_binding(repository, atomic_id)
+                        for atomic_id in migration[
+                            "remaining_atomic_information_ids"
+                        ]
+                    ]
+                migration_pristine_phase = (
+                    governance_receipt.get("schema_version")
+                    == LEGACY_GOVERNANCE_RECEIPT_SCHEMA_VERSION
+                    and governance_receipt.get("phase") == "started"
+                )
+                if migration_pristine_phase:
+                    remaining_effects_match = (
+                        remaining_effects
+                        == authority_manifest["remaining_pristine_bindings"]
+                    )
+                else:
+                    remaining_ids = migration[
+                        "remaining_atomic_information_ids"
+                    ]
+                    next_index = governance_receipt.get("next_index")
+                    if (
+                        governance_receipt.get("schema_version")
+                        != GOVERNANCE_RECEIPT_SCHEMA_VERSION
+                        or governance_receipt.get(
+                            "batch_atomic_information_ids"
+                        )
+                        != remaining_ids
+                        or not isinstance(next_index, int)
+                    ):
+                        raise WechatDigestError(
+                            "Batch Governance migration batch receipt 漂移。"
+                        )
+                    applied_fingerprints = governance_receipt[
+                        "applied_effect_fingerprints"
+                    ]
+                    remaining_effects_match = (
+                        remaining_effects[next_index:]
+                        == authority_manifest["remaining_pristine_bindings"][
+                            next_index:
+                        ]
+                        and all(
+                            remaining_effects[index]["effect_fingerprint"]
+                            == applied_fingerprints[index]
+                            for index in range(next_index)
+                        )
+                    )
                 if (
                     migration.get("authority_ref") != authority_ref
+                    or migration.get("authority_manifest_fingerprint")
+                    != authority_manifest.get("manifest_fingerprint")
+                    or migration.get("authority_manifest_raw_fingerprint")
+                    != authority_manifest_raw_fingerprint
+                    or not completed_effects_match
+                    or not remaining_effects_match
                     or self._governance_effect_fingerprint(
                         migration["completed_atomic_information_ids"]
                     )
                     != migration["legacy_effect_fingerprint"]
-                    or self._governance_effect_fingerprint(
-                        migration["remaining_atomic_information_ids"]
+                    or (
+                        migration_pristine_phase
+                        and self._governance_effect_fingerprint(
+                            migration["remaining_atomic_information_ids"]
+                        )
+                        != migration["pristine_remaining_fingerprint"]
                     )
-                    != migration["pristine_remaining_fingerprint"]
                 ):
                     raise WechatDigestError(
                         "Batch Governance migration durable state 漂移。"
                     )
             else:
+                expected_manifest = (
+                    self._build_batch_governance_authority_manifest_unlocked(
+                        authority_ref=authority_ref,
+                        completed_atomic_information_ids=(
+                            authority_manifest[
+                                "completed_atomic_information_ids"
+                            ]
+                        ),
+                        remaining_atomic_information_ids=(
+                            authority_manifest[
+                                "remaining_atomic_information_ids"
+                            ]
+                        ),
+                    )
+                )
+                if expected_manifest != authority_manifest:
+                    raise WechatDigestError(
+                        "Batch Governance authority manifest 与现场不一致。"
+                    )
                 if (
                     status.get("state") != "failed"
                     or status.get("failure_category") != "BrokenPipeError"
@@ -2472,8 +3234,16 @@ class WechatDigestService:
                     raise WechatDigestError(
                         "Batch Governance migration 旧15条证据不完整。"
                     )
-                completed_ids = ordered_ids[:15]
-                remaining_ids = ordered_ids[15:]
+                completed_ids = tuple(
+                    authority_manifest["completed_atomic_information_ids"]
+                )
+                remaining_ids = tuple(
+                    authority_manifest["remaining_atomic_information_ids"]
+                )
+                if completed_ids + remaining_ids != ordered_ids:
+                    raise WechatDigestError(
+                        "Batch Governance authority IDs 顺序不一致。"
+                    )
                 unresolved = self.proposal_store.list_unresolved()
                 journal = self.journal.list_changes()
                 if any(
@@ -2494,6 +3264,15 @@ class WechatDigestService:
                     "schema_version": GOVERNANCE_MIGRATION_SCHEMA_VERSION,
                     "phase": "activated",
                     "authority_ref": authority_ref,
+                    "implementation_plan_ref": authority_manifest[
+                        "implementation_plan_ref"
+                    ],
+                    "authority_manifest_fingerprint": authority_manifest[
+                        "manifest_fingerprint"
+                    ],
+                    "authority_manifest_raw_fingerprint": (
+                        authority_manifest_raw_fingerprint
+                    ),
                     "legacy_governance_receipt": receipt,
                     "atomic_information_fingerprint": (
                         _governance_atomic_fingerprint(ordered_ids)
@@ -2506,6 +3285,9 @@ class WechatDigestService:
                     ),
                     "pristine_remaining_fingerprint": (
                         self._governance_effect_fingerprint(remaining_ids)
+                    ),
+                    "activation_business_tree_fingerprint": (
+                        authority_manifest["business_tree_fingerprint"]
                     ),
                     "pending_human": any(
                         proposal.atomic_information_id in set(completed_ids)
@@ -2528,6 +3310,18 @@ class WechatDigestService:
                 raise WechatDigestError(
                     "Batch Governance migration Representation 损坏。"
                 )
+            with SQLiteWorldModelRepository(self.database) as repository:
+                activation_business_tree_fingerprint = (
+                    self._governance_business_tree_fingerprint(repository)
+                )
+            if (
+                (not migrated or migration_pristine_phase)
+                and activation_business_tree_fingerprint
+                != authority_manifest.get("business_tree_fingerprint")
+            ):
+                raise WechatDigestError(
+                    "Batch Governance activation 前业务树漂移。"
+                )
             summary = _validated_global_attempt_summary(
                 self._semantic_port().global_attempt_summary(
                     representation_id
@@ -2542,6 +3336,17 @@ class WechatDigestService:
                 raise WechatDigestError(
                     "Batch Governance migration Semantic ledger 不匹配。"
                 )
+            if migrated and not migration_pristine_phase:
+                campaign = self._semantic_port().global_campaign_binding()
+                if (
+                    campaign is None
+                    or campaign.reviewed_git_head
+                    != authority_manifest["reviewed_git_head"]
+                ):
+                    raise WechatDigestError(
+                        "Batch Governance reviewed head readback 漂移。"
+                    )
+                return migration
             continuation = (
                 self._semantic_port().install_batch_governance_continuation(
                     window_binding=self._semantic_authority_binding(
@@ -2572,6 +3377,14 @@ class WechatDigestService:
                     )
                 return migration
 
+            with SQLiteWorldModelRepository(self.database) as repository:
+                if self._governance_business_tree_fingerprint(repository) != (
+                    authority_manifest["business_tree_fingerprint"]
+                ):
+                    raise WechatDigestError(
+                        "Batch Governance continuation 改变了业务树。"
+                    )
+
             migration["semantic_continuation_fingerprint"] = (
                 continuation_fingerprint
             )
@@ -2599,9 +3412,15 @@ class WechatDigestService:
             self.run_store.update_status(run_id, current)
             observed = self.run_store.status(run_id)
             observed_items = observed.get("items")
+            with SQLiteWorldModelRepository(self.database) as repository:
+                business_tree_unchanged = (
+                    self._governance_business_tree_fingerprint(repository)
+                    == authority_manifest["business_tree_fingerprint"]
+                )
             if (
                 observed.get("state") != "processing"
                 or observed.get("failure_category") is not None
+                or not business_tree_unchanged
                 or not isinstance(observed_items, dict)
                 or _validated_governance_migration(
                     self._item(observed_items, item_id).get(
@@ -4848,65 +5667,12 @@ class WechatDigestService:
                     if migration is not None
                     else set()
                 )
-                digestable_ids: list[str] = []
                 scope_ids = (
                     tuple(migration["remaining_atomic_information_ids"])
                     if migration is not None
                     else tuple(atomic_ids)
                 )
-                identity = IdentityGateService(
-                    self.information_store,
-                    repository,
-                    self.proposal_store,
-                    self.journal,
-                    BusinessLanguageHumanJudgmentPort(),
-                )
-                retriever = BoundedInformationCandidateRetriever()
-                for atomic_id in scope_ids:
-                    identity_pending = False
-                    current = self.information_store.get_current(atomic_id)
-                    for concern in current.raw_concerns:
-                        current = self.information_store.get_current(atomic_id)
-                        exact_object_ids = {
-                            assignment.object_id
-                            for record in repository.list_objects()
-                            if record.status == "active"
-                            for assignment in repository.list_names(record.object_id)
-                            if " ".join(assignment.name.split()).casefold()
-                            == " ".join(concern.split()).casefold()
-                        }
-                        if (
-                            len(exact_object_ids) == 1
-                            and exact_object_ids.issubset(current.related_object_ids)
-                        ):
-                            affected.update(exact_object_ids)
-                            continue
-                        result = identity.process(
-                            atomic_id,
-                            IdentityEvidence(
-                                name=concern,
-                                supporting_revision_ids=(current.revision_id,),
-                                identity_bases=(),
-                            ),
-                        )
-                        if result.outcome == "human_review":
-                            identity_pending = True
-                            pending = True
-                            break
-                        if result.object_id is not None:
-                            affected.add(result.object_id)
-                    current = self.information_store.get_current(atomic_id)
-                    pool = self.information_store.list_atomic_information()
-                    retriever.retrieve(
-                        current,
-                        pool[-512:],
-                        pool_complete=len(pool) <= 512,
-                    )
-                    if identity_pending:
-                        affected.update(current.related_object_ids)
-                        continue
-                    digestable_ids.append(atomic_id)
-                batch_ids = tuple(digestable_ids)
+                batch_ids = scope_ids
                 interpretations = (
                     digestion.interpret_batch(batch_ids) if batch_ids else ()
                 )
@@ -4929,16 +5695,81 @@ class WechatDigestService:
                         "微信 Governance resume batch 不属于当前 item。"
                     )
 
+            identity = IdentityGateService(
+                self.information_store,
+                repository,
+                self.proposal_store,
+                self.journal,
+                BusinessLanguageHumanJudgmentPort(),
+            )
+            retriever = BoundedInformationCandidateRetriever()
             for index in range(start_index, len(batch_ids)):
+                atomic_id = batch_ids[index]
+                identity_pending = False
+                current = self.information_store.get_current(atomic_id)
+                for concern in current.raw_concerns:
+                    current = self.information_store.get_current(atomic_id)
+                    exact_object_ids = {
+                        assignment.object_id
+                        for record in repository.list_objects()
+                        if record.status == "active"
+                        for assignment in repository.list_names(record.object_id)
+                        if " ".join(assignment.name.split()).casefold()
+                        == " ".join(concern.split()).casefold()
+                    }
+                    if (
+                        len(exact_object_ids) == 1
+                        and exact_object_ids.issubset(current.related_object_ids)
+                    ):
+                        affected.update(exact_object_ids)
+                        continue
+                    result = identity.process(
+                        atomic_id,
+                        IdentityEvidence(
+                            name=concern,
+                            supporting_revision_ids=(current.revision_id,),
+                            identity_bases=(),
+                        ),
+                    )
+                    if result.outcome == "human_review":
+                        identity_pending = True
+                        pending = True
+                        break
+                    if result.object_id is not None:
+                        affected.add(result.object_id)
+                current = self.information_store.get_current(atomic_id)
+                pool = self.information_store.list_atomic_information()
+                retriever.retrieve(
+                    current,
+                    pool[-512:],
+                    pool_complete=len(pool) <= 512,
+                )
+                if identity_pending:
+                    affected.update(current.related_object_ids)
+                    if self._after_governance_application is not None:
+                        self._after_governance_application(
+                            index + 1,
+                            pending,
+                            tuple(sorted(affected)),
+                            self._governance_effect_binding(
+                                repository, atomic_id
+                            )["effect_fingerprint"],
+                        )
+                    continue
                 digest_result = digestion.apply_interpretation(
-                    batch_ids[index], interpretations[index]
+                    atomic_id, interpretations[index]
                 )
                 if digest_result.proposal_id is not None:
                     pending = True
                 affected.update(digest_result.atomic_information.related_object_ids)
                 if self._after_governance_application is not None:
                     self._after_governance_application(
-                        index + 1, pending, tuple(sorted(affected))
+                        index + 1,
+                        pending,
+                        tuple(sorted(affected)),
+                        self._governance_effect_binding(
+                            repository, atomic_id
+                        )["effect_fingerprint"],
                     )
 
             builder = ContextBuilder(
@@ -5101,6 +5932,7 @@ class WechatDigestService:
                 ),
                 "interpretations": serialized,
                 "next_index": 0,
+                "applied_effect_fingerprints": [],
                 "pending_human": pending,
                 "context_object_ids": sorted(set(object_ids)),
             }
@@ -5113,7 +5945,10 @@ class WechatDigestService:
             batch_persisted = True
 
         def persist_application_progress(
-            next_index: int, pending: bool, object_ids: tuple[str, ...]
+            next_index: int,
+            pending: bool,
+            object_ids: tuple[str, ...],
+            effect_fingerprint: str,
         ) -> None:
             nonlocal latest_batch_receipt
             if latest_batch_receipt is None:
@@ -5121,11 +5956,20 @@ class WechatDigestService:
                     "微信 Governance batch result 尚未持久化。"
                 )
             batch_ids = latest_batch_receipt["batch_atomic_information_ids"]
+            effects = list(
+                latest_batch_receipt["applied_effect_fingerprints"]
+            )
+            if len(effects) != next_index - 1:
+                raise WechatDigestError(
+                    "微信 Governance apply effect cursor 不一致。"
+                )
+            effects.append(effect_fingerprint)
             phase = "applied" if next_index == len(batch_ids) else "applying"
             latest_batch_receipt = {
                 **latest_batch_receipt,
                 "phase": phase,
                 "next_index": next_index,
+                "applied_effect_fingerprints": effects,
                 "pending_human": pending,
                 "context_object_ids": sorted(set(object_ids)),
             }

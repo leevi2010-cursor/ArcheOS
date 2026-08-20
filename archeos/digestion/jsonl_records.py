@@ -63,6 +63,9 @@ class JsonlChangeProposalStore:
             if proposal.status in {"pending", "deferred"}
         )
 
+    def list_history(self) -> tuple[ChangeProposal, ...]:
+        return self._read_history()
+
     def update(self, proposal: ChangeProposal) -> ChangeProposal:
         validate_proposal(proposal)
         history = self._read_history()
