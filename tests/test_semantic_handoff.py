@@ -11293,6 +11293,33 @@ print("passed")
             continuation["previous_execution_contract"],
             continuation["execution_contract"],
         )
+        latest_handoff.validate_timeout_212_resolution_digest(
+            digest_binding=digest,
+            failed_closed_status_fingerprint="sha256:" + "b" * 64,
+            resolution_id=json.loads(
+                (
+                    handoff.audit_root
+                    / "semantic_global_authority"
+                    / "unknown-resolution-ordinal-0212.json"
+                ).read_text(encoding="utf-8")
+            )["resolution_id"],
+        )
+        unknown_166 = json.loads(
+            (
+                handoff.audit_root
+                / "semantic_global_authority"
+                / "unknown-resolution-ordinal-0166.json"
+            ).read_text(encoding="utf-8")
+        )
+        unknown_166_digest = dict(unknown_166["digest"])
+        unknown_166_status_fingerprint = unknown_166_digest.pop(
+            "failed_closed_status_fingerprint"
+        )
+        latest_handoff.validate_unknown_resolution_digest(
+            digest_binding=unknown_166_digest,
+            failed_closed_status_fingerprint=unknown_166_status_fingerprint,
+            resolution_id=unknown_166["resolution_id"],
+        )
         self.assertEqual(
             latest_handoff.install_batch_governance_continuation(
                 CodexCliRepresentationAnalysisProvider(
