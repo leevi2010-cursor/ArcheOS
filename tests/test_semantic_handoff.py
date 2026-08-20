@@ -11320,6 +11320,19 @@ print("passed")
             failed_closed_status_fingerprint=unknown_166_status_fingerprint,
             resolution_id=unknown_166["resolution_id"],
         )
+        historical_replay_runner = FakeRunner()
+        latest_handoff.execute(
+            representation.representation_id,
+            CodexCliRepresentationAnalysisProvider(
+                provider_version="0.147.0",
+                timeout_seconds=300,
+                runner=historical_replay_runner,
+                diagnostic_root=timeout_provider.diagnostic_root,
+            ),
+            privacy_binding=self.privacy_binding(),
+            authority_binding=None,
+        )
+        self.assertEqual(historical_replay_runner.calls, [])
         self.assertEqual(
             latest_handoff.install_batch_governance_continuation(
                 CodexCliRepresentationAnalysisProvider(

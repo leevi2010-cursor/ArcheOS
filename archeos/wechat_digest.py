@@ -227,7 +227,7 @@ class SemanticHandoffPort(Protocol):
         representation_id: str,
         *,
         privacy_binding: SemanticPrivacyBinding,
-        authority_binding: SemanticWindowAuthorityBinding,
+        authority_binding: SemanticWindowAuthorityBinding | None,
     ): ...
 
     def install_global_authority(
@@ -1124,7 +1124,7 @@ class ExistingSemanticHandoff:
         representation_id: str,
         *,
         privacy_binding: SemanticPrivacyBinding,
-        authority_binding: SemanticWindowAuthorityBinding,
+        authority_binding: SemanticWindowAuthorityBinding | None,
     ):
         return self.service.execute(
             representation_id,
@@ -6238,14 +6238,14 @@ class WechatDigestService:
             route=privacy.route,
             receipt_fingerprint=_sha256_bytes(_canonical_json(privacy_payload).encode()),
         )
+        package_exists = self._existing_semantic_package(representation_id)
         result = self._semantic_port().execute(
             representation_id,
             privacy_binding=privacy_binding,
-            authority_binding=self._semantic_authority_binding(
-                run_id,
-                allow_reviewed_head_extension=self._existing_semantic_package(
-                    representation_id
-                ),
+            authority_binding=(
+                None
+                if package_exists
+                else self._semantic_authority_binding(run_id)
             ),
         )
         atomic_ids = tuple(result.ingestion.atomic_information_ids)

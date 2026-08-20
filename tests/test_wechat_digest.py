@@ -271,12 +271,13 @@ class SyntheticSemanticHandoff:
         authority_binding=None,
     ):
         self.latest_representation_id = representation_id
-        if privacy_binding is not None:
-            assert privacy_binding.route == "approved"
-            assert authority_binding is not None
-            self.authority_bindings.append(authority_binding)
         output_root = self.workspace / "02_processing" / "information"
         package = output_root / representation_id
+        if privacy_binding is not None:
+            assert privacy_binding.route == "approved"
+            assert authority_binding is not None or package.exists()
+            if authority_binding is not None:
+                self.authority_bindings.append(authority_binding)
         store = JsonlAtomicInformationStore(
             self.workspace / "03_information" / "atomic_information.jsonl"
         )
