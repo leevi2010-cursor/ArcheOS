@@ -7568,6 +7568,93 @@ class _SemanticGlobalAuthority:
             "continuation_fingerprint": _fingerprint(without_fingerprint),
         }
 
+    def governance_startup_recovery_continuation(
+        self,
+        *,
+        provider: CodexCliRepresentationAnalysisProvider,
+        reviewed_git_head: str,
+        authority_ref: str,
+        authority_manifest_fingerprint: str,
+        authority_manifest_raw_fingerprint: str,
+    ) -> dict[str, object] | None:
+        """Read and verify an existing Issue #150 continuation without writing."""
+
+        with self._locked():
+            grant = self._read_base_grant()
+            extension = self._read_extension(grant)
+            resolution = self._read_unknown_resolution()
+            maintenance = self._read_maintenance_continuation(
+                grant, extension, resolution
+            )
+            timeout_resolution = self._read_timeout_212_resolution(
+                grant, extension, resolution, maintenance
+            )
+            batch_continuation = self._read_batch_governance_continuation(
+                grant, extension, resolution, maintenance, timeout_resolution
+            )
+            gate_c = self._read_gate_c_continuation(
+                grant,
+                extension,
+                resolution,
+                maintenance,
+                timeout_resolution,
+                batch_continuation,
+            )
+            segmented = self._read_segmented_gate_c_continuation(
+                grant,
+                extension,
+                resolution,
+                maintenance,
+                timeout_resolution,
+                batch_continuation,
+                gate_c,
+            )
+            observed = self._read_governance_startup_recovery_continuation(
+                grant,
+                extension,
+                resolution,
+                maintenance,
+                timeout_resolution,
+                batch_continuation,
+                gate_c,
+                segmented,
+            )
+            if observed is None:
+                return None
+            effective = self._effective_authority(
+                grant,
+                extension,
+                resolution,
+                maintenance,
+                timeout_resolution,
+                batch_continuation,
+                gate_c,
+                segmented,
+                observed,
+            )
+            attempts, unknown = self._global_attempts(effective)
+            total = int(grant["baseline_total"]) + len(attempts)
+            if (
+                total != 298
+                or unknown
+                or not attempts
+                or attempts[-1].get("global_ordinal") != 298
+                or observed.get("previous_reviewed_git_head")
+                != "67d159411e968c6b0c2f787f9063a22682c10fb9"
+                or observed.get("reviewed_git_head") != reviewed_git_head
+                or observed.get("authority_ref") != authority_ref
+                or observed.get("authority_manifest_fingerprint")
+                != authority_manifest_fingerprint
+                or observed.get("authority_manifest_raw_fingerprint")
+                != authority_manifest_raw_fingerprint
+                or observed.get("execution_contract")
+                != self._contract_payload(provider)
+            ):
+                raise SemanticHandoffError(
+                    "Semantic Governance 启动恢复 continuation 无法安全接管。"
+                )
+            return dict(observed)
+
     def install_governance_startup_recovery_continuation(
         self,
         *,
@@ -10535,6 +10622,29 @@ class ExternalAgentSemanticHandoffService:
             self.audit_root
         ).install_governance_startup_recovery_continuation(
             window=window_binding,
+            provider=provider,
+            reviewed_git_head=reviewed_git_head,
+            authority_ref=authority_ref,
+            authority_manifest_fingerprint=authority_manifest_fingerprint,
+            authority_manifest_raw_fingerprint=(
+                authority_manifest_raw_fingerprint
+            ),
+        )
+
+    def governance_startup_recovery_continuation(
+        self,
+        provider: CodexCliRepresentationAnalysisProvider,
+        *,
+        reviewed_git_head: str,
+        authority_ref: str,
+        authority_manifest_fingerprint: str,
+        authority_manifest_raw_fingerprint: str,
+    ) -> dict[str, object] | None:
+        """Inspect an existing Issue #150 continuation without writing."""
+
+        return _SemanticGlobalAuthority(
+            self.audit_root
+        ).governance_startup_recovery_continuation(
             provider=provider,
             reviewed_git_head=reviewed_git_head,
             authority_ref=authority_ref,

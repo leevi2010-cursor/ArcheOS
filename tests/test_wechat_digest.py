@@ -589,6 +589,29 @@ class SyntheticSemanticHandoff:
         )
         return expected
 
+    def governance_startup_recovery_continuation(
+        self,
+        *,
+        authority_ref,
+        authority_manifest_fingerprint,
+        authority_manifest_raw_fingerprint,
+    ):
+        observed = self.installed_governance_startup_recovery_continuation
+        if observed is None:
+            return None
+        if (
+            observed["authority_ref"] != authority_ref
+            or observed["authority_manifest_fingerprint"]
+            != authority_manifest_fingerprint
+            or observed["authority_manifest_raw_fingerprint"]
+            != authority_manifest_raw_fingerprint
+            or observed["reviewed_git_head"] != self.reviewed_git_head
+            or self.global_attempt_total != 298
+            or self.global_unknown != 0
+        ):
+            raise RuntimeError("synthetic startup recovery inspection drift")
+        return dict(observed)
+
     def global_campaign_binding(self):
         return self.campaign_binding
 
@@ -3013,6 +3036,72 @@ class WechatDigestTests(unittest.TestCase):
         )
         self.assertEqual(observed, durable_receipt)
         self.assertEqual(provider.attempts, 1)
+
+    def test_governance_startup_adopts_semantic_continuation_before_receipt(
+        self,
+    ) -> None:
+        service, provider, run_id, item_id, atomic_ids = (
+            self.governance_startup_recovery_fixture()
+        )
+        authority_ref = (
+            "https://github.com/leevi2010-cursor/ArcheOS/issues/150"
+            "#issuecomment-1234567890"
+        )
+        manifest = service.build_governance_startup_recovery_manifest(
+            authority_ref=authority_ref
+        )
+        manifest_path = Path(self.temporary.name) / "issue-150-semantic-crash.json"
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+        os.chmod(manifest_path, 0o600)
+        business_before = self.governance_business_state(service)
+        provider_attempts = provider.attempts
+        semantic_calls = self.semantic.provider.calls
+
+        with patch.object(
+            service.run_store,
+            "publish_governance_startup_receipt",
+            side_effect=OSError("synthetic pre-business-receipt interruption"),
+        ):
+            with self.assertRaises(OSError):
+                service.resolve_governance_startup_failure(
+                    authority_ref=authority_ref,
+                    authority_manifest_file=manifest_path,
+                )
+
+        continuation = dict(
+            self.semantic.installed_governance_startup_recovery_continuation
+        )
+        self.assertIsNone(
+            service.run_store.governance_startup_recovery(run_id)
+        )
+        self.assertEqual(
+            service.run_store.status(run_id)["items"][item_id][
+                "atomic_information_ids"
+            ],
+            [],
+        )
+        receipt = service.resolve_governance_startup_failure(
+            authority_ref=authority_ref,
+            authority_manifest_file=manifest_path,
+        )
+
+        self.assertEqual(
+            self.semantic.installed_governance_startup_recovery_continuation,
+            continuation,
+        )
+        self.assertEqual(provider.attempts, provider_attempts)
+        self.assertEqual(self.semantic.provider.calls, semantic_calls)
+        self.assertEqual(self.governance_business_state(service), business_before)
+        self.assertEqual(
+            receipt["semantic_continuation_fingerprint"],
+            continuation["continuation_fingerprint"],
+        )
+        status = service.run_store.status(run_id)
+        self.assertEqual(status["state"], "processing")
+        self.assertIsNone(status["failure_category"])
+        self.assertEqual(
+            status["items"][item_id]["atomic_information_ids"], atomic_ids
+        )
 
     def test_governance_startup_rejects_non_pristine_evidence_zero_provider(
         self,

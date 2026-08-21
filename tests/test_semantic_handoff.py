@@ -11578,6 +11578,23 @@ print("passed")
             startup_continuation["previous_execution_contract"],
             startup_continuation["execution_contract"],
         )
+        inspect_runner = FakeRunner()
+        self.assertEqual(
+            handoff_298.governance_startup_recovery_continuation(
+                CodexCliRepresentationAnalysisProvider(
+                    provider_version="0.147.0",
+                    timeout_seconds=300,
+                    runner=inspect_runner,
+                    diagnostic_root=timeout_provider.diagnostic_root,
+                ),
+                reviewed_git_head=startup_head,
+                authority_ref=startup_authority_ref,
+                authority_manifest_fingerprint="sha256:" + "a" * 64,
+                authority_manifest_raw_fingerprint="sha256:" + "b" * 64,
+            ),
+            startup_continuation,
+        )
+        self.assertEqual(inspect_runner.calls, [])
         self.assertEqual(
             handoff_298.install_governance_startup_recovery_continuation(
                 CodexCliRepresentationAnalysisProvider(

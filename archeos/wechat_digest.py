@@ -290,6 +290,14 @@ class SemanticHandoffPort(Protocol):
         authority_manifest_raw_fingerprint: str,
     ) -> dict[str, object]: ...
 
+    def governance_startup_recovery_continuation(
+        self,
+        *,
+        authority_ref: str,
+        authority_manifest_fingerprint: str,
+        authority_manifest_raw_fingerprint: str,
+    ) -> dict[str, object] | None: ...
+
     def resolve_unknown(
         self,
         *,
@@ -1434,6 +1442,23 @@ class ExistingSemanticHandoff:
         return self.service.install_governance_startup_recovery_continuation(
             self.provider,
             window_binding=window_binding,
+            reviewed_git_head=self.reviewed_git_head,
+            authority_ref=authority_ref,
+            authority_manifest_fingerprint=authority_manifest_fingerprint,
+            authority_manifest_raw_fingerprint=(
+                authority_manifest_raw_fingerprint
+            ),
+        )
+
+    def governance_startup_recovery_continuation(
+        self,
+        *,
+        authority_ref: str,
+        authority_manifest_fingerprint: str,
+        authority_manifest_raw_fingerprint: str,
+    ) -> dict[str, object] | None:
+        return self.service.governance_startup_recovery_continuation(
+            self.provider,
             reviewed_git_head=self.reviewed_git_head,
             authority_ref=authority_ref,
             authority_manifest_fingerprint=authority_manifest_fingerprint,
@@ -3113,7 +3138,10 @@ class WechatDigestService:
             return continuation
 
     def _build_governance_startup_recovery_manifest_unlocked(
-        self, *, authority_ref: str
+        self,
+        *,
+        authority_ref: str,
+        adopted_continuation: Mapping[str, object] | None = None,
     ) -> dict[str, object]:
         run_id = self.run_store.active_run_id()
         if run_id is None:
@@ -3241,6 +3269,26 @@ class WechatDigestService:
         window_binding = self._semantic_authority_binding(
             run_id, allow_reviewed_head_extension=True
         )
+        if adopted_continuation is not None:
+            previous_head = adopted_continuation.get(
+                "previous_reviewed_git_head"
+            )
+            reviewed_head = adopted_continuation.get("reviewed_git_head")
+            if (
+                previous_head
+                != "67d159411e968c6b0c2f787f9063a22682c10fb9"
+                or reviewed_head != self._semantic_port().reviewed_git_head
+            ):
+                raise WechatDigestError(
+                    "Governance 启动恢复 continuation head binding 漂移。"
+                )
+            window_binding = replace(
+                window_binding,
+                reviewed_git_head=str(previous_head),
+            )
+        else:
+            previous_head = window_binding.reviewed_git_head
+            reviewed_head = self._semantic_port().reviewed_git_head
         recovery_binding = {
             "run_id": run_id,
             "plan_fingerprint": _plan_fingerprint(plan),
@@ -3288,8 +3336,6 @@ class WechatDigestService:
                 _canonical_json(asdict(window_binding)).encode("utf-8")
             ),
         }
-        previous_head = window_binding.reviewed_git_head
-        reviewed_head = self._semantic_port().reviewed_git_head
         candidate: dict[str, object] = {
             "schema_version": GOVERNANCE_STARTUP_RECOVERY_MANIFEST_SCHEMA_VERSION,
             "authority_ref": authority_ref,
@@ -3338,17 +3384,9 @@ class WechatDigestService:
                 raise WechatDigestError("Governance 启动恢复 active run 不匹配。")
             existing = self.run_store.governance_startup_recovery(run_id)
             if existing is None:
-                expected = self._build_governance_startup_recovery_manifest_unlocked(
-                    authority_ref=authority_ref
-                )
-                if expected != manifest:
-                    raise WechatDigestError("Governance 启动恢复 manifest 与现场不匹配。")
-                continuation = (
+                semantic_continuation = (
                     self._semantic_port()
-                    .install_governance_startup_recovery_continuation(
-                        window_binding=self._semantic_authority_binding(
-                            run_id, allow_reviewed_head_extension=True
-                        ),
+                    .governance_startup_recovery_continuation(
                         authority_ref=authority_ref,
                         authority_manifest_fingerprint=str(
                             manifest["manifest_fingerprint"]
@@ -3356,6 +3394,26 @@ class WechatDigestService:
                         authority_manifest_raw_fingerprint=raw_fingerprint,
                     )
                 )
+                expected = self._build_governance_startup_recovery_manifest_unlocked(
+                    authority_ref=authority_ref,
+                    adopted_continuation=semantic_continuation,
+                )
+                if expected != manifest:
+                    raise WechatDigestError("Governance 启动恢复 manifest 与现场不匹配。")
+                if semantic_continuation is None:
+                    semantic_continuation = (
+                        self._semantic_port()
+                        .install_governance_startup_recovery_continuation(
+                            window_binding=self._semantic_authority_binding(
+                                run_id, allow_reviewed_head_extension=True
+                            ),
+                            authority_ref=authority_ref,
+                            authority_manifest_fingerprint=str(
+                                manifest["manifest_fingerprint"]
+                            ),
+                            authority_manifest_raw_fingerprint=raw_fingerprint,
+                        )
+                    )
                 receipt_without_fingerprint: dict[str, object] = {
                     "schema_version": GOVERNANCE_STARTUP_RECOVERY_SCHEMA_VERSION,
                     "artifact_kind": "governance_startup_recovery",
@@ -3371,7 +3429,7 @@ class WechatDigestService:
                     "business_tree_fingerprint": manifest[
                         "business_tree_fingerprint"
                     ],
-                    "semantic_continuation_fingerprint": continuation[
+                    "semantic_continuation_fingerprint": semantic_continuation[
                         "continuation_fingerprint"
                     ],
                     "provider_retry_permitted": True,
