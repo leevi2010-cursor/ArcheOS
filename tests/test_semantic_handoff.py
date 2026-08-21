@@ -58,6 +58,7 @@ from archeos.semantic_handoff import (
     SemanticHandoffError,
     SemanticPrivacyBinding,
     SemanticWindowAuthorityBinding,
+    _SemanticGlobalAuthority,
     _package_fingerprint,
     validate_completed_published_audits,
 )
@@ -11443,6 +11444,107 @@ print("passed")
         self.assertEqual(
             attempt_221["global_authority_fingerprint"],
             gate_c_continuation["continuation_fingerprint"],
+        )
+
+        latest_handoff = next_handoff
+        gate_c_window = replace(active_window, reviewed_git_head=gate_c_head)
+        for ordinal in range(222, 298):
+            item_root = root / f"ordinal-{ordinal:04d}"
+            ordinal_representation, ordinal_service = self.build_service(
+                root=item_root,
+                source_id=f"src_{ordinal:032x}",
+            )
+            latest_handoff = ExternalAgentSemanticHandoffService(
+                ordinal_service,
+                JsonlAtomicInformationStore(item_root / "atomic.jsonl"),
+                handoff.audit_root,
+            )
+            ordinal_runner = FakeRunner()
+            latest_handoff.execute(
+                ordinal_representation.representation_id,
+                CodexCliRepresentationAnalysisProvider(
+                    provider_version="0.147.0",
+                    timeout_seconds=300,
+                    runner=ordinal_runner,
+                    diagnostic_root=timeout_provider.diagnostic_root,
+                ),
+                privacy_binding=self.privacy_binding(),
+                authority_binding=gate_c_window,
+            )
+            self.assertEqual(len(ordinal_runner.calls), 1)
+
+        segmented_head = "d" * 40
+        segmented_authority_ref = (
+            "https://github.com/leevi2010-cursor/ArcheOS/issues/148"
+            "#issuecomment-5363000000"
+        )
+        segmented_runner = FakeRunner()
+        segmented_continuation = (
+            latest_handoff.install_segmented_gate_c_continuation(
+                CodexCliRepresentationAnalysisProvider(
+                    provider_version="0.147.0",
+                    timeout_seconds=300,
+                    runner=segmented_runner,
+                    diagnostic_root=timeout_provider.diagnostic_root,
+                ),
+                window_binding=gate_c_window,
+                reviewed_git_head=segmented_head,
+                authority_ref=segmented_authority_ref,
+            )
+        )
+        self.assertEqual(segmented_runner.calls, [])
+        self.assertEqual(segmented_continuation["activation_total"], 297)
+        self.assertEqual(segmented_continuation["next_global_ordinal"], 298)
+
+        old_head_runner = FakeRunner()
+        with self.assertRaises(SemanticHandoffError):
+            _SemanticGlobalAuthority(handoff.audit_root)._load_grant(
+                gate_c_window,
+                CodexCliRepresentationAnalysisProvider(
+                    provider_version="0.147.0",
+                    timeout_seconds=300,
+                    runner=old_head_runner,
+                    diagnostic_root=timeout_provider.diagnostic_root,
+                ),
+            )
+        self.assertEqual(old_head_runner.calls, [])
+
+        ordinal_298_root = root / "ordinal-0298"
+        representation_298, service_298 = self.build_service(
+            root=ordinal_298_root,
+            source_id=f"src_{298:032x}",
+        )
+        handoff_298 = ExternalAgentSemanticHandoffService(
+            service_298,
+            JsonlAtomicInformationStore(ordinal_298_root / "atomic.jsonl"),
+            handoff.audit_root,
+        )
+        runner_298 = FakeRunner()
+        handoff_298.execute(
+            representation_298.representation_id,
+            CodexCliRepresentationAnalysisProvider(
+                provider_version="0.147.0",
+                timeout_seconds=300,
+                runner=runner_298,
+                diagnostic_root=timeout_provider.diagnostic_root,
+            ),
+            privacy_binding=self.privacy_binding(),
+            authority_binding=replace(
+                gate_c_window, reviewed_git_head=segmented_head
+            ),
+        )
+        self.assertEqual(len(runner_298.calls), 1)
+        attempt_298 = next(
+            json.loads(path.read_text(encoding="utf-8"))
+            for path in handoff.audit_root.glob("semantic_run_*/attempts/*.json")
+            if json.loads(path.read_text(encoding="utf-8")).get(
+                "global_ordinal"
+            )
+            == 298
+        )
+        self.assertEqual(
+            attempt_298["global_authority_fingerprint"],
+            segmented_continuation["continuation_fingerprint"],
         )
 
 

@@ -63,9 +63,55 @@ class CliTest(unittest.TestCase):
         self.assertIn("已形成长期信息但治理未完整确认：0", output.getvalue())
         self.assertIn("checkpoint：已推进", output.getvalue())
         digest_service.return_value.run.assert_called_once_with(
-            since=None, from_now=True, all_history=False
+            since=None,
+            from_now=True,
+            all_history=False,
+            max_terminal_items=3,
         )
         capture_provider.assert_called_once()
+
+    @patch("archeos.cli.WechatDigestService")
+    @patch("archeos.cli.WechatCliCaptureProvider")
+    @patch("archeos.cli.require_workspace")
+    def test_wechat_digest_reports_safe_segment_boundary(
+        self,
+        require_workspace: Mock,
+        _capture_provider: Mock,
+        digest_service: Mock,
+    ) -> None:
+        require_workspace.return_value = WorkspaceConfig(
+            Path("/workspace"), Path("/config")
+        )
+        digest_service.return_value.run.return_value = WechatDigestResult(
+            run_id="run_" + "b" * 32,
+            new_messages=4,
+            new_attachments=0,
+            durable_information=2,
+            local_only=0,
+            unsupported=0,
+            pending_human=1,
+            context_objects=0,
+            checkpoint_published=False,
+            replayed=True,
+            segment_safe_stopped=True,
+            segment_items_completed=1,
+            segment_remaining_items=3,
+            segment_stop_reason="item_limit",
+            segment_receipt_fingerprint="sha256:" + "c" * 64,
+        )
+        output = StringIO()
+        with redirect_stdout(output):
+            result = main(
+                ["wechat", "digest", "--max-items-per-run", "1"]
+            )
+        self.assertEqual(result, 0)
+        self.assertIn("本段已安全完成：1 项；当前窗口剩余 3 项。", output.getvalue())
+        digest_service.return_value.run.assert_called_once_with(
+            since=None,
+            from_now=False,
+            all_history=False,
+            max_terminal_items=1,
+        )
 
     @patch("archeos.cli.WechatDigestService")
     @patch("archeos.cli.WechatCliCaptureProvider")
@@ -281,6 +327,56 @@ class CliTest(unittest.TestCase):
         digest_service.return_value.install_semantic_gate_c_continuation.assert_called_once_with(
             authority_ref=authority_ref
         )
+        digest_service.return_value.run.assert_not_called()
+        capture_provider.assert_called_once()
+
+    @patch("archeos.cli.WechatDigestService")
+    @patch("archeos.cli.WechatCliCaptureProvider")
+    @patch("archeos.cli.require_workspace")
+    def test_wechat_digest_installs_segmented_gate_c_continuation_zero_calls(
+        self,
+        require_workspace: Mock,
+        capture_provider: Mock,
+        digest_service: Mock,
+    ) -> None:
+        require_workspace.return_value = WorkspaceConfig(
+            Path("/workspace"), Path("/config")
+        )
+        authority_ref = (
+            "https://github.com/leevi2010-cursor/ArcheOS/issues/148"
+            "#issuecomment-1234567890"
+        )
+        method = (
+            digest_service.return_value
+            .install_semantic_segmented_gate_c_continuation
+        )
+        method.return_value = {
+            "activation_total": 297,
+            "activation_unknown_count": 0,
+            "next_global_ordinal": 298,
+            "absolute_cap": 1000,
+            "previous_reviewed_git_head": "8" * 40,
+            "reviewed_git_head": "9" * 40,
+            "continuation_fingerprint": "sha256:" + "a" * 64,
+        }
+        output = StringIO()
+        with redirect_stdout(output):
+            result = main(
+                [
+                    "wechat",
+                    "digest",
+                    "--install-semantic-segmented-gate-c-continuation",
+                    "--authority-ref",
+                    authority_ref,
+                ]
+            )
+        self.assertEqual(result, 0)
+        payload = json.loads(output.getvalue())
+        self.assertEqual(payload["semantic_provider_calls"], 0)
+        self.assertEqual(payload["governance_provider_calls"], 0)
+        self.assertEqual(payload["global_attempt_total"], 297)
+        self.assertEqual(payload["next_global_ordinal"], 298)
+        method.assert_called_once_with(authority_ref=authority_ref)
         digest_service.return_value.run.assert_not_called()
         capture_provider.assert_called_once()
 

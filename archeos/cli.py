@@ -71,6 +71,7 @@ DEFAULT_WORLD_MODEL_DATABASE = Path("04_core/archeos.sqlite3")
 DEFAULT_ATOMIC_INFORMATION_STORE = Path("03_information/atomic_information.jsonl")
 DEFAULT_CHANGE_PROPOSAL_STORE = Path("03_information/change_proposals.jsonl")
 DEFAULT_CHANGE_JOURNAL = Path("03_information/change_journal.jsonl")
+DEFAULT_WECHAT_DIGEST_MAX_ITEMS = 3
 DEFAULT_MANAGED_SOURCE_ROOT = Path("01_inbox")
 DEFAULT_REPRESENTATION_ROOT = Path("02_processing/representations")
 DEFAULT_REPRESENTATION_INFORMATION_ROOT = Path("02_processing/information")
@@ -562,6 +563,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--batch-size", type=int, default=DEFAULT_EXTERNAL_AGENT_BATCH_SIZE
     )
     wechat_digest.add_argument(
+        "--max-items-per-run",
+        type=int,
+        default=DEFAULT_WECHAT_DIGEST_MAX_ITEMS,
+        help="每次最多完整处理的业务项数量；仅在项目终态边界停止。",
+    )
+    wechat_digest.add_argument(
         "--prepare-next-semantic",
         action="store_true",
         help="仅准备下一 semantic batch；不新增 Semantic Handoff 调用。",
@@ -595,6 +602,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--install-semantic-gate-c-continuation",
         action="store_true",
         help="零 Provider 安装 Issue #146 Gate C 版本续接。",
+    )
+    wechat_digest.add_argument(
+        "--install-semantic-segmented-gate-c-continuation",
+        action="store_true",
+        help="零 Provider 安装 Issue #148 短执行段版本续接。",
     )
     wechat_digest.add_argument(
         "--activate-batch-governance",
@@ -1047,6 +1059,7 @@ def _wechat_product_command(args: argparse.Namespace) -> int:
             args.install_semantic_authority_extension,
             args.install_semantic_maintenance_continuation,
             args.install_semantic_gate_c_continuation,
+            args.install_semantic_segmented_gate_c_continuation,
             args.activate_batch_governance,
             args.resolve_semantic_unknown,
             args.resolve_semantic_timeout_212,
@@ -1083,6 +1096,7 @@ def _wechat_product_command(args: argparse.Namespace) -> int:
     if (
         args.install_semantic_maintenance_continuation
         or args.install_semantic_gate_c_continuation
+        or args.install_semantic_segmented_gate_c_continuation
         or args.activate_batch_governance
     ):
         if args.authority_ref is None:
@@ -1283,6 +1297,40 @@ def _wechat_product_command(args: argparse.Namespace) -> int:
                 )
             )
             return 0
+        if args.install_semantic_segmented_gate_c_continuation:
+            continuation = (
+                service.install_semantic_segmented_gate_c_continuation(
+                    authority_ref=args.authority_ref,
+                )
+            )
+            print(
+                json.dumps(
+                    {
+                        "semantic_provider_calls": 0,
+                        "governance_provider_calls": 0,
+                        "global_attempt_total": continuation["activation_total"],
+                        "global_unknown": continuation[
+                            "activation_unknown_count"
+                        ],
+                        "next_global_ordinal": continuation[
+                            "next_global_ordinal"
+                        ],
+                        "absolute_cap": continuation["absolute_cap"],
+                        "previous_reviewed_git_head": continuation[
+                            "previous_reviewed_git_head"
+                        ],
+                        "reviewed_git_head": continuation[
+                            "reviewed_git_head"
+                        ],
+                        "continuation_fingerprint": continuation[
+                            "continuation_fingerprint"
+                        ],
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                )
+            )
+            return 0
         if args.activate_batch_governance:
             migration = service.activate_batch_governance(
                 authority_ref=args.authority_ref,
@@ -1374,6 +1422,7 @@ def _wechat_product_command(args: argparse.Namespace) -> int:
             since=args.since,
             from_now=args.from_now,
             all_history=args.all_history,
+            max_terminal_items=args.max_items_per_run,
         )
     except (
         OSError,
@@ -1415,6 +1464,12 @@ def _wechat_product_command(args: argparse.Namespace) -> int:
         f"{result.governance_timeouts} / {result.governance_failures}"
     )
     print(f"checkpoint：{checkpoint}")
+    if result.segment_safe_stopped:
+        print(
+            "本段已安全完成："
+            f"{result.segment_items_completed} 项；"
+            f"当前窗口剩余 {result.segment_remaining_items} 项。"
+        )
     return 0
 
 

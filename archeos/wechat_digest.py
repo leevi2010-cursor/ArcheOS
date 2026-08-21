@@ -19,7 +19,7 @@ import tempfile
 import time
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager, nullcontext
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Protocol
@@ -78,6 +78,7 @@ LEGACY_RUN_PLAN_SCHEMA_VERSION = "wechat-digest-run-plan/1.0"
 RUN_STATUS_SCHEMA_VERSION = "wechat-digest-run-status/1.0"
 RUN_PLAN_RECEIPT_SCHEMA_VERSION = "wechat-digest-run-plan-receipt/2.0"
 LEGACY_RUN_PLAN_RECEIPT_SCHEMA_VERSION = "wechat-digest-run-plan-receipt/1.0"
+RUN_SEGMENT_RECEIPT_SCHEMA_VERSION = "wechat-digest-run-segment-receipt/1.0"
 GOVERNANCE_RECEIPT_SCHEMA_VERSION = "wechat-governance-receipt/2.0"
 LEGACY_GOVERNANCE_RECEIPT_SCHEMA_VERSION = "wechat-governance-receipt/1.0"
 GOVERNANCE_MIGRATION_SCHEMA_VERSION = "wechat-governance-migration/1.0"
@@ -258,6 +259,13 @@ class SemanticHandoffPort(Protocol):
     ) -> dict[str, object]: ...
 
     def install_gate_c_continuation(
+        self,
+        *,
+        window_binding: SemanticWindowAuthorityBinding,
+        authority_ref: str,
+    ) -> dict[str, object]: ...
+
+    def install_segmented_gate_c_continuation(
         self,
         *,
         window_binding: SemanticWindowAuthorityBinding,
@@ -759,6 +767,7 @@ class WechatDigestRunStore:
         before_create_status_write: Callable[[], None] | None = None,
         before_create_receipt_write: Callable[[], None] | None = None,
         before_create_active_write: Callable[[], None] | None = None,
+        before_segment_receipt_write: Callable[[], None] | None = None,
     ) -> None:
         self.root = Path(root)
         self.runs_root = self.root / "runs"
@@ -778,6 +787,7 @@ class WechatDigestRunStore:
         self.before_create_status_write = before_create_status_write
         self.before_create_receipt_write = before_create_receipt_write
         self.before_create_active_write = before_create_active_write
+        self.before_segment_receipt_write = before_segment_receipt_write
 
     @contextmanager
     def lock(self) -> Iterator[None]:
@@ -937,6 +947,90 @@ class WechatDigestRunStore:
         _atomic_write_json(self.runs_root / run_id / "status.json", status)
         if self.status(run_id) != status:
             raise WechatDigestError("微信运行状态写入读回失败。")
+
+    def publish_segment_receipt(
+        self,
+        run_id: str,
+        *,
+        status: Mapping[str, object],
+        completed_items: int,
+        remaining_items: int,
+        stop_reason: str,
+    ) -> dict[str, object]:
+        if (
+            isinstance(completed_items, bool)
+            or not isinstance(completed_items, int)
+            or completed_items < 1
+            or isinstance(remaining_items, bool)
+            or not isinstance(remaining_items, int)
+            or remaining_items < 0
+            or stop_reason != "item_limit"
+        ):
+            raise WechatDigestError("微信短执行段摘要无效。")
+        current = self.status(run_id)
+        if current != status or current.get("state") not in {
+            "processing",
+            "completed",
+        }:
+            raise WechatDigestError("微信短执行段状态无法安全读回。")
+        status_fingerprint = _sha256_bytes(
+            _canonical_json(current).encode("utf-8")
+        )
+        without_fingerprint: dict[str, object] = {
+            "schema_version": RUN_SEGMENT_RECEIPT_SCHEMA_VERSION,
+            "run_id": run_id,
+            "stop_reason": stop_reason,
+            "completed_items": completed_items,
+            "remaining_items": remaining_items,
+            "checkpoint_published": bool(current.get("checkpoint_published")),
+            "status_fingerprint": status_fingerprint,
+            "stopped_at": current.get("updated_at"),
+        }
+        receipt = {
+            **without_fingerprint,
+            "receipt_fingerprint": _sha256_bytes(
+                _canonical_json(without_fingerprint).encode("utf-8")
+            ),
+        }
+        segment_root = self.runs_root / run_id / "segments"
+        segment_root.mkdir(parents=True, exist_ok=True)
+        path = segment_root / f"segment-{status_fingerprint.removeprefix('sha256:')}.json"
+        if self.before_segment_receipt_write is not None:
+            self.before_segment_receipt_write()
+        if path.exists():
+            observed = self._read_json(path)
+            if observed != receipt:
+                raise WechatDigestError("微信短执行段 receipt 已存在且不一致。")
+        else:
+            encoded = (_canonical_json(receipt) + "\n").encode("utf-8")
+            descriptor, temporary_name = tempfile.mkstemp(
+                prefix=".segment-", dir=segment_root
+            )
+            temporary_path = Path(temporary_name)
+            try:
+                os.fchmod(descriptor, 0o600)
+                with os.fdopen(descriptor, "wb") as handle:
+                    handle.write(encoded)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                try:
+                    os.link(temporary_path, path, follow_symlinks=False)
+                except FileExistsError:
+                    if self._read_json(path) != receipt:
+                        raise WechatDigestError(
+                            "微信短执行段 receipt 已存在且不一致。"
+                        )
+            finally:
+                if temporary_path.exists():
+                    temporary_path.unlink()
+            directory_fd = os.open(segment_root, os.O_RDONLY)
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+        if self._read_json(path) != receipt:
+            raise WechatDigestError("微信短执行段 receipt 读回失败。")
+        return receipt
 
     def complete_upgrade(
         self, run_id: str, plan: dict[str, object], status: dict[str, object]
@@ -1202,6 +1296,19 @@ class ExistingSemanticHandoff:
             authority_ref=authority_ref,
         )
 
+    def install_segmented_gate_c_continuation(
+        self,
+        *,
+        window_binding: SemanticWindowAuthorityBinding,
+        authority_ref: str,
+    ) -> dict[str, object]:
+        return self.service.install_segmented_gate_c_continuation(
+            self.provider,
+            window_binding=window_binding,
+            reviewed_git_head=self.reviewed_git_head,
+            authority_ref=authority_ref,
+        )
+
     def resolve_unknown(
         self,
         *,
@@ -1296,6 +1403,11 @@ class WechatDigestResult:
     failed_closed: int = 0
     semantic_preserved_but_unabsorbed: int = 0
     governance_preserved_but_incomplete: int = 0
+    segment_safe_stopped: bool = False
+    segment_items_completed: int = 0
+    segment_remaining_items: int = 0
+    segment_stop_reason: str | None = None
+    segment_receipt_fingerprint: str | None = None
 
 
 def _empty_governance_metrics() -> dict[str, object]:
@@ -2653,6 +2765,112 @@ class WechatDigestService:
             ):
                 raise WechatDigestError(
                     "Semantic Gate C continuation 安装读回失败。"
+                )
+            return continuation
+
+    def install_semantic_segmented_gate_c_continuation(
+        self, *, authority_ref: str
+    ) -> dict[str, object]:
+        """Install the fixed Issue #148 short-run continuation, zero Provider."""
+
+        with self.run_store.lock():
+            run_id = self.run_store.active_run_id()
+            if run_id is None:
+                raise WechatDigestError(
+                    "不存在可绑定 Semantic segmented Gate C continuation 的 active run。"
+                )
+            plan = self.run_store.plan(run_id)
+            if self._plan_all_history_upper(plan) is None:
+                raise WechatDigestError(
+                    "Semantic segmented Gate C continuation 只能绑定 frozen campaign。"
+                )
+            after = WechatCursor.from_dict(
+                plan.get("after_cursor"), "plan.after_cursor"
+            )
+            upper = WechatCursor.from_dict(
+                plan.get("upper_bound"), "plan.upper_bound"
+            )
+            checkpoint = self.run_store.checkpoint()
+            if checkpoint is not None and checkpoint != after:
+                raise WechatDigestError(
+                    "Semantic segmented Gate C continuation checkpoint binding 不一致。"
+                )
+            capture = self.capture_provider.capture(after, upper_bound=upper)
+            self._verify_capture_against_plan(capture, plan)
+            status = self.run_store.status(run_id)
+            self._verify_plan_and_status(run_id, capture, plan, status)
+            if (
+                status.get("state") != "processing"
+                or status.get("failure_category") is not None
+                or status.get("checkpoint_published") is not False
+            ):
+                raise WechatDigestError(
+                    "Semantic segmented Gate C continuation active run 状态不匹配。"
+                )
+            items = status.get("items")
+            if not isinstance(items, dict) or len(items) != 189:
+                raise WechatDigestError(
+                    "Semantic segmented Gate C continuation active items 不匹配。"
+                )
+            state_counts: dict[str, int] = {}
+            represented: list[dict[str, object]] = []
+            for item in items.values():
+                if not isinstance(item, dict) or not isinstance(
+                    item.get("state"), str
+                ):
+                    raise WechatDigestError("微信运行状态 items 损坏。")
+                state = str(item["state"])
+                state_counts[state] = state_counts.get(state, 0) + 1
+                if state == "represented":
+                    represented.append(item)
+            if state_counts != {
+                "local_only": 3,
+                "pending_human": 20,
+                "planned": 17,
+                "processed": 6,
+                "represented": 1,
+                "unsupported": 142,
+            }:
+                raise WechatDigestError(
+                    "Semantic segmented Gate C continuation active item 边界不匹配。"
+                )
+            representation_id = represented[0].get("representation_id")
+            if (
+                not isinstance(representation_id, str)
+                or not self.representation_service.verify(
+                    representation_id
+                ).verified
+                or (
+                    self.workspace
+                    / "02_processing"
+                    / "information"
+                    / representation_id
+                ).exists()
+                or represented[0].get("atomic_information_ids") != []
+            ):
+                raise WechatDigestError(
+                    "Semantic segmented Gate C continuation represented item 不匹配。"
+                )
+            continuation = (
+                self._semantic_port().install_segmented_gate_c_continuation(
+                    window_binding=self._semantic_authority_binding(
+                        run_id, allow_reviewed_head_extension=True
+                    ),
+                    authority_ref=authority_ref,
+                )
+            )
+            if (
+                continuation.get("activation_total") != 297
+                or continuation.get("activation_unknown_count") != 0
+                or continuation.get("activation_last_global_ordinal") != 297
+                or continuation.get("next_global_ordinal") != 298
+                or continuation.get("absolute_cap") != 1000
+                or not _sha256_value(
+                    continuation.get("continuation_fingerprint")
+                )
+            ):
+                raise WechatDigestError(
+                    "Semantic segmented Gate C continuation 安装读回失败。"
                 )
             return continuation
 
@@ -4786,12 +5004,19 @@ class WechatDigestService:
         since: str | None = None,
         from_now: bool = False,
         all_history: bool = False,
+        max_terminal_items: int | None = None,
     ) -> WechatDigestResult:
         bootstrap_count = sum((since is not None, from_now, all_history))
         if bootstrap_count > 1:
             raise WechatDigestError(
                 "首次起点只能选择 --since、--from-now 或 --all-history 之一。"
             )
+        if max_terminal_items is not None and (
+            isinstance(max_terminal_items, bool)
+            or not isinstance(max_terminal_items, int)
+            or max_terminal_items < 1
+        ):
+            raise WechatDigestError("每个微信短执行段的完成项目数必须为正整数。")
         with self.run_store.lock():
             self._reject_cleanup_failed_active_run()
             session_factory = getattr(self.interpretation_provider, "session", None)
@@ -4799,6 +5024,8 @@ class WechatDigestService:
             results: list[WechatDigestResult] = []
             pending_final_run_id: str | None = None
             session_body_completed = False
+            completed_in_segment = 0
+            pending_segment_result: WechatDigestResult | None = None
             try:
                 with session:
                     active_run_id = self.run_store.active_run_id()
@@ -4815,12 +5042,34 @@ class WechatDigestService:
                             since=since,
                             from_now=from_now,
                             all_history=all_history,
+                            max_terminal_items=(
+                                None
+                                if max_terminal_items is None
+                                else max_terminal_items - completed_in_segment
+                            ),
                         )
                         results.append(result)
+                        completed_in_segment += result.segment_items_completed
                         if self.run_store.status(result.run_id).get("state") == (
                             "converged"
                         ):
                             pending_final_run_id = result.run_id
+                            break
+                        if result.segment_safe_stopped or (
+                            max_terminal_items is not None
+                            and completed_in_segment >= max_terminal_items
+                        ):
+                            if result.segment_safe_stopped:
+                                pending_segment_result = result
+                            else:
+                                pending_segment_result = replace(
+                                    result,
+                                    segment_safe_stopped=True,
+                                    segment_items_completed=completed_in_segment,
+                                    segment_remaining_items=0,
+                                    segment_stop_reason="item_limit",
+                                )
+                                results[-1] = pending_segment_result
                             break
                         if history_scope and self.run_store.active_run_id() is None:
                             break
@@ -4831,8 +5080,11 @@ class WechatDigestService:
                         all_history = False
                     session_body_completed = True
             except BaseException as exc:
-                if session_body_completed and pending_final_run_id is not None:
-                    self._record_cleanup_failure(pending_final_run_id)
+                cleanup_run_id = pending_final_run_id
+                if cleanup_run_id is None and pending_segment_result is not None:
+                    cleanup_run_id = pending_segment_result.run_id
+                if session_body_completed and cleanup_run_id is not None:
+                    self._record_cleanup_failure(cleanup_run_id)
                 if not isinstance(exc, Exception) or isinstance(
                     exc, WechatDigestError
                 ):
@@ -4842,9 +5094,15 @@ class WechatDigestService:
                 ) from exc
             if pending_final_run_id is not None:
                 try:
-                    results[-1] = self._finalize_converged_run(
-                        pending_final_run_id,
-                        replayed=results[-1].replayed,
+                    converged_result = results[-1]
+                    results[-1] = replace(
+                        self._finalize_converged_run(
+                            pending_final_run_id,
+                            replayed=results[-1].replayed,
+                        ),
+                        segment_items_completed=(
+                            converged_result.segment_items_completed
+                        ),
                     )
                 except Exception as exc:
                     failed = self.run_store.status(pending_final_run_id)
@@ -4857,7 +5115,25 @@ class WechatDigestService:
                     raise WechatDigestError(
                         "微信信息消化未安全完成；checkpoint 未推进。"
                     ) from exc
-            return self._aggregate_results(results)
+            aggregate = self._aggregate_results(results)
+            if pending_segment_result is not None:
+                segment_status = self.run_store.status(pending_segment_result.run_id)
+                receipt = self.run_store.publish_segment_receipt(
+                    pending_segment_result.run_id,
+                    status=segment_status,
+                    completed_items=completed_in_segment,
+                    remaining_items=pending_segment_result.segment_remaining_items,
+                    stop_reason="item_limit",
+                )
+                aggregate = replace(
+                    aggregate,
+                    segment_safe_stopped=True,
+                    segment_items_completed=completed_in_segment,
+                    segment_remaining_items=pending_segment_result.segment_remaining_items,
+                    segment_stop_reason="item_limit",
+                    segment_receipt_fingerprint=str(receipt["receipt_fingerprint"]),
+                )
+            return aggregate
 
     def _reject_cleanup_failed_active_run(self) -> None:
         run_id = self.run_store.active_run_id()
@@ -5732,7 +6008,12 @@ class WechatDigestService:
             ) from exc
 
     def _run_locked(
-        self, *, since: str | None, from_now: bool, all_history: bool
+        self,
+        *,
+        since: str | None,
+        from_now: bool,
+        all_history: bool,
+        max_terminal_items: int | None = None,
     ) -> WechatDigestResult:
         checkpoint = self.run_store.checkpoint()
         active_run_id = self.run_store.active_run_id()
@@ -5837,7 +6118,11 @@ class WechatDigestService:
         assert active_run_id is not None
         try:
             result = self._process(
-                capture, plan, status, replayed=replayed
+                capture,
+                plan,
+                status,
+                replayed=replayed,
+                max_terminal_items=max_terminal_items,
             )
         except Exception as exc:
             failed = dict(status)
@@ -5868,6 +6153,7 @@ class WechatDigestService:
         status: dict[str, object],
         *,
         replayed: bool,
+        max_terminal_items: int | None = None,
     ) -> WechatDigestResult:
         run_id = str(plan["run_id"])
         items = status.get("items")
@@ -5885,6 +6171,31 @@ class WechatDigestService:
             for message in capture.messages
             for attachment in message.attachments
         }
+        completed_items = 0
+
+        def safe_stop_if_needed() -> WechatDigestResult | None:
+            if max_terminal_items is None or completed_items < max_terminal_items:
+                return None
+            current_status = self.run_store.status(run_id)
+            current_items = current_status.get("items")
+            if not isinstance(current_items, dict):
+                raise WechatDigestError("微信运行状态 items 损坏。")
+            remaining = sum(
+                not isinstance(candidate, dict)
+                or candidate.get("state") not in TERMINAL_ITEM_STATES
+                for candidate in current_items.values()
+            )
+            if remaining == 0:
+                return None
+            return self._result(
+                run_id,
+                current_status,
+                replayed=replayed,
+                segment_safe_stopped=True,
+                segment_items_completed=completed_items,
+                segment_remaining_items=remaining,
+                segment_stop_reason="item_limit",
+            )
 
         for attachment_plan in attachment_plans:
             item_id = f"attachment:{attachment_plan['attachment_key']}"
@@ -5893,11 +6204,16 @@ class WechatDigestService:
                 continue
             if attachment_plan["status"] != "available":
                 self._update_item(run_id, status, item_id, state="unsupported")
-                continue
-            captured = by_attachment.get(str(attachment_plan["attachment_key"]))
-            if captured is None or captured.path is None:
-                raise WechatDigestError("微信附件重放无法精确定位。")
-            self._process_attachment(run_id, status, item_id, attachment_plan, captured)
+            else:
+                captured = by_attachment.get(str(attachment_plan["attachment_key"]))
+                if captured is None or captured.path is None:
+                    raise WechatDigestError("微信附件重放无法精确定位。")
+                self._process_attachment(
+                    run_id, status, item_id, attachment_plan, captured
+                )
+            completed_items += 1
+            if (segment_result := safe_stop_if_needed()) is not None:
+                return segment_result
 
         for conversation_plan in _plan_sequence(
             plan.get("conversations"), "conversations"
@@ -5919,6 +6235,9 @@ class WechatDigestService:
             self._process_conversation(
                 run_id, status, item_id, conversation_plan, payload
             )
+            completed_items += 1
+            if (segment_result := safe_stop_if_needed()) is not None:
+                return segment_result
 
         current_status = self.run_store.status(run_id)
         current_items = current_status.get("items")
@@ -5935,13 +6254,23 @@ class WechatDigestService:
         upper = WechatCursor.from_dict(plan["upper_bound"], "plan.upper_bound")
         all_history_upper = self._plan_all_history_upper(plan)
         if all_history_upper is None or upper == all_history_upper:
-            return self._result(run_id, converged, replayed=replayed)
+            return self._result(
+                run_id,
+                converged,
+                replayed=replayed,
+                segment_items_completed=completed_items,
+            )
         self.run_store.publish_checkpoint(run_id, upper)
         converged["checkpoint_published"] = True
         converged["state"] = "completed"
         converged["updated_at"] = self.clock()
         self.run_store.update_status(run_id, converged)
-        return self._result(run_id, converged, replayed=replayed)
+        return self._result(
+            run_id,
+            converged,
+            replayed=replayed,
+            segment_items_completed=completed_items,
+        )
 
     @staticmethod
     def _item(items: dict[object, object], item_id: str) -> dict[str, object]:
@@ -6938,11 +7267,27 @@ class WechatDigestService:
             governance_preserved_but_incomplete=sum(
                 result.governance_preserved_but_incomplete for result in results
             ),
+            segment_safe_stopped=any(
+                result.segment_safe_stopped for result in results
+            ),
+            segment_items_completed=sum(
+                result.segment_items_completed for result in results
+            ),
+            segment_remaining_items=results[-1].segment_remaining_items,
+            segment_stop_reason=results[-1].segment_stop_reason,
+            segment_receipt_fingerprint=results[-1].segment_receipt_fingerprint,
         )
 
     @staticmethod
     def _result(
-        run_id: str, status: Mapping[str, object], *, replayed: bool
+        run_id: str,
+        status: Mapping[str, object],
+        *,
+        replayed: bool,
+        segment_safe_stopped: bool = False,
+        segment_items_completed: int = 0,
+        segment_remaining_items: int = 0,
+        segment_stop_reason: str | None = None,
     ) -> WechatDigestResult:
         items = status.get("items")
         if not isinstance(items, dict):
@@ -7010,4 +7355,8 @@ class WechatDigestService:
                 and item.get("governance_failure") is not None
                 for item in values
             ),
+            segment_safe_stopped=segment_safe_stopped,
+            segment_items_completed=segment_items_completed,
+            segment_remaining_items=segment_remaining_items,
+            segment_stop_reason=segment_stop_reason,
         )
