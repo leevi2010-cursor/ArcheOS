@@ -28,6 +28,18 @@ Agents must keep these layers separate. Processing a recording or document is no
 - **Product / Technical Lead + Reviewer（ChatGPT 主线程）:** 负责产品定位、Product Roadmap、Development Roadmap、优先级与 backlog replenishment、技术路线、系统架构、canonical concepts、durable governance、implementation-ready Issue / Implementation Plan / Acceptance Criteria、实验 Gate 与风险接受标准。Lead 负责 Code Review、Architecture / Concept / Product-alignment Review，判断实现是否符合批准方案，提出修改要求，并决定 PR 是否可合并；在可用工具和权限允许时执行合并，或明确给出 Merge PASS。Lead 可在已批准 Product Stage 内重排技术工作，但不得因工程偏好静默改变 material 产品方向。
 - **Executor / Developer（Codex）:** 每次只实现一个已批准 GitHub Issue：建立 branch / worktree、实现、测试、提交 Draft PR，并根据 ChatGPT Lead Review 在同一 PR 修复。Codex 提供实施事实、测试结果、Roadmap Feedback 与 blocker，但不作 Code / Architecture / Concept Review 的最终判定、不作 Merge 决策、不重规划产品或技术路线，也不得自行修改 approved architecture / concept / Evidence contract 或扩大真实数据与 Provider 授权。
 
+## Worktree lifecycle
+
+ArcheOS 手工工作树使用以下唯一目录与生命周期：
+
+1. 主仓库固定为 `/Users/leo/Projects/ArcheOS`，作为干净的 `main` 控制目录；Issue 开发不在主仓库中直接进行。
+2. 手工工作树统一创建在 `/Users/leo/Projects/ArcheOS-worktrees/issue-<number>-<slug>`，分支统一命名为 `codex/issue-<number>-<slug>`。
+3. 一项 Issue 对应一个分支、一个工作树和一个 PR；同一 PR 的审查修复继续使用原工作树，不另建平行工作树。
+4. 创建前从最新 `origin/main` 建立工作树，并核验目标目录不存在、分支未被其他工作树占用。
+5. PR 合并或任务明确取消后，只有在工作树干净、成果已合并或明确放弃、且没有需要保留的本地运行资料时，才使用 `git worktree remove <path>` 清理；随后执行 `git worktree prune` 并读回工作树列表。
+6. 不使用 `rm -rf` 或 `git worktree remove --force` 绕过清理检查。分支删除是独立动作，仅在合并或明确放弃且保留条件核验完成后执行。
+7. Codex 自动管理的 `~/.codex/worktrees` 不迁移到手工目录，由对应任务生命周期管理；清理前同样需要核验任务、PR、工作树状态和本地资料。
+
 ## Product-led planning authority
 
 ArcheOS development follows this planning chain:
