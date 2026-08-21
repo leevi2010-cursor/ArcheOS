@@ -17,6 +17,7 @@ import stat
 import subprocess
 import tempfile
 import time
+from collections import Counter
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager, nullcontext
 from dataclasses import asdict, dataclass, replace
@@ -90,6 +91,12 @@ GOVERNANCE_STARTUP_RECOVERY_SCHEMA_VERSION = (
 )
 GOVERNANCE_STARTUP_RETRY_SCHEMA_VERSION = (
     "wechat-governance-startup-retry/1.0"
+)
+FAILED_CLOSED_RECOVERY_MANIFEST_SCHEMA_VERSION = (
+    "wechat-failed-closed-recovery-authority/1.0"
+)
+FAILED_CLOSED_RECOVERY_SCHEMA_VERSION = (
+    "wechat-failed-closed-recovery/1.0"
 )
 BATCH_GOVERNANCE_AUTHORITY_SCHEMA_VERSION = (
     "wechat-batch-governance-migration-authority/1.0"
@@ -291,6 +298,23 @@ class SemanticHandoffPort(Protocol):
     ) -> dict[str, object]: ...
 
     def governance_startup_recovery_continuation(
+        self,
+        *,
+        authority_ref: str,
+        authority_manifest_fingerprint: str,
+        authority_manifest_raw_fingerprint: str,
+    ) -> dict[str, object] | None: ...
+
+    def install_failed_closed_recovery_continuation(
+        self,
+        *,
+        window_binding: SemanticWindowAuthorityBinding,
+        authority_ref: str,
+        authority_manifest_fingerprint: str,
+        authority_manifest_raw_fingerprint: str,
+    ) -> dict[str, object]: ...
+
+    def failed_closed_recovery_continuation(
         self,
         *,
         authority_ref: str,
@@ -1018,6 +1042,27 @@ class WechatDigestRunStore:
             raise WechatDigestError("Governance 启动恢复 retry receipt 损坏。")
         return value
 
+    def failed_closed_recovery(
+        self, run_id: str
+    ) -> dict[str, object] | None:
+        path = self.runs_root / run_id / "failed-closed-recovery.json"
+        if not os.path.lexists(path):
+            return None
+        path_stat = path.stat(follow_symlinks=False)
+        if (
+            not stat.S_ISREG(path_stat.st_mode)
+            or stat.S_IMODE(path_stat.st_mode) != 0o600
+        ):
+            raise WechatDigestError("历史失败恢复 receipt 不是私有文件。")
+        value = self._read_json(path)
+        if (
+            not isinstance(value, dict)
+            or value.get("schema_version")
+            != FAILED_CLOSED_RECOVERY_SCHEMA_VERSION
+        ):
+            raise WechatDigestError("历史失败恢复 receipt 损坏。")
+        return value
+
     def publish_governance_startup_receipt(
         self,
         run_id: str,
@@ -1028,6 +1073,7 @@ class WechatDigestRunStore:
         if filename not in {
             "governance-startup-recovery.json",
             "governance-startup-retry.json",
+            "failed-closed-recovery.json",
         }:
             raise WechatDigestError("Governance 启动恢复 receipt 名称无效。")
         path = self.runs_root / run_id / filename
@@ -1458,6 +1504,42 @@ class ExistingSemanticHandoff:
         authority_manifest_raw_fingerprint: str,
     ) -> dict[str, object] | None:
         return self.service.governance_startup_recovery_continuation(
+            self.provider,
+            reviewed_git_head=self.reviewed_git_head,
+            authority_ref=authority_ref,
+            authority_manifest_fingerprint=authority_manifest_fingerprint,
+            authority_manifest_raw_fingerprint=(
+                authority_manifest_raw_fingerprint
+            ),
+        )
+
+    def install_failed_closed_recovery_continuation(
+        self,
+        *,
+        window_binding: SemanticWindowAuthorityBinding,
+        authority_ref: str,
+        authority_manifest_fingerprint: str,
+        authority_manifest_raw_fingerprint: str,
+    ) -> dict[str, object]:
+        return self.service.install_failed_closed_recovery_continuation(
+            self.provider,
+            window_binding=window_binding,
+            reviewed_git_head=self.reviewed_git_head,
+            authority_ref=authority_ref,
+            authority_manifest_fingerprint=authority_manifest_fingerprint,
+            authority_manifest_raw_fingerprint=(
+                authority_manifest_raw_fingerprint
+            ),
+        )
+
+    def failed_closed_recovery_continuation(
+        self,
+        *,
+        authority_ref: str,
+        authority_manifest_fingerprint: str,
+        authority_manifest_raw_fingerprint: str,
+    ) -> dict[str, object] | None:
+        return self.service.failed_closed_recovery_continuation(
             self.provider,
             reviewed_git_head=self.reviewed_git_head,
             authority_ref=authority_ref,
@@ -2159,6 +2241,121 @@ def _validated_governance_startup_recovery_manifest(
         )
     ):
         raise WechatDigestError("Governance 启动恢复 authority manifest 损坏。")
+    return dict(value)
+
+
+def _validated_failed_closed_recovery_manifest(
+    value: object,
+) -> dict[str, object]:
+    if not isinstance(value, dict):
+        raise WechatDigestError("历史失败恢复 authority manifest 损坏。")
+    projected = dict(value)
+    fingerprint = projected.pop("manifest_fingerprint", None)
+    binding = value.get("recovery_binding")
+    summary = value.get("semantic_summary")
+    historical_summary = value.get("historical_failed_closed_summary")
+    if (
+        set(value)
+        != {
+            "schema_version",
+            "authority_ref",
+            "recovery_binding",
+            "business_tree_fingerprint",
+            "previous_reviewed_git_head",
+            "reviewed_git_head",
+            "execution_contract_unchanged",
+            "semantic_summary",
+            "historical_failed_closed_summary",
+            "manifest_fingerprint",
+        }
+        or value.get("schema_version")
+        != FAILED_CLOSED_RECOVERY_MANIFEST_SCHEMA_VERSION
+        or re.fullmatch(
+            r"https://github\.com/leevi2010-cursor/ArcheOS/issues/154"
+            r"#issuecomment-[0-9]+",
+            str(value.get("authority_ref")),
+        )
+        is None
+        or not isinstance(binding, dict)
+        or not _sha256_value(value.get("business_tree_fingerprint"))
+        or value.get("previous_reviewed_git_head")
+        != "c8ece3782ae3ba289d06c36d1e352ce23e0f627b"
+        or re.fullmatch(r"[0-9a-f]{40}", str(value.get("reviewed_git_head")))
+        is None
+        or value.get("reviewed_git_head")
+        == value.get("previous_reviewed_git_head")
+        or value.get("execution_contract_unchanged") is not True
+        or summary
+        != {
+            "global_attempt_total": 298,
+            "global_unknown": 0,
+            "last_global_ordinal": 298,
+            "next_global_ordinal": 299,
+            "absolute_cap": 1000,
+        }
+        or not isinstance(historical_summary, dict)
+        or set(historical_summary)
+        != {
+            "total",
+            "semantic",
+            "governance",
+            "inventory_fingerprint",
+        }
+        or historical_summary.get("total") != 5
+        or historical_summary.get("semantic") != 2
+        or historical_summary.get("governance") != 3
+        or not _sha256_value(
+            historical_summary.get("inventory_fingerprint")
+        )
+        or not _sha256_value(fingerprint)
+        or fingerprint
+        != _sha256_bytes(_canonical_json(projected).encode("utf-8"))
+    ):
+        raise WechatDigestError("历史失败恢复 authority manifest 损坏。")
+    expected_binding = {
+        "run_id",
+        "plan_fingerprint",
+        "plan_receipt_fingerprint",
+        "current_status_fingerprint",
+        "current_failed_status",
+        "capture_fingerprint",
+        "checkpoint_fingerprint",
+        "current_item_id",
+        "source_id",
+        "source_manifest_fingerprint",
+        "representation_id",
+        "representation_manifest_fingerprint",
+        "representation_artifact_inventory_fingerprint",
+        "previous_item_id",
+        "previous_atomic_information_ids",
+        "previous_governance_receipt_fingerprint",
+        "startup_recovery_receipt_fingerprint",
+        "startup_retry_receipt_fingerprint",
+        "semantic_window_binding_fingerprint",
+    }
+    if (
+        set(binding) != expected_binding
+        or not isinstance(binding.get("current_failed_status"), dict)
+        or binding.get("current_status_fingerprint")
+        != _sha256_bytes(
+            _canonical_json(binding.get("current_failed_status")).encode(
+                "utf-8"
+            )
+        )
+        or not isinstance(binding.get("previous_atomic_information_ids"), list)
+        or len(binding["previous_atomic_information_ids"]) != 4
+        or len(set(binding["previous_atomic_information_ids"])) != 4
+        or any(
+            not isinstance(item, str)
+            for item in binding["previous_atomic_information_ids"]
+        )
+        or any(
+            not _sha256_value(binding.get(field))
+            for field in expected_binding
+            if field.endswith("_fingerprint")
+        )
+    ):
+        raise WechatDigestError("历史失败恢复 authority manifest 损坏。")
     return dict(value)
 
 
@@ -3656,6 +3853,603 @@ class WechatDigestService:
                 != ordered_ids
             ):
                 raise WechatDigestError("Governance 启动恢复状态读回失败。")
+            return existing
+
+    def _historical_failed_closed_summary(
+        self, *, active_run_id: str
+    ) -> dict[str, object]:
+        """Read, validate, and bind failed-closed items outside the active run."""
+
+        inventory: list[dict[str, object]] = []
+        variant_counts: Counter[str] = Counter()
+        if not self.run_store.runs_root.is_dir():
+            raise WechatDigestError("历史 failed_closed run inventory 缺失。")
+        for path in sorted(self.run_store.runs_root.iterdir()):
+            if path.name == active_run_id:
+                continue
+            if not path.is_dir() or re.fullmatch(
+                r"run_[0-9a-f]{32}", path.name
+            ) is None:
+                raise WechatDigestError(
+                    "历史 failed_closed run inventory 损坏。"
+                )
+            run_id = path.name
+            plan = self.run_store.plan(run_id)
+            receipt = self.run_store.plan_receipt(run_id)
+            status = self.run_store.status(run_id)
+            plan_fingerprint = _plan_fingerprint(plan)
+            if (
+                plan.get("run_id") != run_id
+                or status.get("run_id") != run_id
+                or status.get("plan_fingerprint") != plan_fingerprint
+                or _committed_receipt_fingerprint(receipt)
+                != plan_fingerprint
+            ):
+                raise WechatDigestError(
+                    "历史 failed_closed run binding 损坏。"
+                )
+            items = status.get("items")
+            if not isinstance(items, dict):
+                raise WechatDigestError(
+                    "历史 failed_closed status inventory 损坏。"
+                )
+            failed_items: list[dict[str, object]] = []
+            for item_id in sorted(items):
+                item = items[item_id]
+                if not isinstance(item, dict):
+                    raise WechatDigestError(
+                        "历史 failed_closed status item 损坏。"
+                    )
+                if item.get("state") != "failed_closed":
+                    continue
+                semantic_failure = item.get("semantic_failure")
+                governance_failure = item.get("governance_failure")
+                if (semantic_failure is None) == (governance_failure is None):
+                    raise WechatDigestError(
+                        "历史 failed_closed failure variant 损坏。"
+                    )
+                variant = (
+                    "semantic"
+                    if semantic_failure is not None
+                    else "governance"
+                )
+                self._verify_failed_closed_item(
+                    run_id=run_id,
+                    plan=plan,
+                    item_id=item_id,
+                    item=item,
+                )
+                variant_counts[variant] += 1
+                failed_items.append(
+                    {
+                        "item_id": item_id,
+                        "failure_variant": variant,
+                        "item_fingerprint": _sha256_bytes(
+                            _canonical_json(item).encode("utf-8")
+                        ),
+                    }
+                )
+            if failed_items:
+                inventory.append(
+                    {
+                        "run_id": run_id,
+                        "plan_fingerprint": plan_fingerprint,
+                        "plan_receipt_fingerprint": _sha256_bytes(
+                            _canonical_json(receipt).encode("utf-8")
+                        ),
+                        "status_fingerprint": _sha256_bytes(
+                            _canonical_json(status).encode("utf-8")
+                        ),
+                        "failed_closed_items": failed_items,
+                    }
+                )
+        if variant_counts != {"semantic": 2, "governance": 3}:
+            raise WechatDigestError(
+                "历史 failed_closed summary 不匹配。"
+            )
+        return {
+            "total": 5,
+            "semantic": 2,
+            "governance": 3,
+            "inventory_fingerprint": _sha256_bytes(
+                _canonical_json(inventory).encode("utf-8")
+            ),
+        }
+
+    def _build_failed_closed_recovery_manifest_unlocked(
+        self,
+        *,
+        authority_ref: str,
+        adopted_continuation: Mapping[str, object] | None = None,
+    ) -> dict[str, object]:
+        run_id = self.run_store.active_run_id()
+        if run_id is None:
+            raise WechatDigestError("不存在可恢复历史失败校验的 active run。")
+        plan = self.run_store.plan(run_id)
+        plan_receipt = self.run_store.plan_receipt(run_id)
+        status = self.run_store.status(run_id)
+        current_failed_status = json.loads(_canonical_json(status))
+        if (
+            status.get("state") != "failed"
+            or status.get("failure_category") != "WechatDigestError"
+            or status.get("checkpoint_published") is not False
+            or self._plan_all_history_upper(plan) is None
+        ):
+            raise WechatDigestError("历史失败恢复 active run 状态不匹配。")
+        after = WechatCursor.from_dict(plan.get("after_cursor"), "plan.after_cursor")
+        upper = WechatCursor.from_dict(plan.get("upper_bound"), "plan.upper_bound")
+        checkpoint = self.run_store.checkpoint()
+        if checkpoint is not None and checkpoint != after:
+            raise WechatDigestError("历史失败恢复 checkpoint binding 不匹配。")
+        capture = self.capture_provider.capture(after, upper_bound=upper)
+        self._verify_capture_against_plan(capture, plan)
+        self._verify_plan_and_status(run_id, capture, plan, status)
+        items = status.get("items")
+        if not isinstance(items, dict) or len(items) != 189:
+            raise WechatDigestError("历史失败恢复 item inventory 不匹配。")
+        state_counts = Counter(
+            item.get("state")
+            for item in items.values()
+            if isinstance(item, dict)
+        )
+        if state_counts != {
+            "local_only": 3,
+            "pending_human": 20,
+            "planned": 16,
+            "processed": 7,
+            "represented": 1,
+            "unsupported": 142,
+        }:
+            raise WechatDigestError("历史失败恢复 item 状态边界不匹配。")
+        historical_failed_closed_summary = (
+            self._historical_failed_closed_summary(active_run_id=run_id)
+        )
+        represented = [
+            (item_id, item)
+            for item_id, item in items.items()
+            if isinstance(item, dict) and item.get("state") == "represented"
+        ]
+        if len(represented) != 1:
+            raise WechatDigestError("历史失败恢复 current item 不唯一。")
+        current_item_id, current_item = represented[0]
+        source_id = current_item.get("source_id")
+        representation_id = current_item.get("representation_id")
+        if not isinstance(source_id, str) or not isinstance(
+            representation_id, str
+        ):
+            raise WechatDigestError("历史失败恢复 current identity 损坏。")
+        source = self.source_repository.get(source_id)
+        representation = self.representation_repository.get(representation_id)
+        artifact_inventory = [
+            {
+                "artifact_id": artifact.artifact_id,
+                "content_hash": artifact.content_hash,
+                "size_bytes": artifact.size_bytes,
+            }
+            for artifact in representation.artifacts
+        ]
+        package = (
+            self.workspace / "02_processing" / "information" / representation_id
+        )
+        if (
+            current_item.get("atomic_information_ids") != []
+            or current_item.get("governance_receipt") is not None
+            or current_item.get("governance_metrics") is not None
+            or current_item.get("semantic_failure") is not None
+            or current_item.get("governance_failure") is not None
+            or package.exists()
+            or representation.source_id != source_id
+            or not self.source_repository.verify(source_id).verified
+            or not self.representation_repository.verify(
+                representation_id
+            ).verified
+        ):
+            raise WechatDigestError("历史失败恢复 current represented item 漂移。")
+        startup = self.run_store.governance_startup_recovery(run_id)
+        retry = self.run_store.governance_startup_retry(run_id)
+        if startup is None or retry is None:
+            raise WechatDigestError("历史失败恢复缺少 Issue #150 durable receipt。")
+        startup_binding = startup.get("recovery_binding")
+        previous_item_id = (
+            startup_binding.get("item_id")
+            if isinstance(startup_binding, dict)
+            else None
+        )
+        previous_item = items.get(previous_item_id)
+        previous_atomic_ids = (
+            previous_item.get("atomic_information_ids")
+            if isinstance(previous_item, dict)
+            else None
+        )
+        previous_receipt = (
+            _validated_governance_receipt(
+                previous_item.get("governance_receipt")
+            )
+            if isinstance(previous_item, dict)
+            else None
+        )
+        previous_representation_id = (
+            previous_item.get("representation_id")
+            if isinstance(previous_item, dict)
+            else None
+        )
+        if (
+            not isinstance(previous_item_id, str)
+            or not isinstance(previous_item, dict)
+            or previous_item.get("state") != "processed"
+            or not isinstance(previous_atomic_ids, list)
+            or len(previous_atomic_ids) != 4
+            or len(set(previous_atomic_ids)) != 4
+            or previous_receipt is None
+            or previous_receipt.get("phase") != "completed"
+            or not isinstance(previous_representation_id, str)
+            or startup.get("retry_consumed") is not False
+            or retry.get("retry_attempt") != 1
+            or retry.get("run_id") != run_id
+            or retry.get("item_id") != previous_item_id
+        ):
+            raise WechatDigestError("历史失败恢复 previous completed item 漂移。")
+        semantic_summary = _validated_global_attempt_summary(
+            self._semantic_port().global_attempt_summary(
+                previous_representation_id
+            )
+        )
+        if semantic_summary != {
+            "global_attempt_total": 298,
+            "global_unknown": 0,
+            "next_global_ordinal": 299,
+            "absolute_cap": 1000,
+        }:
+            raise WechatDigestError("历史失败恢复 Semantic ledger 不匹配。")
+        window_binding = self._semantic_authority_binding(
+            run_id, allow_reviewed_head_extension=True
+        )
+        if adopted_continuation is not None:
+            previous_head = adopted_continuation.get(
+                "previous_reviewed_git_head"
+            )
+            reviewed_head = adopted_continuation.get("reviewed_git_head")
+            if (
+                previous_head
+                != "c8ece3782ae3ba289d06c36d1e352ce23e0f627b"
+                or reviewed_head != self._semantic_port().reviewed_git_head
+            ):
+                raise WechatDigestError(
+                    "历史失败恢复 continuation head binding 漂移。"
+                )
+            window_binding = replace(
+                window_binding, reviewed_git_head=str(previous_head)
+            )
+        else:
+            previous_head = window_binding.reviewed_git_head
+            reviewed_head = self._semantic_port().reviewed_git_head
+        with SQLiteWorldModelRepository(self.database) as repository:
+            business_tree_fingerprint = (
+                self._governance_business_tree_fingerprint(repository)
+            )
+        recovery_binding: dict[str, object] = {
+            "run_id": run_id,
+            "plan_fingerprint": _plan_fingerprint(plan),
+            "plan_receipt_fingerprint": _sha256_bytes(
+                _canonical_json(plan_receipt).encode("utf-8")
+            ),
+            "current_status_fingerprint": _sha256_bytes(
+                _canonical_json(status).encode("utf-8")
+            ),
+            "current_failed_status": current_failed_status,
+            "capture_fingerprint": _capture_fingerprint(capture),
+            "checkpoint_fingerprint": _sha256_bytes(
+                _canonical_json(
+                    None if checkpoint is None else checkpoint.to_dict()
+                ).encode("utf-8")
+            ),
+            "current_item_id": current_item_id,
+            "source_id": source_id,
+            "source_manifest_fingerprint": _sha256_bytes(
+                _canonical_json(source.to_manifest_dict()).encode("utf-8")
+            ),
+            "representation_id": representation_id,
+            "representation_manifest_fingerprint": _sha256_bytes(
+                _canonical_json(representation.to_manifest_dict()).encode("utf-8")
+            ),
+            "representation_artifact_inventory_fingerprint": _sha256_bytes(
+                _canonical_json(artifact_inventory).encode("utf-8")
+            ),
+            "previous_item_id": previous_item_id,
+            "previous_atomic_information_ids": list(previous_atomic_ids),
+            "previous_governance_receipt_fingerprint": _sha256_bytes(
+                _canonical_json(previous_receipt).encode("utf-8")
+            ),
+            "startup_recovery_receipt_fingerprint": _sha256_bytes(
+                _canonical_json(startup).encode("utf-8")
+            ),
+            "startup_retry_receipt_fingerprint": _sha256_bytes(
+                _canonical_json(retry).encode("utf-8")
+            ),
+            "semantic_window_binding_fingerprint": _sha256_bytes(
+                _canonical_json(asdict(window_binding)).encode("utf-8")
+            ),
+        }
+        candidate: dict[str, object] = {
+            "schema_version": FAILED_CLOSED_RECOVERY_MANIFEST_SCHEMA_VERSION,
+            "authority_ref": authority_ref,
+            "recovery_binding": recovery_binding,
+            "business_tree_fingerprint": business_tree_fingerprint,
+            "previous_reviewed_git_head": previous_head,
+            "reviewed_git_head": reviewed_head,
+            "execution_contract_unchanged": True,
+            "semantic_summary": {**semantic_summary, "last_global_ordinal": 298},
+            "historical_failed_closed_summary": (
+                historical_failed_closed_summary
+            ),
+        }
+        candidate["manifest_fingerprint"] = _sha256_bytes(
+            _canonical_json(candidate).encode("utf-8")
+        )
+        return _validated_failed_closed_recovery_manifest(candidate)
+
+    def build_failed_closed_recovery_manifest(
+        self, *, authority_ref: str
+    ) -> dict[str, object]:
+        """Build the read-only Issue #154 private authority candidate."""
+
+        with self.run_store.lock():
+            return self._build_failed_closed_recovery_manifest_unlocked(
+                authority_ref=authority_ref
+            )
+
+    def resolve_failed_closed_continuation(
+        self, *, authority_ref: str, authority_manifest_file: Path
+    ) -> dict[str, object]:
+        """Recover the fixed post-Gate-C failed state with zero Providers."""
+
+        manifest, raw_fingerprint = _read_private_json_manifest(
+            authority_manifest_file
+        )
+        manifest = _validated_failed_closed_recovery_manifest(manifest)
+        if manifest.get("authority_ref") != authority_ref:
+            raise WechatDigestError("历史失败恢复 authority ref 不匹配。")
+        binding = manifest["recovery_binding"]
+        assert isinstance(binding, dict)
+        run_id = str(binding["run_id"])
+        with self.run_store.lock():
+            if self.run_store.active_run_id() != run_id:
+                raise WechatDigestError("历史失败恢复 active run 不匹配。")
+            existing = self.run_store.failed_closed_recovery(run_id)
+            if existing is None:
+                continuation = (
+                    self._semantic_port().failed_closed_recovery_continuation(
+                        authority_ref=authority_ref,
+                        authority_manifest_fingerprint=str(
+                            manifest["manifest_fingerprint"]
+                        ),
+                        authority_manifest_raw_fingerprint=raw_fingerprint,
+                    )
+                )
+                expected = self._build_failed_closed_recovery_manifest_unlocked(
+                    authority_ref=authority_ref,
+                    adopted_continuation=continuation,
+                )
+                if expected != manifest:
+                    raise WechatDigestError(
+                        "历史失败恢复 manifest 与现场不匹配。"
+                    )
+                if continuation is None:
+                    continuation = self._semantic_port().install_failed_closed_recovery_continuation(
+                        window_binding=self._semantic_authority_binding(
+                            run_id, allow_reviewed_head_extension=True
+                        ),
+                        authority_ref=authority_ref,
+                        authority_manifest_fingerprint=str(
+                            manifest["manifest_fingerprint"]
+                        ),
+                        authority_manifest_raw_fingerprint=raw_fingerprint,
+                    )
+                receipt_without_fingerprint: dict[str, object] = {
+                    "schema_version": FAILED_CLOSED_RECOVERY_SCHEMA_VERSION,
+                    "artifact_kind": "failed_closed_recovery",
+                    "authority_ref": authority_ref,
+                    "authority_manifest_fingerprint": manifest[
+                        "manifest_fingerprint"
+                    ],
+                    "authority_manifest_raw_fingerprint": raw_fingerprint,
+                    "recovery_binding": binding,
+                    "business_tree_fingerprint": manifest[
+                        "business_tree_fingerprint"
+                    ],
+                    "historical_failed_closed_summary": manifest[
+                        "historical_failed_closed_summary"
+                    ],
+                    "semantic_continuation_fingerprint": continuation[
+                        "continuation_fingerprint"
+                    ],
+                    "provider_calls": 0,
+                }
+                receipt = {
+                    **receipt_without_fingerprint,
+                    "receipt_fingerprint": _sha256_bytes(
+                        _canonical_json(receipt_without_fingerprint).encode("utf-8")
+                    ),
+                }
+                existing = self.run_store.publish_governance_startup_receipt(
+                    run_id,
+                    filename="failed-closed-recovery.json",
+                    receipt=receipt,
+                )
+            projected = dict(existing)
+            receipt_fingerprint = projected.pop("receipt_fingerprint", None)
+            if (
+                set(existing)
+                != {
+                    "schema_version",
+                    "artifact_kind",
+                    "authority_ref",
+                    "authority_manifest_fingerprint",
+                    "authority_manifest_raw_fingerprint",
+                    "recovery_binding",
+                    "business_tree_fingerprint",
+                    "historical_failed_closed_summary",
+                    "semantic_continuation_fingerprint",
+                    "provider_calls",
+                    "receipt_fingerprint",
+                }
+                or existing.get("schema_version")
+                != FAILED_CLOSED_RECOVERY_SCHEMA_VERSION
+                or existing.get("artifact_kind") != "failed_closed_recovery"
+                or existing.get("authority_ref") != authority_ref
+                or existing.get("authority_manifest_fingerprint")
+                != manifest.get("manifest_fingerprint")
+                or existing.get("authority_manifest_raw_fingerprint")
+                != raw_fingerprint
+                or existing.get("recovery_binding") != binding
+                or existing.get("business_tree_fingerprint")
+                != manifest.get("business_tree_fingerprint")
+                or existing.get("historical_failed_closed_summary")
+                != manifest.get("historical_failed_closed_summary")
+                or not _sha256_value(
+                    existing.get("semantic_continuation_fingerprint")
+                )
+                or existing.get("provider_calls") != 0
+                or not _sha256_value(receipt_fingerprint)
+                or receipt_fingerprint
+                != _sha256_bytes(_canonical_json(projected).encode("utf-8"))
+            ):
+                raise WechatDigestError("历史失败恢复 receipt 不匹配。")
+            observed_continuation = (
+                self._semantic_port().failed_closed_recovery_continuation(
+                    authority_ref=authority_ref,
+                    authority_manifest_fingerprint=str(
+                        manifest["manifest_fingerprint"]
+                    ),
+                    authority_manifest_raw_fingerprint=raw_fingerprint,
+                )
+            )
+            if (
+                observed_continuation is None
+                or observed_continuation.get("continuation_fingerprint")
+                != existing.get("semantic_continuation_fingerprint")
+            ):
+                raise WechatDigestError(
+                    "历史失败恢复 semantic continuation 读回失败。"
+                )
+            plan = self.run_store.plan(run_id)
+            after = WechatCursor.from_dict(
+                plan.get("after_cursor"), "plan.after_cursor"
+            )
+            upper = WechatCursor.from_dict(
+                plan.get("upper_bound"), "plan.upper_bound"
+            )
+            capture = self.capture_provider.capture(after, upper_bound=upper)
+            self._verify_capture_against_plan(capture, plan)
+            checkpoint = self.run_store.checkpoint()
+            source_id = str(binding["source_id"])
+            representation_id = str(binding["representation_id"])
+            source = self.source_repository.get(source_id)
+            representation = self.representation_repository.get(
+                representation_id
+            )
+            artifacts = [
+                {
+                    "artifact_id": artifact.artifact_id,
+                    "content_hash": artifact.content_hash,
+                    "size_bytes": artifact.size_bytes,
+                }
+                for artifact in representation.artifacts
+            ]
+            startup = self.run_store.governance_startup_recovery(run_id)
+            retry = self.run_store.governance_startup_retry(run_id)
+            previous_item = binding["current_failed_status"]["items"].get(
+                binding["previous_item_id"]
+            )
+            previous_receipt = (
+                previous_item.get("governance_receipt")
+                if isinstance(previous_item, dict)
+                else None
+            )
+            historical_failed_closed_summary = (
+                self._historical_failed_closed_summary(
+                    active_run_id=run_id
+                )
+            )
+            if (
+                _plan_fingerprint(plan) != binding.get("plan_fingerprint")
+                or _sha256_bytes(
+                    _canonical_json(self.run_store.plan_receipt(run_id)).encode(
+                        "utf-8"
+                    )
+                )
+                != binding.get("plan_receipt_fingerprint")
+                or _capture_fingerprint(capture)
+                != binding.get("capture_fingerprint")
+                or _sha256_bytes(
+                    _canonical_json(
+                        None if checkpoint is None else checkpoint.to_dict()
+                    ).encode("utf-8")
+                )
+                != binding.get("checkpoint_fingerprint")
+                or not self.source_repository.verify(source_id).verified
+                or _sha256_bytes(
+                    _canonical_json(source.to_manifest_dict()).encode("utf-8")
+                )
+                != binding.get("source_manifest_fingerprint")
+                or representation.source_id != source_id
+                or not self.representation_repository.verify(
+                    representation_id
+                ).verified
+                or _sha256_bytes(
+                    _canonical_json(representation.to_manifest_dict()).encode(
+                        "utf-8"
+                    )
+                )
+                != binding.get("representation_manifest_fingerprint")
+                or _sha256_bytes(
+                    _canonical_json(artifacts).encode("utf-8")
+                )
+                != binding.get(
+                    "representation_artifact_inventory_fingerprint"
+                )
+                or (
+                    self.workspace
+                    / "02_processing"
+                    / "information"
+                    / representation_id
+                ).exists()
+                or startup is None
+                or _sha256_bytes(
+                    _canonical_json(startup).encode("utf-8")
+                )
+                != binding.get("startup_recovery_receipt_fingerprint")
+                or retry is None
+                or _sha256_bytes(_canonical_json(retry).encode("utf-8"))
+                != binding.get("startup_retry_receipt_fingerprint")
+                or _sha256_bytes(
+                    _canonical_json(previous_receipt).encode("utf-8")
+                )
+                != binding.get("previous_governance_receipt_fingerprint")
+                or historical_failed_closed_summary
+                != manifest.get("historical_failed_closed_summary")
+            ):
+                raise WechatDigestError("历史失败恢复 durable binding 漂移。")
+            status = self.run_store.status(run_id)
+            current_failed_status = binding.get("current_failed_status")
+            assert isinstance(current_failed_status, dict)
+            recovered_status = json.loads(
+                _canonical_json(current_failed_status)
+            )
+            recovered_status["state"] = "processing"
+            recovered_status["failure_category"] = None
+            if status == current_failed_status:
+                status = recovered_status
+                self.run_store.update_status(run_id, status)
+            elif status != recovered_status:
+                raise WechatDigestError("历史失败恢复 status 漂移。")
+            if self.run_store.status(run_id) != recovered_status:
+                raise WechatDigestError("历史失败恢复 status 读回失败。")
+            with SQLiteWorldModelRepository(self.database) as repository:
+                if self._governance_business_tree_fingerprint(repository) != (
+                    manifest["business_tree_fingerprint"]
+                ):
+                    raise WechatDigestError("历史失败恢复业务状态漂移。")
             return existing
 
     def _governance_effect_fingerprint(
