@@ -2253,6 +2253,7 @@ def _validated_failed_closed_recovery_manifest(
     fingerprint = projected.pop("manifest_fingerprint", None)
     binding = value.get("recovery_binding")
     summary = value.get("semantic_summary")
+    historical_summary = value.get("historical_failed_closed_summary")
     if (
         set(value)
         != {
@@ -2264,6 +2265,7 @@ def _validated_failed_closed_recovery_manifest(
             "reviewed_git_head",
             "execution_contract_unchanged",
             "semantic_summary",
+            "historical_failed_closed_summary",
             "manifest_fingerprint",
         }
         or value.get("schema_version")
@@ -2291,6 +2293,20 @@ def _validated_failed_closed_recovery_manifest(
             "next_global_ordinal": 299,
             "absolute_cap": 1000,
         }
+        or not isinstance(historical_summary, dict)
+        or set(historical_summary)
+        != {
+            "total",
+            "semantic",
+            "governance",
+            "inventory_fingerprint",
+        }
+        or historical_summary.get("total") != 5
+        or historical_summary.get("semantic") != 2
+        or historical_summary.get("governance") != 3
+        or not _sha256_value(
+            historical_summary.get("inventory_fingerprint")
+        )
         or not _sha256_value(fingerprint)
         or fingerprint
         != _sha256_bytes(_canonical_json(projected).encode("utf-8"))
@@ -2300,8 +2316,8 @@ def _validated_failed_closed_recovery_manifest(
         "run_id",
         "plan_fingerprint",
         "plan_receipt_fingerprint",
-        "status_fingerprint",
-        "failed_status",
+        "current_status_fingerprint",
+        "current_failed_status",
         "capture_fingerprint",
         "checkpoint_fingerprint",
         "current_item_id",
@@ -2319,7 +2335,13 @@ def _validated_failed_closed_recovery_manifest(
     }
     if (
         set(binding) != expected_binding
-        or not isinstance(binding.get("failed_status"), dict)
+        or not isinstance(binding.get("current_failed_status"), dict)
+        or binding.get("current_status_fingerprint")
+        != _sha256_bytes(
+            _canonical_json(binding.get("current_failed_status")).encode(
+                "utf-8"
+            )
+        )
         or not isinstance(binding.get("previous_atomic_information_ids"), list)
         or len(binding["previous_atomic_information_ids"]) != 4
         or len(set(binding["previous_atomic_information_ids"])) != 4
@@ -3833,6 +3855,107 @@ class WechatDigestService:
                 raise WechatDigestError("Governance 启动恢复状态读回失败。")
             return existing
 
+    def _historical_failed_closed_summary(
+        self, *, active_run_id: str
+    ) -> dict[str, object]:
+        """Read, validate, and bind failed-closed items outside the active run."""
+
+        inventory: list[dict[str, object]] = []
+        variant_counts: Counter[str] = Counter()
+        if not self.run_store.runs_root.is_dir():
+            raise WechatDigestError("历史 failed_closed run inventory 缺失。")
+        for path in sorted(self.run_store.runs_root.iterdir()):
+            if path.name == active_run_id:
+                continue
+            if not path.is_dir() or re.fullmatch(
+                r"run_[0-9a-f]{32}", path.name
+            ) is None:
+                raise WechatDigestError(
+                    "历史 failed_closed run inventory 损坏。"
+                )
+            run_id = path.name
+            plan = self.run_store.plan(run_id)
+            receipt = self.run_store.plan_receipt(run_id)
+            status = self.run_store.status(run_id)
+            plan_fingerprint = _plan_fingerprint(plan)
+            if (
+                plan.get("run_id") != run_id
+                or status.get("run_id") != run_id
+                or status.get("plan_fingerprint") != plan_fingerprint
+                or _committed_receipt_fingerprint(receipt)
+                != plan_fingerprint
+            ):
+                raise WechatDigestError(
+                    "历史 failed_closed run binding 损坏。"
+                )
+            items = status.get("items")
+            if not isinstance(items, dict):
+                raise WechatDigestError(
+                    "历史 failed_closed status inventory 损坏。"
+                )
+            failed_items: list[dict[str, object]] = []
+            for item_id in sorted(items):
+                item = items[item_id]
+                if not isinstance(item, dict):
+                    raise WechatDigestError(
+                        "历史 failed_closed status item 损坏。"
+                    )
+                if item.get("state") != "failed_closed":
+                    continue
+                semantic_failure = item.get("semantic_failure")
+                governance_failure = item.get("governance_failure")
+                if (semantic_failure is None) == (governance_failure is None):
+                    raise WechatDigestError(
+                        "历史 failed_closed failure variant 损坏。"
+                    )
+                variant = (
+                    "semantic"
+                    if semantic_failure is not None
+                    else "governance"
+                )
+                self._verify_failed_closed_item(
+                    run_id=run_id,
+                    plan=plan,
+                    item_id=item_id,
+                    item=item,
+                )
+                variant_counts[variant] += 1
+                failed_items.append(
+                    {
+                        "item_id": item_id,
+                        "failure_variant": variant,
+                        "item_fingerprint": _sha256_bytes(
+                            _canonical_json(item).encode("utf-8")
+                        ),
+                    }
+                )
+            if failed_items:
+                inventory.append(
+                    {
+                        "run_id": run_id,
+                        "plan_fingerprint": plan_fingerprint,
+                        "plan_receipt_fingerprint": _sha256_bytes(
+                            _canonical_json(receipt).encode("utf-8")
+                        ),
+                        "status_fingerprint": _sha256_bytes(
+                            _canonical_json(status).encode("utf-8")
+                        ),
+                        "failed_closed_items": failed_items,
+                    }
+                )
+        if variant_counts != {"semantic": 2, "governance": 3}:
+            raise WechatDigestError(
+                "历史 failed_closed summary 不匹配。"
+            )
+        return {
+            "total": 5,
+            "semantic": 2,
+            "governance": 3,
+            "inventory_fingerprint": _sha256_bytes(
+                _canonical_json(inventory).encode("utf-8")
+            ),
+        }
+
     def _build_failed_closed_recovery_manifest_unlocked(
         self,
         *,
@@ -3845,7 +3968,7 @@ class WechatDigestService:
         plan = self.run_store.plan(run_id)
         plan_receipt = self.run_store.plan_receipt(run_id)
         status = self.run_store.status(run_id)
-        failed_status = json.loads(_canonical_json(status))
+        current_failed_status = json.loads(_canonical_json(status))
         if (
             status.get("state") != "failed"
             or status.get("failure_category") != "WechatDigestError"
@@ -3870,15 +3993,17 @@ class WechatDigestService:
             if isinstance(item, dict)
         )
         if state_counts != {
-            "failed_closed": 5,
             "local_only": 3,
             "pending_human": 20,
             "planned": 16,
             "processed": 7,
             "represented": 1,
-            "unsupported": 137,
+            "unsupported": 142,
         }:
             raise WechatDigestError("历史失败恢复 item 状态边界不匹配。")
+        historical_failed_closed_summary = (
+            self._historical_failed_closed_summary(active_run_id=run_id)
+        )
         represented = [
             (item_id, item)
             for item_id, item in items.items()
@@ -4008,10 +4133,10 @@ class WechatDigestService:
             "plan_receipt_fingerprint": _sha256_bytes(
                 _canonical_json(plan_receipt).encode("utf-8")
             ),
-            "status_fingerprint": _sha256_bytes(
+            "current_status_fingerprint": _sha256_bytes(
                 _canonical_json(status).encode("utf-8")
             ),
-            "failed_status": failed_status,
+            "current_failed_status": current_failed_status,
             "capture_fingerprint": _capture_fingerprint(capture),
             "checkpoint_fingerprint": _sha256_bytes(
                 _canonical_json(
@@ -4054,6 +4179,9 @@ class WechatDigestService:
             "reviewed_git_head": reviewed_head,
             "execution_contract_unchanged": True,
             "semantic_summary": {**semantic_summary, "last_global_ordinal": 298},
+            "historical_failed_closed_summary": (
+                historical_failed_closed_summary
+            ),
         }
         candidate["manifest_fingerprint"] = _sha256_bytes(
             _canonical_json(candidate).encode("utf-8")
@@ -4129,6 +4257,9 @@ class WechatDigestService:
                     "business_tree_fingerprint": manifest[
                         "business_tree_fingerprint"
                     ],
+                    "historical_failed_closed_summary": manifest[
+                        "historical_failed_closed_summary"
+                    ],
                     "semantic_continuation_fingerprint": continuation[
                         "continuation_fingerprint"
                     ],
@@ -4157,6 +4288,7 @@ class WechatDigestService:
                     "authority_manifest_raw_fingerprint",
                     "recovery_binding",
                     "business_tree_fingerprint",
+                    "historical_failed_closed_summary",
                     "semantic_continuation_fingerprint",
                     "provider_calls",
                     "receipt_fingerprint",
@@ -4172,6 +4304,8 @@ class WechatDigestService:
                 or existing.get("recovery_binding") != binding
                 or existing.get("business_tree_fingerprint")
                 != manifest.get("business_tree_fingerprint")
+                or existing.get("historical_failed_closed_summary")
+                != manifest.get("historical_failed_closed_summary")
                 or not _sha256_value(
                     existing.get("semantic_continuation_fingerprint")
                 )
@@ -4224,13 +4358,18 @@ class WechatDigestService:
             ]
             startup = self.run_store.governance_startup_recovery(run_id)
             retry = self.run_store.governance_startup_retry(run_id)
-            previous_item = binding["failed_status"]["items"].get(
+            previous_item = binding["current_failed_status"]["items"].get(
                 binding["previous_item_id"]
             )
             previous_receipt = (
                 previous_item.get("governance_receipt")
                 if isinstance(previous_item, dict)
                 else None
+            )
+            historical_failed_closed_summary = (
+                self._historical_failed_closed_summary(
+                    active_run_id=run_id
+                )
             )
             if (
                 _plan_fingerprint(plan) != binding.get("plan_fingerprint")
@@ -4287,15 +4426,19 @@ class WechatDigestService:
                     _canonical_json(previous_receipt).encode("utf-8")
                 )
                 != binding.get("previous_governance_receipt_fingerprint")
+                or historical_failed_closed_summary
+                != manifest.get("historical_failed_closed_summary")
             ):
                 raise WechatDigestError("历史失败恢复 durable binding 漂移。")
             status = self.run_store.status(run_id)
-            failed_status = binding.get("failed_status")
-            assert isinstance(failed_status, dict)
-            recovered_status = json.loads(_canonical_json(failed_status))
+            current_failed_status = binding.get("current_failed_status")
+            assert isinstance(current_failed_status, dict)
+            recovered_status = json.loads(
+                _canonical_json(current_failed_status)
+            )
             recovered_status["state"] = "processing"
             recovered_status["failure_category"] = None
-            if status == failed_status:
+            if status == current_failed_status:
                 status = recovered_status
                 self.run_store.update_status(run_id, status)
             elif status != recovered_status:

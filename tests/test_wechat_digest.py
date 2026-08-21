@@ -1866,12 +1866,11 @@ class WechatDigestTests(unittest.TestCase):
             status["items"][current_item_id]["state"], "represented"
         )
         additions = {
-            "failed_closed": 5,
             "local_only": 3,
             "pending_human": 20,
             "planned": 16,
             "processed": 6,
-            "unsupported": 137,
+            "unsupported": 142,
         }
         index = 0
         for state, count in additions.items():
@@ -1884,6 +1883,42 @@ class WechatDigestTests(unittest.TestCase):
         status["failure_category"] = "WechatDigestError"
         status["checkpoint_published"] = False
         service.run_store.update_status(run_id, status)
+        historical_run_ids = []
+        for historical_index, failure_variant in enumerate(
+            ("semantic", "semantic", "governance", "governance", "governance"),
+            start=1,
+        ):
+            historical_capture = SyntheticCaptureProvider(
+                [
+                    message(
+                        1000 + historical_index,
+                        conversation=f"issue-154-history-{historical_index}",
+                    )
+                ]
+            ).capture(ZERO_CURSOR)
+            historical_plan, historical_status = _build_plan(
+                historical_capture,
+                clock=lambda: "2026-08-21T00:00:00+00:00",
+            )
+            historical_run_id = str(historical_plan["run_id"])
+            historical_item = next(
+                iter(historical_status["items"].values())
+            )
+            historical_item["state"] = "failed_closed"
+            if failure_variant == "semantic":
+                historical_item["semantic_failure"] = {
+                    "synthetic": True
+                }
+            else:
+                historical_item["governance_failure"] = {
+                    "synthetic": True
+                }
+            service.run_store.create(historical_plan, historical_status)
+            historical_run_ids.append(historical_run_id)
+        service.run_store.active_path.write_text(
+            json.dumps({"active_run_id": run_id}), encoding="utf-8"
+        )
+        self.issue154_historical_run_ids = historical_run_ids
         self.semantic.reviewed_git_head = "9" * 40
         return service, provider, run_id, current_item_id, startup_item_id
 
@@ -3357,10 +3392,31 @@ class WechatDigestTests(unittest.TestCase):
             "https://github.com/leevi2010-cursor/ArcheOS/issues/154"
             "#issuecomment-1234567890"
         )
-        with patch.object(service, "_verify_plan_and_status"):
+        with patch.object(service, "_verify_plan_and_status"), patch.object(
+            service, "_verify_failed_closed_item"
+        ):
             manifest = service.build_failed_closed_recovery_manifest(
                 authority_ref=authority_ref
             )
+        self.assertEqual(
+            manifest["historical_failed_closed_summary"]["total"], 5
+        )
+        self.assertEqual(
+            Counter(
+                item["state"]
+                for item in manifest["recovery_binding"][
+                    "current_failed_status"
+                ]["items"].values()
+            ),
+            {
+                "local_only": 3,
+                "pending_human": 20,
+                "planned": 16,
+                "processed": 7,
+                "represented": 1,
+                "unsupported": 142,
+            },
+        )
         manifest_path = Path(self.temporary.name) / "issue-154-authority.json"
         manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
         os.chmod(manifest_path, 0o600)
@@ -3369,13 +3425,19 @@ class WechatDigestTests(unittest.TestCase):
         semantic_calls = self.semantic.provider.calls
         governance_attempts = provider.attempts
 
-        with patch.object(service, "_verify_plan_and_status"):
+        with patch.object(service, "_verify_plan_and_status"), patch.object(
+            service, "_verify_failed_closed_item"
+        ):
             receipt = service.resolve_failed_closed_continuation(
                 authority_ref=authority_ref,
                 authority_manifest_file=manifest_path,
             )
 
         self.assertEqual(receipt["provider_calls"], 0)
+        self.assertEqual(
+            receipt["historical_failed_closed_summary"],
+            manifest["historical_failed_closed_summary"],
+        )
         self.assertEqual(self.semantic.provider.calls, semantic_calls)
         self.assertEqual(provider.attempts, governance_attempts)
         self.assertEqual(self.governance_business_state(service), business_before)
@@ -3390,7 +3452,9 @@ class WechatDigestTests(unittest.TestCase):
             service.run_store.runs_root / run_id / "failed-closed-recovery.json"
         )
         receipt_bytes = receipt_path.read_bytes()
-        with patch.object(service, "_verify_plan_and_status"):
+        with patch.object(service, "_verify_plan_and_status"), patch.object(
+            service, "_verify_failed_closed_item"
+        ):
             self.assertEqual(
                 service.resolve_failed_closed_continuation(
                     authority_ref=authority_ref,
@@ -3422,7 +3486,9 @@ class WechatDigestTests(unittest.TestCase):
             "https://github.com/leevi2010-cursor/ArcheOS/issues/154"
             "#issuecomment-1234567890"
         )
-        with patch.object(service, "_verify_plan_and_status"):
+        with patch.object(service, "_verify_plan_and_status"), patch.object(
+            service, "_verify_failed_closed_item"
+        ):
             manifest = service.build_failed_closed_recovery_manifest(
                 authority_ref=authority_ref
             )
@@ -3441,6 +3507,8 @@ class WechatDigestTests(unittest.TestCase):
             return original(*args, **kwargs)
 
         with patch.object(service, "_verify_plan_and_status"), patch.object(
+            service, "_verify_failed_closed_item"
+        ), patch.object(
             service.run_store,
             "publish_governance_startup_receipt",
             side_effect=fail_before_receipt,
@@ -3455,7 +3523,9 @@ class WechatDigestTests(unittest.TestCase):
         )
         self.assertIsNone(service.run_store.failed_closed_recovery(run_id))
 
-        with patch.object(service, "_verify_plan_and_status"):
+        with patch.object(service, "_verify_plan_and_status"), patch.object(
+            service, "_verify_failed_closed_item"
+        ):
             receipt = service.resolve_failed_closed_continuation(
                 authority_ref=authority_ref,
                 authority_manifest_file=manifest_path,
@@ -3479,7 +3549,9 @@ class WechatDigestTests(unittest.TestCase):
             "https://github.com/leevi2010-cursor/ArcheOS/issues/154"
             "#issuecomment-1234567890"
         )
-        with patch.object(service, "_verify_plan_and_status"):
+        with patch.object(service, "_verify_plan_and_status"), patch.object(
+            service, "_verify_failed_closed_item"
+        ):
             manifest = service.build_failed_closed_recovery_manifest(
                 authority_ref=authority_ref
             )
@@ -3493,7 +3565,9 @@ class WechatDigestTests(unittest.TestCase):
         service.run_store.update_status(run_id, status)
         attempts = provider.attempts
 
-        with patch.object(service, "_verify_plan_and_status"):
+        with patch.object(service, "_verify_plan_and_status"), patch.object(
+            service, "_verify_failed_closed_item"
+        ):
             with self.assertRaises(WechatDigestError):
                 service.resolve_failed_closed_continuation(
                     authority_ref=authority_ref,
@@ -3502,6 +3576,101 @@ class WechatDigestTests(unittest.TestCase):
 
         self.assertEqual(provider.attempts, attempts)
         self.assertEqual(service.run_store.status(run_id), status)
+
+    def test_failed_closed_recovery_rejects_historical_items_in_active(
+        self,
+    ) -> None:
+        service, provider, run_id, _current, _previous = (
+            self.failed_closed_recovery_fixture()
+        )
+        status = service.run_store.status(run_id)
+        unsupported = [
+            item
+            for item in status["items"].values()
+            if item["state"] == "unsupported"
+        ]
+        for item in unsupported[:5]:
+            item["state"] = "failed_closed"
+        service.run_store.update_status(run_id, status)
+        status_before = service.run_store.status(run_id)
+        semantic_calls = self.semantic.provider.calls
+        governance_attempts = provider.attempts
+
+        with patch.object(service, "_verify_plan_and_status"), patch.object(
+            service, "_verify_failed_closed_item"
+        ):
+            with self.assertRaisesRegex(
+                WechatDigestError, "item 状态边界不匹配"
+            ):
+                service.build_failed_closed_recovery_manifest(
+                    authority_ref=(
+                        "https://github.com/leevi2010-cursor/ArcheOS/issues/154"
+                        "#issuecomment-1234567890"
+                    )
+                )
+
+        self.assertEqual(service.run_store.status(run_id), status_before)
+        self.assertEqual(self.semantic.provider.calls, semantic_calls)
+        self.assertEqual(provider.attempts, governance_attempts)
+
+    def test_failed_closed_recovery_rejects_historical_summary_drift(
+        self,
+    ) -> None:
+        service, provider, run_id, _current, _previous = (
+            self.failed_closed_recovery_fixture()
+        )
+        authority_ref = (
+            "https://github.com/leevi2010-cursor/ArcheOS/issues/154"
+            "#issuecomment-1234567890"
+        )
+        with patch.object(service, "_verify_plan_and_status"), patch.object(
+            service, "_verify_failed_closed_item"
+        ):
+            manifest = service.build_failed_closed_recovery_manifest(
+                authority_ref=authority_ref
+            )
+        manifest_path = Path(self.temporary.name) / "issue-154-history.json"
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+        os.chmod(manifest_path, 0o600)
+        historical_run_id = self.issue154_historical_run_ids[0]
+        historical_status = service.run_store.status(historical_run_id)
+        historical_item = next(iter(historical_status["items"].values()))
+        historical_item["semantic_failure"]["synthetic"] = "drift"
+        service.run_store.update_status(
+            historical_run_id, historical_status
+        )
+        active_status = service.run_store.status(run_id)
+        semantic_calls = self.semantic.provider.calls
+        governance_attempts = provider.attempts
+
+        with patch.object(service, "_verify_plan_and_status"), patch.object(
+            service, "_verify_failed_closed_item"
+        ):
+            drifted_summary = service._historical_failed_closed_summary(
+                active_run_id=run_id
+            )
+            self.assertEqual(drifted_summary["total"], 5)
+            self.assertNotEqual(
+                drifted_summary["inventory_fingerprint"],
+                manifest["historical_failed_closed_summary"][
+                    "inventory_fingerprint"
+                ],
+            )
+            with self.assertRaisesRegex(
+                WechatDigestError, "manifest 与现场不匹配"
+            ):
+                service.resolve_failed_closed_continuation(
+                    authority_ref=authority_ref,
+                    authority_manifest_file=manifest_path,
+                )
+
+        self.assertEqual(service.run_store.status(run_id), active_status)
+        self.assertIsNone(service.run_store.failed_closed_recovery(run_id))
+        self.assertIsNone(
+            self.semantic.installed_failed_closed_recovery_continuation
+        )
+        self.assertEqual(self.semantic.provider.calls, semantic_calls)
+        self.assertEqual(provider.attempts, governance_attempts)
 
     def test_governance_startup_persisted_batch_recovers_without_provider(
         self,
