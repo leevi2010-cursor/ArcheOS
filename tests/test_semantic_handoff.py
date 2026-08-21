@@ -11547,7 +11547,7 @@ print("passed")
             segmented_continuation["continuation_fingerprint"],
         )
 
-        startup_head = "e" * 40
+        startup_head = "c8ece3782ae3ba289d06c36d1e352ce23e0f627b"
         startup_authority_ref = (
             "https://github.com/leevi2010-cursor/ArcheOS/issues/150"
             "#issuecomment-5367000000"
@@ -11613,6 +11613,122 @@ print("passed")
             ),
             startup_continuation,
         )
+        timeout_212 = json.loads(
+            (
+                handoff.audit_root
+                / "semantic_global_authority"
+                / "unknown-resolution-ordinal-0212.json"
+            ).read_text(encoding="utf-8")
+        )
+        handoff_298.validate_timeout_212_resolution_digest(
+            digest_binding=digest,
+            failed_closed_status_fingerprint="sha256:" + "b" * 64,
+            resolution_id=timeout_212["resolution_id"],
+        )
+        handoff_298.validate_unknown_resolution_digest(
+            digest_binding=unknown_166_digest,
+            failed_closed_status_fingerprint=unknown_166_status_fingerprint,
+            resolution_id=unknown_166["resolution_id"],
+        )
+        failed_closed_head = "f" * 40
+        failed_closed_authority_ref = (
+            "https://github.com/leevi2010-cursor/ArcheOS/issues/154"
+            "#issuecomment-5369000000"
+        )
+        failed_closed_runner = FakeRunner()
+        failed_closed_continuation = (
+            handoff_298.install_failed_closed_recovery_continuation(
+                CodexCliRepresentationAnalysisProvider(
+                    provider_version="0.147.0",
+                    timeout_seconds=300,
+                    runner=failed_closed_runner,
+                    diagnostic_root=timeout_provider.diagnostic_root,
+                ),
+                window_binding=replace(
+                    gate_c_window, reviewed_git_head=startup_head
+                ),
+                reviewed_git_head=failed_closed_head,
+                authority_ref=failed_closed_authority_ref,
+                authority_manifest_fingerprint="sha256:" + "c" * 64,
+                authority_manifest_raw_fingerprint="sha256:" + "d" * 64,
+            )
+        )
+        self.assertEqual(failed_closed_runner.calls, [])
+        self.assertEqual(failed_closed_continuation["activation_total"], 298)
+        self.assertEqual(
+            failed_closed_continuation["activation_unknown_count"], 0
+        )
+        self.assertEqual(failed_closed_continuation["next_global_ordinal"], 299)
+        self.assertEqual(
+            handoff_298.install_failed_closed_recovery_continuation(
+                CodexCliRepresentationAnalysisProvider(
+                    provider_version="0.147.0",
+                    timeout_seconds=300,
+                    runner=FakeRunner(),
+                    diagnostic_root=timeout_provider.diagnostic_root,
+                ),
+                window_binding=replace(
+                    gate_c_window, reviewed_git_head=failed_closed_head
+                ),
+                reviewed_git_head=failed_closed_head,
+                authority_ref=failed_closed_authority_ref,
+                authority_manifest_fingerprint="sha256:" + "c" * 64,
+                authority_manifest_raw_fingerprint="sha256:" + "d" * 64,
+            ),
+            failed_closed_continuation,
+        )
+        handoff_298.validate_timeout_212_resolution_digest(
+            digest_binding=digest,
+            failed_closed_status_fingerprint="sha256:" + "b" * 64,
+            resolution_id=timeout_212["resolution_id"],
+        )
+        handoff_298.validate_unknown_resolution_digest(
+            digest_binding=unknown_166_digest,
+            failed_closed_status_fingerprint=unknown_166_status_fingerprint,
+            resolution_id=unknown_166["resolution_id"],
+        )
+        failed_closed_path = (
+            handoff.audit_root
+            / "semantic_global_authority"
+            / "failed-closed-recovery-continuation.json"
+        )
+        failed_closed_bytes = failed_closed_path.read_bytes()
+        damaged_authority = json.loads(failed_closed_bytes)
+        damaged_authority["authority_manifest_fingerprint"] = (
+            "sha256:" + "0" * 64
+        )
+        failed_closed_path.write_text(
+            json.dumps(damaged_authority), encoding="utf-8"
+        )
+        with self.assertRaises(SemanticHandoffError):
+            handoff_298.validate_unknown_resolution_digest(
+                digest_binding=unknown_166_digest,
+                failed_closed_status_fingerprint=(
+                    unknown_166_status_fingerprint
+                ),
+                resolution_id=unknown_166["resolution_id"],
+            )
+        failed_closed_path.write_bytes(failed_closed_bytes)
+        unknown_path = (
+            handoff.audit_root
+            / "semantic_global_authority"
+            / "unknown-resolution-ordinal-0166.json"
+        )
+        unknown_bytes = unknown_path.read_bytes()
+        damaged_unknown = json.loads(unknown_bytes)
+        damaged_unknown["digest"]["failed_closed_status_fingerprint"] = (
+            "sha256:" + "0" * 64
+        )
+        unknown_path.write_text(json.dumps(damaged_unknown), encoding="utf-8")
+        with self.assertRaises(SemanticHandoffError):
+            handoff_298.validate_unknown_resolution_digest(
+                digest_binding=unknown_166_digest,
+                failed_closed_status_fingerprint=(
+                    unknown_166_status_fingerprint
+                ),
+                resolution_id=unknown_166["resolution_id"],
+            )
+        unknown_path.write_bytes(unknown_bytes)
 
         ordinal_299_root = root / "ordinal-0299"
         representation_299, service_299 = self.build_service(
@@ -11636,7 +11752,7 @@ print("passed")
                 ),
                 privacy_binding=self.privacy_binding(),
                 authority_binding=replace(
-                    gate_c_window, reviewed_git_head=segmented_head
+                    gate_c_window, reviewed_git_head=startup_head
                 ),
             )
         self.assertEqual(old_299_runner.calls, [])
@@ -11651,7 +11767,7 @@ print("passed")
             ),
             privacy_binding=self.privacy_binding(),
             authority_binding=replace(
-                gate_c_window, reviewed_git_head=startup_head
+                gate_c_window, reviewed_git_head=failed_closed_head
             ),
         )
         self.assertEqual(len(runner_299.calls), 1)
@@ -11665,7 +11781,7 @@ print("passed")
         )
         self.assertEqual(
             attempt_299["global_authority_fingerprint"],
-            startup_continuation["continuation_fingerprint"],
+            failed_closed_continuation["continuation_fingerprint"],
         )
 
 

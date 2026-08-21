@@ -287,6 +287,91 @@ class CliTest(unittest.TestCase):
     @patch("archeos.cli.WechatDigestService")
     @patch("archeos.cli.WechatCliCaptureProvider")
     @patch("archeos.cli.require_workspace")
+    def test_wechat_digest_resolves_failed_closed_continuation_zero_calls(
+        self,
+        require_workspace: Mock,
+        capture_provider: Mock,
+        digest_service: Mock,
+    ) -> None:
+        require_workspace.return_value = WorkspaceConfig(
+            Path("/workspace"), Path("/config")
+        )
+        digest_service.return_value.resolve_failed_closed_continuation.return_value = {
+            "receipt_fingerprint": "sha256:" + "e" * 64,
+        }
+        authority_ref = (
+            "https://github.com/leevi2010-cursor/ArcheOS/issues/154"
+            "#issuecomment-1234567890"
+        )
+        authority = Path("/private/issue-154-authority.json")
+        output = StringIO()
+        with redirect_stdout(output):
+            result = main(
+                [
+                    "wechat",
+                    "digest",
+                    "--resolve-failed-closed-continuation",
+                    "--failed-closed-authority-file",
+                    str(authority),
+                    "--authority-ref",
+                    authority_ref,
+                ]
+            )
+        self.assertEqual(result, 0)
+        payload = json.loads(output.getvalue())
+        self.assertEqual(payload["semantic_provider_calls"], 0)
+        self.assertEqual(payload["governance_provider_calls"], 0)
+        self.assertEqual(payload["global_attempt_total"], 298)
+        self.assertEqual(payload["global_unknown"], 0)
+        self.assertEqual(payload["next_global_ordinal"], 299)
+        self.assertFalse(payload["checkpoint_published"])
+        digest_service.return_value.resolve_failed_closed_continuation.assert_called_once_with(
+            authority_ref=authority_ref,
+            authority_manifest_file=authority,
+        )
+        digest_service.return_value.run.assert_not_called()
+        capture_provider.assert_called_once()
+
+    @patch("archeos.cli.require_workspace")
+    def test_failed_closed_recovery_cli_requires_exact_private_manifest(
+        self, require_workspace: Mock
+    ) -> None:
+        authority_ref = (
+            "https://github.com/leevi2010-cursor/ArcheOS/issues/154"
+            "#issuecomment-1234567890"
+        )
+        output = StringIO()
+        with redirect_stdout(output):
+            result = main(
+                [
+                    "wechat",
+                    "digest",
+                    "--resolve-failed-closed-continuation",
+                    "--authority-ref",
+                    authority_ref,
+                ]
+            )
+        self.assertEqual(result, 2)
+        self.assertIn("必须指定私有 authority file", output.getvalue())
+        require_workspace.assert_not_called()
+
+        output = StringIO()
+        with redirect_stdout(output):
+            result = main(
+                [
+                    "wechat",
+                    "digest",
+                    "--failed-closed-authority-file",
+                    "/private/unbound.json",
+                ]
+            )
+        self.assertEqual(result, 2)
+        self.assertIn("只能与恢复入口一起使用", output.getvalue())
+        require_workspace.assert_not_called()
+
+    @patch("archeos.cli.WechatDigestService")
+    @patch("archeos.cli.WechatCliCaptureProvider")
+    @patch("archeos.cli.require_workspace")
     def test_wechat_digest_installs_maintenance_continuation_zero_calls(
         self,
         require_workspace: Mock,
