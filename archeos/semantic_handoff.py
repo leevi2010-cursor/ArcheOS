@@ -153,6 +153,9 @@ _GATE_C_CONTINUATION_SCHEMA = "semantic-handoff-gate-c-continuation/1.0"
 _SEGMENTED_GATE_C_CONTINUATION_SCHEMA = (
     "semantic-handoff-segmented-gate-c-continuation/1.0"
 )
+_GOVERNANCE_STARTUP_RECOVERY_CONTINUATION_SCHEMA = (
+    "semantic-handoff-governance-startup-recovery-continuation/1.0"
+)
 _UNKNOWN_RESOLUTION_MANIFEST_SCHEMA = (
     "semantic-handoff-unknown-resolution-authority/1.0"
 )
@@ -173,6 +176,9 @@ _BATCH_GOVERNANCE_CONTINUATION_RECEIPT = (
 )
 _GATE_C_CONTINUATION_RECEIPT = "gate-c-continuation.json"
 _SEGMENTED_GATE_C_CONTINUATION_RECEIPT = "segmented-gate-c-continuation.json"
+_GOVERNANCE_STARTUP_RECOVERY_CONTINUATION_RECEIPT = (
+    "governance-startup-recovery-continuation.json"
+)
 _UNKNOWN_RESOLUTION_RECEIPT = "unknown-resolution-ordinal-0166.json"
 _TIMEOUT_212_RESOLUTION_RECEIPT = "unknown-resolution-ordinal-0212.json"
 _GLOBAL_AUTHORITY_LOCK = "authority.lock"
@@ -474,6 +480,7 @@ def _validate_global_authority_directory(path: Path) -> None:
         _BATCH_GOVERNANCE_CONTINUATION_RECEIPT,
         _GATE_C_CONTINUATION_RECEIPT,
         _SEGMENTED_GATE_C_CONTINUATION_RECEIPT,
+        _GOVERNANCE_STARTUP_RECOVERY_CONTINUATION_RECEIPT,
     }:
         raise SemanticHandoffError("Semantic global authority inventory 损坏。")
     lock_path = children.get(_GLOBAL_AUTHORITY_LOCK)
@@ -506,6 +513,11 @@ def _validate_global_authority_directory(path: Path) -> None:
     segmented_gate_c_path = children.get(_SEGMENTED_GATE_C_CONTINUATION_RECEIPT)
     if segmented_gate_c_path is not None:
         _require_private_file(segmented_gate_c_path)
+    startup_recovery_path = children.get(
+        _GOVERNANCE_STARTUP_RECOVERY_CONTINUATION_RECEIPT
+    )
+    if startup_recovery_path is not None:
+        _require_private_file(startup_recovery_path)
 
 
 def _validate_shared_recovery_root(root: Path, *, create: bool) -> bool:
@@ -1332,6 +1344,18 @@ class _SemanticRecoveryRun:
                         gate_c_continuation,
                     )
                 )
+                startup_recovery_continuation = (
+                    global_authority._read_governance_startup_recovery_continuation(
+                        base,
+                        extension,
+                        resolution,
+                        maintenance,
+                        timeout_resolution,
+                        batch_governance_continuation,
+                        gate_c_continuation,
+                        segmented_gate_c_continuation,
+                    )
+                )
                 effective = global_authority._effective_authority(
                     base,
                     extension,
@@ -1341,6 +1365,7 @@ class _SemanticRecoveryRun:
                     batch_governance_continuation,
                     gate_c_continuation,
                     segmented_gate_c_continuation,
+                    startup_recovery_continuation,
                 )
                 attempts, _unknown = global_authority._global_attempts(effective)
                 if not any(
@@ -2402,6 +2427,9 @@ class _SemanticGlobalAuthority:
         self.segmented_gate_c_continuation_path = (
             self.root / _SEGMENTED_GATE_C_CONTINUATION_RECEIPT
         )
+        self.governance_startup_recovery_continuation_path = (
+            self.root / _GOVERNANCE_STARTUP_RECOVERY_CONTINUATION_RECEIPT
+        )
         self.unknown_resolution_path = self.root / _UNKNOWN_RESOLUTION_RECEIPT
         self.timeout_212_resolution_path = (
             self.root / _TIMEOUT_212_RESOLUTION_RECEIPT
@@ -2455,6 +2483,18 @@ class _SemanticGlobalAuthority:
                 gate_c_continuation,
             )
         )
+        startup_recovery_continuation = (
+            self._read_governance_startup_recovery_continuation(
+                grant,
+                extension,
+                resolution,
+                continuation,
+                timeout_resolution,
+                batch_governance_continuation,
+                gate_c_continuation,
+                segmented_gate_c_continuation,
+            )
+        )
         effective = self._effective_authority(
             grant,
             extension,
@@ -2464,6 +2504,7 @@ class _SemanticGlobalAuthority:
             batch_governance_continuation,
             gate_c_continuation,
             segmented_gate_c_continuation,
+            startup_recovery_continuation,
         )
         self._global_attempts(effective)
         campaign = grant.get("campaign")
@@ -7254,6 +7295,400 @@ class _SemanticGlobalAuthority:
                 )
             return observed
 
+    def _read_governance_startup_recovery_continuation(
+        self,
+        grant: Mapping[str, object],
+        extension: Mapping[str, object] | None,
+        resolution: Mapping[str, object] | None,
+        maintenance_continuation: Mapping[str, object] | None,
+        timeout_212_resolution: Mapping[str, object] | None,
+        batch_governance_continuation: Mapping[str, object] | None,
+        gate_c_continuation: Mapping[str, object] | None,
+        segmented_gate_c_continuation: Mapping[str, object] | None,
+    ) -> dict[str, object] | None:
+        if not os.path.lexists(
+            self.governance_startup_recovery_continuation_path
+        ):
+            return None
+        if segmented_gate_c_continuation is None:
+            raise SemanticHandoffError(
+                "Semantic Governance 启动恢复缺少前序 authority。"
+            )
+        receipt = _private_json_exact(
+            self.governance_startup_recovery_continuation_path
+        )
+        projected = dict(receipt)
+        fingerprint = projected.pop("continuation_fingerprint", None)
+        previous = self._effective_authority(
+            grant,
+            extension,
+            resolution,
+            maintenance_continuation,
+            timeout_212_resolution,
+            batch_governance_continuation,
+            gate_c_continuation,
+            segmented_gate_c_continuation,
+        )
+        window = receipt.get("window")
+        if (
+            set(receipt)
+            != {
+                "schema_version",
+                "artifact_kind",
+                "authority_ref",
+                "authority_manifest_fingerprint",
+                "authority_manifest_raw_fingerprint",
+                "previous_global_authority_fingerprint",
+                "previous_reviewed_git_head",
+                "reviewed_git_head",
+                "previous_execution_contract",
+                "execution_contract",
+                "campaign",
+                "window",
+                "activation_total",
+                "activation_unknown_count",
+                "activation_last_global_ordinal",
+                "activation_attempt_inventory_fingerprint",
+                "next_global_ordinal",
+                "absolute_cap",
+                "continuation_fingerprint",
+            }
+            or receipt.get("schema_version")
+            != _GOVERNANCE_STARTUP_RECOVERY_CONTINUATION_SCHEMA
+            or receipt.get("artifact_kind")
+            != "semantic_handoff_governance_startup_recovery_continuation"
+            or re.fullmatch(
+                r"https://github\.com/leevi2010-cursor/ArcheOS/issues/150"
+                r"#issuecomment-[0-9]+",
+                str(receipt.get("authority_ref")),
+            )
+            is None
+            or not _sha256_fingerprint(
+                receipt.get("authority_manifest_fingerprint")
+            )
+            or not _sha256_fingerprint(
+                receipt.get("authority_manifest_raw_fingerprint")
+            )
+            or receipt.get("previous_global_authority_fingerprint")
+            != previous.get("global_authority_fingerprint")
+            or receipt.get("previous_reviewed_git_head")
+            != previous.get("reviewed_git_head")
+            or receipt.get("previous_execution_contract")
+            != previous.get("contract")
+            or receipt.get("execution_contract") != previous.get("contract")
+            or receipt.get("campaign") != grant.get("campaign")
+            or not isinstance(window, dict)
+            or re.fullmatch(
+                r"[0-9a-f]{40}", str(receipt.get("reviewed_git_head"))
+            )
+            is None
+            or receipt.get("reviewed_git_head")
+            == receipt.get("previous_reviewed_git_head")
+            or receipt.get("activation_total") != 298
+            or receipt.get("activation_unknown_count") != 0
+            or receipt.get("activation_last_global_ordinal") != 298
+            or not _sha256_fingerprint(
+                receipt.get("activation_attempt_inventory_fingerprint")
+            )
+            or receipt.get("next_global_ordinal") != 299
+            or receipt.get("absolute_cap") != 1000
+            or not _sha256_fingerprint(fingerprint)
+            or fingerprint != _fingerprint(projected)
+        ):
+            raise SemanticHandoffError(
+                "Semantic Governance 启动恢复 continuation binding 损坏。"
+            )
+        binding = _authority_window_from_payload(window)
+        if binding.reviewed_git_head != receipt.get(
+            "previous_reviewed_git_head"
+        ):
+            raise SemanticHandoffError(
+                "Semantic Governance 启动恢复 window binding 损坏。"
+            )
+        return receipt
+
+    def _expected_governance_startup_recovery_continuation(
+        self,
+        *,
+        window: SemanticWindowAuthorityBinding,
+        provider: CodexCliRepresentationAnalysisProvider,
+        reviewed_git_head: str,
+        authority_ref: str,
+        authority_manifest_fingerprint: str,
+        authority_manifest_raw_fingerprint: str,
+    ) -> dict[str, object]:
+        grant = self._read_base_grant()
+        extension = self._read_extension(grant)
+        resolution = self._read_unknown_resolution()
+        maintenance = self._read_maintenance_continuation(
+            grant, extension, resolution
+        )
+        timeout_resolution = self._read_timeout_212_resolution(
+            grant, extension, resolution, maintenance
+        )
+        batch_continuation = self._read_batch_governance_continuation(
+            grant, extension, resolution, maintenance, timeout_resolution
+        )
+        gate_c = self._read_gate_c_continuation(
+            grant,
+            extension,
+            resolution,
+            maintenance,
+            timeout_resolution,
+            batch_continuation,
+        )
+        segmented = self._read_segmented_gate_c_continuation(
+            grant,
+            extension,
+            resolution,
+            maintenance,
+            timeout_resolution,
+            batch_continuation,
+            gate_c,
+        )
+        if segmented is None:
+            raise SemanticHandoffError(
+                "Semantic Governance 启动恢复缺少前序 authority。"
+            )
+        previous = self._effective_authority(
+            grant,
+            extension,
+            resolution,
+            maintenance,
+            timeout_resolution,
+            batch_continuation,
+            gate_c,
+            segmented,
+        )
+        window_payload = _authority_window_payload(window)
+        existing = self._read_governance_startup_recovery_continuation(
+            grant,
+            extension,
+            resolution,
+            maintenance,
+            timeout_resolution,
+            batch_continuation,
+            gate_c,
+            segmented,
+        )
+        if existing is not None:
+            comparable_window = dict(window_payload)
+            if comparable_window.get("reviewed_git_head") == existing.get(
+                "reviewed_git_head"
+            ):
+                comparable_window["reviewed_git_head"] = existing[
+                    "previous_reviewed_git_head"
+                ]
+            if (
+                reviewed_git_head != existing.get("reviewed_git_head")
+                or authority_ref != existing.get("authority_ref")
+                or authority_manifest_fingerprint
+                != existing.get("authority_manifest_fingerprint")
+                or authority_manifest_raw_fingerprint
+                != existing.get("authority_manifest_raw_fingerprint")
+                or self._contract_payload(provider)
+                != existing.get("execution_contract")
+                or not _payloads_exactly_equal(
+                    comparable_window, existing.get("window")
+                )
+            ):
+                raise SemanticHandoffError(
+                    "Semantic Governance 启动恢复 continuation 已存在且不匹配。"
+                )
+            effective = self._effective_authority(
+                grant,
+                extension,
+                resolution,
+                maintenance,
+                timeout_resolution,
+                batch_continuation,
+                gate_c,
+                segmented,
+                existing,
+            )
+            _attempts, unknown = self._global_attempts(effective)
+            if unknown:
+                raise SemanticHandoffError(
+                    "Semantic Governance 启动恢复存在未知 attempt。"
+                )
+            return dict(existing)
+        self._validate_effective_window(window_payload, grant, previous)
+        attempts, unknown = self._global_attempts(previous)
+        total = int(grant["baseline_total"]) + len(attempts)
+        if (
+            total != 298
+            or unknown
+            or not attempts
+            or attempts[-1].get("global_ordinal") != 298
+            or segmented.get("reviewed_git_head")
+            != "67d159411e968c6b0c2f787f9063a22682c10fb9"
+            or self._contract_payload(provider) != previous.get("contract")
+            or re.fullmatch(r"[0-9a-f]{40}", reviewed_git_head) is None
+            or reviewed_git_head == previous.get("reviewed_git_head")
+            or re.fullmatch(
+                r"https://github\.com/leevi2010-cursor/ArcheOS/issues/150"
+                r"#issuecomment-[0-9]+",
+                authority_ref,
+            )
+            is None
+            or not _sha256_fingerprint(authority_manifest_fingerprint)
+            or not _sha256_fingerprint(authority_manifest_raw_fingerprint)
+        ):
+            raise SemanticHandoffError(
+                "Semantic Governance 启动恢复 activation binding 不匹配。"
+            )
+        without_fingerprint: dict[str, object] = {
+            "schema_version": _GOVERNANCE_STARTUP_RECOVERY_CONTINUATION_SCHEMA,
+            "artifact_kind": (
+                "semantic_handoff_governance_startup_recovery_continuation"
+            ),
+            "authority_ref": authority_ref,
+            "authority_manifest_fingerprint": authority_manifest_fingerprint,
+            "authority_manifest_raw_fingerprint": (
+                authority_manifest_raw_fingerprint
+            ),
+            "previous_global_authority_fingerprint": previous[
+                "global_authority_fingerprint"
+            ],
+            "previous_reviewed_git_head": previous["reviewed_git_head"],
+            "reviewed_git_head": reviewed_git_head,
+            "previous_execution_contract": previous["contract"],
+            "execution_contract": previous["contract"],
+            "campaign": grant["campaign"],
+            "window": window_payload,
+            "activation_total": 298,
+            "activation_unknown_count": 0,
+            "activation_last_global_ordinal": 298,
+            "activation_attempt_inventory_fingerprint": _fingerprint(attempts),
+            "next_global_ordinal": 299,
+            "absolute_cap": 1000,
+        }
+        return {
+            **without_fingerprint,
+            "continuation_fingerprint": _fingerprint(without_fingerprint),
+        }
+
+    def install_governance_startup_recovery_continuation(
+        self,
+        *,
+        window: SemanticWindowAuthorityBinding,
+        provider: CodexCliRepresentationAnalysisProvider,
+        reviewed_git_head: str,
+        authority_ref: str,
+        authority_manifest_fingerprint: str,
+        authority_manifest_raw_fingerprint: str,
+    ) -> dict[str, object]:
+        preflight = self._expected_governance_startup_recovery_continuation(
+            window=window,
+            provider=provider,
+            reviewed_git_head=reviewed_git_head,
+            authority_ref=authority_ref,
+            authority_manifest_fingerprint=authority_manifest_fingerprint,
+            authority_manifest_raw_fingerprint=authority_manifest_raw_fingerprint,
+        )
+        with self._locked():
+            expected = self._expected_governance_startup_recovery_continuation(
+                window=window,
+                provider=provider,
+                reviewed_git_head=reviewed_git_head,
+                authority_ref=authority_ref,
+                authority_manifest_fingerprint=authority_manifest_fingerprint,
+                authority_manifest_raw_fingerprint=(
+                    authority_manifest_raw_fingerprint
+                ),
+            )
+            if not _payloads_exactly_equal(preflight, expected):
+                raise SemanticHandoffError(
+                    "Semantic Governance 启动恢复 preflight 漂移。"
+                )
+            path = self.governance_startup_recovery_continuation_path
+            if os.path.lexists(path):
+                if not _payloads_exactly_equal(
+                    _private_json_exact(path), expected
+                ):
+                    raise SemanticHandoffError(
+                        "Semantic Governance 启动恢复已存在且不匹配。"
+                    )
+            else:
+                _publish_private_json_marker(path, expected)
+            _refsync_and_readback(
+                files=(
+                    self.grant_path,
+                    self.extension_path,
+                    self.unknown_resolution_path,
+                    self.maintenance_continuation_path,
+                    self.timeout_212_resolution_path,
+                    self.batch_governance_continuation_path,
+                    self.gate_c_continuation_path,
+                    self.segmented_gate_c_continuation_path,
+                    path,
+                    self.lock_path,
+                ),
+                directories=(self.root, self.audit_root),
+            )
+            grant = self._read_base_grant()
+            extension = self._read_extension(grant)
+            resolution = self._read_unknown_resolution()
+            maintenance = self._read_maintenance_continuation(
+                grant, extension, resolution
+            )
+            timeout_resolution = self._read_timeout_212_resolution(
+                grant, extension, resolution, maintenance
+            )
+            batch_continuation = self._read_batch_governance_continuation(
+                grant, extension, resolution, maintenance, timeout_resolution
+            )
+            gate_c = self._read_gate_c_continuation(
+                grant,
+                extension,
+                resolution,
+                maintenance,
+                timeout_resolution,
+                batch_continuation,
+            )
+            segmented = self._read_segmented_gate_c_continuation(
+                grant,
+                extension,
+                resolution,
+                maintenance,
+                timeout_resolution,
+                batch_continuation,
+                gate_c,
+            )
+            observed = self._read_governance_startup_recovery_continuation(
+                grant,
+                extension,
+                resolution,
+                maintenance,
+                timeout_resolution,
+                batch_continuation,
+                gate_c,
+                segmented,
+            )
+            if observed is None or not _payloads_exactly_equal(
+                observed, expected
+            ):
+                raise SemanticHandoffError(
+                    "Semantic Governance 启动恢复安装读回失败。"
+                )
+            effective = self._effective_authority(
+                grant,
+                extension,
+                resolution,
+                maintenance,
+                timeout_resolution,
+                batch_continuation,
+                gate_c,
+                segmented,
+                observed,
+            )
+            _attempts, unknown = self._global_attempts(effective)
+            if unknown:
+                raise SemanticHandoffError(
+                    "Semantic Governance 启动恢复安装读回存在未知 attempt。"
+                )
+            return expected
+
     @staticmethod
     def _effective_authority(
         grant: Mapping[str, object],
@@ -7264,6 +7699,8 @@ class _SemanticGlobalAuthority:
         batch_governance_continuation: Mapping[str, object] | None = None,
         gate_c_continuation: Mapping[str, object] | None = None,
         segmented_gate_c_continuation: Mapping[str, object] | None = None,
+        governance_startup_recovery_continuation: Mapping[str, object]
+        | None = None,
     ) -> dict[str, object]:
         effective = _SemanticGlobalAuthority._effective_authority_before_resolution(
             grant, extension
@@ -7332,6 +7769,22 @@ class _SemanticGlobalAuthority:
             effective["contract"] = segmented_gate_c_continuation[
                 "execution_contract"
             ]
+        if governance_startup_recovery_continuation is not None:
+            effective["global_authority_fingerprint"] = (
+                governance_startup_recovery_continuation[
+                    "continuation_fingerprint"
+                ]
+            )
+            effective["reviewed_git_head"] = (
+                governance_startup_recovery_continuation[
+                    "reviewed_git_head"
+                ]
+            )
+            effective["contract"] = (
+                governance_startup_recovery_continuation[
+                    "execution_contract"
+                ]
+            )
         return effective
 
     @staticmethod
@@ -7402,6 +7855,18 @@ class _SemanticGlobalAuthority:
                 gate_c_continuation,
             )
         )
+        startup_recovery_continuation = (
+            self._read_governance_startup_recovery_continuation(
+                grant,
+                extension,
+                resolution,
+                continuation,
+                timeout_resolution,
+                batch_governance_continuation,
+                gate_c_continuation,
+                segmented_gate_c_continuation,
+            )
+        )
         effective = self._effective_authority(
             grant,
             extension,
@@ -7411,6 +7876,7 @@ class _SemanticGlobalAuthority:
             batch_governance_continuation,
             gate_c_continuation,
             segmented_gate_c_continuation,
+            startup_recovery_continuation,
         )
         window_payload = _authority_window_payload(window)
         self._validate_effective_window(window_payload, grant, effective)
@@ -7473,6 +7939,18 @@ class _SemanticGlobalAuthority:
                 gate_c_continuation,
             )
         )
+        startup_recovery_continuation = (
+            self._read_governance_startup_recovery_continuation(
+                base_grant,
+                extension,
+                resolution,
+                maintenance_continuation,
+                timeout_212_resolution,
+                batch_governance_continuation,
+                gate_c_continuation,
+                segmented_gate_c_continuation,
+            )
+        )
         previous_authority = self._effective_authority_before_resolution(
             base_grant, extension
         )
@@ -7503,6 +7981,16 @@ class _SemanticGlobalAuthority:
             batch_governance_continuation,
             gate_c_continuation,
         )
+        segmented_authority = self._effective_authority(
+            base_grant,
+            extension,
+            resolution,
+            maintenance_continuation,
+            timeout_212_resolution,
+            batch_governance_continuation,
+            gate_c_continuation,
+            segmented_gate_c_continuation,
+        )
         expected_effective = self._effective_authority(
             base_grant,
             extension,
@@ -7512,6 +8000,7 @@ class _SemanticGlobalAuthority:
             batch_governance_continuation,
             gate_c_continuation,
             segmented_gate_c_continuation,
+            startup_recovery_continuation,
         )
         if not _payloads_exactly_equal(grant, expected_effective):
             raise SemanticHandoffError(
@@ -7551,6 +8040,11 @@ class _SemanticGlobalAuthority:
         segmented_gate_c_fingerprint = (
             segmented_gate_c_continuation.get("continuation_fingerprint")
             if segmented_gate_c_continuation is not None
+            else None
+        )
+        startup_recovery_fingerprint = (
+            startup_recovery_continuation.get("continuation_fingerprint")
+            if startup_recovery_continuation is not None
             else None
         )
         attempts: list[dict[str, object]] = []
@@ -7711,14 +8205,33 @@ class _SemanticGlobalAuthority:
                     segmented_gate_c_continuation is not None
                     and authority_fingerprint == segmented_gate_c_fingerprint
                 ):
+                    authority = segmented_authority
+                    if (
+                        isinstance(global_ordinal, bool)
+                        or not isinstance(global_ordinal, int)
+                        or not 298
+                        <= global_ordinal
+                        <= (
+                            298
+                            if startup_recovery_continuation is not None
+                            else 1000
+                        )
+                    ):
+                        raise SemanticHandoffError(
+                            "Semantic segmented Gate C continuation ordinal 损坏。"
+                        )
+                elif (
+                    startup_recovery_continuation is not None
+                    and authority_fingerprint == startup_recovery_fingerprint
+                ):
                     authority = expected_effective
                     if (
                         isinstance(global_ordinal, bool)
                         or not isinstance(global_ordinal, int)
-                        or not 298 <= global_ordinal <= 1000
+                        or not 299 <= global_ordinal <= 1000
                     ):
                         raise SemanticHandoffError(
-                            "Semantic segmented Gate C continuation ordinal 损坏。"
+                            "Semantic Governance 启动恢复 continuation ordinal 损坏。"
                         )
                 else:
                     raise SemanticHandoffError(
@@ -7904,6 +8417,19 @@ class _SemanticGlobalAuthority:
                 raise SemanticHandoffError(
                     "Semantic segmented Gate C continuation activation 漂移。"
                 )
+        if startup_recovery_continuation is not None:
+            activation = attempts[:218]
+            if (
+                len(activation) != 218
+                or activation[-1].get("global_ordinal") != 298
+                or startup_recovery_continuation.get(
+                    "activation_attempt_inventory_fingerprint"
+                )
+                != _fingerprint(activation)
+            ):
+                raise SemanticHandoffError(
+                    "Semantic Governance 启动恢复 continuation activation 漂移。"
+                )
         previous_window: dict[str, object] | None = None
         for attempt in attempts:
             window = attempt.get("window")
@@ -7946,6 +8472,11 @@ class _SemanticGlobalAuthority:
                     window,
                     segmented_gate_c_continuation,
                     gate_c_continuation,
+                ) and not self._window_matches_gate_c_continuation(
+                    previous_window,
+                    window,
+                    startup_recovery_continuation,
+                    segmented_gate_c_continuation,
                 ):
                     raise SemanticHandoffError(
                         "Semantic global authority current window 漂移。"
@@ -8140,6 +8671,18 @@ class _SemanticGlobalAuthority:
                     gate_c_continuation,
                 )
             )
+            startup_recovery_continuation = (
+                self._read_governance_startup_recovery_continuation(
+                    base_grant,
+                    extension,
+                    resolution,
+                    maintenance,
+                    timeout_resolution,
+                    batch_governance_continuation,
+                    gate_c_continuation,
+                    segmented_gate_c_continuation,
+                )
+            )
             current_window = _authority_window_payload(window)
             if attempts:
                 last_window = attempts[-1]["window"]
@@ -8175,6 +8718,11 @@ class _SemanticGlobalAuthority:
                         current_window,
                         segmented_gate_c_continuation,
                         gate_c_continuation,
+                    ) or self._window_matches_gate_c_continuation(
+                        last_window,
+                        current_window,
+                        startup_recovery_continuation,
+                        segmented_gate_c_continuation,
                     )
                 else:
                     valid_window = _window_history_extends(
@@ -9971,6 +10519,31 @@ class ExternalAgentSemanticHandoffService:
             authority_ref=authority_ref,
         )
 
+    def install_governance_startup_recovery_continuation(
+        self,
+        provider: CodexCliRepresentationAnalysisProvider,
+        *,
+        window_binding: SemanticWindowAuthorityBinding,
+        reviewed_git_head: str,
+        authority_ref: str,
+        authority_manifest_fingerprint: str,
+        authority_manifest_raw_fingerprint: str,
+    ) -> dict[str, object]:
+        """Install the approved Issue #150 zero-Provider continuation."""
+
+        return _SemanticGlobalAuthority(
+            self.audit_root
+        ).install_governance_startup_recovery_continuation(
+            window=window_binding,
+            provider=provider,
+            reviewed_git_head=reviewed_git_head,
+            authority_ref=authority_ref,
+            authority_manifest_fingerprint=authority_manifest_fingerprint,
+            authority_manifest_raw_fingerprint=(
+                authority_manifest_raw_fingerprint
+            ),
+        )
+
     def resolve_unknown(
         self,
         provider: CodexCliRepresentationAnalysisProvider,
@@ -10101,6 +10674,18 @@ class ExternalAgentSemanticHandoffService:
                     gate_c_continuation,
                 )
             )
+            startup_recovery_continuation = (
+                authority._read_governance_startup_recovery_continuation(
+                    base,
+                    extension,
+                    resolution,
+                    maintenance,
+                    timeout_resolution,
+                    batch_governance_continuation,
+                    gate_c_continuation,
+                    segmented_gate_c_continuation,
+                )
+            )
             effective = authority._effective_authority(
                 base,
                 extension,
@@ -10110,6 +10695,7 @@ class ExternalAgentSemanticHandoffService:
                 batch_governance_continuation,
                 gate_c_continuation,
                 segmented_gate_c_continuation,
+                startup_recovery_continuation,
             )
             attempts, unknown = authority._global_attempts(effective)
             if not attempts:
