@@ -231,16 +231,22 @@ def _all_cursor_rows(
     located_tables: dict[str, tuple[tuple[str, str, str, bool, str], ...]],
     *,
     start_timestamp: int,
+    end_timestamp: int | None = None,
 ) -> list[tuple[str, str, object, object]]:
     rows: list[tuple[str, str, object, object]] = []
     for database, tables in located_tables.items():
         try:
             with closing(sqlite3.connect(database)) as connection:
                 for relative_key, username, _label, _group, table_name in tables:
+                    time_filter = "WHERE create_time >= ?"
+                    parameters: tuple[int, ...] = (start_timestamp,)
+                    if end_timestamp is not None:
+                        time_filter += " AND create_time <= ?"
+                        parameters += (end_timestamp,)
                     values = connection.execute(
                         f"SELECT local_id, create_time FROM [{table_name}] "
-                        "WHERE create_time >= ? ORDER BY create_time ASC",
-                        (start_timestamp,),
+                        f"{time_filter} ORDER BY create_time ASC",
+                        parameters,
                     ).fetchall()
                     rows.extend(
                         (username, relative_key, *value) for value in values
@@ -337,8 +343,13 @@ def _capture(request: dict[str, object]) -> dict[str, object]:
     sessions = _sessions(app, names)
     table_locations = _message_table_locations(app)
     located_tables = _located_session_tables(sessions, table_locations)
+    cursor_query_upper = fixed_upper or all_history_upper
     all_cursor_rows = _all_cursor_rows(
-        located_tables, start_timestamp=after[0]
+        located_tables,
+        start_timestamp=after[0],
+        end_timestamp=(
+            None if cursor_query_upper is None else cursor_query_upper[0]
+        ),
     )
     if request["observe_only"]:
         cursors = [

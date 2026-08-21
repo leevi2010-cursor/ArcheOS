@@ -5,15 +5,16 @@ import json
 import os
 import shutil
 import signal
+import sqlite3
 import subprocess
 import sys
 import tempfile
 import unittest
 from collections import Counter
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 from dataclasses import replace
 from pathlib import Path
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 from unittest.mock import patch
 
 from archeos.atomic_information import (
@@ -48,7 +49,13 @@ from archeos.representation_information import (
 )
 from archeos.semantic_handoff import _package_fingerprint
 from archeos.source import LocalManagedSourceRepository
-from archeos.wechat_capture_helper import _window_upper
+from archeos import wechat_capture_helper
+from archeos.wechat_capture_helper import (
+    _all_cursor_rows,
+    _capture as capture_with_wechat_cli,
+    _digest as capture_digest,
+    _window_upper,
+)
 from archeos.wechat_digest import (
     TERMINAL_ITEM_STATES,
     ZERO_CURSOR,
@@ -5595,6 +5602,321 @@ class WechatDigestTests(unittest.TestCase):
         ):
             service.run(from_now=True)
         self.assertEqual(capture.calls, [])
+
+
+class WechatCaptureHelperTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.root = Path(self.temporary.name)
+        self.database = self.root / "msg.db"
+        self.database_key = "msg/msg.db"
+        self.username = "wxid_synthetic"
+        self.table_name = "Msg_" + hashlib.md5(
+            self.username.encode()
+        ).hexdigest()
+        with closing(sqlite3.connect(self.database)) as connection:
+            connection.execute(
+                f"CREATE TABLE [{self.table_name}] ("
+                "local_id INTEGER PRIMARY KEY, local_type INTEGER, "
+                "create_time INTEGER, real_sender_id TEXT, "
+                "raw_content TEXT, compression INTEGER)"
+            )
+            connection.executemany(
+                f"INSERT INTO [{self.table_name}] VALUES (?, ?, ?, ?, ?, ?)",
+                [
+                    (1, 1, 100, "sender", "message-1", 0),
+                    (2, 1, 200, "sender", "message-2", 0),
+                    (3, 1, 200, "sender", "message-3", 0),
+                    (4, 1, 200, "sender", "message-4", 0),
+                    (5, 1, 300, "sender", "message-5", 0),
+                ],
+            )
+            connection.commit()
+        self.app = SimpleNamespace(
+            cache={self.database_key: str(self.database)},
+            msg_db_keys=(self.database_key,),
+            decrypted_dir=self.root,
+            db_dir=self.root,
+            display_name_fn=lambda value: value,
+        )
+        conversation_key = capture_digest(
+            "wechat_conversation", self.username
+        )
+        self.cursors = {
+            local_id: (
+                timestamp,
+                conversation_key,
+                capture_digest(
+                    "wechat_message",
+                    self.username,
+                    self.database_key,
+                    local_id,
+                    timestamp,
+                ),
+            )
+            for local_id, timestamp in (
+                (1, 100),
+                (2, 200),
+                (3, 200),
+                (4, 200),
+                (5, 300),
+            )
+        }
+        self.modules = self._provider_modules()
+
+    def tearDown(self) -> None:
+        self.temporary.cleanup()
+
+    def _provider_modules(self) -> dict[str, ModuleType]:
+        root = ModuleType("wechat_cli")
+        core = ModuleType("wechat_cli.core")
+        contacts = ModuleType("wechat_cli.core.contacts")
+        context = ModuleType("wechat_cli.core.context")
+        messages = ModuleType("wechat_cli.core.messages")
+        contacts.get_contact_names = lambda *_args: {
+            self.username: "Synthetic Conversation"
+        }
+        context.AppContext = lambda _config_path: self.app
+        messages._split_msg_type = lambda value: (int(value), 0)
+        messages._parse_int = lambda value: int(value)
+        messages._parse_xml_root = lambda _value: None
+        messages._load_name2id_maps = lambda _connection: {}
+        messages.decompress_content = lambda value, _compression: value
+        messages._format_message_text = (
+            lambda _local_id,
+            _local_type,
+            content,
+            _is_group,
+            _username,
+            _display_name,
+            _names,
+            _display_name_fn,
+            **_kwargs: (None, content)
+        )
+        messages._resolve_sender_label = lambda *_args, **_kwargs: (
+            "Synthetic Sender"
+        )
+
+        def query_messages(
+            connection,
+            table_name,
+            *,
+            start_ts,
+            end_ts,
+            limit,
+        ):
+            self.assertIsNone(limit)
+            return connection.execute(
+                f"SELECT local_id, local_type, create_time, "
+                f"real_sender_id, raw_content, compression "
+                f"FROM [{table_name}] "
+                "WHERE create_time >= ? AND create_time <= ? "
+                "ORDER BY create_time ASC, local_id ASC",
+                (start_ts, end_ts),
+            ).fetchall()
+
+        messages._query_messages = query_messages
+        root.core = core
+        core.contacts = contacts
+        core.context = context
+        core.messages = messages
+        return {
+            "wechat_cli": root,
+            "wechat_cli.core": core,
+            "wechat_cli.core.contacts": contacts,
+            "wechat_cli.core.context": context,
+            "wechat_cli.core.messages": messages,
+        }
+
+    @contextmanager
+    def capture_runtime(self):
+        with patch.dict(sys.modules, self.modules), patch.object(
+            wechat_capture_helper,
+            "_sessions",
+            return_value=((
+                self.username,
+                "Synthetic Conversation",
+                False,
+            ),),
+        ):
+            yield
+
+    @staticmethod
+    def request(
+        *,
+        upper_bound=None,
+        all_history_upper_bound=None,
+        observe_only=False,
+        message_limit=1000,
+    ):
+        return {
+            "config_path": None,
+            "after_cursor": {
+                "timestamp": 99,
+                "conversation_key": "",
+                "message_key": "",
+            },
+            "upper_bound": upper_bound,
+            "all_history_upper_bound": all_history_upper_bound,
+            "observe_only": observe_only,
+            "window_days": 30,
+            "window_message_limit": message_limit,
+        }
+
+    @staticmethod
+    def cursor_dict(cursor):
+        return {
+            "timestamp": cursor[0],
+            "conversation_key": cursor[1],
+            "message_key": cursor[2],
+        }
+
+    def _legacy_capture(self, request):
+        def unbounded_cursor_discovery(
+            located_tables,
+            *,
+            start_timestamp,
+            end_timestamp=None,
+        ):
+            del end_timestamp
+            return _all_cursor_rows(
+                located_tables, start_timestamp=start_timestamp
+            )
+
+        with self.capture_runtime(), patch.object(
+            wechat_capture_helper,
+            "_all_cursor_rows",
+            side_effect=unbounded_cursor_discovery,
+        ):
+            return capture_with_wechat_cli(request)
+
+    def test_cursor_discovery_uses_optional_sql_upper_bound(self) -> None:
+        statements = []
+        real_connect = sqlite3.connect
+
+        class TrackingConnection:
+            def __init__(self, path):
+                self.connection = real_connect(path)
+
+            def execute(self, statement, parameters=()):
+                statements.append((statement, parameters))
+                return self.connection.execute(statement, parameters)
+
+            def close(self):
+                self.connection.close()
+
+        located = {
+            str(self.database): ((
+                self.database_key,
+                self.username,
+                "Synthetic Conversation",
+                False,
+                self.table_name,
+            ),)
+        }
+        with patch.object(
+            wechat_capture_helper.sqlite3,
+            "connect",
+            side_effect=TrackingConnection,
+        ):
+            bounded = _all_cursor_rows(
+                located, start_timestamp=99, end_timestamp=200
+            )
+        self.assertEqual([row[3] for row in bounded], [100, 200, 200, 200])
+        self.assertIn("create_time <= ?", statements[0][0])
+        self.assertEqual(statements[0][1], (99, 200))
+
+        statements.clear()
+        with patch.object(
+            wechat_capture_helper.sqlite3,
+            "connect",
+            side_effect=TrackingConnection,
+        ):
+            unbounded = _all_cursor_rows(located, start_timestamp=99)
+        self.assertEqual([row[3] for row in unbounded], [100, 200, 200, 200, 300])
+        self.assertNotIn("create_time <= ?", statements[0][0])
+        self.assertEqual(statements[0][1], (99,))
+
+    def test_fixed_upper_is_sql_bounded_and_byte_equivalent(self) -> None:
+        same_second = sorted(
+            cursor for cursor in self.cursors.values() if cursor[0] == 200
+        )
+        upper = same_second[1]
+        request = self.request(upper_bound=self.cursor_dict(upper))
+        legacy = self._legacy_capture(request)
+        with self.capture_runtime(), patch.object(
+            wechat_capture_helper,
+            "_all_cursor_rows",
+            wraps=_all_cursor_rows,
+        ) as discovery:
+            optimized = capture_with_wechat_cli(request)
+        self.assertEqual(discovery.call_args.kwargs["end_timestamp"], 200)
+        self.assertEqual(
+            json.dumps(optimized, ensure_ascii=False, separators=(",", ":")),
+            json.dumps(legacy, ensure_ascii=False, separators=(",", ":")),
+        )
+        returned = [
+            (
+                item["cursor"]["timestamp"],
+                item["cursor"]["conversation_key"],
+                item["cursor"]["message_key"],
+            )
+            for item in optimized["messages"]
+        ]
+        self.assertEqual(
+            [cursor for cursor in returned if cursor[0] == 200],
+            same_second[:2],
+        )
+
+    def test_all_history_upper_is_sql_bounded_and_byte_equivalent(self) -> None:
+        upper = sorted(
+            cursor for cursor in self.cursors.values() if cursor[0] == 200
+        )[1]
+        request = self.request(
+            all_history_upper_bound=self.cursor_dict(upper)
+        )
+        legacy = self._legacy_capture(request)
+        with self.capture_runtime(), patch.object(
+            wechat_capture_helper,
+            "_all_cursor_rows",
+            wraps=_all_cursor_rows,
+        ) as discovery:
+            optimized = capture_with_wechat_cli(request)
+        self.assertEqual(discovery.call_args.kwargs["end_timestamp"], 200)
+        self.assertEqual(
+            json.dumps(optimized, ensure_ascii=False, separators=(",", ":")),
+            json.dumps(legacy, ensure_ascii=False, separators=(",", ":")),
+        )
+
+    def test_observe_only_uses_known_upper_without_returning_messages(self) -> None:
+        upper = sorted(self.cursors.values())[3]
+        request = self.request(
+            all_history_upper_bound=self.cursor_dict(upper),
+            observe_only=True,
+        )
+        with self.capture_runtime(), patch.object(
+            wechat_capture_helper,
+            "_all_cursor_rows",
+            wraps=_all_cursor_rows,
+        ) as discovery:
+            result = capture_with_wechat_cli(request)
+        self.assertEqual(discovery.call_args.kwargs["end_timestamp"], upper[0])
+        self.assertEqual(result["observed_upper"], self.cursor_dict(upper))
+        self.assertEqual(result["messages"], [])
+
+    def test_unbounded_window_discovery_is_unchanged(self) -> None:
+        request = self.request(message_limit=2)
+        with self.capture_runtime(), patch.object(
+            wechat_capture_helper,
+            "_all_cursor_rows",
+            wraps=_all_cursor_rows,
+        ) as discovery:
+            result = capture_with_wechat_cli(request)
+        self.assertIsNone(discovery.call_args.kwargs["end_timestamp"])
+        expected = _window_upper(
+            list(self.cursors.values()), window_days=30, message_limit=2
+        )
+        self.assertEqual(result["observed_upper"], self.cursor_dict(expected))
 
 
 class WechatCliCaptureProviderTests(unittest.TestCase):
