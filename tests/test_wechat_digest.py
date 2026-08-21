@@ -50,6 +50,7 @@ from archeos.semantic_handoff import _package_fingerprint
 from archeos.source import LocalManagedSourceRepository
 from archeos.wechat_capture_helper import _window_upper
 from archeos.wechat_digest import (
+    TERMINAL_ITEM_STATES,
     ZERO_CURSOR,
     CapturedAttachment,
     CapturedMessage,
@@ -254,6 +255,7 @@ class SyntheticSemanticHandoff:
         self.installed_maintenance_continuation = None
         self.installed_batch_governance_continuation = None
         self.installed_gate_c_continuation = None
+        self.installed_segmented_gate_c_continuation = None
         self.unknown_resolution = None
         self.timeout_212_resolution = None
         self.before_unknown_commit = None
@@ -488,6 +490,42 @@ class SyntheticSemanticHandoff:
         ):
             raise RuntimeError("synthetic Gate C continuation drift")
         self.installed_gate_c_continuation = expected
+        assert self.campaign_binding is not None
+        self.campaign_binding = SimpleNamespace(
+            created_at=self.campaign_binding.created_at,
+            lower_cursor=self.campaign_binding.lower_cursor,
+            frozen_global_upper_cursor=(
+                self.campaign_binding.frozen_global_upper_cursor
+            ),
+            capture_provider_version=self.campaign_binding.capture_provider_version,
+            semantic_batch_size=self.campaign_binding.semantic_batch_size,
+            reviewed_git_head=self.reviewed_git_head,
+        )
+        return expected
+
+    def install_segmented_gate_c_continuation(
+        self,
+        *,
+        window_binding,
+        authority_ref,
+    ):
+        expected = {
+            "authority_ref": authority_ref,
+            "previous_reviewed_git_head": "c" * 40,
+            "reviewed_git_head": self.reviewed_git_head,
+            "activation_total": 297,
+            "activation_unknown_count": 0,
+            "activation_last_global_ordinal": 297,
+            "next_global_ordinal": 298,
+            "absolute_cap": 1000,
+            "continuation_fingerprint": "sha256:" + "f" * 64,
+        }
+        if (
+            self.installed_segmented_gate_c_continuation is not None
+            and self.installed_segmented_gate_c_continuation != expected
+        ):
+            raise RuntimeError("synthetic segmented Gate C continuation drift")
+        self.installed_segmented_gate_c_continuation = expected
         assert self.campaign_binding is not None
         self.campaign_binding = SimpleNamespace(
             created_at=self.campaign_binding.created_at,
@@ -2564,6 +2602,68 @@ class WechatDigestTests(unittest.TestCase):
         self.assertEqual(self.semantic.provider.calls, semantic_calls)
         self.assertEqual(provider.calls, governance_calls)
 
+    def test_segmented_gate_c_continuation_binds_current_safe_state_zero_calls(
+        self,
+    ) -> None:
+        service, provider, run_id = (
+            self.maintenance_continuation_failed_state_fixture()
+        )
+        status = json.loads(json.dumps(service.run_store.status(run_id)))
+        status["state"] = "processing"
+        status["failure_category"] = None
+        for item in status["items"].values():
+            if item["state"] == "failed_closed":
+                item["state"] = "pending_human"
+        additions = {
+            "planned": 14,
+            "pending_human": 18,
+            "processed": 6,
+            "local_only": 3,
+            "unsupported": 142,
+        }
+        index = 0
+        for state, count in additions.items():
+            for _ in range(count):
+                index += 1
+                status["items"][f"synthetic-segment-{index:03d}"] = {
+                    "state": state
+                }
+        service.run_store.update_status(run_id, status)
+        self.semantic.reviewed_git_head = "d" * 40
+        self.semantic.campaign_binding = SimpleNamespace(
+            created_at="2026-08-20T00:00:00Z",
+            lower_cursor=(0, "", ""),
+            frozen_global_upper_cursor=(999, "m", "c"),
+            capture_provider_version="0.5.0",
+            semantic_batch_size=40,
+            reviewed_git_head="c" * 40,
+        )
+        authority_ref = (
+            "https://github.com/leevi2010-cursor/ArcheOS/issues/148"
+            "#issuecomment-1234567890"
+        )
+        status_path = service.run_store.runs_root / run_id / "status.json"
+        status_before = status_path.read_bytes()
+        semantic_calls = self.semantic.provider.calls
+        governance_calls = provider.calls
+        binding = SimpleNamespace(reviewed_git_head="c" * 40)
+
+        with patch.object(service, "_verify_plan_and_status"), patch.object(
+            service, "_semantic_authority_binding", return_value=binding
+        ):
+            continuation = (
+                service.install_semantic_segmented_gate_c_continuation(
+                    authority_ref=authority_ref
+                )
+            )
+
+        self.assertEqual(continuation["activation_total"], 297)
+        self.assertEqual(continuation["activation_unknown_count"], 0)
+        self.assertEqual(continuation["next_global_ordinal"], 298)
+        self.assertEqual(status_path.read_bytes(), status_before)
+        self.assertEqual(self.semantic.provider.calls, semantic_calls)
+        self.assertEqual(provider.calls, governance_calls)
+
     def test_maintenance_continuation_rejects_other_run_state_pairs(
         self,
     ) -> None:
@@ -2833,6 +2933,56 @@ class WechatDigestTests(unittest.TestCase):
         self.assertEqual(provider.session_entries, 1)
         self.assertEqual(self.semantic.provider.calls, semantic_calls)
 
+    def test_segment_cleanup_failure_blocks_next_run_without_segment_receipt(
+        self,
+    ) -> None:
+        self.create_object()
+
+        class CleanupFailureProvider(SerialSessionProvider):
+            @contextmanager
+            def session(self):
+                self.session_entries += 1
+                try:
+                    yield self
+                finally:
+                    self.session_exits += 1
+                    raise RuntimeError("synthetic segment cleanup failure")
+
+        provider = CleanupFailureProvider()
+        service = WechatDigestService(
+            workspace=self.workspace,
+            capture_provider=SyntheticCaptureProvider([message(1), message(2)]),
+            semantic_handoff_factory=lambda: self.semantic,
+            interpretation_provider=provider,
+        )
+
+        with self.assertRaises(WechatDigestError):
+            service.run(all_history=True, max_terminal_items=1)
+
+        run_id = service.run_store.active_run_id()
+        assert run_id is not None
+        status = service.run_store.status(run_id)
+        self.assertEqual(status["failure_category"], "governance_session_cleanup")
+        self.assertEqual(
+            sum(
+                isinstance(item, dict)
+                and item.get("state") in TERMINAL_ITEM_STATES
+                for item in status["items"].values()
+            ),
+            1,
+        )
+        self.assertFalse(
+            (service.run_store.runs_root / run_id / "segments").exists()
+        )
+        calls_after_failure = provider.calls
+        self.assertGreater(calls_after_failure, 0)
+
+        with self.assertRaisesRegex(WechatDigestError, "cleanup 失败"):
+            service.run(max_terminal_items=1)
+
+        self.assertEqual(provider.calls, calls_after_failure)
+        self.assertEqual(provider.session_entries, 1)
+
     def test_sigterm_during_sdk_exit_force_kills_and_blocks_recovery(self) -> None:
         self.create_object()
         operation = {
@@ -2983,6 +3133,138 @@ class WechatDigestTests(unittest.TestCase):
             if value["message_keys"]
         )
         self.assertEqual(payload["message_keys"], sorted(payload["message_keys"]))
+
+    def test_bounded_segments_resume_without_reprocessing_completed_items(self) -> None:
+        self.create_object()
+        capture = SyntheticCaptureProvider(
+            [
+                message(1, conversation="conversation_a"),
+                message(2, conversation="conversation_b"),
+                message(3, conversation="conversation_c"),
+            ]
+        )
+        service = self.service(capture)
+
+        first = service.run(all_history=True, max_terminal_items=1)
+        self.assertTrue(first.segment_safe_stopped)
+        self.assertEqual(first.segment_items_completed, 1)
+        self.assertEqual(first.segment_remaining_items, 2)
+        self.assertFalse(first.checkpoint_published)
+        self.assertEqual(self.semantic.provider.calls, 1)
+
+        second = service.run(max_terminal_items=1)
+        self.assertTrue(second.segment_safe_stopped)
+        self.assertEqual(second.segment_items_completed, 1)
+        self.assertEqual(second.segment_remaining_items, 1)
+        self.assertEqual(self.semantic.provider.calls, 2)
+
+        final = service.run(max_terminal_items=1)
+        self.assertFalse(final.segment_safe_stopped)
+        self.assertTrue(final.checkpoint_published)
+        self.assertEqual(final.segment_items_completed, 1)
+        self.assertEqual(self.semantic.provider.calls, 3)
+        self.assertIsNone(service.run_store.active_run_id())
+
+        receipts = tuple(
+            (
+                self.workspace
+                / "02_processing"
+                / "wechat_digest"
+                / "runs"
+            ).glob("*/segments/segment-*.json")
+        )
+        self.assertEqual(len(receipts), 2)
+        for path in receipts:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            self.assertEqual(
+                payload["schema_version"],
+                "wechat-digest-run-segment-receipt/1.0",
+            )
+            self.assertEqual(payload["stop_reason"], "item_limit")
+            self.assertEqual(payload["completed_items"], 1)
+            self.assertRegex(payload["receipt_fingerprint"], r"^sha256:[0-9a-f]{64}$")
+
+    def test_segment_limit_stops_after_checkpoint_before_next_history_window(
+        self,
+    ) -> None:
+        self.create_object()
+        capture = SyntheticCaptureProvider(
+            [
+                message(
+                    1,
+                    timestamp=1_700_000_000,
+                    conversation="conversation_a",
+                ),
+                message(
+                    2,
+                    timestamp=1_700_000_100,
+                    conversation="conversation_b",
+                ),
+            ],
+            window_seconds=10,
+        )
+        service = self.service(capture)
+
+        first = service.run(all_history=True, max_terminal_items=1)
+
+        self.assertTrue(first.segment_safe_stopped)
+        self.assertTrue(first.checkpoint_published)
+        self.assertEqual(first.segment_items_completed, 1)
+        self.assertEqual(first.segment_remaining_items, 0)
+        self.assertEqual(self.semantic.provider.calls, 1)
+        first_run_id = service.run_store.active_run_id()
+        assert first_run_id is not None
+        self.assertEqual(
+            service.run_store.status(first_run_id)["state"], "completed"
+        )
+
+        final = service.run(max_terminal_items=1)
+
+        self.assertFalse(final.segment_safe_stopped)
+        self.assertTrue(final.checkpoint_published)
+        self.assertEqual(self.semantic.provider.calls, 2)
+        self.assertIsNone(service.run_store.active_run_id())
+
+    def test_invalid_bounded_segment_size_fails_before_capture(self) -> None:
+        capture = SyntheticCaptureProvider([message(1)])
+        service = self.service(capture)
+        for value in (0, -1, True):
+            with self.subTest(value=value), self.assertRaises(WechatDigestError):
+                service.run(all_history=True, max_terminal_items=value)
+        self.assertEqual(capture.calls, [])
+
+    def test_segment_receipt_crash_resumes_without_reprocessing_item(self) -> None:
+        self.create_object()
+        capture = SyntheticCaptureProvider(
+            [
+                message(1, conversation="conversation_a"),
+                message(2, conversation="conversation_b"),
+            ]
+        )
+        failures = 1
+
+        def fail_once() -> None:
+            nonlocal failures
+            if failures:
+                failures -= 1
+                raise RuntimeError("synthetic segment receipt interruption")
+
+        run_store = WechatDigestRunStore(
+            self.workspace / "02_processing" / "wechat_digest",
+            before_segment_receipt_write=fail_once,
+        )
+        service = self.service(capture, run_store=run_store)
+        with self.assertRaises(RuntimeError):
+            service.run(all_history=True, max_terminal_items=1)
+        self.assertEqual(self.semantic.provider.calls, 1)
+        self.assertEqual(
+            tuple(run_store.runs_root.glob("*/segments/segment-*.json")), ()
+        )
+
+        result = service.run(max_terminal_items=1)
+        self.assertTrue(result.checkpoint_published)
+        self.assertEqual(self.semantic.provider.calls, 2)
+        self.assertIsNone(run_store.active_run_id())
 
     def test_all_history_uses_durable_thirty_day_windows(self) -> None:
         self.create_object()
