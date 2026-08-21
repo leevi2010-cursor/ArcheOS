@@ -237,6 +237,56 @@ class CliTest(unittest.TestCase):
     @patch("archeos.cli.WechatDigestService")
     @patch("archeos.cli.WechatCliCaptureProvider")
     @patch("archeos.cli.require_workspace")
+    def test_wechat_digest_resolves_governance_startup_with_business_summary(
+        self,
+        require_workspace: Mock,
+        capture_provider: Mock,
+        digest_service: Mock,
+    ) -> None:
+        require_workspace.return_value = WorkspaceConfig(
+            Path("/workspace"), Path("/config")
+        )
+        digest_service.return_value.resolve_governance_startup_failure.return_value = {
+            "receipt_fingerprint": "sha256:" + "f" * 64,
+        }
+        authority_ref = (
+            "https://github.com/leevi2010-cursor/ArcheOS/issues/150"
+            "#issuecomment-1234567890"
+        )
+        authority = Path("/private/issue-150-authority.json")
+        output = StringIO()
+        with redirect_stdout(output):
+            result = main(
+                [
+                    "wechat",
+                    "digest",
+                    "--resolve-governance-startup-failure",
+                    "--governance-startup-authority-file",
+                    str(authority),
+                    "--authority-ref",
+                    authority_ref,
+                ]
+            )
+        self.assertEqual(result, 0)
+        payload = json.loads(output.getvalue())
+        self.assertEqual(payload["semantic_provider_calls"], 0)
+        self.assertEqual(payload["governance_provider_calls"], 0)
+        self.assertEqual(payload["durable_information_preserved"], 4)
+        self.assertEqual(payload["previous_governance_model_turns"], 0)
+        self.assertEqual(payload["safe_restart_attempts_available"], 1)
+        self.assertEqual(payload["objects_created"], 0)
+        self.assertFalse(payload["checkpoint_published"])
+        self.assertIn("已保留4条长期信息", payload["message"])
+        digest_service.return_value.resolve_governance_startup_failure.assert_called_once_with(
+            authority_ref=authority_ref,
+            authority_manifest_file=authority,
+        )
+        digest_service.return_value.run.assert_not_called()
+        capture_provider.assert_called_once()
+
+    @patch("archeos.cli.WechatDigestService")
+    @patch("archeos.cli.WechatCliCaptureProvider")
+    @patch("archeos.cli.require_workspace")
     def test_wechat_digest_installs_maintenance_continuation_zero_calls(
         self,
         require_workspace: Mock,
