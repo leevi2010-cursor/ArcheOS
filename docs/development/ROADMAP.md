@@ -45,7 +45,9 @@ Context 是否随着真实数据增长变得更有用而不是更嘈杂
 真实旧数据与长期使用压力下，整条认知链是否仍然成立
 ```
 
-任何新的大型能力、UI、平台基础设施或集成在进入当前主线前，都必须说明它关闭哪一个当前 Stage Gate 的 Evidence Gap；否则默认后置。维护、安全、隐私、完整性和回归修复按 `AGENTS.md` 的 Maintenance / Integrity 例外处理。
+任何新的大型能力、UI、平台基础设施或集成在进入当前主线前，都必须说明它关闭哪一个当前 Stage Gate 的 Evidence Gap；否则默认后置。维护、隐私、完整性和回归修复仍可按 `AGENTS.md` 的 Maintenance / Integrity 例外处理，但只有阻塞主流程、造成正常故障不可恢复、业务数据可能丢失、provenance 错误、隐私凭证泄露或不可逆风险时才抢占当前主线。恶意攻击、主动篡改、全面安全加固、GitHub Actions、main 分支保护与企业级合规统一留在 deferred Issue #122，不零散拆入 Stage 1 MVP Issue。
+
+当前开发排序同时使用 ROI 判断：优先选择能以最小时间、模型调用、人工确认和维护成本，产生可由 Product Owner 直接检查的业务 Evidence 的工作。处理条数、测试数量、治理门数量和局部技术完整度只能作为过程指标，不能替代业务结果。
 
 产品名称长期使用 **向阳经营系统（Sunward Operating System）**；`ArcheOS` 仅作为当前重构迁移阶段的工程 / 仓库代号。待新系统完成真实数据验证、旧 `sunward-operating-system` 完成 clean-cut 退役且命名切换不会造成双重权威时，再将 ArcheOS 正式恢复为“向阳经营系统”产品名称；在此之前不为了改名打断当前主线。
 
@@ -581,25 +583,33 @@ Goal
 
 以下顺序是**当前 Product Stage 下关闭 Evidence Gap 的最佳已知技术顺序**，不是不可修改的长期产品承诺。若真实实验产生 Roadmap Feedback，应先判断影响范围，再按权威链修正 Product / Development Roadmap。
 
+截至 Issue #156 的 Roadmap Feedback，原 `#88 → #32 → #33 → #34 → #17` 已全部结束，批量语义与批量治理也已获得真实运行证据。当前缺口不再是继续扩大 Atomic Information 数量，而是证明这些 Evidence 能否形成可理解、可纠错、可复用的长期认知。
+
 当前主线：
 
 ```text
-                    #88
-  Information Consolidation 最小真实语料集
-                     ↓
-                    #32
-     Information Consolidation 真实实验
-                     ↓
-           #33 implement | rewrite | not needed
-                     ↓
-                    #34
-  implement/rewrite → 完成并合并 #33；not needed → Lead 重写/确认 #34 前置条件
-                     ↓
-                    #17
-       真实旧数据压力测试 / clean-cut
-                     ↓
-             Stage 1 Gate Review
+Stage 1 Gate Review / Evidence inventory
+        ↓
+选择 3–5 个真实长期 Object 作为最小业务验证集
+        ↓
+对象—事件—时间线最小切片
+  - Object identity 与 Role 使用现有 canonical concepts
+  - Event 保留时间、参与对象、地点信息、变化、Evidence 与 uncertainty
+  - Timeline 作为 View / Projection，不建立第二份 truth
+        ↓
+Product Owner 真实人工验收
+  - 是什么、发生过什么、当前状态
+  - 依据、冲突、未知与纠错
+  - 是否明显优于翻找原始聊天 / 文件
+        ↓
+只针对验收中真实出现的瓶颈简化运行与人工确认
+        ↓
+内部可用版 Gate
 ```
+
+当前尚未处理的输入保留为受控验证集：在对象—事件—时间线合同明确后，用于验证主流程与业务理解；不以清空队列或增加 Atomic Information 总量作为独立目标。
+
+重复活动的结构化遵循现有概念边界：有明确目标与完成条件时可形成 bounded Project；持续经营活动可形成 Business Line；多次独立 Evidence 支持的可复用方法先形成 Pattern / Protocol candidate。不得仅因文字或事件重复就自动升级。
 
 并行 / 后置：
 
@@ -608,9 +618,11 @@ Goal
 #47 Conversation contract research       后置；启动前按 #31/#48/#61/#62 重新对齐
 #43 Codex Conversation production        后置；启动前重新 preflight 并重写
 #44 Workspace portability               后置
-Human View / Frontend                    已规划，不启动
+Human View / Frontend                    仅在对象—事件—时间线 read contract 获得真实验收后，启动最小业务 View；不先建设大而全前端
 #42 Protocol 驱动的决策增强实验          Product Stage 2；当前 blocked
 Protocol / Pattern Governance            Stage 2 后置规划，不启动
+#106 增量微信消化                         暂停以“清空队列”为目标；剩余输入转为新主线的受控验证集
+#122 整体审查与正式生产门                 Deferred；Stage 1 业务评估前不启动
 ```
 
 旧 `sunward-operating-system` 从现在起不再承担产品主线；新输入、新认知、新 Agent Context 与新功能均进入 ArcheOS。#17 只负责完成最后的旧数据 / UI 资产盘点和仓库正式 Archive 条件确认，而不是维持旧系统继续运行。
