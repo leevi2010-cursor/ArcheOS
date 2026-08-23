@@ -84,13 +84,15 @@ def _fingerprint(selection: Selection, context: Mapping[str, Any], contract_vers
     return hashlib.sha256(payload.encode()).hexdigest()
 
 
-def validate_package(package: Mapping[str, Any], supplied_ids: set[str], evidence_ids: set[str] | None = None) -> dict[str, Any]:
+def validate_package(package: Mapping[str, Any], supplied_ids: set[str], evidence_ids: set[str] | None = None, expected_object_id: str | None = None) -> dict[str, Any]:
     """Validate provider output and enforce complete, non-duplicated accounting."""
     required = {"object_id", "what_it_is", "timeline_entries", "current_state", "conflicts", "unknowns", "information_accounting", "coverage"}
     if not required <= set(package):
         raise TimelineError("provider result is missing required timeline fields")
     if not isinstance(package.get("object_id"), str) or not package["object_id"].strip():
         raise TimelineError("provider result must identify the selected Object")
+    if expected_object_id is not None and package["object_id"] != expected_object_id:
+        raise TimelineError("provider result Object ID does not match selection")
     accounting = package["information_accounting"]
     if not isinstance(accounting, dict) or set(accounting) != supplied_ids:
         raise TimelineError("information_accounting must cover every input exactly once")
@@ -149,18 +151,18 @@ def build_timelines(selections: tuple[Selection, ...], contexts: Mapping[str, Ma
                 saved = json.loads(target.read_text(encoding="utf-8"))
                 if saved.get("input_fingerprint") == fingerprint:
                     supplied_saved = set(context.get("atomic_information_ids", ())) | set(selection.atomic_information_ids)
-                    validate_package(saved, supplied_saved, set(context.get("evidence_ids", ())))
+                    validate_package(saved, supplied_saved, set(context.get("evidence_ids", ())), selection.object_id)
                     packages.append(saved); continue
             except (OSError, ValueError, json.JSONDecodeError):
                 pass
         supplied = set(context.get("atomic_information_ids", ())) | set(selection.atomic_information_ids)
-        result = validate_package(provider({**context, "supplemental_atomic_information_ids": list(selection.atomic_information_ids)}), supplied, set(context.get("evidence_ids", ())))
+        result = validate_package(provider({**context, "supplemental_atomic_information_ids": list(selection.atomic_information_ids)}), supplied, set(context.get("evidence_ids", ())), selection.object_id)
         calls += 1
         result.update({"object_id": selection.object_id, "selection_label": selection.label, "input_fingerprint": fingerprint})
         temporary = target.with_suffix(".json.tmp")
         temporary.write_text(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
         os.replace(temporary, target)
-        validate_package(json.loads(target.read_text(encoding="utf-8")), supplied, set(context.get("evidence_ids", ())))
+        validate_package(json.loads(target.read_text(encoding="utf-8")), supplied, set(context.get("evidence_ids", ())), selection.object_id)
         packages.append(result)
     return {"schema_version": "stage1-object-timeline.v1", "packages": packages, "provider_calls": calls}
 
