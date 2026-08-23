@@ -143,6 +143,18 @@ Hypothesis 是 Atomic Information 的 canonical 语义形态，用于保存**尚
 
 Hypothesis 与当前 World Model 不一致时，首先把它当作待验证命题，不把“提出不同解释”本身当成需要立即重写 World Model 的冲突。
 
+### 6.4 Atomic Information → Event / Timeline 业务归并
+
+Atomic Information 是可追溯的证据层；Timeline 中的 Event 回答“业务上发生了什么”。两者不得默认一一对应。
+
+- 同一参与者、业务事项 / 交易 / 协作动作与相容时间上下文中的提问、答复、确认、补充和状态变化，应优先归并为一个 Event，并共同引用相关 Atomic Information / Evidence；
+- 纯确认语、地址补充、追问、范围细节或同一安排的后续说明，不单独成为 Event，除非它本身造成独立业务状态变化；
+- 业务事项、参与者组合、时间窗口或状态变化确实独立时才拆分 Event；不得为了减少数量而合并互相冲突、不同交易、不同人物或不可兼容时间的内容；
+- 不猜测时间、身份、地点、因果或状态；无法证明的内容继续显示为冲突、不确定或未知；
+- 重复活动不得自动升级为 Project / Business Line / Pattern / Protocol。
+
+业务归并是 Processing / Projection 行为，不创建 EventGroup、Cluster、新 Store 或平行的业务 truth。
+
 ---
 
 ## 7. 安全自动 World Model 变更

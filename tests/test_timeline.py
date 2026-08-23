@@ -206,6 +206,31 @@ def _package_from_context(context: dict[str, object]) -> dict[str, object]:
     }
 
 
+def _consolidated_package_from_context(
+    context: dict[str, object],
+) -> dict[str, object]:
+    package = _package_from_context(context)
+    atomic_ids = list(context["atomic_information_ids"])
+    if len(atomic_ids) < 2:
+        return package
+    midpoint = len(atomic_ids) // 2
+    groups = (atomic_ids[:midpoint], atomic_ids[midpoint:])
+    for index, group in enumerate(groups):
+        entry = package["timeline_entries"][index]
+        entry["event"] = f"Synthetic consolidated business event {index + 1}."
+        entry["atomic_information_ids"] = group
+        entry["evidence_ids"] = [
+            context["evidence_by_atomic"][atomic_id][0] for atomic_id in group
+        ]
+    return package
+
+
+def _serialized_test_package(package: dict[str, object]) -> bytes:
+    return (
+        json.dumps(package, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+    ).encode("utf-8")
+
+
 class _SyntheticProvider:
     contract_version = "synthetic-timeline.v1"
 
@@ -278,6 +303,74 @@ class TimelineContractTests(unittest.TestCase):
                 "coverage",
             },
         )
+
+    def test_provider_contract_v2_requires_business_event_consolidation(self) -> None:
+        self.assertEqual(
+            CodexTimelineProvider.contract_version,
+            "stage1-object-timeline-provider.v2",
+        )
+
+        atomic_ids = tuple(f"atomic-{index}" for index in range(8))
+        context = _context(self.object_id, atomic_ids)
+        provider_context = {
+            **context,
+            "selected_object_id": self.object_id,
+            "selection_label": "Synthetic",
+            "supplemental_atomic_information_ids": [],
+        }
+        consolidated = _consolidated_package_from_context(provider_context)
+        validate_package(
+            consolidated,
+            set(atomic_ids),
+            **_validation_options(context, self.object_id),
+        )
+        self.assertEqual(len(consolidated["timeline_entries"]), 2)
+        self.assertTrue(
+            any(
+                len(entry["atomic_information_ids"]) > 1
+                for entry in consolidated["timeline_entries"]
+            )
+        )
+
+    def test_consolidation_gate_rejects_message_level_and_unproven_grouping(
+        self,
+    ) -> None:
+        atomic_ids = tuple(f"atomic-{index}" for index in range(8))
+        context = _context(self.object_id, atomic_ids)
+        provider_context = {
+            **context,
+            "selected_object_id": self.object_id,
+            "selection_label": "Synthetic",
+            "supplemental_atomic_information_ids": [],
+        }
+        base = _package_from_context(provider_context)
+
+        message_level = deepcopy(base)
+        template = message_level["timeline_entries"][0]
+        message_level["timeline_entries"] = []
+        for index, atomic_id in enumerate(atomic_ids):
+            entry = deepcopy(template)
+            entry["event"] = f"Message-level event {index + 1}"
+            entry["atomic_information_ids"] = [atomic_id]
+            entry["evidence_ids"] = [context["evidence_by_atomic"][atomic_id][0]]
+            message_level["timeline_entries"].append(entry)
+        with self.assertRaisesRegex(TimelineError, "at most 7 Events"):
+            validate_package(
+                message_level,
+                set(atomic_ids),
+                **_validation_options(context, self.object_id),
+            )
+
+        no_multi_information_event = deepcopy(message_level)
+        no_multi_information_event["timeline_entries"] = no_multi_information_event[
+            "timeline_entries"
+        ][:7]
+        with self.assertRaisesRegex(TimelineError, "multi-Information Event"):
+            validate_package(
+                no_multi_information_event,
+                set(atomic_ids),
+                **_validation_options(context, self.object_id),
+            )
 
     def test_provider_schema_requires_provenance_only_where_validator_does(
         self,
@@ -719,6 +812,45 @@ class TimelineRecoveryTests(unittest.TestCase):
             self.assertNotIn("evidence-view:", markdown)
             self.assertNotRegex(markdown, r"\b[a-z][a-z0-9]*_[a-z0-9_]+\b")
 
+    def test_failed_consolidation_is_not_persisted_retried_or_fallbacked(self) -> None:
+        selections = self.selections
+        contexts = dict(self.contexts)
+        atomic_ids = tuple(f"atomic-business-{index}" for index in range(8))
+        contexts[selections[0].object_id] = _context(
+            selections[0].object_id,
+            atomic_ids,
+        )
+
+        class MessageLevelProvider:
+            contract_version = "stage1-object-timeline-provider.v2"
+
+            def __init__(self) -> None:
+                self.calls: list[str] = []
+
+            def __call__(self, context: dict[str, object]) -> dict[str, object]:
+                self.calls.append(str(context["selected_object_id"]))
+                package = _package_from_context(context)
+                template = package["timeline_entries"][0]
+                package["timeline_entries"] = []
+                for index, atomic_id in enumerate(context["atomic_information_ids"]):
+                    entry = deepcopy(template)
+                    entry["event"] = f"Message-level event {index + 1}"
+                    entry["atomic_information_ids"] = [atomic_id]
+                    entry["evidence_ids"] = [
+                        context["evidence_by_atomic"][atomic_id][0]
+                    ]
+                    package["timeline_entries"].append(entry)
+                return package
+
+        with tempfile.TemporaryDirectory() as temp:
+            output = Path(temp) / "output"
+            provider = MessageLevelProvider()
+            with self.assertRaisesRegex(TimelineError, "at most 7 Events"):
+                build_timelines(selections, contexts, provider, output)
+            self.assertEqual(provider.calls, [selections[0].object_id])
+            self.assertEqual(list(output.glob("*.json")), [])
+            self.assertEqual(list(output.glob("*.md")), [])
+
     def test_conflict_uses_business_evidence_number_without_duplicate_expansion(
         self,
     ) -> None:
@@ -831,6 +963,109 @@ class TimelineRecoveryTests(unittest.TestCase):
                 self.assertEqual(resumed.calls, [])
                 self.assertEqual(result["provider_calls"], 0)
                 self.assertEqual(result["complete"], complete)
+
+    def test_v1_recovery_requires_full_v2_consolidation_gate(self) -> None:
+        class ConsolidatedV1Provider:
+            contract_version = "stage1-object-timeline-provider.v1"
+
+            def __call__(self, context: dict[str, object]) -> dict[str, object]:
+                return _consolidated_package_from_context(context)
+
+        for fragmented in (False, True):
+            with (
+                self.subTest(fragmented=fragmented),
+                tempfile.TemporaryDirectory() as temp,
+            ):
+                root = Path(temp)
+                selections = self.selections
+                contexts = {
+                    selection.object_id: _context(
+                        selection.object_id,
+                        tuple(
+                            f"{selection.object_id}-atomic-{index}"
+                            for index in range(8)
+                        ),
+                    )
+                    for selection in selections
+                }
+                output = root / "output"
+                build_timelines(
+                    selections,
+                    contexts,
+                    ConsolidatedV1Provider(),
+                    output,
+                )
+                selection = selections[0]
+                context = contexts[selection.object_id]
+                artifact = output / f"{selection.object_id}.json"
+                package = json.loads(artifact.read_text(encoding="utf-8"))
+                legacy_fingerprint = package["input_fingerprint"]
+
+                if fragmented:
+                    template = package["timeline_entries"][0]
+                    package["timeline_entries"] = []
+                    for index, atomic_id in enumerate(
+                        context["atomic_information_ids"]
+                    ):
+                        entry = deepcopy(template)
+                        entry["event"] = f"Legacy message event {index + 1}"
+                        entry["atomic_information_ids"] = [atomic_id]
+                        entry["evidence_ids"] = [
+                            context["evidence_by_atomic"][atomic_id][0]
+                        ]
+                        package["timeline_entries"].append(entry)
+                    artifact.write_bytes(_serialized_test_package(package))
+
+                legacy_bytes = artifact.read_bytes()
+                stable_fingerprint = _fingerprint(
+                    selection,
+                    context,
+                    CodexTimelineProvider.contract_version,
+                )
+                receipt_path = root / "receipts" / f"{selection.object_id}.json"
+                authorization = LegacyRecoveryAuthorization(
+                    authority_ref="Issue #164 synthetic post-merge Lead authorization",
+                    object_id=selection.object_id,
+                    legacy_artifact_sha256=hashlib.sha256(legacy_bytes).hexdigest(),
+                    legacy_input_fingerprint=legacy_fingerprint,
+                    stable_input_fingerprint=stable_fingerprint,
+                )
+
+                if fragmented:
+                    with self.assertRaisesRegex(TimelineError, "at most 7 Events"):
+                        recover_legacy_timeline_artifact(
+                            artifact,
+                            receipt_path,
+                            selection,
+                            context,
+                            CodexTimelineProvider.contract_version,
+                            authorization,
+                        )
+                    self.assertEqual(artifact.read_bytes(), legacy_bytes)
+                    self.assertFalse(receipt_path.exists())
+                    continue
+
+                receipt = recover_legacy_timeline_artifact(
+                    artifact,
+                    receipt_path,
+                    selection,
+                    context,
+                    CodexTimelineProvider.contract_version,
+                    authorization,
+                )
+                recovered = json.loads(artifact.read_text(encoding="utf-8"))
+                self.assertEqual(
+                    receipt["stable_input_fingerprint"],
+                    stable_fingerprint,
+                )
+                self.assertEqual(recovered["input_fingerprint"], stable_fingerprint)
+                validate_package(
+                    recovered,
+                    set(context["atomic_information_ids"]),
+                    artifact=True,
+                    evidence_view_refs=context["evidence_view_refs"],
+                    **_validation_options(context, selection.object_id),
+                )
 
     def test_legacy_recovery_rejects_hash_context_and_evidence_drift_before_write(
         self,
@@ -1258,6 +1493,19 @@ class TimelineCliSyntheticWorkspaceTest(unittest.TestCase):
                         raise AssertionError(
                             "fake SDK did not receive the provenance rule"
                         )
+                    for rule in (
+                        "never map them one-to-one by default",
+                        "First consolidate questions, answers, confirmations, details, "
+                        "and state changes",
+                        "return no more than 7 Events",
+                        "prefer 2-6 genuinely independent Events without padding",
+                        "make at least one Event cite multiple supplied Atomic "
+                        "Information items",
+                    ):
+                        if rule not in prompt:
+                            raise AssertionError(
+                                "fake SDK did not receive the consolidation rule"
+                            )
                     context = json.loads(prompt.split("BOUNDED_CONTEXT_JSON:\n", 1)[1])
                     sdk_calls.append(context["selected_object_id"])
                     return Result(_package_from_context(context))
