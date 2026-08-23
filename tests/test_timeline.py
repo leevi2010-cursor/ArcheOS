@@ -279,6 +279,110 @@ class TimelineContractTests(unittest.TestCase):
             },
         )
 
+    def test_provider_schema_requires_provenance_only_where_validator_does(
+        self,
+    ) -> None:
+        schema = _timeline_schema()
+        properties = schema["properties"]
+        required_reference_owners = (
+            properties["what_it_is"],
+            properties["timeline_entries"]["items"],
+            properties["current_state"],
+            properties["conflicts"]["items"],
+        )
+        for owner in required_reference_owners:
+            with self.subTest(owner=owner):
+                references = owner["properties"]
+                self.assertNotIn("minItems", references["object_ids"])
+                self.assertEqual(references["atomic_information_ids"]["minItems"], 1)
+                self.assertEqual(references["evidence_ids"]["minItems"], 1)
+
+        unknown_references = properties["unknowns"]["items"]["properties"]
+        for field in ("object_ids", "atomic_information_ids", "evidence_ids"):
+            with self.subTest(unknown_field=field):
+                self.assertNotIn("minItems", unknown_references[field])
+
+        self.assertNotIn("uniqueItems", json.dumps(schema))
+        self.validate(deepcopy(self.package))
+
+    def test_validator_rejects_empty_and_duplicate_required_provenance(self) -> None:
+        required_reference_owners = (
+            "what_it_is",
+            "timeline_entries",
+            "current_state",
+            "conflicts",
+        )
+        for owner in required_reference_owners:
+            for field in ("atomic_information_ids", "evidence_ids"):
+                with self.subTest(owner=owner, field=field, violation="empty"):
+                    candidate = deepcopy(self.package)
+                    if owner == "timeline_entries":
+                        target = candidate[owner][0]
+                    elif owner == "conflicts":
+                        candidate[owner] = [
+                            {
+                                "summary": "Synthetic conflict",
+                                "unresolved": False,
+                                "object_ids": [],
+                                "atomic_information_ids": [self.atomic_id],
+                                "evidence_ids": [
+                                    self.context["evidence_by_atomic"][self.atomic_id][
+                                        0
+                                    ]
+                                ],
+                            }
+                        ]
+                        target = candidate[owner][0]
+                    else:
+                        target = candidate[owner]
+                    target[field] = []
+                    with self.assertRaisesRegex(TimelineError, "must not be empty"):
+                        self.validate(candidate)
+
+                with self.subTest(owner=owner, field=field, violation="duplicate"):
+                    candidate = deepcopy(self.package)
+                    if owner == "timeline_entries":
+                        target = candidate[owner][0]
+                    elif owner == "conflicts":
+                        candidate[owner] = [
+                            {
+                                "summary": "Synthetic conflict",
+                                "unresolved": False,
+                                "object_ids": [],
+                                "atomic_information_ids": [self.atomic_id],
+                                "evidence_ids": [
+                                    self.context["evidence_by_atomic"][self.atomic_id][
+                                        0
+                                    ]
+                                ],
+                            }
+                        ]
+                        target = candidate[owner][0]
+                    else:
+                        target = candidate[owner]
+                    target[field] = [*target[field], *target[field]]
+                    with self.assertRaisesRegex(
+                        TimelineError, "must not contain duplicates"
+                    ):
+                        self.validate(candidate)
+
+        unknown = deepcopy(self.package)
+        unknown["unknowns"][0]["object_ids"] = []
+        unknown["unknowns"][0]["atomic_information_ids"] = []
+        unknown["unknowns"][0]["evidence_ids"] = []
+        self.validate(unknown)
+
+        duplicate_unknown = deepcopy(self.package)
+        for field in ("object_ids", "atomic_information_ids", "evidence_ids"):
+            with self.subTest(owner="unknowns", field=field, violation="duplicate"):
+                candidate = deepcopy(duplicate_unknown)
+                target = candidate["unknowns"][0]
+                target[field] = [*target[field], *target[field]]
+                with self.assertRaisesRegex(
+                    TimelineError, "must not contain duplicates"
+                ):
+                    self.validate(candidate)
+
     def test_selection_is_private_minimal_and_bounded(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             path = Path(temp) / "selection.json"
@@ -1145,6 +1249,14 @@ class TimelineCliSyntheticWorkspaceTest(unittest.TestCase):
                     ):
                         raise AssertionError(
                             "fake SDK did not receive the language rule"
+                        )
+                    if (
+                        "The Object explanation, every event, the current state, and "
+                        "every conflict must each cite at least one supplied Atomic "
+                        "Information and its corresponding Evidence." not in prompt
+                    ):
+                        raise AssertionError(
+                            "fake SDK did not receive the provenance rule"
                         )
                     context = json.loads(prompt.split("BOUNDED_CONTEXT_JSON:\n", 1)[1])
                     sdk_calls.append(context["selected_object_id"])
