@@ -84,6 +84,11 @@ def _fingerprint(selection: Selection, context: Mapping[str, Any], contract_vers
     return hashlib.sha256(payload.encode()).hexdigest()
 
 
+def evidence_view_refs(atomic_id: str, evidence: list[Mapping[str, Any]]) -> dict[str, Mapping[str, Any]]:
+    """Create stable, bounded Evidence view references for provider payloads."""
+    return {f"{atomic_id}:{index + 1}": item for index, item in enumerate(evidence)}
+
+
 def validate_package(package: Mapping[str, Any], supplied_ids: set[str], evidence_ids: set[str] | None = None, expected_object_id: str | None = None) -> dict[str, Any]:
     """Validate provider output and enforce complete, non-duplicated accounting."""
     required = {"object_id", "what_it_is", "timeline_entries", "current_state", "conflicts", "unknowns", "information_accounting", "coverage"}
@@ -171,12 +176,13 @@ def build_timelines(selections: tuple[Selection, ...], contexts: Mapping[str, Ma
                 saved = json.loads(target.read_text(encoding="utf-8"))
                 if saved.get("input_fingerprint") == fingerprint:
                     supplied_saved = set(context.get("atomic_information_ids", ())) | set(selection.atomic_information_ids)
-                    validate_package(saved, supplied_saved, set(context.get("evidence_ids", ())), selection.object_id)
+                    validate_package(saved, supplied_saved, set(context.get("evidence_ids", ())) | set(context.get("evidence_view_refs", {})), selection.object_id)
                     packages.append(saved); continue
             except (OSError, ValueError, json.JSONDecodeError):
                 pass
         supplied = set(context.get("atomic_information_ids", ())) | set(selection.atomic_information_ids)
-        result = validate_package(provider({**context, "supplemental_atomic_information_ids": list(selection.atomic_information_ids)}), supplied, set(context.get("evidence_ids", ())), selection.object_id)
+        allowed_evidence = set(context.get("evidence_ids", ())) | set(context.get("evidence_view_refs", {}))
+        result = validate_package(provider({**context, "supplemental_atomic_information_ids": list(selection.atomic_information_ids), "allowed_evidence": sorted(allowed_evidence)}), supplied, allowed_evidence, selection.object_id)
         calls += 1
         result.update({"object_id": selection.object_id, "selection_label": selection.label, "input_fingerprint": fingerprint})
         temporary = target.with_suffix(".json.tmp")
