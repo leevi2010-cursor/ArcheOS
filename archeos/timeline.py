@@ -117,6 +117,11 @@ def validate_package(package: Mapping[str, Any], supplied_ids: set[str], evidenc
             raise TimelineError("non-event time cannot be presented as event time")
         if "uncertainty" not in entry:
             raise TimelineError("timeline entry requires uncertainty")
+        for field in ("participants", "location", "state_change", "evidence_ids"):
+            if field not in entry:
+                raise TimelineError(f"timeline entry requires {field}")
+        if not isinstance(entry["evidence_ids"], list) or not entry["evidence_ids"]:
+            raise TimelineError("timeline entry requires Evidence")
     coverage = package.get("coverage")
     if isinstance(coverage, dict) and coverage.get("complete") is False and not package.get("incomplete_reasons"):
         raise TimelineError("incomplete package requires incomplete_reasons")
@@ -155,10 +160,11 @@ def build_timelines(selections: tuple[Selection, ...], contexts: Mapping[str, Ma
 
 
 def render_markdown(package: Mapping[str, Any]) -> str:
+    entries = sorted(package.get("timeline_entries", []), key=lambda e: (e.get("time") is None, e.get("time") or ""))
     lines = [f"# {package.get('selection_label', package['object_id'])}", "", "## 对象是什么", str(package["what_it_is"]), "", "## 关键事件时间线"]
-    for entry in package.get("timeline_entries", []):
-        lines.append(f"- **{entry.get('time', '未知时间')}**：{entry.get('event', entry.get('description', '未知事件'))}")
-    lines += ["", "## 当前状态", str(package["current_state"].get("state", package["current_state"])), "", "## 冲突"]
+    for entry in entries:
+        lines.append(f"- **{entry.get('time') or '未知时间'}**（{entry.get('time_basis','unknown')}）：{entry.get('event')}；参与者：{entry.get('participants')}；地点：{entry.get('location')}；状态变化：{entry.get('state_change')}；依据：{entry.get('evidence_ids')}；不确定性：{entry.get('uncertainty')}")
+    lines += ["", "## 当前状态", str(package["current_state"].get("state", package["current_state"])), "", "## 依据", str(package["current_state"].get("evidence_ids", [])), "", "## 冲突"]
     lines += [f"- {x}" for x in package.get("conflicts", [])] or ["- 无"]
     lines += ["", "## 未知与待确认"]
     lines += [f"- {x}" for x in package.get("unknowns", [])] or ["- 无"]
