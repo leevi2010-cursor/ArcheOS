@@ -11,6 +11,14 @@ from .analysis import FileAnalysisProvider
 from .atomic_information import JsonlAtomicInformationStore, ingest_processing_package
 from .codex_app_server import CodexAnalysisProvider
 from .context import ContextBuilder, ContextRequest
+from .codex_app_server import _load_sdk
+from .timeline import (
+    CodexTimelineProvider,
+    TimelineError,
+    build_timelines,
+    evidence_view_refs,
+    load_selection,
+)
 from .digestion import (
     AtomicInformationDigestionService,
     BusinessLanguageHumanJudgmentPort,
@@ -79,7 +87,9 @@ DEFAULT_SEMANTIC_HANDOFF_AUDIT_ROOT = Path("02_processing/semantic_handoff_runs"
 
 
 def _add_workspace_config_argument(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--config", type=Path, help="ArcheOS local Workspace configuration path.")
+    parser.add_argument(
+        "--config", type=Path, help="ArcheOS local Workspace configuration path."
+    )
 
 
 def _resolve_durable_paths(args: argparse.Namespace) -> None:
@@ -93,16 +103,25 @@ def _resolve_durable_paths(args: argparse.Namespace) -> None:
     elif args.command == "information":
         defaults = {"store": DEFAULT_ATOMIC_INFORMATION_STORE}
         if args.information_command == "extract":
-            defaults.update({
-                "managed_root": DEFAULT_MANAGED_SOURCE_ROOT,
-                "representation_root": DEFAULT_REPRESENTATION_ROOT,
-                "output_root": DEFAULT_REPRESENTATION_INFORMATION_ROOT,
-            })
+            defaults.update(
+                {
+                    "managed_root": DEFAULT_MANAGED_SOURCE_ROOT,
+                    "representation_root": DEFAULT_REPRESENTATION_ROOT,
+                    "output_root": DEFAULT_REPRESENTATION_INFORMATION_ROOT,
+                }
+            )
             if args.external_agent_route is not None:
                 defaults["audit_root"] = DEFAULT_SEMANTIC_HANDOFF_AUDIT_ROOT
     elif args.command == "object":
         defaults = {"database": DEFAULT_WORLD_MODEL_DATABASE}
     elif args.command in {"digest", "context"}:
+        defaults = {
+            "database": DEFAULT_WORLD_MODEL_DATABASE,
+            "information_store": DEFAULT_ATOMIC_INFORMATION_STORE,
+            "proposal_store": DEFAULT_CHANGE_PROPOSAL_STORE,
+            "journal": DEFAULT_CHANGE_JOURNAL,
+        }
+    elif args.command == "stage1-review":
         defaults = {
             "database": DEFAULT_WORLD_MODEL_DATABASE,
             "information_store": DEFAULT_ATOMIC_INFORMATION_STORE,
@@ -118,9 +137,17 @@ def _resolve_durable_paths(args: argparse.Namespace) -> None:
         }
     if not defaults:
         return
-    workspace = require_workspace(args.config) if any(getattr(args, name) is None for name in defaults) else None
+    workspace = (
+        require_workspace(args.config)
+        if any(getattr(args, name) is None for name in defaults)
+        else None
+    )
     for name, relative_default in defaults.items():
-        setattr(args, name, resolve_storage_path(getattr(args, name), workspace, relative_default))
+        setattr(
+            args,
+            name,
+            resolve_storage_path(getattr(args, name), workspace, relative_default),
+        )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -130,27 +157,49 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--version", action="version", version=__version__)
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    init = subparsers.add_parser("init", help="Initialize a private local ArcheOS Workspace.")
+    init = subparsers.add_parser(
+        "init", help="Initialize a private local ArcheOS Workspace."
+    )
     init.add_argument("workspace_path", type=Path, nargs="?", default=Path.cwd())
     init.add_argument("--config", type=Path, help="ArcheOS local configuration path.")
 
-    doctor_command = subparsers.add_parser("doctor", help="Check the local core installation and Workspace.")
-    doctor_command.add_argument("--config", type=Path, help="ArcheOS local configuration path.")
+    doctor_command = subparsers.add_parser(
+        "doctor", help="Check the local core installation and Workspace."
+    )
+    doctor_command.add_argument(
+        "--config", type=Path, help="ArcheOS local configuration path."
+    )
 
-    config = subparsers.add_parser("config", help="Inspect local ArcheOS configuration.")
+    config = subparsers.add_parser(
+        "config", help="Inspect local ArcheOS configuration."
+    )
     config.add_argument("--config", type=Path, help="ArcheOS local configuration path.")
     config_commands = config.add_subparsers(dest="config_command", required=True)
     config_commands.add_parser("show", help="Show non-secret local configuration.")
 
-    mcp = subparsers.add_parser("mcp", help="Run the local read-only ArcheOS MCP server.")
+    mcp = subparsers.add_parser(
+        "mcp", help="Run the local read-only ArcheOS MCP server."
+    )
     mcp_commands = mcp.add_subparsers(dest="mcp_command", required=True)
-    mcp_serve = mcp_commands.add_parser("serve", help="Serve canonical read tools over stdio.")
-    mcp_serve.add_argument("--workspace", type=Path, help="Initialized ArcheOS Workspace.")
-    mcp_serve.add_argument("--config", type=Path, help="ArcheOS local configuration path.")
+    mcp_serve = mcp_commands.add_parser(
+        "serve", help="Serve canonical read tools over stdio."
+    )
+    mcp_serve.add_argument(
+        "--workspace", type=Path, help="Initialized ArcheOS Workspace."
+    )
+    mcp_serve.add_argument(
+        "--config", type=Path, help="ArcheOS local configuration path."
+    )
 
-    integration = subparsers.add_parser("integration", help="Manage supported local Agent integrations.")
-    integration_commands = integration.add_subparsers(dest="integration_target", required=True)
-    codex = integration_commands.add_parser("codex", help="Manage the local Codex MCP registration.")
+    integration = subparsers.add_parser(
+        "integration", help="Manage supported local Agent integrations."
+    )
+    integration_commands = integration.add_subparsers(
+        dest="integration_target", required=True
+    )
+    codex = integration_commands.add_parser(
+        "codex", help="Manage the local Codex MCP registration."
+    )
     codex_commands = codex.add_subparsers(dest="integration_command", required=True)
     for command_name, help_text in (
         ("install", "Install the ArcheOS-managed local Codex MCP entry."),
@@ -158,8 +207,14 @@ def build_parser() -> argparse.ArgumentParser:
         ("remove", "Remove only the ArcheOS-managed local Codex MCP entry."),
     ):
         command = codex_commands.add_parser(command_name, help=help_text)
-        command.add_argument("--config", type=Path, help="ArcheOS local configuration path.")
-        command.add_argument("--codex-config", type=Path, help="Codex config.toml path (for explicit local scope).")
+        command.add_argument(
+            "--config", type=Path, help="ArcheOS local configuration path."
+        )
+        command.add_argument(
+            "--codex-config",
+            type=Path,
+            help="Codex config.toml path (for explicit local scope).",
+        )
 
     process = subparsers.add_parser(
         "process", help="Process one verified Managed Source audio input."
@@ -233,15 +288,9 @@ def build_parser() -> argparse.ArgumentParser:
         "extract", help="Extract one verified Representation into Atomic Information."
     )
     extract.add_argument("representation_id")
-    extract.add_argument(
-        "--managed-root", type=Path, default=None
-    )
-    extract.add_argument(
-        "--representation-root", type=Path, default=None
-    )
-    extract.add_argument(
-        "--output-root", type=Path, default=None
-    )
+    extract.add_argument("--managed-root", type=Path, default=None)
+    extract.add_argument("--representation-root", type=Path, default=None)
+    extract.add_argument("--output-root", type=Path, default=None)
     provider = extract.add_mutually_exclusive_group(required=True)
     provider.add_argument(
         "--analysis-file",
@@ -260,15 +309,17 @@ def build_parser() -> argparse.ArgumentParser:
         "--provider-version",
         help="Expected Codex version assertion; the executable remains the fact source.",
     )
-    extract.add_argument("--codex-bin", default="codex", help="Explicit Codex CLI executable for the approved route.")
+    extract.add_argument(
+        "--codex-bin",
+        default="codex",
+        help="Explicit Codex CLI executable for the approved route.",
+    )
     extract.add_argument("--timeout-seconds", type=float, default=120.0)
     extract.add_argument("--model", default=DEFAULT_SEMANTIC_MODEL)
     extract.add_argument(
         "--reasoning-effort", default=DEFAULT_SEMANTIC_REASONING_EFFORT
     )
-    extract.add_argument(
-        "--audit-root", type=Path, default=None
-    )
+    extract.add_argument("--audit-root", type=Path, default=None)
     extract.add_argument(
         "--batch-size", type=int, default=DEFAULT_EXTERNAL_AGENT_BATCH_SIZE
     )
@@ -354,15 +405,9 @@ def build_parser() -> argparse.ArgumentParser:
         "context", help="Build a read-only bounded context for an Object."
     )
     _add_workspace_config_argument(context)
-    context.add_argument(
-        "--database", type=Path, default=None
-    )
-    context.add_argument(
-        "--information-store", type=Path, default=None
-    )
-    context.add_argument(
-        "--proposal-store", type=Path, default=None
-    )
+    context.add_argument("--database", type=Path, default=None)
+    context.add_argument("--information-store", type=Path, default=None)
+    context.add_argument("--proposal-store", type=Path, default=None)
     context.add_argument("--journal", type=Path, default=None)
     context_commands = context.add_subparsers(dest="context_command", required=True)
     context_build = context_commands.add_parser(
@@ -375,6 +420,23 @@ def build_parser() -> argparse.ArgumentParser:
     context_build.add_argument("--max-changes", type=int, default=50)
     context_build.add_argument("--max-pending", type=int, default=20)
     context_build.add_argument("--max-evidence", type=int, default=5)
+
+    review = subparsers.add_parser(
+        "stage1-review",
+        help="Build a read-only Stage 1 Object Timeline review package.",
+    )
+    review_commands = review.add_subparsers(dest="review_command", required=True)
+    review_build = review_commands.add_parser(
+        "build", help="Build local JSON and business Markdown projections."
+    )
+    review_build.add_argument("--selection-file", type=Path, required=True)
+    review_build.add_argument("--output-root", type=Path, required=True)
+    review_build.add_argument("--resume", action="store_true")
+    review_build.add_argument("--config", type=Path)
+    review_build.add_argument("--database", type=Path, default=None)
+    review_build.add_argument("--information-store", type=Path, default=None)
+    review_build.add_argument("--proposal-store", type=Path, default=None)
+    review_build.add_argument("--journal", type=Path, default=None)
 
     source = subparsers.add_parser(
         "source", help="Admit, inspect, verify, and restore local Managed Sources."
@@ -391,10 +453,14 @@ def build_parser() -> argparse.ArgumentParser:
         "admit", help="Explicitly admit one external file as a Managed Source."
     )
     source_admit.add_argument("external_file", type=Path)
-    source_admit.add_argument("--source-id", help="Inject a deterministic Source ID for tests.")
+    source_admit.add_argument(
+        "--source-id", help="Inject a deterministic Source ID for tests."
+    )
     source_admit.add_argument("--media-type")
     source_admit.add_argument(
-        "--managed-root", type=Path, default=argparse.SUPPRESS,
+        "--managed-root",
+        type=Path,
+        default=argparse.SUPPRESS,
         help="Managed Source root (default: 01_inbox).",
     )
     for command_name, help_text in (
@@ -404,12 +470,16 @@ def build_parser() -> argparse.ArgumentParser:
         command = source_commands.add_parser(command_name, help=help_text)
         command.add_argument("source_id")
         command.add_argument(
-            "--managed-root", type=Path, default=argparse.SUPPRESS,
+            "--managed-root",
+            type=Path,
+            default=argparse.SUPPRESS,
             help="Managed Source root (default: 01_inbox).",
         )
     source_list = source_commands.add_parser("list", help="List local Managed Sources.")
     source_list.add_argument(
-        "--managed-root", type=Path, default=argparse.SUPPRESS,
+        "--managed-root",
+        type=Path,
+        default=argparse.SUPPRESS,
         help="Managed Source root (default: 01_inbox).",
     )
     source_restore = source_commands.add_parser(
@@ -418,7 +488,9 @@ def build_parser() -> argparse.ArgumentParser:
     source_restore.add_argument("source_id")
     source_restore.add_argument("target_file", type=Path)
     source_restore.add_argument(
-        "--managed-root", type=Path, default=argparse.SUPPRESS,
+        "--managed-root",
+        type=Path,
+        default=argparse.SUPPRESS,
         help="Managed Source root (default: 01_inbox).",
     )
     source_handoff = source_commands.add_parser(
@@ -433,7 +505,9 @@ def build_parser() -> argparse.ArgumentParser:
     handoff_write.add_argument("source_id")
     handoff_write.add_argument("--target-file", type=Path)
     handoff_write.add_argument(
-        "--managed-root", type=Path, default=argparse.SUPPRESS,
+        "--managed-root",
+        type=Path,
+        default=argparse.SUPPRESS,
         help="Managed Source root (default: 01_inbox).",
     )
     handoff_show = source_handoff_commands.add_parser(
@@ -441,7 +515,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     handoff_show.add_argument("marker_path", type=Path)
     handoff_show.add_argument(
-        "--managed-root", type=Path, default=argparse.SUPPRESS,
+        "--managed-root",
+        type=Path,
+        default=argparse.SUPPRESS,
         help="Managed Source root (default: 01_inbox).",
     )
 
@@ -515,19 +591,13 @@ def build_parser() -> argparse.ArgumentParser:
     wechat = conversation_providers.add_parser(
         "wechat", help="Build the strict local WeChat Conversation Representation."
     )
-    wechat_commands = wechat.add_subparsers(
-        dest="conversation_command", required=True
-    )
+    wechat_commands = wechat.add_subparsers(dest="conversation_command", required=True)
     wechat_represent = wechat_commands.add_parser(
         "represent", help="Represent one verified WeChat Managed Source."
     )
     wechat_represent.add_argument("source_id")
-    wechat_represent.add_argument(
-        "--managed-root", type=Path, default=None
-    )
-    wechat_represent.add_argument(
-        "--representation-root", type=Path, default=None
-    )
+    wechat_represent.add_argument("--managed-root", type=Path, default=None)
+    wechat_represent.add_argument("--representation-root", type=Path, default=None)
 
     wechat_product = subparsers.add_parser(
         "wechat", help="消化从上次成功位置以来的微信信息。"
@@ -730,30 +800,71 @@ def _process_command(args: argparse.Namespace) -> int:
 def _workspace_command(args: argparse.Namespace) -> int:
     try:
         if args.command == "init":
-            config, changed = initialize_workspace(args.workspace_path, config_path=args.config)
-            print(json.dumps({**config.to_dict(), "created_or_updated": changed}, ensure_ascii=False, indent=2))
+            config, changed = initialize_workspace(
+                args.workspace_path, config_path=args.config
+            )
+            print(
+                json.dumps(
+                    {**config.to_dict(), "created_or_updated": changed},
+                    ensure_ascii=False,
+                    indent=2,
+                )
+            )
             return 0
         if args.command == "doctor":
             report = doctor(args.config)
             print(json.dumps(report, ensure_ascii=False, indent=2))
             return 0 if report.get("healthy") else 1
         if args.command == "config":
-            if args.config_command != "show":  # pragma: no cover - argparse enforces this
+            if (
+                args.config_command != "show"
+            ):  # pragma: no cover - argparse enforces this
                 return 2
-            print(json.dumps(load_workspace_config(args.config).to_dict(), ensure_ascii=False, indent=2))
+            print(
+                json.dumps(
+                    load_workspace_config(args.config).to_dict(),
+                    ensure_ascii=False,
+                    indent=2,
+                )
+            )
             return 0
         if args.command == "integration":
-            if args.integration_target != "codex":  # pragma: no cover - argparse enforces this
+            if (
+                args.integration_target != "codex"
+            ):  # pragma: no cover - argparse enforces this
                 return 2
             if args.integration_command == "remove":
-                print(json.dumps({"result": remove_codex_integration(args.codex_config)}, ensure_ascii=False, indent=2))
+                print(
+                    json.dumps(
+                        {"result": remove_codex_integration(args.codex_config)},
+                        ensure_ascii=False,
+                        indent=2,
+                    )
+                )
                 return 0
             config = load_workspace_config(args.config)
             if args.integration_command == "install":
-                print(json.dumps({"result": "installed", "config_path": install_codex_integration(config, args.codex_config)}, ensure_ascii=False, indent=2))
+                print(
+                    json.dumps(
+                        {
+                            "result": "installed",
+                            "config_path": install_codex_integration(
+                                config, args.codex_config
+                            ),
+                        },
+                        ensure_ascii=False,
+                        indent=2,
+                    )
+                )
                 return 0
             if args.integration_command == "status":
-                print(json.dumps(codex_integration_status(config, args.codex_config), ensure_ascii=False, indent=2))
+                print(
+                    json.dumps(
+                        codex_integration_status(config, args.codex_config),
+                        ensure_ascii=False,
+                        indent=2,
+                    )
+                )
                 return 0
         return 2
     except (OSError, ValueError) as exc:
@@ -801,7 +912,9 @@ def _information_command(args: argparse.Namespace) -> int:
                 )
             else:
                 if args.provider_version is None:
-                    raise ValueError("--provider-version is required with --external-agent-route")
+                    raise ValueError(
+                        "--provider-version is required with --external-agent-route"
+                    )
                 provider = CodexCliRepresentationAnalysisProvider(
                     codex_binary=args.codex_bin,
                     provider_version=args.provider_version,
@@ -977,6 +1090,95 @@ def _source_command(args: argparse.Namespace) -> int:
         return 1
 
 
+def _stage1_review_command(args: argparse.Namespace) -> int:
+    try:
+        selections = load_selection(args.selection_file)
+        if not args.database.is_file():
+            raise TimelineError(f"World Model database does not exist: {args.database}")
+        contexts: dict[str, dict[str, object]] = {}
+        with SQLiteWorldModelRepository(args.database) as repository:
+            store = JsonlAtomicInformationStore(args.information_store)
+            builder = ContextBuilder(
+                repository,
+                ObjectResolver(repository),
+                store,
+                JsonlChangeJournal(args.journal),
+                JsonlChangeProposalStore(args.proposal_store),
+            )
+            for selection in selections:
+                bundle = builder.build(
+                    ContextRequest(scope="object", object_id=selection.object_id)
+                )
+                bundle_payload = asdict(bundle)
+                bounded_ids = [
+                    item.atomic_information_id for item in bundle.atomic_information
+                ]
+                supplemental_payloads = []
+                for atomic_id in selection.supplemental_atomic_information_ids:
+                    current = store.get_current(atomic_id)
+                    if atomic_id not in bounded_ids:
+                        supplemental_payloads.append(asdict(current))
+
+                evidence_references: dict[str, object] = {}
+                evidence_by_atomic: dict[str, list[str]] = {}
+                atomic_payloads = [
+                    *bundle_payload["atomic_information"],
+                    *supplemental_payloads,
+                ]
+                for atomic_payload in atomic_payloads:
+                    atomic_id = atomic_payload["atomic_information_id"]
+                    references = evidence_view_refs(
+                        atomic_id,
+                        atomic_payload["source_evidence"],
+                    )
+                    evidence_references.update(references)
+                    evidence_by_atomic[atomic_id] = list(references)
+
+                allowed_object_ids = {bundle.root.object_id}
+                allowed_object_ids.update(
+                    relationship.neighbor.object_id
+                    for relationship in bundle.relationships
+                )
+                contexts[selection.object_id] = {
+                    "context": bundle_payload,
+                    "supplemental_atomic_information": supplemental_payloads,
+                    "atomic_information_ids": [
+                        *bounded_ids,
+                        *(
+                            atomic_id
+                            for atomic_id in selection.supplemental_atomic_information_ids
+                            if atomic_id not in bounded_ids
+                        ),
+                    ],
+                    "allowed_object_ids": sorted(allowed_object_ids),
+                    "evidence_view_refs": evidence_references,
+                    "evidence_by_atomic": evidence_by_atomic,
+                    "required_incomplete_reasons": list(
+                        bundle.metadata.incomplete_reasons
+                    ),
+                }
+        result = build_timelines(
+            selections,
+            contexts,
+            CodexTimelineProvider(sdk_loader=_load_sdk),
+            args.output_root,
+            args.resume,
+        )
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        return 0 if result["complete"] else 1
+    except (
+        OSError,
+        RuntimeError,
+        sqlite3.Error,
+        TimelineError,
+        TypeError,
+        ValueError,
+        json.JSONDecodeError,
+    ) as exc:
+        print(f"error: stage1-review build failed: {exc}")
+        return 1
+
+
 def _representation_command(args: argparse.Namespace) -> int:
     repository = LocalRepresentationRepository(args.representation_root)
     service = RepresentationService(
@@ -989,7 +1191,9 @@ def _representation_command(args: argparse.Namespace) -> int:
             if adapter.name == "image-preflight":
                 configuration["privacy_route"] = args.privacy_route or "unknown"
             elif args.privacy_route is not None:
-                raise RepresentationError("--privacy-route is only supported by image-preflight")
+                raise RepresentationError(
+                    "--privacy-route is only supported by image-preflight"
+                )
             result = service.build(args.source_id, adapter, configuration)
             print(json.dumps(result.to_dict(), ensure_ascii=False, indent=2))
             return 0
@@ -1096,7 +1300,9 @@ def _wechat_product_command(args: argparse.Namespace) -> int:
         return 2
     if args.install_semantic_authority:
         if args.inventory_authority_file is None:
-            print("error: 安装 Semantic authority 必须指定私有 inventory authority file。")
+            print(
+                "error: 安装 Semantic authority 必须指定私有 inventory authority file。"
+            )
             return 2
     elif args.inventory_authority_file is not None:
         print("error: inventory authority file 只能与安装入口一起使用。")
@@ -1199,7 +1405,9 @@ def _wechat_product_command(args: argparse.Namespace) -> int:
                         "representation_id": prepared.representation_id,
                         "anchor_unit_ids": list(prepared.anchor_unit_ids),
                         "semantic_provider_calls": prepared.semantic_provider_calls,
-                        "governance_provider_calls": prepared.governance_provider_calls if prepared.governance_provider_calls is not None else "unavailable",
+                        "governance_provider_calls": prepared.governance_provider_calls
+                        if prepared.governance_provider_calls is not None
+                        else "unavailable",
                         "checkpoint_published": False,
                     },
                     ensure_ascii=False,
@@ -1208,7 +1416,15 @@ def _wechat_product_command(args: argparse.Namespace) -> int:
             )
             return 0
         if args.upgrade_active_v1:
-            print(json.dumps({"run_id": service.upgrade_active_v1(), "semantic_provider_calls": 0}, ensure_ascii=False))
+            print(
+                json.dumps(
+                    {
+                        "run_id": service.upgrade_active_v1(),
+                        "semantic_provider_calls": 0,
+                    },
+                    ensure_ascii=False,
+                )
+            )
             return 0
         if args.upgrade_active_v2_all_history:
             print(
@@ -1248,19 +1464,13 @@ def _wechat_product_command(args: argparse.Namespace) -> int:
                     {
                         "semantic_provider_calls": 0,
                         "activation_total": extension["activation_total"],
-                        "previous_absolute_cap": extension[
-                            "previous_absolute_cap"
-                        ],
+                        "previous_absolute_cap": extension["previous_absolute_cap"],
                         "new_absolute_cap": extension["new_absolute_cap"],
                         "first_authorized_ordinal": extension[
                             "first_authorized_ordinal"
                         ],
-                        "last_authorized_ordinal": extension[
-                            "last_authorized_ordinal"
-                        ],
-                        "extension_fingerprint": extension[
-                            "extension_fingerprint"
-                        ],
+                        "last_authorized_ordinal": extension["last_authorized_ordinal"],
+                        "extension_fingerprint": extension["extension_fingerprint"],
                     },
                     ensure_ascii=False,
                     indent=2,
@@ -1276,22 +1486,14 @@ def _wechat_product_command(args: argparse.Namespace) -> int:
                     {
                         "semantic_provider_calls": 0,
                         "governance_provider_calls": 0,
-                        "global_attempt_total": continuation[
-                            "activation_total"
-                        ],
-                        "global_unknown": continuation[
-                            "activation_unknown_count"
-                        ],
-                        "next_global_ordinal": continuation[
-                            "next_global_ordinal"
-                        ],
+                        "global_attempt_total": continuation["activation_total"],
+                        "global_unknown": continuation["activation_unknown_count"],
+                        "next_global_ordinal": continuation["next_global_ordinal"],
                         "absolute_cap": continuation["absolute_cap"],
                         "previous_reviewed_git_head": continuation[
                             "previous_reviewed_git_head"
                         ],
-                        "reviewed_git_head": continuation[
-                            "reviewed_git_head"
-                        ],
+                        "reviewed_git_head": continuation["reviewed_git_head"],
                         "continuation_fingerprint": continuation[
                             "continuation_fingerprint"
                         ],
@@ -1310,22 +1512,14 @@ def _wechat_product_command(args: argparse.Namespace) -> int:
                     {
                         "semantic_provider_calls": 0,
                         "governance_provider_calls": 0,
-                        "global_attempt_total": continuation[
-                            "activation_total"
-                        ],
-                        "global_unknown": continuation[
-                            "activation_unknown_count"
-                        ],
-                        "next_global_ordinal": continuation[
-                            "next_global_ordinal"
-                        ],
+                        "global_attempt_total": continuation["activation_total"],
+                        "global_unknown": continuation["activation_unknown_count"],
+                        "next_global_ordinal": continuation["next_global_ordinal"],
                         "absolute_cap": continuation["absolute_cap"],
                         "previous_reviewed_git_head": continuation[
                             "previous_reviewed_git_head"
                         ],
-                        "reviewed_git_head": continuation[
-                            "reviewed_git_head"
-                        ],
+                        "reviewed_git_head": continuation["reviewed_git_head"],
                         "continuation_fingerprint": continuation[
                             "continuation_fingerprint"
                         ],
@@ -1336,10 +1530,8 @@ def _wechat_product_command(args: argparse.Namespace) -> int:
             )
             return 0
         if args.install_semantic_segmented_gate_c_continuation:
-            continuation = (
-                service.install_semantic_segmented_gate_c_continuation(
-                    authority_ref=args.authority_ref,
-                )
+            continuation = service.install_semantic_segmented_gate_c_continuation(
+                authority_ref=args.authority_ref,
             )
             print(
                 json.dumps(
@@ -1347,19 +1539,13 @@ def _wechat_product_command(args: argparse.Namespace) -> int:
                         "semantic_provider_calls": 0,
                         "governance_provider_calls": 0,
                         "global_attempt_total": continuation["activation_total"],
-                        "global_unknown": continuation[
-                            "activation_unknown_count"
-                        ],
-                        "next_global_ordinal": continuation[
-                            "next_global_ordinal"
-                        ],
+                        "global_unknown": continuation["activation_unknown_count"],
+                        "next_global_ordinal": continuation["next_global_ordinal"],
                         "absolute_cap": continuation["absolute_cap"],
                         "previous_reviewed_git_head": continuation[
                             "previous_reviewed_git_head"
                         ],
-                        "reviewed_git_head": continuation[
-                            "reviewed_git_head"
-                        ],
+                        "reviewed_git_head": continuation["reviewed_git_head"],
                         "continuation_fingerprint": continuation[
                             "continuation_fingerprint"
                         ],
@@ -1372,9 +1558,7 @@ def _wechat_product_command(args: argparse.Namespace) -> int:
         if args.resolve_governance_startup_failure:
             resolution = service.resolve_governance_startup_failure(
                 authority_ref=args.authority_ref,
-                authority_manifest_file=(
-                    args.governance_startup_authority_file
-                ),
+                authority_manifest_file=(args.governance_startup_authority_file),
             )
             print(
                 json.dumps(
@@ -1442,9 +1626,7 @@ def _wechat_product_command(args: argparse.Namespace) -> int:
                         "remaining_batch": len(
                             migration["remaining_atomic_information_ids"]
                         ),
-                        "migration_fingerprint": migration[
-                            "migration_fingerprint"
-                        ],
+                        "migration_fingerprint": migration["migration_fingerprint"],
                     },
                     ensure_ascii=False,
                     indent=2,
@@ -1465,9 +1647,7 @@ def _wechat_product_command(args: argparse.Namespace) -> int:
                         "global_unknown": 0,
                         "absolute_cap": 1000,
                         "remaining": 834,
-                        "next_global_ordinal": continuation[
-                            "next_global_ordinal"
-                        ],
+                        "next_global_ordinal": continuation["next_global_ordinal"],
                         "failed_closed": 1,
                         "preserved_but_unabsorbed": 1,
                         "resolution_receipt_fingerprint": resolution[
@@ -1481,9 +1661,7 @@ def _wechat_product_command(args: argparse.Namespace) -> int:
             return 0
         if args.resolve_semantic_timeout_212:
             resolution = service.resolve_semantic_timeout_212(
-                authority_manifest_file=(
-                    args.semantic_timeout_212_authority_file
-                ),
+                authority_manifest_file=(args.semantic_timeout_212_authority_file),
             )
             continuation = resolution["continuation"]
             print(
@@ -1495,9 +1673,7 @@ def _wechat_product_command(args: argparse.Namespace) -> int:
                         "global_unknown": 0,
                         "absolute_cap": 1000,
                         "remaining": 788,
-                        "next_global_ordinal": continuation[
-                            "next_global_ordinal"
-                        ],
+                        "next_global_ordinal": continuation["next_global_ordinal"],
                         "failed_closed": 1,
                         "preserved_but_unabsorbed": 1,
                         "resolution_receipt_fingerprint": resolution[
@@ -1536,17 +1712,15 @@ def _wechat_product_command(args: argparse.Namespace) -> int:
     print(f"本地保留（隐私）：{result.local_only}")
     print(f"暂不支持：{result.unsupported}")
     print(f"待你判断：{result.pending_human}")
+    print(f"已保留但未形成长期信息：{result.semantic_preserved_but_unabsorbed}")
     print(
-        "已保留但未形成长期信息："
-        f"{result.semantic_preserved_but_unabsorbed}"
-    )
-    print(
-        "已形成长期信息但治理未完整确认："
-        f"{result.governance_preserved_but_incomplete}"
+        f"已形成长期信息但治理未完整确认：{result.governance_preserved_but_incomplete}"
     )
     print(f"更新了 {result.context_objects} 个长期对象的 Context")
     print(f"治理 app-server 启动：{result.governance_app_server_starts}")
-    print(f"治理 thread / turn：{result.governance_threads} / {result.governance_turns}")
+    print(
+        f"治理 thread / turn：{result.governance_threads} / {result.governance_turns}"
+    )
     print(
         "治理耗时（ms）："
         f"startup={result.governance_startup_wall_ms}, "
@@ -1589,6 +1763,8 @@ def main(argv: list[str] | None = None) -> int:
         return _digest_command(args)
     if args.command == "context":
         return _context_command(args)
+    if args.command == "stage1-review":
+        return _stage1_review_command(args)
     if args.command == "source":
         return _source_command(args)
     if args.command == "representation":
