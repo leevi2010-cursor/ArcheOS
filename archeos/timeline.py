@@ -9,7 +9,7 @@ import stat
 import tempfile
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -305,6 +305,17 @@ class Selection:
     supplemental_atomic_information_ids: tuple[str, ...] = ()
 
 
+@dataclass(frozen=True)
+class LegacyRecoveryAuthorization:
+    """Exact local authority binding for one legacy Timeline artifact."""
+
+    authority_ref: str
+    object_id: str
+    legacy_artifact_sha256: str
+    legacy_input_fingerprint: str
+    stable_input_fingerprint: str
+
+
 def load_selection(path: Path) -> tuple[Selection, ...]:
     """Load the private, minimal 3-5 Object selection contract."""
     if stat.S_IMODE(path.stat().st_mode) != 0o600:
@@ -357,6 +368,16 @@ def _fingerprint(
     context: Mapping[str, Any],
     contract_version: str,
 ) -> str:
+    semantic_context = dict(context)
+    raw_bundle = semantic_context.get("context")
+    if isinstance(raw_bundle, Mapping):
+        bundle = dict(raw_bundle)
+        raw_metadata = bundle.get("metadata")
+        if isinstance(raw_metadata, Mapping):
+            metadata = dict(raw_metadata)
+            metadata.pop("generated_at", None)
+            bundle["metadata"] = metadata
+        semantic_context["context"] = bundle
     payload = json.dumps(
         {
             "selection": {
@@ -366,7 +387,7 @@ def _fingerprint(
                     selection.supplemental_atomic_information_ids
                 ),
             },
-            "context": context,
+            "context": semantic_context,
             "provider_contract": contract_version,
         },
         sort_keys=True,
@@ -869,6 +890,151 @@ def _atomic_write(path: Path, content: str) -> None:
             temporary.unlink()
 
 
+def _sha256_bytes(content: bytes) -> str:
+    return hashlib.sha256(content).hexdigest()
+
+
+def _sha256_digest(value: object, field: str) -> str:
+    digest = _non_empty_text(value, field)
+    if len(digest) != 64 or any(
+        character not in "0123456789abcdef" for character in digest
+    ):
+        raise TimelineError(f"{field} must be a SHA-256 digest")
+    return digest
+
+
+def _serialized_package(package: Mapping[str, Any]) -> bytes:
+    return (
+        json.dumps(package, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+    ).encode("utf-8")
+
+
+def recover_legacy_timeline_artifact(
+    artifact_path: Path,
+    receipt_path: Path,
+    selection: Selection,
+    context: Mapping[str, Any],
+    contract_version: str,
+    authorization: LegacyRecoveryAuthorization,
+) -> dict[str, Any]:
+    """Rebind one exact validated legacy artifact without calling a Provider."""
+    resolved_artifact = artifact_path.expanduser().resolve()
+    resolved_receipt = receipt_path.expanduser().resolve()
+    if _git_ancestor(resolved_artifact) is not None:
+        raise TimelineError("legacy artifact must remain outside Git")
+    if _git_ancestor(resolved_receipt) is not None:
+        raise TimelineError("recovery receipt must remain outside Git")
+    if not resolved_artifact.is_file():
+        raise TimelineError("legacy Timeline artifact does not exist")
+    if resolved_receipt.exists():
+        raise TimelineError("recovery receipt already exists")
+
+    authority_ref = _non_empty_text(
+        authorization.authority_ref, "recovery authority_ref"
+    )
+    authority_object_id = _non_empty_text(
+        authorization.object_id, "recovery Object binding"
+    )
+    if authority_object_id != selection.object_id:
+        raise TimelineError(
+            "recovery authority Object binding does not match selection"
+        )
+    expected_legacy_hash = _sha256_digest(
+        authorization.legacy_artifact_sha256,
+        "recovery legacy artifact hash",
+    )
+    expected_legacy_fingerprint = _sha256_digest(
+        authorization.legacy_input_fingerprint,
+        "recovery legacy input fingerprint",
+    )
+    expected_stable_fingerprint = _sha256_digest(
+        authorization.stable_input_fingerprint,
+        "recovery stable input fingerprint",
+    )
+
+    legacy_bytes = resolved_artifact.read_bytes()
+    if _sha256_bytes(legacy_bytes) != expected_legacy_hash:
+        raise TimelineError("legacy Timeline artifact hash does not match authority")
+    stable_fingerprint = _fingerprint(selection, context, contract_version)
+    if stable_fingerprint != expected_stable_fingerprint:
+        raise TimelineError(
+            "current semantic Context does not match recovery authority"
+        )
+    try:
+        legacy_package = json.loads(legacy_bytes)
+    except json.JSONDecodeError as exc:
+        raise TimelineError("legacy Timeline artifact is not valid JSON") from exc
+
+    supplied = set(context.get("atomic_information_ids", ()))
+    supplied.update(selection.supplemental_atomic_information_ids)
+    allowed_objects, allowed_evidence, by_atomic, required_reasons = _validation_scope(
+        context
+    )
+    evidence_views = context.get("evidence_view_refs")
+    if not isinstance(evidence_views, dict):
+        raise TimelineError("current Evidence references are invalid")
+    validation_options = {
+        "evidence_ids": allowed_evidence,
+        "expected_object_id": selection.object_id,
+        "allowed_object_ids": allowed_objects,
+        "evidence_by_atomic": by_atomic,
+        "required_incomplete_reasons": required_reasons,
+        "evidence_view_refs": evidence_views,
+    }
+    validated_legacy = validate_package(
+        legacy_package,
+        supplied,
+        artifact=True,
+        **validation_options,
+    )
+    if validated_legacy["input_fingerprint"] != expected_legacy_fingerprint:
+        raise TimelineError(
+            "legacy input fingerprint does not match recovery authority"
+        )
+    if expected_legacy_fingerprint == stable_fingerprint:
+        raise TimelineError("Timeline artifact already uses the stable fingerprint")
+
+    recovered_package = dict(validated_legacy)
+    recovered_package["input_fingerprint"] = stable_fingerprint
+    recovered_bytes = _serialized_package(recovered_package)
+    recovered_hash = _sha256_bytes(recovered_bytes)
+    receipt = {
+        "schema_version": "stage1-timeline-recovery-receipt.v1",
+        "authority_ref": authority_ref,
+        "object_id": selection.object_id,
+        "legacy_artifact_sha256": expected_legacy_hash,
+        "recovered_artifact_sha256": recovered_hash,
+        "legacy_input_fingerprint": expected_legacy_fingerprint,
+        "stable_input_fingerprint": stable_fingerprint,
+    }
+
+    resolved_receipt.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    os.chmod(resolved_receipt.parent, 0o700)
+    _atomic_write(resolved_artifact, recovered_bytes.decode("utf-8"))
+    os.chmod(resolved_artifact, 0o600)
+    readback_bytes = resolved_artifact.read_bytes()
+    if _sha256_bytes(readback_bytes) != recovered_hash:
+        raise TimelineError("recovered Timeline artifact hash readback failed")
+    recovered_readback = validate_package(
+        json.loads(readback_bytes),
+        supplied,
+        artifact=True,
+        **validation_options,
+    )
+    if recovered_readback != recovered_package:
+        raise TimelineError("recovered Timeline artifact validation readback failed")
+    _atomic_write(
+        resolved_receipt,
+        json.dumps(receipt, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+    )
+    os.chmod(resolved_receipt, 0o600)
+    if stat.S_IMODE(resolved_receipt.stat().st_mode) != 0o600:
+        raise TimelineError("recovery receipt must have private mode 0600")
+    if json.loads(resolved_receipt.read_text(encoding="utf-8")) != receipt:
+        raise TimelineError("recovery receipt readback failed")
+    return receipt
+
+
 def _validation_scope(
     context: Mapping[str, Any],
 ) -> tuple[set[str], set[str], dict[str, set[str]], set[str]]:
@@ -987,15 +1153,7 @@ def build_timelines(
                 "evidence_index": _build_evidence_index(result, evidence_views),
             }
         )
-        serialized = (
-            json.dumps(
-                result,
-                ensure_ascii=False,
-                indent=2,
-                sort_keys=True,
-            )
-            + "\n"
-        )
+        serialized = _serialized_package(result).decode("utf-8")
         _atomic_write(target, serialized)
         readback = json.loads(target.read_text(encoding="utf-8"))
         validated_readback = validate_package(
@@ -1065,6 +1223,11 @@ def _internal_reference_ids(package: Mapping[str, Any]) -> set[str]:
     internal_ids.update(
         item["atomic_information_id"] for item in package["information_accounting"]
     )
+    internal_ids.update(
+        item["source_id"]
+        for item in package.get("evidence_index", [])
+        if isinstance(item, dict) and isinstance(item.get("source_id"), str)
+    )
     return internal_ids
 
 
@@ -1103,41 +1266,147 @@ def _evidence_lookup(package: Mapping[str, Any]) -> dict[str, Mapping[str, Any]]
     }
 
 
-def _evidence_lines(
+def _evidence_numbers(
     item: Mapping[str, Any],
+    numbers: Mapping[str, int],
+) -> str:
+    cited = [
+        numbers[evidence_ref]
+        for evidence_ref in item.get("evidence_ids", [])
+        if evidence_ref in numbers
+    ]
+    return "、".join(str(number) for number in cited) if cited else "暂无可展示依据"
+
+
+def _source_recorded_at(value: object) -> tuple[datetime, str] | None:
+    parsed: datetime
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        seconds = float(value)
+        if seconds < 0:
+            return None
+        if seconds >= 100_000_000_000:
+            seconds /= 1000
+        try:
+            parsed = datetime.fromtimestamp(seconds, timezone.utc)
+        except (OverflowError, OSError, ValueError):
+            return None
+    elif isinstance(value, str) and value.strip():
+        try:
+            parsed = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        if parsed.tzinfo is None:
+            return None
+        parsed = parsed.astimezone(timezone.utc)
+    else:
+        return None
+    business_time = parsed.astimezone(timezone(timedelta(hours=8)))
+    return parsed, business_time.isoformat(timespec="seconds")
+
+
+def _locator_presentation(entry: Mapping[str, Any]) -> tuple[str, datetime | None, str]:
+    segment = entry.get("segment")
+    fallback = (
+        f"第 {segment} 条资料" if isinstance(segment, int) else "资料中的对应位置"
+    )
+    raw_locator = entry.get("locator")
+    locator: object = raw_locator
+    if isinstance(raw_locator, str):
+        try:
+            locator = json.loads(raw_locator)
+        except json.JSONDecodeError:
+            prefix, separator, suffix = raw_locator.partition(":")
+            if separator and suffix.isdigit():
+                labels = {"line": "行", "segment": "段", "page": "页", "row": "行"}
+                label = labels.get(prefix.lower())
+                if label is not None:
+                    return f"第 {int(suffix)} {label}", None, "未提供"
+            return fallback, None, "未提供"
+    if not isinstance(locator, Mapping):
+        return fallback, None, "未提供"
+
+    recorded = None
+    cursor = locator.get("cursor")
+    if isinstance(cursor, Mapping):
+        recorded = _source_recorded_at(cursor.get("timestamp"))
+    if recorded is None:
+        for field in ("sent_at", "recorded_at", "timestamp"):
+            recorded = _source_recorded_at(locator.get(field))
+            if recorded is not None:
+                break
+
+    location = fallback
+    for field, label in (
+        ("sequence", "条记录"),
+        ("page", "页"),
+        ("line", "行"),
+        ("row", "行"),
+        ("slide", "页幻灯片"),
+    ):
+        position = locator.get(field)
+        if (
+            isinstance(position, int)
+            and not isinstance(position, bool)
+            and position >= 0
+        ):
+            location = f"第 {position} {label}"
+            break
+    if isinstance(cursor, Mapping) or "message_key" in locator:
+        location = (
+            f"聊天记录中的第 {segment} 条" if isinstance(segment, int) else "聊天记录"
+        )
+    if recorded is None:
+        return location, None, "未提供"
+    return location, recorded[0], recorded[1]
+
+
+def _business_artifact(value: object, hidden_ids: set[str]) -> str:
+    displayed = _display(value, hidden_ids=hidden_ids)
+    return displayed.replace("\\", "/").rsplit("/", 1)[-1]
+
+
+def _evidence_section_lines(
     lookup: Mapping[str, Mapping[str, Any]],
-    *,
-    indent: str,
+    numbers: Mapping[str, int],
     hidden_ids: set[str],
 ) -> list[str]:
-    evidence = [
-        lookup[evidence_ref]
-        for evidence_ref in item.get("evidence_ids", [])
-        if evidence_ref in lookup
-    ]
-    if not evidence:
-        return [f"{indent}- 暂无可展示依据"]
     lines: list[str] = []
-    for entry in evidence:
-        time = (
-            f"{_display(entry['start'], hidden_ids=hidden_ids)} 至 "
-            f"{_display(entry['end'], hidden_ids=hidden_ids)}"
-            if entry["start"] is not None or entry["end"] is not None
-            else "未提供"
-        )
+    for evidence_ref, number in sorted(numbers.items(), key=lambda item: item[1]):
+        entry = lookup[evidence_ref]
+        location, _recorded_sort, recorded_display = _locator_presentation(entry)
         lines.extend(
             [
-                f"{indent}- 摘录：{_display(entry['excerpt'], hidden_ids=hidden_ids)}",
-                f"{indent}  - 来源文件/记录："
-                f"{_display(entry['artifact'], hidden_ids=hidden_ids)}",
-                f"{indent}  - 说话人："
-                f"{_display(entry['speaker'], hidden_ids=hidden_ids)}",
-                f"{indent}  - 定位："
-                f"{_display(entry['locator'], hidden_ids=hidden_ids)}",
-                f"{indent}  - 时间：{time}",
+                f"- **依据 {number}**",
+                f"  - 摘录：{_display(entry['excerpt'], hidden_ids=hidden_ids)}",
+                "  - 来源文件/记录："
+                f"{_business_artifact(entry['artifact'], hidden_ids)}",
+                f"  - 说话人：{_display(entry['speaker'], hidden_ids=hidden_ids)}",
+                f"  - 业务位置：{location}",
+                f"  - 资料记录时间：{recorded_display}（不等于事件发生时间）",
             ]
         )
-    return lines
+    return lines or ["- 暂无可展示依据"]
+
+
+def _unknown_entry_sort_key(
+    entry: Mapping[str, Any],
+    lookup: Mapping[str, Mapping[str, Any]],
+) -> tuple[int, datetime]:
+    timestamps = []
+    for evidence_ref in entry.get("evidence_ids", []):
+        evidence = lookup.get(evidence_ref)
+        if evidence is None:
+            continue
+        _location, recorded, _displayed = _locator_presentation(evidence)
+        if recorded is not None:
+            timestamps.append(recorded)
+    return (
+        (0, min(timestamps))
+        if timestamps
+        else (1, datetime.max.replace(tzinfo=timezone.utc))
+    )
 
 
 def render_markdown(package: Mapping[str, Any]) -> str:
@@ -1152,6 +1421,13 @@ def render_markdown(package: Mapping[str, Any]) -> str:
     what_it_is = package["what_it_is"]
     current_state = package["current_state"]
     evidence_lookup = _evidence_lookup(package)
+    evidence_numbers = {
+        evidence_ref: index
+        for index, evidence_ref in enumerate(evidence_lookup, start=1)
+    }
+    unknown_entries.sort(
+        key=lambda entry: _unknown_entry_sort_key(entry, evidence_lookup)
+    )
     hidden_ids = _internal_reference_ids(package)
     lines = [
         f"# {package.get('selection_label', '对象时间线')}",
@@ -1166,6 +1442,7 @@ def render_markdown(package: Mapping[str, Any]) -> str:
             or "尚未确认"
         ),
         f"- 生命周期：{_business_label(what_it_is['lifecycle'], _LIFECYCLE_LABELS)}",
+        f"- 依据：{_evidence_numbers(what_it_is, evidence_numbers)}",
         "",
         "## 关键事件时间线",
         "### 已知事件时间",
@@ -1189,16 +1466,8 @@ def render_markdown(package: Mapping[str, Any]) -> str:
                 f"  - 状态变化：{_display(entry['state_change'], '未确认', hidden_ids=hidden_ids)}",
                 f"  - 不确定性："
                 f"{_display(entry['uncertainty'], '无明显不确定性', hidden_ids=hidden_ids)}",
-                "  - 依据：",
+                f"  - 依据：{_evidence_numbers(entry, evidence_numbers)}",
             ]
-        )
-        lines.extend(
-            _evidence_lines(
-                entry,
-                evidence_lookup,
-                indent="    ",
-                hidden_ids=hidden_ids,
-            )
         )
     lines.append("### 事件时间尚不明确")
     if not unknown_entries:
@@ -1219,16 +1488,9 @@ def render_markdown(package: Mapping[str, Any]) -> str:
                 f"  - 状态变化：{_display(entry['state_change'], '未确认', hidden_ids=hidden_ids)}",
                 f"  - 不确定性："
                 f"{_display(entry['uncertainty'], '时间尚未确认', hidden_ids=hidden_ids)}",
-                "  - 依据：",
+                "  - 事件时间：未知",
+                f"  - 依据：{_evidence_numbers(entry, evidence_numbers)}",
             ]
-        )
-        lines.extend(
-            _evidence_lines(
-                entry,
-                evidence_lookup,
-                indent="    ",
-                hidden_ids=hidden_ids,
-            )
         )
     lines.extend(
         [
@@ -1238,28 +1500,12 @@ def render_markdown(package: Mapping[str, Any]) -> str:
             f"- 截至：{_display(current_state['as_of'], '尚未确认', hidden_ids=hidden_ids)}",
             f"- 不确定性："
             f"{_display(current_state['uncertainty'], '无明显不确定性', hidden_ids=hidden_ids)}",
+            f"- 依据：{_evidence_numbers(current_state, evidence_numbers)}",
             "",
             "## 依据",
-            "- 对象解释",
         ]
     )
-    lines.extend(
-        _evidence_lines(
-            what_it_is,
-            evidence_lookup,
-            indent="  ",
-            hidden_ids=hidden_ids,
-        )
-    )
-    lines.append("- 当前状态")
-    lines.extend(
-        _evidence_lines(
-            current_state,
-            evidence_lookup,
-            indent="  ",
-            hidden_ids=hidden_ids,
-        )
-    )
+    lines.extend(_evidence_section_lines(evidence_lookup, evidence_numbers, hidden_ids))
     lines.extend(
         [
             "",
@@ -1272,30 +1518,14 @@ def render_markdown(package: Mapping[str, Any]) -> str:
             lines.append(
                 f"- {_display(conflict['summary'], hidden_ids=hidden_ids)}（{status}）"
             )
-            lines.append("  - 依据：")
-            lines.extend(
-                _evidence_lines(
-                    conflict,
-                    evidence_lookup,
-                    indent="    ",
-                    hidden_ids=hidden_ids,
-                )
-            )
+            lines.append(f"  - 依据：{_evidence_numbers(conflict, evidence_numbers)}")
     else:
         lines.append("- 暂未发现")
     lines.extend(["", "## 未知与待确认"])
     if package["unknowns"]:
         for unknown in package["unknowns"]:
             lines.append(f"- {_display(unknown['question'], hidden_ids=hidden_ids)}")
-            lines.append("  - 依据：")
-            lines.extend(
-                _evidence_lines(
-                    unknown,
-                    evidence_lookup,
-                    indent="    ",
-                    hidden_ids=hidden_ids,
-                )
-            )
+            lines.append(f"  - 依据：{_evidence_numbers(unknown, evidence_numbers)}")
     else:
         lines.append("- 暂无")
     coverage = package["coverage"]
