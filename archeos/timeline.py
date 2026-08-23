@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Mapping
@@ -88,14 +89,22 @@ def build_timelines(selections: tuple[Selection, ...], contexts: Mapping[str, Ma
         fingerprint = _fingerprint(selection, context)
         target = output_root / f"{selection.object_id}.json"
         if resume and target.is_file():
-            saved = json.loads(target.read_text(encoding="utf-8"))
-            if saved.get("input_fingerprint") == fingerprint:
-                packages.append(saved); continue
+            try:
+                saved = json.loads(target.read_text(encoding="utf-8"))
+                if saved.get("input_fingerprint") == fingerprint:
+                    supplied_saved = set(context.get("atomic_information_ids", ())) | set(selection.atomic_information_ids)
+                    validate_package(saved, supplied_saved, set(context.get("evidence_ids", ())))
+                    packages.append(saved); continue
+            except (OSError, ValueError, json.JSONDecodeError):
+                pass
         supplied = set(context.get("atomic_information_ids", ())) | set(selection.atomic_information_ids)
         result = validate_package(provider({**context, "supplemental_atomic_information_ids": list(selection.atomic_information_ids)}), supplied, set(context.get("evidence_ids", ())))
         calls += 1
         result.update({"object_id": selection.object_id, "selection_label": selection.label, "input_fingerprint": fingerprint})
-        target.write_text(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        temporary = target.with_suffix(".json.tmp")
+        temporary.write_text(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        os.replace(temporary, target)
+        validate_package(json.loads(target.read_text(encoding="utf-8")), supplied, set(context.get("evidence_ids", ())))
         packages.append(result)
     return {"schema_version": "stage1-object-timeline.v1", "packages": packages, "provider_calls": calls}
 
