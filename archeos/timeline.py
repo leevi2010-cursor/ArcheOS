@@ -93,6 +93,11 @@ def validate_package(package: Mapping[str, Any], supplied_ids: set[str], evidenc
         raise TimelineError("provider result must identify the selected Object")
     if expected_object_id is not None and package["object_id"] != expected_object_id:
         raise TimelineError("provider result Object ID does not match selection")
+    if not isinstance(package["what_it_is"], str) or not package["what_it_is"].strip():
+        raise TimelineError("what_it_is must be non-empty text")
+    state = package["current_state"]
+    if not isinstance(state, dict) or not isinstance(state.get("state"), str) or not state["state"].strip() or not isinstance(state.get("evidence_ids"), list) or not state["evidence_ids"] or "uncertainty" not in state:
+        raise TimelineError("current_state requires state, evidence_ids and uncertainty")
     accounting = package["information_accounting"]
     if not isinstance(accounting, dict) or set(accounting) != supplied_ids:
         raise TimelineError("information_accounting must cover every input exactly once")
@@ -110,6 +115,18 @@ def validate_package(package: Mapping[str, Any], supplied_ids: set[str], evidenc
     walk(package)
     if evidence_ids is not None and not refs <= evidence_ids:
         raise TimelineError("provider result references unavailable Evidence")
+    for key in ("atomic_information_ids", "object_ids"):
+        values = set()
+        def collect(value: Any) -> None:
+            if isinstance(value, dict):
+                for k, v in value.items():
+                    if k == key and isinstance(v, list): values.update(v)
+                    else: collect(v)
+            elif isinstance(value, list):
+                for v in value: collect(v)
+        collect(package)
+        if key == "atomic_information_ids" and not values <= supplied_ids:
+            raise TimelineError("provider result references unavailable Atomic Information")
     if not package["current_state"].get("evidence_ids"):
         raise TimelineError("current_state must cite Evidence")
     for entry in package.get("timeline_entries", []):
