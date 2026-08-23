@@ -35,10 +35,13 @@ class CodexTimelineProvider:
     def __call__(self, context: Mapping[str, Any]) -> Mapping[str, Any]:
         codex_type, deny_all, read_only = self.sdk_loader()
         prompt = "Return one complete Object Timeline package as JSON. Use only supplied bounded context; never guess IDs or dates. Unknown event time must be null. Do not call tools or mutate data.\n" + json.dumps(context, ensure_ascii=False, default=str)
-        with tempfile.TemporaryDirectory(prefix="archeos-timeline-") as directory:
-            with codex_type() as codex:  # type: ignore[attr-defined]
-                thread = codex.thread_start(approval_mode=deny_all, cwd=directory, developer_instructions="Read-only; return structured JSON only.", ephemeral=True, sandbox=read_only)
-                result = thread.run(prompt, output_schema=_timeline_schema(), sandbox=read_only)
+        try:
+            with tempfile.TemporaryDirectory(prefix="archeos-timeline-") as directory:
+                with codex_type() as codex:  # type: ignore[attr-defined]
+                    thread = codex.thread_start(approval_mode=deny_all, cwd=directory, developer_instructions="Read-only; return structured JSON only.", ephemeral=True, sandbox=read_only)
+                    result = thread.run(prompt, output_schema=_timeline_schema(), sandbox=read_only)
+        except Exception as exc:
+            raise TimelineError(f"Codex timeline provider failed: {exc}") from exc
         response = getattr(result, "final_response", None)
         if not isinstance(response, str): raise TimelineError("Codex provider returned no structured result")
         try: return json.loads(response)
