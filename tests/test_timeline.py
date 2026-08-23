@@ -27,11 +27,14 @@ from archeos.digestion.models import (
 )
 from archeos.timeline import (
     CodexTimelineProvider,
+    LegacyRecoveryAuthorization,
     Selection,
     TimelineError,
+    _fingerprint,
     _timeline_schema,
     build_timelines,
     load_selection,
+    recover_legacy_timeline_artifact,
     render_markdown,
     validate_package,
 )
@@ -298,6 +301,88 @@ class TimelineContractTests(unittest.TestCase):
             with self.assertRaisesRegex(TimelineError, "unsupported"):
                 load_selection(path)
 
+    def test_stable_fingerprint_excludes_only_context_generated_at(self) -> None:
+        context = deepcopy(self.context)
+        context["context"] = {
+            "root": {
+                "object_id": self.object_id,
+                "roles": ["project"],
+                "lifecycle": {"kind": "bounded", "status": "active"},
+            },
+            "relationships": [{"relation": "related_to", "neighbor": "other"}],
+            "atomic_information": [
+                {
+                    "revision_id": "revision-1",
+                    "source_evidence": [{"excerpt": "evidence-1"}],
+                }
+            ],
+            "recent_changes": [{"change_id": "change-1"}],
+            "pending_judgments": [{"proposal_id": "proposal-1"}],
+            "metadata": {
+                "generated_at": "2026-08-23T00:00:00Z",
+                "complete": True,
+            },
+        }
+        selection = Selection(self.object_id, "Synthetic")
+        baseline = _fingerprint(selection, context, "provider.v1")
+        rebuilt = deepcopy(context)
+        rebuilt["context"]["metadata"]["generated_at"] = "2026-08-24T00:00:00Z"
+        self.assertEqual(baseline, _fingerprint(selection, rebuilt, "provider.v1"))
+
+        mutations = {
+            "Object": lambda value: value["context"]["root"].update(
+                object_id="object-drift"
+            ),
+            "Role": lambda value: value["context"]["root"]["roles"].append(
+                "business_line"
+            ),
+            "Lifecycle": lambda value: value["context"]["root"]["lifecycle"].update(
+                status="paused"
+            ),
+            "Relationship": lambda value: value["context"]["relationships"][0].update(
+                relation="depends_on"
+            ),
+            "Atomic revision": lambda value: value["context"]["atomic_information"][
+                0
+            ].update(revision_id="revision-2"),
+            "Evidence": lambda value: value["context"]["atomic_information"][0][
+                "source_evidence"
+            ][0].update(excerpt="evidence-2"),
+            "Change": lambda value: value["context"]["recent_changes"][0].update(
+                change_id="change-2"
+            ),
+            "pending judgment": lambda value: value["context"]["pending_judgments"][
+                0
+            ].update(proposal_id="proposal-2"),
+            "metadata semantic field": lambda value: value["context"][
+                "metadata"
+            ].update(complete=False),
+        }
+        for label, mutate in mutations.items():
+            with self.subTest(label=label):
+                drifted = deepcopy(context)
+                mutate(drifted)
+                self.assertNotEqual(
+                    baseline,
+                    _fingerprint(selection, drifted, "provider.v1"),
+                )
+        self.assertNotEqual(
+            baseline,
+            _fingerprint(Selection(self.object_id, "Changed"), context, "provider.v1"),
+        )
+        self.assertNotEqual(
+            baseline,
+            _fingerprint(
+                Selection(self.object_id, "Synthetic", ("atomic-supplemental",)),
+                context,
+                "provider.v1",
+            ),
+        )
+        self.assertNotEqual(
+            baseline,
+            _fingerprint(selection, context, "provider.v2"),
+        )
+
     def test_validator_rejects_identity_reference_time_and_structure_errors(
         self,
     ) -> None:
@@ -520,7 +605,8 @@ class TimelineRecoveryTests(unittest.TestCase):
             self.assertIn("synthetic-artifact.md", markdown)
             self.assertNotIn("synthetic-source-record", markdown)
             self.assertIn("Synthetic Speaker", markdown)
-            self.assertIn("line:12", markdown)
+            self.assertIn("第 12 行", markdown)
+            self.assertNotIn("line:12", markdown)
             self.assertIn("业务角色：项目", markdown)
             self.assertIn("生命周期：持续经营", markdown)
             self.assertNotIn("project", markdown)
@@ -529,7 +615,9 @@ class TimelineRecoveryTests(unittest.TestCase):
             self.assertNotIn("evidence-view:", markdown)
             self.assertNotRegex(markdown, r"\b[a-z][a-z0-9]*_[a-z0-9_]+\b")
 
-    def test_conflict_expands_bounded_readable_evidence(self) -> None:
+    def test_conflict_uses_business_evidence_number_without_duplicate_expansion(
+        self,
+    ) -> None:
         class ConflictProvider(_SyntheticProvider):
             def __call__(self, context: dict[str, object]) -> dict[str, object]:
                 package = super().__call__(context)
@@ -560,10 +648,247 @@ class TimelineRecoveryTests(unittest.TestCase):
             markdown = (output / "object-0.md").read_text(encoding="utf-8")
             conflict = markdown.split("## 冲突", 1)[1].split("## 未知", 1)[0]
             self.assertIn("Two supplied accounts disagree.", conflict)
-            self.assertIn("Synthetic evidence excerpt", conflict)
-            self.assertIn("synthetic-artifact.md", conflict)
-            self.assertIn("Synthetic Speaker", conflict)
-            self.assertNotIn("evidence-view:", conflict)
+            self.assertIn("依据：1", conflict)
+            self.assertNotIn("Synthetic evidence excerpt", conflict)
+            self.assertEqual(markdown.count("Synthetic evidence excerpt"), 1)
+            self.assertEqual(markdown.count("- **依据 1**"), 1)
+
+    def test_authorized_legacy_recovery_is_zero_call_for_complete_and_incomplete(
+        self,
+    ) -> None:
+        for complete in (True, False):
+            with self.subTest(complete=complete), tempfile.TemporaryDirectory() as temp:
+                root = Path(temp)
+                output = root / "output"
+                selection = self.selections[0]
+                context = self.contexts[selection.object_id]
+                provider = _SyntheticProvider()
+                build_timelines(
+                    self.selections,
+                    self.contexts,
+                    provider,
+                    output,
+                )
+                artifact = output / f"{selection.object_id}.json"
+                package = json.loads(artifact.read_text(encoding="utf-8"))
+                if not complete:
+                    package["coverage"].update(
+                        complete=False,
+                        incomplete_reasons=["synthetic gap"],
+                    )
+                legacy_fingerprint = "1" * 64
+                package["input_fingerprint"] = legacy_fingerprint
+                legacy_bytes = (
+                    json.dumps(package, ensure_ascii=False, indent=2, sort_keys=True)
+                    + "\n"
+                ).encode()
+                artifact.write_bytes(legacy_bytes)
+                receipt_path = root / "receipts" / f"{selection.object_id}.json"
+                stable_fingerprint = _fingerprint(
+                    selection,
+                    context,
+                    provider.contract_version,
+                )
+                authorization = LegacyRecoveryAuthorization(
+                    authority_ref="Issue #160 synthetic authorization",
+                    object_id=selection.object_id,
+                    legacy_artifact_sha256=hashlib.sha256(legacy_bytes).hexdigest(),
+                    legacy_input_fingerprint=legacy_fingerprint,
+                    stable_input_fingerprint=stable_fingerprint,
+                )
+
+                receipt = recover_legacy_timeline_artifact(
+                    artifact,
+                    receipt_path,
+                    selection,
+                    context,
+                    provider.contract_version,
+                    authorization,
+                )
+                self.assertEqual(receipt["authority_ref"], authorization.authority_ref)
+                self.assertEqual(receipt["object_id"], selection.object_id)
+                self.assertEqual(
+                    receipt["legacy_artifact_sha256"],
+                    authorization.legacy_artifact_sha256,
+                )
+                self.assertEqual(
+                    receipt["recovered_artifact_sha256"],
+                    hashlib.sha256(artifact.read_bytes()).hexdigest(),
+                )
+                self.assertEqual(receipt_path.stat().st_mode & 0o777, 0o600)
+                resumed = _SyntheticProvider()
+                result = build_timelines(
+                    self.selections,
+                    self.contexts,
+                    resumed,
+                    output,
+                    resume=True,
+                )
+                self.assertEqual(resumed.calls, [])
+                self.assertEqual(result["provider_calls"], 0)
+                self.assertEqual(result["complete"], complete)
+
+    def test_legacy_recovery_rejects_hash_context_and_evidence_drift_before_write(
+        self,
+    ) -> None:
+        for case in (
+            "artifact hash",
+            "semantic Context",
+            "Evidence",
+            "authority Object",
+        ):
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as temp:
+                root = Path(temp)
+                output = root / "output"
+                build_timelines(
+                    self.selections,
+                    self.contexts,
+                    _SyntheticProvider(),
+                    output,
+                )
+                selection = self.selections[0]
+                context = deepcopy(self.contexts[selection.object_id])
+                artifact = output / f"{selection.object_id}.json"
+                package = json.loads(artifact.read_text(encoding="utf-8"))
+                legacy_fingerprint = "2" * 64
+                package["input_fingerprint"] = legacy_fingerprint
+                legacy_bytes = (
+                    json.dumps(package, ensure_ascii=False, indent=2, sort_keys=True)
+                    + "\n"
+                ).encode()
+                artifact.write_bytes(legacy_bytes)
+                stable_fingerprint = _fingerprint(
+                    selection,
+                    context,
+                    _SyntheticProvider.contract_version,
+                )
+                authority_hash = hashlib.sha256(legacy_bytes).hexdigest()
+                if case == "artifact hash":
+                    artifact.write_bytes(legacy_bytes + b" ")
+                elif case == "semantic Context":
+                    context["context"]["root"]["semantic_drift"] = True
+                else:
+                    evidence_ref = next(iter(context["evidence_view_refs"]))
+                    context["evidence_view_refs"][evidence_ref]["evidence"][
+                        "excerpt"
+                    ] = "drifted Evidence"
+                    stable_fingerprint = _fingerprint(
+                        selection,
+                        context,
+                        _SyntheticProvider.contract_version,
+                    )
+                before = artifact.read_bytes()
+                authorization = LegacyRecoveryAuthorization(
+                    authority_ref="Issue #160 synthetic authorization",
+                    object_id=(
+                        "object-not-authorized"
+                        if case == "authority Object"
+                        else selection.object_id
+                    ),
+                    legacy_artifact_sha256=authority_hash,
+                    legacy_input_fingerprint=legacy_fingerprint,
+                    stable_input_fingerprint=stable_fingerprint,
+                )
+                receipt = root / "receipt.json"
+                with self.assertRaises(TimelineError):
+                    recover_legacy_timeline_artifact(
+                        artifact,
+                        receipt,
+                        selection,
+                        context,
+                        _SyntheticProvider.contract_version,
+                        authorization,
+                    )
+                self.assertEqual(artifact.read_bytes(), before)
+                self.assertFalse(receipt.exists())
+
+    def test_markdown_deduplicates_evidence_and_separates_source_record_time(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            context = _context("object-0", ("atomic-0", "atomic-1"))
+            refs = list(context["evidence_view_refs"])
+            locators = (
+                {
+                    "source_id": "source-private-a",
+                    "message_key": "message-private-a",
+                    "cursor": {
+                        "timestamp": 1_700_000_100,
+                        "conversation_key": "conversation-private-a",
+                        "message_key": "message-private-a",
+                    },
+                },
+                {
+                    "source_id": "source-private-b",
+                    "message_key": "message-private-b",
+                    "cursor": {
+                        "timestamp": 1_700_000_000,
+                        "conversation_key": "conversation-private-b",
+                        "message_key": "message-private-b",
+                    },
+                },
+            )
+            for index, evidence_ref in enumerate(refs):
+                evidence = context["evidence_view_refs"][evidence_ref]["evidence"]
+                evidence["excerpt"] = f"Unique evidence {index + 1}"
+                evidence["locator"] = json.dumps(locators[index], sort_keys=True)
+
+            def package_provider(payload: dict[str, object]) -> dict[str, object]:
+                package = _package_from_context(payload)
+                if payload["selected_object_id"] != "object-0":
+                    return package
+                package["timeline_entries"][1]["event"] = "Later recorded unknown event"
+                package["timeline_entries"].append(
+                    {
+                        **deepcopy(package["timeline_entries"][1]),
+                        "event": "Earlier recorded unknown event",
+                        "atomic_information_ids": ["atomic-1"],
+                        "evidence_ids": [refs[1]],
+                    }
+                )
+                return package
+
+            selections = tuple(
+                Selection(f"object-{index}", f"Object {index}") for index in range(3)
+            )
+            contexts = {
+                "object-0": context,
+                "object-1": _context("object-1", ("atomic-object-1",)),
+                "object-2": _context("object-2", ("atomic-object-2",)),
+            }
+            package_provider.contract_version = "synthetic-timeline.v1"
+            build_timelines(
+                selections,
+                contexts,
+                package_provider,
+                Path(temp) / "output",
+            )
+            markdown = (Path(temp) / "output" / "object-0.md").read_text(
+                encoding="utf-8"
+            )
+            self.assertEqual(markdown.count("Unique evidence 1"), 1)
+            self.assertEqual(markdown.count("Unique evidence 2"), 1)
+            self.assertEqual(markdown.count("- **依据 1**"), 1)
+            self.assertEqual(markdown.count("- **依据 2**"), 1)
+            self.assertLess(
+                markdown.index("Earlier recorded unknown event"),
+                markdown.index("Later recorded unknown event"),
+            )
+            self.assertEqual(markdown.count("事件时间：未知"), 2)
+            self.assertIn("2023-11-15T06:13:20+08:00", markdown)
+            self.assertIn("不等于事件发生时间", markdown)
+            self.assertIn("聊天记录中的第 1 条", markdown)
+            for hidden in (
+                "message-private-a",
+                "message-private-b",
+                "conversation-private-a",
+                "conversation-private-b",
+                '"cursor"',
+                "evidence-view:",
+                "source-private-a",
+                "source-private-b",
+            ):
+                self.assertNotIn(hidden, markdown)
 
     def test_only_corrupt_or_malformed_saved_results_are_rebuilt(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -887,7 +1212,8 @@ class TimelineCliSyntheticWorkspaceTest(unittest.TestCase):
                 self.assertIn(f"Synthetic evidence for atomic-{index}", markdown)
                 self.assertIn("synthetic-source.md", markdown)
                 self.assertIn("Speaker_1", markdown)
-                self.assertIn("segment:1", markdown)
+                self.assertIn("第 1 段", markdown)
+                self.assertNotIn("segment:1", markdown)
                 self.assertIn("业务角色：项目", markdown)
                 self.assertIn("生命周期：持续经营", markdown)
                 self.assertNotIn(revisions[index].origin_source_id, markdown)
