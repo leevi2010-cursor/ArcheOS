@@ -3,7 +3,7 @@ from pathlib import Path
 
 import unittest
 
-from archeos.timeline import CodexTimelineProvider, TimelineError, build_timelines, load_selection, render_markdown
+from archeos.timeline import CodexTimelineProvider, TimelineError, build_timelines, load_selection, render_markdown, validate_package
 
 
 class TimelineTests(unittest.TestCase):
@@ -24,6 +24,10 @@ class TimelineTests(unittest.TestCase):
     with tempfile.TemporaryDirectory() as d:
       p = Path(d) / "s.json"; p.write_text(json.dumps({"objects": [{"object_id": "1", "label": "x"}]}))
       with self.assertRaises(TimelineError): load_selection(p)
+
+  def test_unknown_evidence_ref_rejected(self):
+    package = {"object_id":"o", "what_it_is":"x", "timeline_entries":[], "current_state":{"state":"ok", "evidence_ids":["bad"], "uncertainty":None}, "conflicts":[], "unknowns":[], "information_accounting":{"a":"current_state"}, "coverage":{"complete":True}}
+    with self.assertRaises(TimelineError): validate_package(package, {"a"}, {"good"}, "o")
 
 
   def test_build_and_resume_has_zero_repeat_calls(self):
