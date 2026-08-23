@@ -11,6 +11,7 @@ from .analysis import FileAnalysisProvider
 from .atomic_information import JsonlAtomicInformationStore, ingest_processing_package
 from .codex_app_server import CodexAnalysisProvider
 from .context import ContextBuilder, ContextRequest
+from .timeline import TimelineError, build_timelines, load_selection, render_markdown
 from .digestion import (
     AtomicInformationDigestionService,
     BusinessLanguageHumanJudgmentPort,
@@ -375,6 +376,13 @@ def build_parser() -> argparse.ArgumentParser:
     context_build.add_argument("--max-changes", type=int, default=50)
     context_build.add_argument("--max-pending", type=int, default=20)
     context_build.add_argument("--max-evidence", type=int, default=5)
+
+    review = subparsers.add_parser("stage1-review", help="Build a read-only Stage 1 Object Timeline review package.")
+    review_commands = review.add_subparsers(dest="review_command", required=True)
+    review_build = review_commands.add_parser("build", help="Build local JSON and business Markdown projections.")
+    review_build.add_argument("--selection-file", type=Path, required=True)
+    review_build.add_argument("--output-root", type=Path, required=True)
+    review_build.add_argument("--resume", action="store_true")
 
     source = subparsers.add_parser(
         "source", help="Admit, inspect, verify, and restore local Managed Sources."
@@ -974,6 +982,26 @@ def _source_command(args: argparse.Namespace) -> int:
         return 2  # pragma: no cover - argparse enforces this
     except (OSError, SourceError, TypeError, ValueError) as exc:
         print(f"error: {exc}")
+        return 1
+
+
+def _stage1_review_command(args: argparse.Namespace) -> int:
+    try:
+        selections = load_selection(args.selection_file)
+        raw = json.loads(args.selection_file.read_text(encoding="utf-8"))
+        contexts = raw.get("contexts", {}) if isinstance(raw, dict) else {}
+        def provider(context):
+            result = context.get("provider_result")
+            if not isinstance(result, dict):
+                raise TimelineError("selection file lacks synthetic provider_result")
+            return result
+        result = build_timelines(selections, contexts, provider, args.output_root, args.resume)
+        for package in result["packages"]:
+            (args.output_root / f"{package['object_id']}.md").write_text(render_markdown(package), encoding="utf-8")
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        return 0
+    except (OSError, TimelineError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        print(f"error: stage1-review build failed: {exc}")
         return 1
 
 
@@ -1589,6 +1617,8 @@ def main(argv: list[str] | None = None) -> int:
         return _digest_command(args)
     if args.command == "context":
         return _context_command(args)
+    if args.command == "stage1-review":
+        return _stage1_review_command(args)
     if args.command == "source":
         return _source_command(args)
     if args.command == "representation":
