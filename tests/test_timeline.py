@@ -97,7 +97,16 @@ def _context(object_id: str, atomic_ids: tuple[str, ...]) -> dict[str, object]:
     evidence_refs = {
         evidence_id: {
             "atomic_information_id": atomic_id,
-            "evidence": {"excerpt": f"Evidence for {atomic_id}"},
+            "evidence": {
+                "source_id": "synthetic-source-record",
+                "artifact": "synthetic-artifact.md",
+                "segment": 1,
+                "speaker": "Synthetic Speaker",
+                "start": "00:00:01.000",
+                "end": "00:00:02.000",
+                "excerpt": "Synthetic evidence excerpt",
+                "locator": "line:12",
+            },
         }
         for atomic_id, evidence_ids in evidence_by_atomic.items()
         for evidence_id in evidence_ids
@@ -122,7 +131,7 @@ def _package_from_context(context: dict[str, object]) -> dict[str, object]:
     return {
         "object_id": object_id,
         "what_it_is": {
-            "summary": f"{object_id} is a synthetic long-lived Object.",
+            "summary": "This is a synthetic long-lived business Object.",
             "roles": ["project"],
             "lifecycle": "ongoing",
             "object_ids": [object_id],
@@ -136,7 +145,9 @@ def _package_from_context(context: dict[str, object]) -> dict[str, object]:
                 "time_end": None,
                 "time_basis": "event_time",
                 "time_basis_detail": "The supplied Evidence states the event time.",
-                "participants": [{"name": object_id, "object_id": object_id}],
+                "participants": [
+                    {"name": "Synthetic participant", "object_id": object_id}
+                ],
                 "location": "Synthetic location",
                 "state_change": "The synthetic state became active.",
                 "uncertainty": None,
@@ -318,6 +329,9 @@ class TimelineContractTests(unittest.TestCase):
             "incomplete without reason": lambda value: value["coverage"].update(
                 complete=False
             ),
+            "Provider Evidence index injection": lambda value: value.update(
+                evidence_index=[]
+            ),
         }
         for label, mutate in mutations.items():
             with self.subTest(label=label):
@@ -454,6 +468,9 @@ class TimelineRecoveryTests(unittest.TestCase):
             )
             self.assertEqual(result["provider_calls"], 2)
             self.assertEqual(resumed.calls, ["object-1", "object-2"])
+            first_index = json.loads(
+                (output / "object-0.json").read_text(encoding="utf-8")
+            )["evidence_index"]
             second_resume = _SyntheticProvider()
             result = build_timelines(
                 self.selections,
@@ -465,7 +482,59 @@ class TimelineRecoveryTests(unittest.TestCase):
             self.assertEqual(result["provider_calls"], 0)
             self.assertEqual(second_resume.calls, [])
 
-    def test_corrupt_and_incomplete_saved_results_are_rebuilt(self) -> None:
+            saved = json.loads((output / "object-0.json").read_text(encoding="utf-8"))
+            self.assertEqual(saved["evidence_index"], first_index)
+            self.assertEqual(len(saved["evidence_index"]), 1)
+            presentation = saved["evidence_index"][0]
+            self.assertEqual(presentation["excerpt"], "Synthetic evidence excerpt")
+            self.assertEqual(presentation["speaker"], "Synthetic Speaker")
+            self.assertEqual(presentation["locator"], "line:12")
+            markdown = (output / "object-0.md").read_text(encoding="utf-8")
+            self.assertIn("Synthetic evidence excerpt", markdown)
+            self.assertIn("synthetic-artifact.md", markdown)
+            self.assertIn("synthetic-source-record", markdown)
+            self.assertIn("Synthetic Speaker", markdown)
+            self.assertIn("line:12", markdown)
+            self.assertNotIn("object-0", markdown)
+            self.assertNotIn("evidence-view:", markdown)
+
+    def test_conflict_expands_bounded_readable_evidence(self) -> None:
+        class ConflictProvider(_SyntheticProvider):
+            def __call__(self, context: dict[str, object]) -> dict[str, object]:
+                package = super().__call__(context)
+                atomic_id = context["atomic_information_ids"][0]
+                evidence_ref = context["evidence_by_atomic"][atomic_id][0]
+                package["current_state"]["uncertainty"] = (
+                    "The supplied accounts remain unresolved."
+                )
+                package["conflicts"] = [
+                    {
+                        "summary": "Two supplied accounts disagree.",
+                        "unresolved": True,
+                        "object_ids": [context["selected_object_id"]],
+                        "atomic_information_ids": [atomic_id],
+                        "evidence_ids": [evidence_ref],
+                    }
+                ]
+                return package
+
+        with tempfile.TemporaryDirectory() as temp:
+            output = Path(temp) / "output"
+            build_timelines(
+                self.selections,
+                self.contexts,
+                ConflictProvider(),
+                output,
+            )
+            markdown = (output / "object-0.md").read_text(encoding="utf-8")
+            conflict = markdown.split("## 冲突", 1)[1].split("## 未知", 1)[0]
+            self.assertIn("Two supplied accounts disagree.", conflict)
+            self.assertIn("Synthetic evidence excerpt", conflict)
+            self.assertIn("synthetic-artifact.md", conflict)
+            self.assertIn("Synthetic Speaker", conflict)
+            self.assertNotIn("evidence-view:", conflict)
+
+    def test_only_corrupt_or_malformed_saved_results_are_rebuilt(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             output = Path(temp) / "output"
             build_timelines(
@@ -483,6 +552,11 @@ class TimelineRecoveryTests(unittest.TestCase):
             )
             incomplete_path.write_text(json.dumps(incomplete), encoding="utf-8")
 
+            malformed_path = output / "object-2.json"
+            malformed = json.loads(malformed_path.read_text(encoding="utf-8"))
+            malformed["evidence_index"][0]["excerpt"] = "Provider-injected content"
+            malformed_path.write_text(json.dumps(malformed), encoding="utf-8")
+
             provider = _SyntheticProvider()
             result = build_timelines(
                 self.selections,
@@ -492,7 +566,23 @@ class TimelineRecoveryTests(unittest.TestCase):
                 resume=True,
             )
             self.assertEqual(result["provider_calls"], 2)
-            self.assertEqual(provider.calls, ["object-0", "object-1"])
+            self.assertEqual(provider.calls, ["object-0", "object-2"])
+            self.assertFalse(result["complete"])
+            incomplete_markdown = (output / "object-1.md").read_text(encoding="utf-8")
+            self.assertIn("provider reported incomplete synthesis", incomplete_markdown)
+            self.assertIn("验收结论：不通过", incomplete_markdown)
+
+            second_provider = _SyntheticProvider()
+            second_result = build_timelines(
+                self.selections,
+                self.contexts,
+                second_provider,
+                output,
+                resume=True,
+            )
+            self.assertEqual(second_result["provider_calls"], 0)
+            self.assertEqual(second_provider.calls, [])
+            self.assertFalse(second_result["complete"])
 
     def test_each_json_and_markdown_is_fsynced_and_readable(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -725,6 +815,10 @@ class TimelineCliSyntheticWorkspaceTest(unittest.TestCase):
                     "archeos.cli._load_sdk",
                     return_value=(Codex, "deny-all", "read-only"),
                 ),
+                mock.patch(
+                    "archeos.timeline._fingerprint",
+                    return_value="0" * 64,
+                ),
                 redirect_stdout(stdout),
             ):
                 exit_code = main(
@@ -746,6 +840,67 @@ class TimelineCliSyntheticWorkspaceTest(unittest.TestCase):
             result = json.loads(stdout.getvalue())
             self.assertEqual(result["provider_calls"], 3)
             self.assertTrue(result["complete"])
+
+            for index, record in enumerate(objects):
+                markdown = (output / f"{record.object_id}.md").read_text(
+                    encoding="utf-8"
+                )
+                self.assertIn(f"Synthetic evidence for atomic-{index}", markdown)
+                self.assertIn("synthetic-source.md", markdown)
+                self.assertIn("Speaker_1", markdown)
+                self.assertIn("segment:1", markdown)
+                self.assertNotIn(record.object_id, markdown)
+                self.assertNotIn(
+                    revisions[index].atomic_information_id,
+                    markdown,
+                )
+                self.assertNotIn("evidence-view:", markdown)
+
+            incomplete_path = output / f"{objects[1].object_id}.json"
+            incomplete = json.loads(incomplete_path.read_text(encoding="utf-8"))
+            incomplete["coverage"].update(
+                complete=False,
+                incomplete_reasons=["synthetic bounded Context gap"],
+            )
+            incomplete_path.write_text(json.dumps(incomplete), encoding="utf-8")
+            resume_stdout = StringIO()
+            with (
+                _chdir(elsewhere),
+                mock.patch(
+                    "archeos.workspace.default_config_path",
+                    return_value=config,
+                ),
+                mock.patch(
+                    "archeos.cli._load_sdk",
+                    return_value=(Codex, "deny-all", "read-only"),
+                ),
+                mock.patch(
+                    "archeos.timeline._fingerprint",
+                    return_value="0" * 64,
+                ),
+                redirect_stdout(resume_stdout),
+            ):
+                resume_exit_code = main(
+                    [
+                        "stage1-review",
+                        "build",
+                        "--selection-file",
+                        str(selection),
+                        "--output-root",
+                        str(output),
+                        "--resume",
+                    ]
+                )
+            resume_result = json.loads(resume_stdout.getvalue())
+            self.assertEqual(resume_exit_code, 1)
+            self.assertEqual(resume_result["provider_calls"], 0)
+            self.assertFalse(resume_result["complete"])
+            self.assertEqual(len(sdk_calls), 3)
+            incomplete_markdown = (output / f"{objects[1].object_id}.md").read_text(
+                encoding="utf-8"
+            )
+            self.assertIn("synthetic bounded Context gap", incomplete_markdown)
+            self.assertIn("验收结论：不通过", incomplete_markdown)
 
             after_bytes = {
                 name: path.read_bytes() for name, path in protected_paths.items()

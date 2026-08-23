@@ -57,7 +57,22 @@ _PROVIDER_FIELDS = {
     "information_accounting",
     "coverage",
 }
-_ARTIFACT_FIELDS = _PROVIDER_FIELDS | {"selection_label", "input_fingerprint"}
+_ARTIFACT_FIELDS = _PROVIDER_FIELDS | {
+    "selection_label",
+    "input_fingerprint",
+    "evidence_index",
+}
+_EVIDENCE_PRESENTATION_FIELDS = {
+    "evidence_ref",
+    "excerpt",
+    "source_id",
+    "artifact",
+    "speaker",
+    "segment",
+    "start",
+    "end",
+    "locator",
+}
 
 
 def _strict_object(
@@ -430,6 +445,75 @@ def _parse_event_time(value: str, field: str) -> datetime:
     return parsed.astimezone(timezone.utc)
 
 
+def _cited_evidence_ids(package: Mapping[str, Any]) -> tuple[str, ...]:
+    cited: set[str] = set()
+    referenced_items = [
+        package["what_it_is"],
+        *package["timeline_entries"],
+        package["current_state"],
+        *package["conflicts"],
+        *package["unknowns"],
+    ]
+    for item in referenced_items:
+        cited.update(item["evidence_ids"])
+    return tuple(sorted(cited))
+
+
+def _evidence_presentation(
+    evidence_ref: str,
+    evidence_view_refs: Mapping[str, Mapping[str, Any]],
+) -> dict[str, Any]:
+    raw_view = evidence_view_refs.get(evidence_ref)
+    view = _strict_fields(
+        raw_view,
+        f"evidence_view_refs[{evidence_ref}]",
+        {"atomic_information_id", "evidence"},
+    )
+    _non_empty_text(
+        view["atomic_information_id"],
+        f"evidence_view_refs[{evidence_ref}].atomic_information_id",
+    )
+    evidence = view["evidence"]
+    if not isinstance(evidence, dict):
+        raise TimelineError("bounded Context Evidence record is invalid")
+    source_id = _non_empty_text(evidence.get("source_id"), "Evidence.source_id")
+    artifact = _non_empty_text(evidence.get("artifact"), "Evidence.artifact")
+    excerpt = _non_empty_text(evidence.get("excerpt"), "Evidence.excerpt")
+    speaker = _nullable_text_value(evidence.get("speaker"), "Evidence.speaker")
+    start = _nullable_text_value(evidence.get("start"), "Evidence.start")
+    end = _nullable_text_value(evidence.get("end"), "Evidence.end")
+    segment = evidence.get("segment")
+    if isinstance(segment, bool) or not isinstance(segment, int) or segment < 0:
+        raise TimelineError("Evidence.segment must be a non-negative integer")
+    raw_locator = evidence.get("locator")
+    locator = (
+        _non_empty_text(raw_locator, "Evidence.locator")
+        if raw_locator is not None
+        else f"segment:{segment}"
+    )
+    return {
+        "evidence_ref": evidence_ref,
+        "excerpt": excerpt,
+        "source_id": source_id,
+        "artifact": artifact,
+        "speaker": speaker,
+        "segment": segment,
+        "start": start,
+        "end": end,
+        "locator": locator,
+    }
+
+
+def _build_evidence_index(
+    package: Mapping[str, Any],
+    evidence_view_refs: Mapping[str, Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    return [
+        _evidence_presentation(evidence_ref, evidence_view_refs)
+        for evidence_ref in _cited_evidence_ids(package)
+    ]
+
+
 def validate_package(
     package: Mapping[str, Any],
     supplied_ids: set[str],
@@ -439,10 +523,23 @@ def validate_package(
     allowed_object_ids: set[str] | None = None,
     evidence_by_atomic: Mapping[str, set[str]] | None = None,
     required_incomplete_reasons: set[str] | None = None,
+    evidence_view_refs: Mapping[str, Mapping[str, Any]] | None = None,
+    artifact: bool | None = None,
 ) -> dict[str, Any]:
     """Deterministically validate provider output before any result is persisted."""
     fields = set(package)
-    if fields != _PROVIDER_FIELDS and fields != _ARTIFACT_FIELDS:
+    expected_fields = (
+        _ARTIFACT_FIELDS
+        if artifact is True
+        else _PROVIDER_FIELDS
+        if artifact is False
+        else None
+    )
+    if expected_fields is not None and fields != expected_fields:
+        raise TimelineError(
+            "provider result does not match the Timeline package fields"
+        )
+    if expected_fields is None and fields not in (_PROVIDER_FIELDS, _ARTIFACT_FIELDS):
         raise TimelineError(
             "provider result does not match the Timeline package fields"
         )
@@ -680,6 +777,19 @@ def validate_package(
             character not in "0123456789abcdef" for character in fingerprint
         ):
             raise TimelineError("input_fingerprint must be a SHA-256 digest")
+        if evidence_view_refs is None:
+            raise TimelineError("artifact Evidence index cannot be verified")
+        expected_index = _build_evidence_index(package, evidence_view_refs)
+        raw_index = package["evidence_index"]
+        if not isinstance(raw_index, list) or any(
+            not isinstance(item, dict) or set(item) != _EVIDENCE_PRESENTATION_FIELDS
+            for item in raw_index
+        ):
+            raise TimelineError("artifact Evidence index is malformed")
+        if raw_index != expected_index:
+            raise TimelineError(
+                "artifact Evidence index does not match bounded Context"
+            )
     return dict(package)
 
 
@@ -787,18 +897,19 @@ def build_timelines(
             "allowed_object_ids": allowed_objects,
             "evidence_by_atomic": by_atomic,
             "required_incomplete_reasons": required_reasons,
+            "evidence_view_refs": context["evidence_view_refs"],
         }
 
         if resume and target.is_file():
             try:
                 saved = json.loads(target.read_text(encoding="utf-8"))
                 validated_saved = validate_package(
-                    saved, supplied, **validation_options
+                    saved,
+                    supplied,
+                    artifact=True,
+                    **validation_options,
                 )
-                if (
-                    validated_saved["input_fingerprint"] == fingerprint
-                    and validated_saved["coverage"]["complete"]
-                ):
+                if validated_saved["input_fingerprint"] == fingerprint:
                     _atomic_write(markdown_target, render_markdown(validated_saved))
                     packages.append(validated_saved)
                     continue
@@ -830,11 +941,19 @@ def build_timelines(
             raise TimelineError(
                 f"timeline provider failed for Object {selection.object_id}: {exc}"
             ) from exc
-        result = validate_package(provider_result, supplied, **validation_options)
+        result = validate_package(
+            provider_result,
+            supplied,
+            artifact=False,
+            **validation_options,
+        )
         result.update(
             {
                 "selection_label": selection.label,
                 "input_fingerprint": fingerprint,
+                "evidence_index": _build_evidence_index(
+                    result, context["evidence_view_refs"]
+                ),
             }
         )
         serialized = (
@@ -848,7 +967,12 @@ def build_timelines(
         )
         _atomic_write(target, serialized)
         readback = json.loads(target.read_text(encoding="utf-8"))
-        validated_readback = validate_package(readback, supplied, **validation_options)
+        validated_readback = validate_package(
+            readback,
+            supplied,
+            artifact=True,
+            **validation_options,
+        )
         if validated_readback != result:
             raise TimelineError(
                 "durable Timeline readback does not match validated result"
@@ -864,20 +988,98 @@ def build_timelines(
     }
 
 
-def _display(value: object, empty: str = "未提供") -> str:
+def _display(
+    value: object,
+    empty: str = "未提供",
+    *,
+    hidden_ids: set[str] | None = None,
+) -> str:
     if value is None:
         return empty
     if isinstance(value, str):
-        return value
+        result = value
+        for internal_id in sorted(hidden_ids or set(), key=len, reverse=True):
+            result = result.replace(internal_id, "（内部标识已隐藏）")
+        return result
     if isinstance(value, list):
-        return "、".join(_display(item) for item in value) if value else empty
+        return (
+            "、".join(_display(item, hidden_ids=hidden_ids) for item in value)
+            if value
+            else empty
+        )
     return str(value)
 
 
-def _reference_summary(item: Mapping[str, Any]) -> str:
-    atomic = _display(item.get("atomic_information_ids"), "无")
-    evidence = _display(item.get("evidence_ids"), "无")
-    return f"信息：{atomic}；依据：{evidence}"
+def _internal_reference_ids(package: Mapping[str, Any]) -> set[str]:
+    internal_ids = {package["object_id"]}
+    referenced_items = [
+        package["what_it_is"],
+        *package["timeline_entries"],
+        package["current_state"],
+        *package["conflicts"],
+        *package["unknowns"],
+    ]
+    for item in referenced_items:
+        internal_ids.update(item["object_ids"])
+        internal_ids.update(item["atomic_information_ids"])
+        internal_ids.update(item["evidence_ids"])
+        for participant in item.get("participants", []):
+            if participant["object_id"] is not None:
+                internal_ids.add(participant["object_id"])
+    internal_ids.update(
+        item["atomic_information_id"] for item in package["information_accounting"]
+    )
+    return internal_ids
+
+
+def _evidence_lookup(package: Mapping[str, Any]) -> dict[str, Mapping[str, Any]]:
+    raw_index = package.get("evidence_index", [])
+    if not isinstance(raw_index, list):
+        return {}
+    return {
+        item["evidence_ref"]: item
+        for item in raw_index
+        if isinstance(item, dict) and isinstance(item.get("evidence_ref"), str)
+    }
+
+
+def _evidence_lines(
+    item: Mapping[str, Any],
+    lookup: Mapping[str, Mapping[str, Any]],
+    *,
+    indent: str,
+    hidden_ids: set[str],
+) -> list[str]:
+    evidence = [
+        lookup[evidence_ref]
+        for evidence_ref in item.get("evidence_ids", [])
+        if evidence_ref in lookup
+    ]
+    if not evidence:
+        return [f"{indent}- 暂无可展示依据"]
+    lines: list[str] = []
+    for entry in evidence:
+        time = (
+            f"{_display(entry['start'], hidden_ids=hidden_ids)} 至 "
+            f"{_display(entry['end'], hidden_ids=hidden_ids)}"
+            if entry["start"] is not None or entry["end"] is not None
+            else "未提供"
+        )
+        lines.extend(
+            [
+                f"{indent}- 摘录：{_display(entry['excerpt'], hidden_ids=hidden_ids)}",
+                f"{indent}  - 来源文件/记录："
+                f"{_display(entry['artifact'], hidden_ids=hidden_ids)}",
+                f"{indent}  - Source："
+                f"{_display(entry['source_id'], hidden_ids=hidden_ids)}",
+                f"{indent}  - 说话人："
+                f"{_display(entry['speaker'], hidden_ids=hidden_ids)}",
+                f"{indent}  - 定位："
+                f"{_display(entry['locator'], hidden_ids=hidden_ids)}",
+                f"{indent}  - 时间：{time}",
+            ]
+        )
+    return lines
 
 
 def render_markdown(package: Mapping[str, Any]) -> str:
@@ -891,13 +1093,15 @@ def render_markdown(package: Mapping[str, Any]) -> str:
     ]
     what_it_is = package["what_it_is"]
     current_state = package["current_state"]
+    evidence_lookup = _evidence_lookup(package)
+    hidden_ids = _internal_reference_ids(package)
     lines = [
-        f"# {package.get('selection_label', package['object_id'])}",
+        f"# {package.get('selection_label', '对象时间线')}",
         "",
         "## 对象是什么",
-        what_it_is["summary"],
-        f"- 业务角色：{_display(what_it_is['roles'], '尚未确认')}",
-        f"- 生命周期：{_display(what_it_is['lifecycle'], '尚未确认')}",
+        _display(what_it_is["summary"], hidden_ids=hidden_ids),
+        f"- 业务角色：{_display(what_it_is['roles'], '尚未确认', hidden_ids=hidden_ids)}",
+        f"- 生命周期：{_display(what_it_is['lifecycle'], '尚未确认', hidden_ids=hidden_ids)}",
         "",
         "## 关键事件时间线",
         "### 已知事件时间",
@@ -908,17 +1112,29 @@ def render_markdown(package: Mapping[str, Any]) -> str:
         participants = _display(
             [participant["name"] for participant in entry["participants"]],
             "未确认",
+            hidden_ids=hidden_ids,
         )
         lines.extend(
             [
-                f"- **{entry['time']}**：{entry['event']}",
-                f"  - 时间依据：{entry['time_basis_detail']}",
+                f"- **{_display(entry['time'], hidden_ids=hidden_ids)}**："
+                f"{_display(entry['event'], hidden_ids=hidden_ids)}",
+                f"  - 时间依据："
+                f"{_display(entry['time_basis_detail'], hidden_ids=hidden_ids)}",
                 f"  - 参与者：{participants}",
-                f"  - 地点：{_display(entry['location'], '未确认')}",
-                f"  - 状态变化：{_display(entry['state_change'], '未确认')}",
-                f"  - {_reference_summary(entry)}",
-                f"  - 不确定性：{_display(entry['uncertainty'], '无明显不确定性')}",
+                f"  - 地点：{_display(entry['location'], '未确认', hidden_ids=hidden_ids)}",
+                f"  - 状态变化：{_display(entry['state_change'], '未确认', hidden_ids=hidden_ids)}",
+                f"  - 不确定性："
+                f"{_display(entry['uncertainty'], '无明显不确定性', hidden_ids=hidden_ids)}",
+                "  - 依据：",
             ]
+        )
+        lines.extend(
+            _evidence_lines(
+                entry,
+                evidence_lookup,
+                indent="    ",
+                hidden_ids=hidden_ids,
+            )
         )
     lines.append("### 事件时间尚不明确")
     if not unknown_entries:
@@ -927,29 +1143,61 @@ def render_markdown(package: Mapping[str, Any]) -> str:
         participants = _display(
             [participant["name"] for participant in entry["participants"]],
             "未确认",
+            hidden_ids=hidden_ids,
         )
         lines.extend(
             [
-                f"- {entry['event']}",
-                f"  - 时间依据：{entry['time_basis_detail']}",
+                f"- {_display(entry['event'], hidden_ids=hidden_ids)}",
+                f"  - 时间依据："
+                f"{_display(entry['time_basis_detail'], hidden_ids=hidden_ids)}",
                 f"  - 参与者：{participants}",
-                f"  - 地点：{_display(entry['location'], '未确认')}",
-                f"  - 状态变化：{_display(entry['state_change'], '未确认')}",
-                f"  - {_reference_summary(entry)}",
-                f"  - 不确定性：{_display(entry['uncertainty'], '时间尚未确认')}",
+                f"  - 地点：{_display(entry['location'], '未确认', hidden_ids=hidden_ids)}",
+                f"  - 状态变化：{_display(entry['state_change'], '未确认', hidden_ids=hidden_ids)}",
+                f"  - 不确定性："
+                f"{_display(entry['uncertainty'], '时间尚未确认', hidden_ids=hidden_ids)}",
+                "  - 依据：",
             ]
+        )
+        lines.extend(
+            _evidence_lines(
+                entry,
+                evidence_lookup,
+                indent="    ",
+                hidden_ids=hidden_ids,
+            )
         )
     lines.extend(
         [
             "",
             "## 当前状态",
-            current_state["state"],
-            f"- 截至：{_display(current_state['as_of'], '尚未确认')}",
-            f"- 不确定性：{_display(current_state['uncertainty'], '无明显不确定性')}",
+            _display(current_state["state"], hidden_ids=hidden_ids),
+            f"- 截至：{_display(current_state['as_of'], '尚未确认', hidden_ids=hidden_ids)}",
+            f"- 不确定性："
+            f"{_display(current_state['uncertainty'], '无明显不确定性', hidden_ids=hidden_ids)}",
             "",
             "## 依据",
-            f"- 对象解释：{_reference_summary(what_it_is)}",
-            f"- 当前状态：{_reference_summary(current_state)}",
+            "- 对象解释",
+        ]
+    )
+    lines.extend(
+        _evidence_lines(
+            what_it_is,
+            evidence_lookup,
+            indent="  ",
+            hidden_ids=hidden_ids,
+        )
+    )
+    lines.append("- 当前状态")
+    lines.extend(
+        _evidence_lines(
+            current_state,
+            evidence_lookup,
+            indent="  ",
+            hidden_ids=hidden_ids,
+        )
+    )
+    lines.extend(
+        [
             "",
             "## 冲突",
         ]
@@ -958,14 +1206,32 @@ def render_markdown(package: Mapping[str, Any]) -> str:
         for conflict in package["conflicts"]:
             status = "尚未解决" if conflict["unresolved"] else "已能并列解释"
             lines.append(
-                f"- {conflict['summary']}（{status}；{_reference_summary(conflict)}）"
+                f"- {_display(conflict['summary'], hidden_ids=hidden_ids)}（{status}）"
+            )
+            lines.append("  - 依据：")
+            lines.extend(
+                _evidence_lines(
+                    conflict,
+                    evidence_lookup,
+                    indent="    ",
+                    hidden_ids=hidden_ids,
+                )
             )
     else:
         lines.append("- 暂未发现")
     lines.extend(["", "## 未知与待确认"])
     if package["unknowns"]:
         for unknown in package["unknowns"]:
-            lines.append(f"- {unknown['question']}（{_reference_summary(unknown)}）")
+            lines.append(f"- {_display(unknown['question'], hidden_ids=hidden_ids)}")
+            lines.append("  - 依据：")
+            lines.extend(
+                _evidence_lines(
+                    unknown,
+                    evidence_lookup,
+                    indent="    ",
+                    hidden_ids=hidden_ids,
+                )
+            )
     else:
         lines.append("- 暂无")
     coverage = package["coverage"]
@@ -979,4 +1245,8 @@ def render_markdown(package: Mapping[str, Any]) -> str:
     )
     if coverage["incomplete_reasons"]:
         lines.append("- 不完整原因：" + "；".join(coverage["incomplete_reasons"]))
+    if not coverage["complete"]:
+        lines.append(
+            "- 验收结论：不通过（本包已完成 Provider 处理，但 bounded Context 覆盖不完整）"
+        )
     return "\n".join(lines) + "\n"
