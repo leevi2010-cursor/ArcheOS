@@ -25,7 +25,7 @@ class TimelineProvider(Protocol):
 
 
 def _timeline_schema() -> dict[str, Any]:
-    return {"type": "object", "additionalProperties": True}
+    return {"type": "object", "additionalProperties": False, "required": ["object_id", "what_it_is", "timeline_entries", "current_state", "conflicts", "unknowns", "information_accounting", "coverage"], "properties": {"object_id": {"type": "string"}, "what_it_is": {"type": "string"}, "timeline_entries": {"type": "array"}, "current_state": {"type": "object"}, "conflicts": {"type": "array"}, "unknowns": {"type": "array"}, "information_accounting": {"type": "object"}, "coverage": {"type": "object"}}}
 
 
 class CodexTimelineProvider:
@@ -89,6 +89,8 @@ def validate_package(package: Mapping[str, Any], supplied_ids: set[str], evidenc
     required = {"object_id", "what_it_is", "timeline_entries", "current_state", "conflicts", "unknowns", "information_accounting", "coverage"}
     if not required <= set(package):
         raise TimelineError("provider result is missing required timeline fields")
+    if not isinstance(package.get("object_id"), str) or not package["object_id"].strip():
+        raise TimelineError("provider result must identify the selected Object")
     accounting = package["information_accounting"]
     if not isinstance(accounting, dict) or set(accounting) != supplied_ids:
         raise TimelineError("information_accounting must cover every input exactly once")
