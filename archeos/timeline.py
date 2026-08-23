@@ -8,13 +8,19 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import stat
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Mapping
+from typing import Any, Callable, Mapping, Protocol
 
 
 class TimelineError(ValueError):
     pass
+
+
+class TimelineProvider(Protocol):
+    contract_version: str
+    def __call__(self, context: Mapping[str, Any]) -> Mapping[str, Any]: ...
 
 
 @dataclass(frozen=True)
@@ -25,7 +31,11 @@ class Selection:
 
 
 def load_selection(path: Path) -> tuple[Selection, ...]:
+    if stat.S_IMODE(path.stat().st_mode) != 0o600:
+        raise TimelineError("selection file must have private mode 0600")
     raw = json.loads(path.read_text(encoding="utf-8"))
+    if isinstance(raw, dict) and "contexts" in raw:
+        raise TimelineError("selection file may not contain contexts or provider results")
     entries = raw.get("objects") if isinstance(raw, dict) else raw
     if not isinstance(entries, list) or not 3 <= len(entries) <= 5:
         raise TimelineError("selection must contain exactly 3–5 objects")
@@ -47,8 +57,8 @@ def load_selection(path: Path) -> tuple[Selection, ...]:
     return tuple(result)
 
 
-def _fingerprint(selection: Selection, context: Mapping[str, Any]) -> str:
-    payload = json.dumps({"selection": selection.__dict__, "context": context}, sort_keys=True, ensure_ascii=False)
+def _fingerprint(selection: Selection, context: Mapping[str, Any], contract_version: str = "timeline.v1") -> str:
+    payload = json.dumps({"selection": selection.__dict__, "context": context, "provider_contract": contract_version}, sort_keys=True, ensure_ascii=False)
     return hashlib.sha256(payload.encode()).hexdigest()
 
 
@@ -86,7 +96,8 @@ def build_timelines(selections: tuple[Selection, ...], contexts: Mapping[str, Ma
     for selection in selections:
         context = contexts.get(selection.object_id)
         if context is None: raise TimelineError(f"unknown object: {selection.object_id}")
-        fingerprint = _fingerprint(selection, context)
+        contract_version = getattr(provider, "contract_version", "timeline.v1")
+        fingerprint = _fingerprint(selection, context, contract_version)
         target = output_root / f"{selection.object_id}.json"
         if resume and target.is_file():
             try:
