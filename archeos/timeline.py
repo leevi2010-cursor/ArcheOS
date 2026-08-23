@@ -98,6 +98,9 @@ def validate_package(package: Mapping[str, Any], supplied_ids: set[str], evidenc
     state = package["current_state"]
     if not isinstance(state, dict) or not isinstance(state.get("state"), str) or not state["state"].strip() or not isinstance(state.get("evidence_ids"), list) or not state["evidence_ids"] or "uncertainty" not in state:
         raise TimelineError("current_state requires state, evidence_ids and uncertainty")
+    if package.get("conflicts"):
+        if not state.get("uncertainty") or not any("conflict" in str(x).lower() or "冲突" in str(x) for x in (state.get("uncertainty"), state.get("state"))):
+            raise TimelineError("unresolved conflicts require explicit current-state conflict uncertainty")
     accounting = package["information_accounting"]
     if not isinstance(accounting, dict) or set(accounting) != supplied_ids:
         raise TimelineError("information_accounting must cover every input exactly once")
