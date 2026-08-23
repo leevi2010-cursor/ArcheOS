@@ -108,6 +108,18 @@ def validate_package(package: Mapping[str, Any], supplied_ids: set[str], evidenc
         raise TimelineError("provider result references unavailable Evidence")
     if not package["current_state"].get("evidence_ids"):
         raise TimelineError("current_state must cite Evidence")
+    for entry in package.get("timeline_entries", []):
+        if not isinstance(entry, dict) or not entry.get("event"):
+            raise TimelineError("timeline entry requires event")
+        if entry.get("time_basis", "unknown") not in {"event_time", "claim_time", "source_time", "processing_time", "unknown"}:
+            raise TimelineError("invalid time_basis")
+        if entry.get("time_basis") != "event_time" and entry.get("time") not in (None, "unknown"):
+            raise TimelineError("non-event time cannot be presented as event time")
+        if "uncertainty" not in entry:
+            raise TimelineError("timeline entry requires uncertainty")
+    coverage = package.get("coverage")
+    if isinstance(coverage, dict) and coverage.get("complete") is False and not package.get("incomplete_reasons"):
+        raise TimelineError("incomplete package requires incomplete_reasons")
     return dict(package)
 
 
