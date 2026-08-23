@@ -129,6 +129,10 @@ def validate_package(package: Mapping[str, Any], supplied_ids: set[str], evidenc
 
 
 def build_timelines(selections: tuple[Selection, ...], contexts: Mapping[str, Mapping[str, Any]], provider: Callable[[Mapping[str, Any]], Mapping[str, Any]], output_root: Path, resume: bool = False) -> dict[str, Any]:
+    repo_root = Path.cwd().resolve()
+    resolved_output = output_root.resolve()
+    if resolved_output == repo_root or repo_root in resolved_output.parents:
+        raise TimelineError("output-root must be outside the repository (local-only)")
     output_root.mkdir(parents=True, exist_ok=True)
     packages = []
     calls = 0
