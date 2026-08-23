@@ -138,6 +138,7 @@ ArcheOS 已形成稳定的核心方向：Input → Information → Structured Wo
 至少需要真实、持续、多来源的数据验证，并能人工回答：
 
 - 系统现在认为某个长期对象“是什么、发生过什么、现在是什么状态”；
+- 与该 Object 相关的重要 Event 能否按时间组织，并说明涉及的人、公司、地点、变化与未知项；
 - 每个重要结论为什么成立、来自哪里；
 - 哪些信息只是派生、重复、时间更新、冲突或未确定；
 - 当系统理解错误时，是否可以修正而不破坏历史；
@@ -145,6 +146,17 @@ ArcheOS 已形成稳定的核心方向：Input → Information → Structured Wo
 - 对真实工作而言，ArcheOS Context 是否显著比原始文件、聊天历史或临时摘要更可用。
 
 Stage Gate 不以 synthetic tests 替代真实语义验证。任何未解决的信息丢失、provenance 错误、错误 World Model 写入或错误合并独立 Evidence 的 P0/P1 问题都会阻止通过。
+
+### MVP 交付优先级
+
+Stage 1 按以下顺序衡量投入价值：
+
+1. 用户能否围绕真实 Object、Event、时间变化和当前状态形成更清楚的业务理解；
+2. 从 Source 到 Atomic Information、Structured World Model 与 Context 的主流程能否在正常故障下恢复且不丢失业务数据；
+3. 运行时间、模型调用和人工确认成本是否与产生的业务价值相称；
+4. 只有前三项已经获得真实 Evidence，或出现现实风险阻塞时，才扩大通用恢复框架、安全加固和平台基础设施。
+
+Atomic Information 是可追溯的证据层，不是 Stage 1 的最终业务成果。单纯增加处理条数、清空输入队列或增加技术门禁，不能替代对 Structured Object、Timeline View 与 Context 可用性的人工验证。
 
 ### 当前 Development Gap 的来源
 
@@ -166,6 +178,8 @@ Stage Gate 不以 synthetic tests 替代真实语义验证。任何未解决的�
 
 - 不以 Web UI、SaaS、多租户、billing 或完整团队协作为阶段成功标准；
 - 不为了展示产品完整度提前建设大而全的平台；
+- 不把恶意攻击、主动篡改、全面安全加固、GitHub Actions、main 分支保护或企业级合规零散插回 MVP 主流程；这些内容统一保留在 deferred Issue #122，等待 Stage 1 业务评估后整体审查；
+- 不因为安全加固延期而放弃正常故障恢复、数据不丢失、provenance、隐私凭证和不可逆操作授权等最低业务底线；
 - 不开发 ArcheOS 自有 Agent 来掩盖底层认知质量问题。
 
 ---
