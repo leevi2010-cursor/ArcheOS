@@ -31,6 +31,7 @@ from archeos.timeline import (
     Selection,
     TimelineError,
     _fingerprint,
+    _normalize_provider_result,
     _timeline_schema,
     build_timelines,
     load_selection,
@@ -622,6 +623,54 @@ class TimelineContractTests(unittest.TestCase):
                 with self.assertRaises(TimelineError):
                     self.validate(candidate)
 
+    def test_missing_event_time_label_is_the_only_normalized_field(self) -> None:
+        candidate = deepcopy(self.package)
+        candidate["timeline_entries"][0].update(time=None, time_end=None)
+        before = deepcopy(candidate)
+
+        normalized = _normalize_provider_result(candidate)
+        expected = deepcopy(before)
+        expected["timeline_entries"][0]["time_basis"] = "unknown"
+        self.assertEqual(normalized, expected)
+        self.assertEqual(candidate, before)
+        self.validate(normalized)
+
+    def test_other_time_shapes_and_valid_entries_are_not_normalized(self) -> None:
+        cases = {
+            "missing time field": lambda entry: entry.pop("time"),
+            "missing time_end field": lambda entry: entry.pop("time_end"),
+            "event_time only time_end": lambda entry: entry.update(
+                time=None,
+                time_end="2026-08-23T10:00:00+08:00",
+            ),
+            "source_time with time": lambda entry: entry.update(
+                time_basis="source_time",
+                time="2026-08-23T09:00:00+08:00",
+                time_end=None,
+            ),
+            "invalid event time": lambda entry: entry.update(
+                time="not-an-iso-time",
+                time_end=None,
+            ),
+            "event end before start": lambda entry: entry.update(
+                time="2026-08-23T09:00:00+08:00",
+                time_end="2026-08-23T08:00:00+08:00",
+            ),
+        }
+        for label, mutate in cases.items():
+            with self.subTest(label=label):
+                candidate = deepcopy(self.package)
+                mutate(candidate["timeline_entries"][0])
+                self.assertEqual(_normalize_provider_result(candidate), candidate)
+                with self.assertRaises(TimelineError):
+                    self.validate(candidate)
+
+        for index in (0, 1):
+            with self.subTest(valid_entry=index):
+                candidate = deepcopy(self.package)
+                normalized = _normalize_provider_result(candidate)
+                self.assertEqual(normalized, candidate)
+
     def test_validator_rejects_cross_atomic_evidence_and_silent_conflict(self) -> None:
         second_atomic = "atomic-second"
         context = _context(self.object_id, (self.atomic_id, second_atomic))
@@ -850,6 +899,38 @@ class TimelineRecoveryTests(unittest.TestCase):
             self.assertEqual(provider.calls, [selections[0].object_id])
             self.assertEqual(list(output.glob("*.json")), [])
             self.assertEqual(list(output.glob("*.md")), [])
+
+    def test_missing_event_time_is_normalized_with_one_call_per_object(self) -> None:
+        class MissingTimeProvider(_SyntheticProvider):
+            contract_version = "stage1-object-timeline-provider.v2"
+
+            def __call__(self, context: dict[str, object]) -> dict[str, object]:
+                package = super().__call__(context)
+                package["timeline_entries"][0].update(time=None, time_end=None)
+                return package
+
+        with tempfile.TemporaryDirectory() as temp:
+            output = Path(temp) / "output"
+            provider = MissingTimeProvider()
+            result = build_timelines(
+                self.selections,
+                self.contexts,
+                provider,
+                output,
+            )
+            self.assertEqual(result["provider_calls"], 3)
+            self.assertEqual(
+                provider.calls,
+                [selection.object_id for selection in self.selections],
+            )
+            for selection in self.selections:
+                package = json.loads(
+                    (output / f"{selection.object_id}.json").read_text(encoding="utf-8")
+                )
+                entry = package["timeline_entries"][0]
+                self.assertEqual(entry["time_basis"], "unknown")
+                self.assertIsNone(entry["time"])
+                self.assertIsNone(entry["time_end"])
 
     def test_conflict_uses_business_evidence_number_without_duplicate_expansion(
         self,
@@ -1494,6 +1575,8 @@ class TimelineCliSyntheticWorkspaceTest(unittest.TestCase):
                             "fake SDK did not receive the provenance rule"
                         )
                     for rule in (
+                        "When no actual event time value is available, never use "
+                        "event_time; use unknown with both time and time_end set to null",
                         "never map them one-to-one by default",
                         "First consolidate questions, answers, confirmations, details, "
                         "and state changes",
