@@ -44,3 +44,16 @@ class TimelineTests(unittest.TestCase):
     self.assertEqual(result["provider_calls"], 0)
     self.assertEqual(len(calls), 3)
     self.assertIn("当前状态", render_markdown(result["packages"][0]))
+
+  def test_corrupt_saved_result_is_rebuilt(self):
+    import tempfile
+    with tempfile.TemporaryDirectory() as d:
+      root = Path(d) / "out"; root.mkdir()
+      selections = tuple(type("S", (), {"object_id": str(i), "label": str(i), "atomic_information_ids": (f"a{i}",)})() for i in range(3))
+      contexts = {str(i): {"atomic_information_ids": [f"a{i}"], "evidence_ids": [f"e{i}"]} for i in range(3)}
+      root.joinpath("0.json").write_text("broken")
+      def provider(ctx):
+        oid = ctx["atomic_information_ids"][0][1:]
+        return {"object_id": oid, "what_it_is": "x", "timeline_entries": [], "current_state": {"state": "ok", "evidence_ids": [f"e{oid}"]}, "conflicts": [], "unknowns": [], "information_accounting": {f"a{oid}": "current_state"}, "coverage": {"complete": True}}
+      result = build_timelines(selections, contexts, provider, root, True)
+      self.assertEqual(result["provider_calls"], 3)
