@@ -36,7 +36,7 @@ class TimelineTests(unittest.TestCase):
     def provider(ctx):
         calls.append(ctx["atomic_information_ids"])
         oid = ctx["atomic_information_ids"][0][1:]
-        return {"object_id": oid, "what_it_is": "x", "timeline_entries": [], "current_state": {"state": "ok", "evidence_ids": [f"e{oid}"]}, "conflicts": [], "unknowns": [], "information_accounting": {f"a{oid}": "current_state"}, "coverage": {"complete": True}}
+        return {"object_id": oid, "what_it_is": "x", "timeline_entries": [], "current_state": {"state": "ok", "evidence_ids": [f"e{oid}"], "uncertainty": None}, "conflicts": [], "unknowns": [], "information_accounting": {f"a{oid}": "current_state"}, "coverage": {"complete": True}}
     result = build_timelines(selections, contexts, provider, tmp_path / "out")
     self.assertEqual(result["provider_calls"], 3)
     self.assertEqual(len(calls), 3)
@@ -54,6 +54,6 @@ class TimelineTests(unittest.TestCase):
       root.joinpath("0.json").write_text("broken")
       def provider(ctx):
         oid = ctx["atomic_information_ids"][0][1:]
-        return {"object_id": oid, "what_it_is": "x", "timeline_entries": [], "current_state": {"state": "ok", "evidence_ids": [f"e{oid}"]}, "conflicts": [], "unknowns": [], "information_accounting": {f"a{oid}": "current_state"}, "coverage": {"complete": True}}
+        return {"object_id": oid, "what_it_is": "x", "timeline_entries": [], "current_state": {"state": "ok", "evidence_ids": [f"e{oid}"], "uncertainty": None}, "conflicts": [], "unknowns": [], "information_accounting": {f"a{oid}": "current_state"}, "coverage": {"complete": True}}
       result = build_timelines(selections, contexts, provider, root, True)
       self.assertEqual(result["provider_calls"], 3)
