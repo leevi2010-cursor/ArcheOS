@@ -73,6 +73,33 @@ _EVIDENCE_PRESENTATION_FIELDS = {
     "end",
     "locator",
 }
+_ROLE_LABELS = {
+    "person": "人物",
+    "company": "公司",
+    "brand": "品牌",
+    "project": "项目",
+    "business_line": "业务线",
+    "event": "事件",
+    "goal": "目标",
+    "decision": "决策",
+}
+_LIFECYCLE_LABELS = {
+    "ongoing": "持续经营",
+    "bounded": "有明确完成边界",
+    "planned": "计划中",
+    "active": "进行中",
+    "paused": "已暂停",
+    "completed": "已完成",
+    "cancelled": "已取消",
+    "ended": "已结束",
+}
+_COVERAGE_REASON_LABELS = {
+    "relationships_limit": "部分关联对象未纳入本次检查",
+    "atomic_information_limit": "部分信息未纳入本次检查",
+    "recent_changes_limit": "部分近期变化未纳入本次检查",
+    "pending_judgments_limit": "部分待确认事项未纳入本次检查",
+    "evidence_limit": "部分信息依据未完整纳入本次检查",
+}
 
 
 def _strict_object(
@@ -229,7 +256,10 @@ class CodexTimelineProvider:
             "Account for every supplied Atomic Information ID exactly once. An "
             "unresolved conflict must remain explicit in current_state. If bounded "
             "input coverage is incomplete, set coverage.complete=false and give "
-            "incomplete_reasons. Do not call tools or mutate data.\n"
+            "incomplete_reasons. Write every human-facing text field in concise "
+            "Chinese business language. Do not expose implementation terms, schema "
+            "details, or internal IDs in human-facing text. Do not call tools or "
+            "mutate data.\n"
             "BOUNDED_CONTEXT_JSON:\n"
             + json.dumps(context, ensure_ascii=False, sort_keys=True, default=str)
         )
@@ -240,7 +270,9 @@ class CodexTimelineProvider:
                         approval_mode=deny_all,
                         cwd=directory,
                         developer_instructions=(
-                            "Read-only. Return only schema-compliant structured JSON."
+                            "Read-only. Return only schema-compliant structured JSON. "
+                            "All human-facing text must use concise Chinese business "
+                            "language without implementation terminology."
                         ),
                         ephemeral=True,
                         sandbox=read_only,
@@ -891,13 +923,14 @@ def build_timelines(
         allowed_objects, allowed_evidence, by_atomic, required_reasons = (
             _validation_scope(context)
         )
+        evidence_views = context["evidence_view_refs"]
         validation_options = {
             "evidence_ids": allowed_evidence,
             "expected_object_id": selection.object_id,
             "allowed_object_ids": allowed_objects,
             "evidence_by_atomic": by_atomic,
             "required_incomplete_reasons": required_reasons,
-            "evidence_view_refs": context["evidence_view_refs"],
+            "evidence_view_refs": evidence_views,
         }
 
         if resume and target.is_file():
@@ -951,9 +984,7 @@ def build_timelines(
             {
                 "selection_label": selection.label,
                 "input_fingerprint": fingerprint,
-                "evidence_index": _build_evidence_index(
-                    result, context["evidence_view_refs"]
-                ),
+                "evidence_index": _build_evidence_index(result, evidence_views),
             }
         )
         serialized = (
@@ -1000,6 +1031,11 @@ def _display(
         result = value
         for internal_id in sorted(hidden_ids or set(), key=len, reverse=True):
             result = result.replace(internal_id, "（内部标识已隐藏）")
+        result = result.replace("bounded Context", "当前资料范围")
+        result = result.replace("Provider", "处理过程")
+        result = result.replace("provider", "处理过程")
+        result = result.replace("schema", "数据规则")
+        result = result.replace("Schema", "数据规则")
         return result
     if isinstance(value, list):
         return (
@@ -1030,6 +1066,30 @@ def _internal_reference_ids(package: Mapping[str, Any]) -> set[str]:
         item["atomic_information_id"] for item in package["information_accounting"]
     )
     return internal_ids
+
+
+def _business_label(value: object, labels: Mapping[str, str]) -> str:
+    if not isinstance(value, str) or not value.strip():
+        return "尚未确认"
+    clean = value.strip()
+    if clean in labels:
+        return labels[clean]
+    if "_" in clean or clean.isascii() and clean.replace("-", "").isalnum():
+        return "尚未确认"
+    return clean
+
+
+def _coverage_reason(value: object, hidden_ids: set[str]) -> str:
+    if isinstance(value, str) and value in _COVERAGE_REASON_LABELS:
+        return _COVERAGE_REASON_LABELS[value]
+    if isinstance(value, str) and (
+        "_" in value
+        or "provider" in value.lower()
+        or "bounded context" in value.lower()
+        or "schema" in value.lower()
+    ):
+        return "部分资料尚未完整覆盖"
+    return _display(value, hidden_ids=hidden_ids)
 
 
 def _evidence_lookup(package: Mapping[str, Any]) -> dict[str, Mapping[str, Any]]:
@@ -1070,8 +1130,6 @@ def _evidence_lines(
                 f"{indent}- 摘录：{_display(entry['excerpt'], hidden_ids=hidden_ids)}",
                 f"{indent}  - 来源文件/记录："
                 f"{_display(entry['artifact'], hidden_ids=hidden_ids)}",
-                f"{indent}  - Source："
-                f"{_display(entry['source_id'], hidden_ids=hidden_ids)}",
                 f"{indent}  - 说话人："
                 f"{_display(entry['speaker'], hidden_ids=hidden_ids)}",
                 f"{indent}  - 定位："
@@ -1100,8 +1158,14 @@ def render_markdown(package: Mapping[str, Any]) -> str:
         "",
         "## 对象是什么",
         _display(what_it_is["summary"], hidden_ids=hidden_ids),
-        f"- 业务角色：{_display(what_it_is['roles'], '尚未确认', hidden_ids=hidden_ids)}",
-        f"- 生命周期：{_display(what_it_is['lifecycle'], '尚未确认', hidden_ids=hidden_ids)}",
+        "- 业务角色："
+        + (
+            "、".join(
+                _business_label(role, _ROLE_LABELS) for role in what_it_is["roles"]
+            )
+            or "尚未确认"
+        ),
+        f"- 生命周期：{_business_label(what_it_is['lifecycle'], _LIFECYCLE_LABELS)}",
         "",
         "## 关键事件时间线",
         "### 已知事件时间",
@@ -1244,9 +1308,13 @@ def render_markdown(package: Mapping[str, Any]) -> str:
         ]
     )
     if coverage["incomplete_reasons"]:
-        lines.append("- 不完整原因：" + "；".join(coverage["incomplete_reasons"]))
-    if not coverage["complete"]:
         lines.append(
-            "- 验收结论：不通过（本包已完成 Provider 处理，但 bounded Context 覆盖不完整）"
+            "- 不完整原因："
+            + "；".join(
+                _coverage_reason(reason, hidden_ids)
+                for reason in coverage["incomplete_reasons"]
+            )
         )
+    if not coverage["complete"]:
+        lines.append("- 验收结论：当前资料覆盖不完整，本次验收不通过")
     return "\n".join(lines) + "\n"

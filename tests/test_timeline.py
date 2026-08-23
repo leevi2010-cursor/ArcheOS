@@ -417,7 +417,32 @@ class TimelineContractTests(unittest.TestCase):
         )
         self.assertIn("截至：2026-08-23", rendered)
         self.assertIn("地点：未确认", rendered)
+        self.assertIn("业务角色：项目", rendered)
+        self.assertIn("生命周期：持续经营", rendered)
+        self.assertNotIn("业务角色：project", rendered)
+        self.assertNotIn("生命周期：ongoing", rendered)
         self.assertNotIn("{'", rendered)
+
+        package["what_it_is"]["roles"] = [
+            "person",
+            "company",
+            "brand",
+            "project",
+            "business_line",
+            "event",
+            "goal",
+            "decision",
+            "unexpected_role",
+        ]
+        package["what_it_is"]["lifecycle"] = "bounded"
+        rendered = render_markdown(package)
+        self.assertIn(
+            "业务角色：人物、公司、品牌、项目、业务线、事件、目标、决策、尚未确认",
+            rendered,
+        )
+        self.assertIn("生命周期：有明确完成边界", rendered)
+        self.assertNotIn("business_line", rendered)
+        self.assertNotIn("unexpected_role", rendered)
 
 
 class TimelineRecoveryTests(unittest.TestCase):
@@ -487,16 +512,22 @@ class TimelineRecoveryTests(unittest.TestCase):
             self.assertEqual(len(saved["evidence_index"]), 1)
             presentation = saved["evidence_index"][0]
             self.assertEqual(presentation["excerpt"], "Synthetic evidence excerpt")
+            self.assertEqual(presentation["source_id"], "synthetic-source-record")
             self.assertEqual(presentation["speaker"], "Synthetic Speaker")
             self.assertEqual(presentation["locator"], "line:12")
             markdown = (output / "object-0.md").read_text(encoding="utf-8")
             self.assertIn("Synthetic evidence excerpt", markdown)
             self.assertIn("synthetic-artifact.md", markdown)
-            self.assertIn("synthetic-source-record", markdown)
+            self.assertNotIn("synthetic-source-record", markdown)
             self.assertIn("Synthetic Speaker", markdown)
             self.assertIn("line:12", markdown)
+            self.assertIn("业务角色：项目", markdown)
+            self.assertIn("生命周期：持续经营", markdown)
+            self.assertNotIn("project", markdown)
+            self.assertNotIn("ongoing", markdown)
             self.assertNotIn("object-0", markdown)
             self.assertNotIn("evidence-view:", markdown)
+            self.assertNotRegex(markdown, r"\b[a-z][a-z0-9]*_[a-z0-9_]+\b")
 
     def test_conflict_expands_bounded_readable_evidence(self) -> None:
         class ConflictProvider(_SyntheticProvider):
@@ -569,8 +600,9 @@ class TimelineRecoveryTests(unittest.TestCase):
             self.assertEqual(provider.calls, ["object-0", "object-2"])
             self.assertFalse(result["complete"])
             incomplete_markdown = (output / "object-1.md").read_text(encoding="utf-8")
-            self.assertIn("provider reported incomplete synthesis", incomplete_markdown)
-            self.assertIn("验收结论：不通过", incomplete_markdown)
+            self.assertIn("部分资料尚未完整覆盖", incomplete_markdown)
+            self.assertIn("本次验收不通过", incomplete_markdown)
+            self.assertNotIn("provider", incomplete_markdown.lower())
 
             second_provider = _SyntheticProvider()
             second_result = build_timelines(
@@ -782,6 +814,13 @@ class TimelineCliSyntheticWorkspaceTest(unittest.TestCase):
             class Thread:
                 def run(self, prompt: str, **kwargs: object) -> Result:
                     self.assert_strict_schema(kwargs["output_schema"])
+                    if (
+                        "Write every human-facing text field in concise Chinese business language"
+                        not in prompt
+                    ):
+                        raise AssertionError(
+                            "fake SDK did not receive the language rule"
+                        )
                     context = json.loads(prompt.split("BOUNDED_CONTEXT_JSON:\n", 1)[1])
                     sdk_calls.append(context["selected_object_id"])
                     return Result(_package_from_context(context))
@@ -849,12 +888,27 @@ class TimelineCliSyntheticWorkspaceTest(unittest.TestCase):
                 self.assertIn("synthetic-source.md", markdown)
                 self.assertIn("Speaker_1", markdown)
                 self.assertIn("segment:1", markdown)
+                self.assertIn("业务角色：项目", markdown)
+                self.assertIn("生命周期：持续经营", markdown)
+                self.assertNotIn(revisions[index].origin_source_id, markdown)
                 self.assertNotIn(record.object_id, markdown)
                 self.assertNotIn(
                     revisions[index].atomic_information_id,
                     markdown,
                 )
                 self.assertNotIn("evidence-view:", markdown)
+                self.assertNotIn("Provider", markdown)
+                self.assertNotIn("bounded Context", markdown)
+                self.assertNotRegex(markdown, r"\b(?:project|ongoing)\b")
+                self.assertNotRegex(markdown, r"\b[a-z][a-z0-9]*_[a-z0-9_]+\b")
+
+                saved_package = json.loads(
+                    (output / f"{record.object_id}.json").read_text(encoding="utf-8")
+                )
+                self.assertEqual(
+                    saved_package["evidence_index"][0]["source_id"],
+                    revisions[index].origin_source_id,
+                )
 
             incomplete_path = output / f"{objects[1].object_id}.json"
             incomplete = json.loads(incomplete_path.read_text(encoding="utf-8"))
@@ -899,8 +953,12 @@ class TimelineCliSyntheticWorkspaceTest(unittest.TestCase):
             incomplete_markdown = (output / f"{objects[1].object_id}.md").read_text(
                 encoding="utf-8"
             )
-            self.assertIn("synthetic bounded Context gap", incomplete_markdown)
-            self.assertIn("验收结论：不通过", incomplete_markdown)
+            self.assertIn("部分资料尚未完整覆盖", incomplete_markdown)
+            self.assertIn("本次验收不通过", incomplete_markdown)
+            self.assertNotIn("provider", incomplete_markdown.lower())
+            self.assertNotIn("Provider", incomplete_markdown)
+            self.assertNotIn("bounded Context", incomplete_markdown)
+            self.assertNotIn("synthetic bounded Context gap", incomplete_markdown)
 
             after_bytes = {
                 name: path.read_bytes() for name, path in protected_paths.items()
