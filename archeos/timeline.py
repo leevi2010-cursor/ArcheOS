@@ -8,6 +8,7 @@ import os
 import stat
 import tempfile
 from collections.abc import Callable, Mapping, Sequence
+from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -258,6 +259,8 @@ class CodexTimelineProvider:
             "participants, locations, state changes, or certainty. Use event_time "
             "only for a demonstrated event occurrence time; for claim/source/processing "
             "time set time and time_end to null and retain the applicable time_basis. "
+            "When no actual event time value is available, never use event_time; use "
+            "unknown with both time and time_end set to null. "
             "The Object explanation, every event, the current state, and every "
             "conflict must each cite at least one supplied Atomic Information and "
             "its corresponding Evidence. Atomic Information states what the source "
@@ -584,6 +587,25 @@ def _build_evidence_index(
         _evidence_presentation(evidence_ref, evidence_view_refs)
         for evidence_ref in _cited_evidence_ids(package)
     ]
+
+
+def _normalize_provider_result(package: Mapping[str, Any]) -> dict[str, Any]:
+    """Conservatively normalize one contradictory missing-event-time label."""
+    normalized = deepcopy(dict(package))
+    entries = normalized.get("timeline_entries")
+    if not isinstance(entries, list):
+        return normalized
+    for entry in entries:
+        if (
+            isinstance(entry, dict)
+            and entry.get("time_basis") == "event_time"
+            and "time" in entry
+            and entry["time"] is None
+            and "time_end" in entry
+            and entry["time_end"] is None
+        ):
+            entry["time_basis"] = "unknown"
+    return normalized
 
 
 def validate_package(
@@ -1176,7 +1198,7 @@ def build_timelines(
                 f"timeline provider failed for Object {selection.object_id}: {exc}"
             ) from exc
         result = validate_package(
-            provider_result,
+            _normalize_provider_result(provider_result),
             supplied,
             artifact=False,
             **validation_options,
