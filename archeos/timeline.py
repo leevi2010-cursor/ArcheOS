@@ -117,26 +117,30 @@ def _nullable_text() -> dict[str, Any]:
     return {"type": ["string", "null"]}
 
 
-def _reference_properties() -> dict[str, Any]:
+def _reference_properties(*, require_provenance: bool = False) -> dict[str, Any]:
     references = {"type": "array", "items": {"type": "string"}}
+    provenance_references = {
+        **references,
+        **({"minItems": 1} if require_provenance else {}),
+    }
     return {
         "object_ids": references,
-        "atomic_information_ids": references,
-        "evidence_ids": references,
+        "atomic_information_ids": provenance_references,
+        "evidence_ids": provenance_references,
     }
 
 
 def _timeline_schema() -> dict[str, Any]:
     """Return the complete strict schema supplied to the Codex SDK."""
-    references = _reference_properties()
+    required_references = _reference_properties(require_provenance=True)
     what_it_is = _strict_object(
         {
             "summary": {"type": "string"},
             "roles": {"type": "array", "items": {"type": "string"}},
             "lifecycle": _nullable_text(),
-            **references,
+            **required_references,
         },
-        ("summary", "roles", "lifecycle", *references),
+        ("summary", "roles", "lifecycle", *required_references),
     )
     participant = _strict_object(
         {"name": {"type": "string"}, "object_id": _nullable_text()},
@@ -153,7 +157,7 @@ def _timeline_schema() -> dict[str, Any]:
             "location": _nullable_text(),
             "state_change": _nullable_text(),
             "uncertainty": _nullable_text(),
-            **references,
+            **required_references,
         },
         (
             "event",
@@ -165,7 +169,7 @@ def _timeline_schema() -> dict[str, Any]:
             "location",
             "state_change",
             "uncertainty",
-            *references,
+            *required_references,
         ),
     )
     current_state = _strict_object(
@@ -173,25 +177,26 @@ def _timeline_schema() -> dict[str, Any]:
             "state": {"type": "string"},
             "as_of": _nullable_text(),
             "uncertainty": _nullable_text(),
-            **references,
+            **required_references,
         },
-        ("state", "as_of", "uncertainty", *references),
+        ("state", "as_of", "uncertainty", *required_references),
     )
     conflict = _strict_object(
         {
             "summary": {"type": "string"},
             "unresolved": {"type": "boolean"},
-            **references,
+            **required_references,
         },
-        ("summary", "unresolved", *references),
+        ("summary", "unresolved", *required_references),
     )
+    optional_references = _reference_properties()
     unknown = _strict_object(
         {
             "question": {"type": "string"},
             "kind": {"type": "string", "enum": list(_UNKNOWN_KINDS)},
-            **references,
+            **optional_references,
         },
-        ("question", "kind", *references),
+        ("question", "kind", *optional_references),
     )
     accounting = _strict_object(
         {
@@ -253,6 +258,9 @@ class CodexTimelineProvider:
             "participants, locations, state changes, or certainty. Use event_time "
             "only for a demonstrated event occurrence time; for claim/source/processing "
             "time set time and time_end to null and retain the applicable time_basis. "
+            "The Object explanation, every event, the current state, and every "
+            "conflict must each cite at least one supplied Atomic Information and "
+            "its corresponding Evidence. "
             "Account for every supplied Atomic Information ID exactly once. An "
             "unresolved conflict must remain explicit in current_state. If bounded "
             "input coverage is incomplete, set coverage.complete=false and give "
