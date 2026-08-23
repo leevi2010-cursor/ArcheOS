@@ -12,6 +12,7 @@ import stat
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Mapping, Protocol
+import tempfile
 
 
 class TimelineError(ValueError):
@@ -21,6 +22,27 @@ class TimelineError(ValueError):
 class TimelineProvider(Protocol):
     contract_version: str
     def __call__(self, context: Mapping[str, Any]) -> Mapping[str, Any]: ...
+
+
+def _timeline_schema() -> dict[str, Any]:
+    return {"type": "object", "additionalProperties": True}
+
+
+class CodexTimelineProvider:
+    contract_version = "timeline.v1"
+    def __init__(self, *, sdk_loader: Callable[[], tuple[type[object], object, object]]):
+        self.sdk_loader = sdk_loader
+    def __call__(self, context: Mapping[str, Any]) -> Mapping[str, Any]:
+        codex_type, deny_all, read_only = self.sdk_loader()
+        prompt = "Return one complete Object Timeline package as JSON. Use only supplied bounded context; never guess IDs or dates. Unknown event time must be null. Do not call tools or mutate data.\n" + json.dumps(context, ensure_ascii=False, default=str)
+        with tempfile.TemporaryDirectory(prefix="archeos-timeline-") as directory:
+            with codex_type() as codex:  # type: ignore[attr-defined]
+                thread = codex.thread_start(approval_mode=deny_all, cwd=directory, developer_instructions="Read-only; return structured JSON only.", ephemeral=True, sandbox=read_only)
+                result = thread.run(prompt, output_schema=_timeline_schema(), sandbox=read_only)
+        response = getattr(result, "final_response", None)
+        if not isinstance(response, str): raise TimelineError("Codex provider returned no structured result")
+        try: return json.loads(response)
+        except json.JSONDecodeError as exc: raise TimelineError("Codex provider returned invalid JSON") from exc
 
 
 @dataclass(frozen=True)
