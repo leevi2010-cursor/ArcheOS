@@ -3,10 +3,22 @@ from pathlib import Path
 
 import unittest
 
-from archeos.timeline import TimelineError, build_timelines, load_selection, render_markdown
+from archeos.timeline import CodexTimelineProvider, TimelineError, build_timelines, load_selection, render_markdown
 
 
 class TimelineTests(unittest.TestCase):
+  def test_codex_provider_fake_sdk_single_call(self):
+    calls = []
+    class Result: final_response = '{"object_id":"o","what_it_is":"x","timeline_entries":[],"current_state":{"state":"ok","evidence_ids":["e"]},"conflicts":[],"unknowns":[],"information_accounting":{"a":"current_state"},"coverage":{"complete":true}}'
+    class Thread:
+      def run(self, *args, **kwargs): calls.append(1); return Result()
+    class Codex:
+      def __enter__(self): return self
+      def __exit__(self, *args): pass
+      def thread_start(self, **kwargs): return Thread()
+    provider = CodexTimelineProvider(sdk_loader=lambda: (Codex, "deny", "read"))
+    self.assertEqual(provider({"object_id":"o"})["object_id"], "o")
+    self.assertEqual(len(calls), 1)
   def test_selection_requires_three_to_five(self):
     import tempfile
     with tempfile.TemporaryDirectory() as d:
