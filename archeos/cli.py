@@ -11,7 +11,8 @@ from .analysis import FileAnalysisProvider
 from .atomic_information import JsonlAtomicInformationStore, ingest_processing_package
 from .codex_app_server import CodexAnalysisProvider
 from .context import ContextBuilder, ContextRequest
-from .timeline import TimelineError, build_timelines, load_selection, render_markdown
+from .timeline import CodexTimelineProvider, TimelineError, build_timelines, load_selection, render_markdown
+from .codex_app_server import _load_sdk
 from .digestion import (
     AtomicInformationDigestionService,
     BusinessLanguageHumanJudgmentPort,
@@ -383,6 +384,11 @@ def build_parser() -> argparse.ArgumentParser:
     review_build.add_argument("--selection-file", type=Path, required=True)
     review_build.add_argument("--output-root", type=Path, required=True)
     review_build.add_argument("--resume", action="store_true")
+    review_build.add_argument("--config", type=Path)
+    review_build.add_argument("--database", type=Path, default=DEFAULT_WORLD_MODEL_DATABASE)
+    review_build.add_argument("--information-store", type=Path, default=DEFAULT_ATOMIC_INFORMATION_STORE)
+    review_build.add_argument("--proposal-store", type=Path, default=DEFAULT_CHANGE_PROPOSAL_STORE)
+    review_build.add_argument("--journal", type=Path, default=DEFAULT_CHANGE_JOURNAL)
 
     source = subparsers.add_parser(
         "source", help="Admit, inspect, verify, and restore local Managed Sources."
@@ -988,14 +994,21 @@ def _source_command(args: argparse.Namespace) -> int:
 def _stage1_review_command(args: argparse.Namespace) -> int:
     try:
         selections = load_selection(args.selection_file)
-        raw = json.loads(args.selection_file.read_text(encoding="utf-8"))
-        contexts = raw.get("contexts", {}) if isinstance(raw, dict) else {}
-        def provider(context):
-            result = context.get("provider_result")
-            if not isinstance(result, dict):
-                raise TimelineError("selection file lacks synthetic provider_result")
-            return result
-        result = build_timelines(selections, contexts, provider, args.output_root, args.resume)
+        if args.config is not None:
+            workspace = require_workspace(args.config)
+            args.database = resolve_storage_path(args.database, workspace, DEFAULT_WORLD_MODEL_DATABASE)
+            args.information_store = resolve_storage_path(args.information_store, workspace, DEFAULT_ATOMIC_INFORMATION_STORE)
+            args.proposal_store = resolve_storage_path(args.proposal_store, workspace, DEFAULT_CHANGE_PROPOSAL_STORE)
+            args.journal = resolve_storage_path(args.journal, workspace, DEFAULT_CHANGE_JOURNAL)
+        contexts = {}
+        with SQLiteWorldModelRepository(args.database) as repository:
+            builder = ContextBuilder(repository, ObjectResolver(repository), JsonlAtomicInformationStore(args.information_store), JsonlChangeJournal(args.journal), JsonlChangeProposalStore(args.proposal_store))
+            store = JsonlAtomicInformationStore(args.information_store)
+            for selection in selections:
+                bundle = builder.build(ContextRequest(scope="object", object_id=selection.object_id))
+                supplemental = [asdict(store.get_current(item)) for item in selection.atomic_information_ids]
+                contexts[selection.object_id] = {"context": asdict(bundle), "supplemental_atomic_information": supplemental, "atomic_information_ids": [x.atomic_information_id for x in bundle.atomic_information] + list(selection.atomic_information_ids), "evidence_ids": [e for x in bundle.atomic_information for e in [ev.locator or ev.excerpt for ev in x.source_evidence]]}
+        result = build_timelines(selections, contexts, CodexTimelineProvider(sdk_loader=_load_sdk), args.output_root, args.resume)
         for package in result["packages"]:
             (args.output_root / f"{package['object_id']}.md").write_text(render_markdown(package), encoding="utf-8")
         print(json.dumps(result, ensure_ascii=False, indent=2))
