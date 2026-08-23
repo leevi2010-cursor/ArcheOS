@@ -240,7 +240,7 @@ def _timeline_schema() -> dict[str, Any]:
 class CodexTimelineProvider:
     """One-shot read-only Codex SDK adapter for one bounded Object context."""
 
-    contract_version = "stage1-object-timeline-provider.v1"
+    contract_version = "stage1-object-timeline-provider.v2"
 
     def __init__(
         self,
@@ -260,7 +260,18 @@ class CodexTimelineProvider:
             "time set time and time_end to null and retain the applicable time_basis. "
             "The Object explanation, every event, the current state, and every "
             "conflict must each cite at least one supplied Atomic Information and "
-            "its corresponding Evidence. "
+            "its corresponding Evidence. Atomic Information states what the source "
+            "expressed; an Event states what happened in the business, so never map "
+            "them one-to-one by default. First consolidate questions, answers, "
+            "confirmations, details, and state changes that concern the same "
+            "participants, business matter or transaction, and compatible time "
+            "context into one Event citing multiple Atomic Information and Evidence "
+            "items where appropriate. Keep genuinely different matters, participant "
+            "groups, incompatible time windows, state changes, or conflicts separate. "
+            "When at least 8 Atomic Information items are supplied, return no more "
+            "than 7 Events, prefer 2-6 genuinely independent Events without padding, "
+            "return fewer Events than supplied items, and make at least one Event "
+            "cite multiple supplied Atomic Information items. "
             "Account for every supplied Atomic Information ID exactly once. An "
             "unresolved conflict must remain explicit in current_state. If bounded "
             "input coverage is incomplete, set coverage.complete=false and give "
@@ -707,6 +718,22 @@ def validate_package(
             require_atomic=True,
             require_evidence=True,
         )
+
+    if len(supplied_ids) >= 8:
+        if len(raw_entries) > 7:
+            raise TimelineError(
+                "Timeline consolidation requires at most 7 Events for 8+ inputs"
+            )
+        if len(raw_entries) >= len(supplied_ids):
+            raise TimelineError(
+                "Timeline consolidation requires fewer Events than supplied inputs"
+            )
+        if not any(
+            len(set(entry["atomic_information_ids"])) >= 2 for entry in raw_entries
+        ):
+            raise TimelineError(
+                "Timeline consolidation requires at least one multi-Information Event"
+            )
 
     current_state = _strict_fields(
         package["current_state"],

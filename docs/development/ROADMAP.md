@@ -585,6 +585,23 @@ Goal
 
 截至 Issue #156 的 Roadmap Feedback，原 `#88 → #32 → #33 → #34 → #17` 已全部结束，批量语义与批量治理也已获得真实运行证据。当前缺口不再是继续扩大 Atomic Information 数量，而是证明这些 Evidence 能否形成可理解、可纠错、可复用的长期认知。
 
+### Stage 1 真实 Timeline Roadmap Feedback
+
+Observation:
+结构正确、Evidence 完整的 Timeline 仍可能只是把消息重新排版，未形成业务理解。
+
+Evidence:
+首批 3 个真实 Object 中，两份结果分别将 12 / 14 条输入展开为近似等量的消息级 Event；另一份将 11 条输入归并为 4 项业务 Event，可读性明显更高。
+
+Affected Stage / Assumption:
+“Atomic Information 能自然形成可用 Timeline View”的假设被削弱；Event consolidation 必须成为 Stage 1 业务质量合同。
+
+Suggested Change:
+保留 Atomic Information 为证据层；Timeline Projection 先按同一人物、事项、交易、业务动作与相容时间上下文归并，再输出少数有业务意义的 Event。
+
+Decision:
+revise
+
 当前主线：
 
 ```text
@@ -594,6 +611,7 @@ Stage 1 Gate Review / Evidence inventory
         ↓
 对象—事件—时间线最小切片
   - Object identity 与 Role 使用现有 canonical concepts
+  - Atomic Information 保留为证据层，同一业务事项的多条信息归并为少数 Event
   - Event 保留时间、参与对象、地点信息、变化、Evidence 与 uncertainty
   - Timeline 作为 View / Projection，不建立第二份 truth
         ↓
