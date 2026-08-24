@@ -2,7 +2,7 @@
 
 ## 状态
 
-Accepted-candidate — 2026-08-25
+Accepted — 2026-08-25
 
 ## 背景
 
