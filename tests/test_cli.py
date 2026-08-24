@@ -501,6 +501,56 @@ class CliTest(unittest.TestCase):
     @patch("archeos.cli.WechatDigestService")
     @patch("archeos.cli.WechatCliCaptureProvider")
     @patch("archeos.cli.require_workspace")
+    def test_wechat_digest_installs_generic_reviewed_head_continuation_zero_calls(
+        self,
+        require_workspace: Mock,
+        capture_provider: Mock,
+        digest_service: Mock,
+    ) -> None:
+        require_workspace.return_value = WorkspaceConfig(
+            Path("/workspace"), Path("/config")
+        )
+        authority_ref = (
+            "https://github.com/leevi2010-cursor/ArcheOS/issues/176"
+            "#issuecomment-5402000000"
+        )
+        method = (
+            digest_service.return_value
+            .install_semantic_reviewed_head_continuation
+        )
+        method.return_value = {
+            "activation_total": 361,
+            "activation_unknown_count": 0,
+            "next_global_ordinal": 362,
+            "absolute_cap": 1000,
+            "previous_reviewed_git_head": "8" * 40,
+            "reviewed_git_head": "9" * 40,
+            "continuation_fingerprint": "sha256:" + "a" * 64,
+        }
+        output = StringIO()
+        with redirect_stdout(output):
+            result = main(
+                [
+                    "wechat",
+                    "digest",
+                    "--install-semantic-reviewed-head-continuation",
+                    "--authority-ref",
+                    authority_ref,
+                ]
+            )
+        self.assertEqual(result, 0)
+        payload = json.loads(output.getvalue())
+        self.assertEqual(payload["semantic_provider_calls"], 0)
+        self.assertEqual(payload["governance_provider_calls"], 0)
+        self.assertEqual(payload["global_attempt_total"], 361)
+        self.assertEqual(payload["next_global_ordinal"], 362)
+        method.assert_called_once_with(authority_ref=authority_ref)
+        digest_service.return_value.run.assert_not_called()
+        capture_provider.assert_called_once()
+
+    @patch("archeos.cli.WechatDigestService")
+    @patch("archeos.cli.WechatCliCaptureProvider")
+    @patch("archeos.cli.require_workspace")
     def test_wechat_digest_installs_gate_c_continuation_zero_calls(
         self,
         require_workspace: Mock,

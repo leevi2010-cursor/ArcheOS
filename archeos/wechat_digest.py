@@ -288,6 +288,14 @@ class SemanticHandoffPort(Protocol):
         authority_ref: str,
     ) -> dict[str, object]: ...
 
+    def install_reviewed_head_continuation(
+        self,
+        *,
+        window_binding: SemanticWindowAuthorityBinding,
+        authority_ref: str,
+        active_run_binding: Mapping[str, object],
+    ) -> dict[str, object]: ...
+
     def install_batch_governance_continuation(
         self,
         *,
@@ -2217,6 +2225,21 @@ class ExistingSemanticHandoff:
             window_binding=window_binding,
             reviewed_git_head=self.reviewed_git_head,
             authority_ref=authority_ref,
+        )
+
+    def install_reviewed_head_continuation(
+        self,
+        *,
+        window_binding: SemanticWindowAuthorityBinding,
+        authority_ref: str,
+        active_run_binding: Mapping[str, object],
+    ) -> dict[str, object]:
+        return self.service.install_reviewed_head_continuation(
+            self.provider,
+            window_binding=window_binding,
+            reviewed_git_head=self.reviewed_git_head,
+            authority_ref=authority_ref,
+            active_run_binding=active_run_binding,
         )
 
     def install_batch_governance_continuation(
@@ -4508,6 +4531,89 @@ class WechatDigestService:
             if continuation.get("continuation_fingerprint") is None:
                 raise WechatDigestError(
                     "Semantic maintenance continuation 安装读回失败。"
+                )
+            return continuation
+
+    def install_semantic_reviewed_head_continuation(
+        self, *, authority_ref: str
+    ) -> dict[str, object]:
+        """Install one general reviewed-head continuation without Providers."""
+
+        with self.run_store.lock():
+            run_id = self.run_store.active_run_id()
+            if run_id is None:
+                raise WechatDigestError(
+                    "不存在可绑定 Semantic reviewed-head continuation 的 active run。"
+                )
+            plan = self.run_store.plan(run_id)
+            if self._plan_all_history_upper(plan) is None:
+                raise WechatDigestError(
+                    "Semantic reviewed-head continuation 只能绑定 frozen campaign。"
+                )
+            checkpoint = self.run_store.checkpoint()
+            if checkpoint is not None:
+                raise WechatDigestError(
+                    "Semantic reviewed-head continuation 要求 checkpoint 未发布。"
+                )
+            status = self.run_store.status(run_id)
+            plan_before = _canonical_json(plan)
+            status_before = _canonical_json(status)
+            self._load_active_capture_artifacts(run_id, plan, status)
+            if (
+                status.get("state") != "processing"
+                or status.get("failure_category") is not None
+                or status.get("checkpoint_published") is not False
+            ):
+                raise WechatDigestError(
+                    "Semantic reviewed-head continuation active run 状态不匹配。"
+                )
+            self._verify_pre_provider_items(plan, status)
+            plan_fingerprint = _plan_fingerprint(plan)
+            capture_receipt_fingerprint = plan.get(
+                "capture_receipt_fingerprint"
+            )
+            if (
+                status.get("plan_fingerprint") != plan_fingerprint
+                or not _sha256_value(capture_receipt_fingerprint)
+            ):
+                raise WechatDigestError(
+                    "Semantic reviewed-head continuation active binding 损坏。"
+                )
+            active_run_binding = {
+                "run_id": run_id,
+                "plan_fingerprint": plan_fingerprint,
+                "capture_receipt_fingerprint": capture_receipt_fingerprint,
+                "status_fingerprint": _sha256_bytes(
+                    status_before.encode("utf-8")
+                ),
+            }
+            continuation = (
+                self._semantic_port().install_reviewed_head_continuation(
+                    window_binding=self._semantic_authority_binding(
+                        run_id, allow_reviewed_head_extension=True
+                    ),
+                    authority_ref=authority_ref,
+                    active_run_binding=active_run_binding,
+                )
+            )
+            if (
+                continuation.get("activation_unknown_count") != 0
+                or continuation.get("activation_last_global_ordinal")
+                != continuation.get("activation_total")
+                or isinstance(continuation.get("activation_total"), bool)
+                or not isinstance(continuation.get("activation_total"), int)
+                or continuation.get("next_global_ordinal")
+                != continuation["activation_total"] + 1
+                or not _sha256_value(
+                    continuation.get("continuation_fingerprint")
+                )
+                or _canonical_json(self.run_store.plan(run_id)) != plan_before
+                or _canonical_json(self.run_store.status(run_id))
+                != status_before
+                or self.run_store.checkpoint() is not None
+            ):
+                raise WechatDigestError(
+                    "Semantic reviewed-head continuation 安装读回失败。"
                 )
             return continuation
 
@@ -9671,17 +9777,11 @@ class WechatDigestService:
                 "微信 represented pre-provider 证据未能完整读回。"
             ) from exc
 
-    def _value_error_was_pre_provider(
+    def _verify_pre_provider_items(
         self,
         plan: Mapping[str, object],
         status: Mapping[str, object],
-    ) -> bool:
-        if (
-            status.get("state") != "failed"
-            or status.get("failure_category") != "ValueError"
-            or status.get("checkpoint_published") is not False
-        ):
-            return False
+    ) -> None:
         items = status.get("items")
         if not isinstance(items, dict):
             raise WechatDigestError("微信 pre-provider 恢复状态 items 损坏。")
@@ -9733,6 +9833,19 @@ class WechatDigestService:
             )
         if represented:
             self._verify_represented_pre_provider_item(plan, represented[0])
+
+    def _value_error_was_pre_provider(
+        self,
+        plan: Mapping[str, object],
+        status: Mapping[str, object],
+    ) -> bool:
+        if (
+            status.get("state") != "failed"
+            or status.get("failure_category") != "ValueError"
+            or status.get("checkpoint_published") is not False
+        ):
+            return False
+        self._verify_pre_provider_items(plan, status)
         return True
 
     def _load_or_upgrade_active_capture(
