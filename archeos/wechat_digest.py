@@ -4126,7 +4126,6 @@ class WechatDigestService:
         run_id: str,
         *,
         allow_reviewed_head_extension: bool = False,
-        replay_completed_window_captures: bool = False,
     ) -> SemanticWindowAuthorityBinding:
         plan = self.run_store.plan(run_id)
         receipt = self.run_store.plan_receipt(run_id)
@@ -4214,27 +4213,12 @@ class WechatDigestService:
                     continue
                 candidate_receipt = self.run_store.plan_receipt(path.name)
                 candidate_status = self.run_store.status(path.name)
-                if replay_completed_window_captures:
-                    self._segment_performance[
-                        "completed_window_connector_replays"
-                    ] = self._segment_performance.get(
-                        "completed_window_connector_replays", 0
-                    ) + 1
                 self._verify_plan_and_status(
                     path.name,
-                    (
-                        self.capture_provider.capture(
-                            candidate_after,
-                            upper_bound=candidate_upper,
-                        )
-                        if replay_completed_window_captures
-                        else None
-                    ),
+                    None,
                     candidate_plan,
                     candidate_status,
-                    lightweight_capture=(
-                        not replay_completed_window_captures
-                    ),
+                    lightweight_capture=True,
                 )
                 if (
                     candidate_status.get("state") != "completed"
@@ -4336,6 +4320,38 @@ class WechatDigestService:
             reviewed_git_head=campaign_reviewed_head,
         )
 
+    def _load_active_capture_artifacts(
+        self,
+        run_id: str,
+        plan: dict[str, object],
+        status: dict[str, object],
+        *,
+        allow_pending_unknown_resolution: bool = False,
+    ) -> tuple[WechatCapture, dict[str, object]]:
+        """Read and validate one active window without invoking its connector."""
+
+        if plan.get("schema_version") != SNAPSHOT_RUN_PLAN_SCHEMA_VERSION:
+            raise WechatDigestError(
+                "active 微信运行必须先完成 durable capture 升级。"
+            )
+        started = time.monotonic()
+        capture, _ = self.run_store.load_capture_artifacts(run_id, plan=plan)
+        index = self.run_store.load_capture_index(run_id, capture=capture)
+        if self._segment_performance:
+            self._segment_performance["snapshot_readback_ms"] = (
+                self._segment_performance.get("snapshot_readback_ms", 0)
+                + round((time.monotonic() - started) * 1000)
+            )
+        self._verify_capture_against_plan(capture, plan)
+        self._verify_plan_and_status(
+            run_id,
+            capture,
+            plan,
+            status,
+            allow_pending_unknown_resolution=allow_pending_unknown_resolution,
+        )
+        return capture, index
+
     def install_semantic_authority(
         self,
         *,
@@ -4352,12 +4368,8 @@ class WechatDigestService:
                 raise WechatDigestError(
                     "Semantic authority 只能绑定已冻结全局上界的 campaign。"
                 )
-            after = WechatCursor.from_dict(plan["after_cursor"], "plan.after_cursor")
-            upper = WechatCursor.from_dict(plan["upper_bound"], "plan.upper_bound")
-            capture = self.capture_provider.capture(after, upper_bound=upper)
-            self._verify_capture_against_plan(capture, plan)
             status = self.run_store.status(run_id)
-            self._verify_plan_and_status(run_id, capture, plan, status)
+            self._load_active_capture_artifacts(run_id, plan, status)
             binding = self._semantic_authority_binding(run_id)
             grant = self._semantic_port().install_global_authority(
                 inventory_authority_file=inventory_authority_file,
@@ -4381,12 +4393,8 @@ class WechatDigestService:
                 raise WechatDigestError(
                     "Semantic authority extension 只能绑定已冻结全局上界的 campaign。"
                 )
-            after = WechatCursor.from_dict(plan["after_cursor"], "plan.after_cursor")
-            upper = WechatCursor.from_dict(plan["upper_bound"], "plan.upper_bound")
-            capture = self.capture_provider.capture(after, upper_bound=upper)
-            self._verify_capture_against_plan(capture, plan)
             status = self.run_store.status(run_id)
-            self._verify_plan_and_status(run_id, capture, plan, status)
+            self._load_active_capture_artifacts(run_id, plan, status)
             items = status.get("items")
             if not isinstance(items, dict) or any(
                 not isinstance(item, dict)
@@ -4427,18 +4435,13 @@ class WechatDigestService:
             after = WechatCursor.from_dict(
                 plan.get("after_cursor"), "plan.after_cursor"
             )
-            upper = WechatCursor.from_dict(
-                plan.get("upper_bound"), "plan.upper_bound"
-            )
             checkpoint = self.run_store.checkpoint()
             if checkpoint is not None and checkpoint != after:
                 raise WechatDigestError(
                     "Semantic maintenance continuation checkpoint binding 不一致。"
                 )
-            capture = self.capture_provider.capture(after, upper_bound=upper)
-            self._verify_capture_against_plan(capture, plan)
             status = self.run_store.status(run_id)
-            self._verify_plan_and_status(run_id, capture, plan, status)
+            self._load_active_capture_artifacts(run_id, plan, status)
             processing_pre_state = (
                 status.get("state") == "processing"
                 and status.get("failure_category") is None
@@ -4522,18 +4525,13 @@ class WechatDigestService:
             after = WechatCursor.from_dict(
                 plan.get("after_cursor"), "plan.after_cursor"
             )
-            upper = WechatCursor.from_dict(
-                plan.get("upper_bound"), "plan.upper_bound"
-            )
             checkpoint = self.run_store.checkpoint()
             if checkpoint is not None and checkpoint != after:
                 raise WechatDigestError(
                     "Semantic Gate C continuation checkpoint binding 不一致。"
                 )
-            capture = self.capture_provider.capture(after, upper_bound=upper)
-            self._verify_capture_against_plan(capture, plan)
             status = self.run_store.status(run_id)
-            self._verify_plan_and_status(run_id, capture, plan, status)
+            self._load_active_capture_artifacts(run_id, plan, status)
             if (
                 status.get("state") != "processing"
                 or status.get("failure_category") is not None
@@ -4614,18 +4612,13 @@ class WechatDigestService:
             after = WechatCursor.from_dict(
                 plan.get("after_cursor"), "plan.after_cursor"
             )
-            upper = WechatCursor.from_dict(
-                plan.get("upper_bound"), "plan.upper_bound"
-            )
             checkpoint = self.run_store.checkpoint()
             if checkpoint is not None and checkpoint != after:
                 raise WechatDigestError(
                     "Semantic segmented Gate C continuation checkpoint binding 不一致。"
                 )
-            capture = self.capture_provider.capture(after, upper_bound=upper)
-            self._verify_capture_against_plan(capture, plan)
             status = self.run_store.status(run_id)
-            self._verify_plan_and_status(run_id, capture, plan, status)
+            self._load_active_capture_artifacts(run_id, plan, status)
             if (
                 status.get("state") != "processing"
                 or status.get("failure_category") is not None
@@ -4713,11 +4706,10 @@ class WechatDigestService:
         plan = self.run_store.plan(run_id)
         plan_receipt = self.run_store.plan_receipt(run_id)
         after = WechatCursor.from_dict(plan.get("after_cursor"), "plan.after_cursor")
-        upper = WechatCursor.from_dict(plan.get("upper_bound"), "plan.upper_bound")
-        capture = self.capture_provider.capture(after, upper_bound=upper)
-        self._verify_capture_against_plan(capture, plan)
         status = self.run_store.status(run_id)
-        self._verify_plan_and_status(run_id, capture, plan, status)
+        capture, _ = self._load_active_capture_artifacts(
+            run_id, plan, status
+        )
         checkpoint = self.run_store.checkpoint()
         if (
             self._plan_all_history_upper(plan) is None
@@ -5067,15 +5059,9 @@ class WechatDigestService:
             item = self._item(items, item_id)
             ordered_ids = list(binding["ordered_atomic_information_ids"])
             plan = self.run_store.plan(run_id)
-            after = WechatCursor.from_dict(
-                plan.get("after_cursor"), "plan.after_cursor"
+            capture, _ = self._load_active_capture_artifacts(
+                run_id, plan, status
             )
-            upper = WechatCursor.from_dict(
-                plan.get("upper_bound"), "plan.upper_bound"
-            )
-            capture = self.capture_provider.capture(after, upper_bound=upper)
-            self._verify_capture_against_plan(capture, plan)
-            self._verify_plan_and_status(run_id, capture, plan, status)
             source_id = str(binding["source_id"])
             representation_id = str(binding["representation_id"])
             source = self.source_repository.get(source_id)
@@ -5235,15 +5221,14 @@ class WechatDigestService:
         plan = self.run_store.plan(run_id)
         plan_receipt = self.run_store.plan_receipt(run_id)
         after = WechatCursor.from_dict(plan.get("after_cursor"), "plan.after_cursor")
-        upper = WechatCursor.from_dict(plan.get("upper_bound"), "plan.upper_bound")
         status = self.run_store.status(run_id)
         capture_fingerprint = plan.get("capture_fingerprint")
         if not _sha256_value(capture_fingerprint):
             raise WechatDigestError("多项目 Governance capture binding 损坏。")
         if replay_capture:
-            capture = self.capture_provider.capture(after, upper_bound=upper)
-            self._verify_capture_against_plan(capture, plan)
-            self._verify_plan_and_status(run_id, capture, plan, status)
+            capture, _ = self._load_active_capture_artifacts(
+                run_id, plan, status
+            )
             capture_fingerprint = _capture_fingerprint(capture)
         else:
             self._verify_plan_and_status(run_id, None, plan, status)
@@ -5381,7 +5366,6 @@ class WechatDigestService:
         window_binding = self._semantic_authority_binding(
             run_id,
             allow_reviewed_head_extension=True,
-            replay_completed_window_captures=False,
         )
         if adopted_continuation is not None:
             previous_head = adopted_continuation.get("previous_reviewed_git_head")
@@ -5570,7 +5554,6 @@ class WechatDigestService:
                             window_binding=self._semantic_authority_binding(
                                 run_id,
                                 allow_reviewed_head_extension=True,
-                                replay_completed_window_captures=False,
                             ),
                             authority_ref=authority_ref,
                             authority_manifest_fingerprint=str(
@@ -5911,13 +5894,12 @@ class WechatDigestService:
         ):
             raise WechatDigestError("历史失败恢复 active run 状态不匹配。")
         after = WechatCursor.from_dict(plan.get("after_cursor"), "plan.after_cursor")
-        upper = WechatCursor.from_dict(plan.get("upper_bound"), "plan.upper_bound")
         checkpoint = self.run_store.checkpoint()
         if checkpoint is not None and checkpoint != after:
             raise WechatDigestError("历史失败恢复 checkpoint binding 不匹配。")
-        capture = self.capture_provider.capture(after, upper_bound=upper)
-        self._verify_capture_against_plan(capture, plan)
-        self._verify_plan_and_status(run_id, capture, plan, status)
+        capture, _ = self._load_active_capture_artifacts(
+            run_id, plan, status
+        )
         items = status.get("items")
         if not isinstance(items, dict) or len(items) != 189:
             raise WechatDigestError("历史失败恢复 item inventory 不匹配。")
@@ -6267,14 +6249,9 @@ class WechatDigestService:
                     "历史失败恢复 semantic continuation 读回失败。"
                 )
             plan = self.run_store.plan(run_id)
-            after = WechatCursor.from_dict(
-                plan.get("after_cursor"), "plan.after_cursor"
+            capture, _ = self._load_active_capture_artifacts(
+                run_id, plan, self.run_store.status(run_id)
             )
-            upper = WechatCursor.from_dict(
-                plan.get("upper_bound"), "plan.upper_bound"
-            )
-            capture = self.capture_provider.capture(after, upper_bound=upper)
-            self._verify_capture_against_plan(capture, plan)
             checkpoint = self.run_store.checkpoint()
             source_id = str(binding["source_id"])
             representation_id = str(binding["representation_id"])
@@ -7173,16 +7150,15 @@ class WechatDigestService:
                 "Batch Governance migration 只能绑定 frozen campaign。"
             )
         after = WechatCursor.from_dict(plan.get("after_cursor"), "plan.after_cursor")
-        upper = WechatCursor.from_dict(plan.get("upper_bound"), "plan.upper_bound")
         checkpoint = self.run_store.checkpoint()
         if checkpoint not in {None, after}:
             raise WechatDigestError(
                 "Batch Governance migration checkpoint binding 不一致。"
             )
-        capture = self.capture_provider.capture(after, upper_bound=upper)
-        self._verify_capture_against_plan(capture, plan)
         status = self.run_store.status(run_id)
-        self._verify_plan_and_status(run_id, capture, plan, status)
+        capture, _ = self._load_active_capture_artifacts(
+            run_id, plan, status
+        )
         if (
             status.get("state") != "failed"
             or status.get("failure_category") != "BrokenPipeError"
@@ -7467,10 +7443,8 @@ class WechatDigestService:
             upper = WechatCursor.from_dict(
                 plan.get("upper_bound"), "plan.upper_bound"
             )
-            capture = self.capture_provider.capture(after, upper_bound=upper)
-            self._verify_capture_against_plan(capture, plan)
             status = self.run_store.status(run_id)
-            self._verify_plan_and_status(run_id, capture, plan, status)
+            self._load_active_capture_artifacts(run_id, plan, status)
             items = status.get("items")
             if not isinstance(items, dict):
                 raise WechatDigestError("微信运行状态 items 损坏。")
@@ -8092,14 +8066,9 @@ class WechatDigestService:
                 raise WechatDigestError(
                     "Semantic unknown recovery 只能绑定 frozen campaign。"
                 )
-            after = WechatCursor.from_dict(plan["after_cursor"], "plan.after_cursor")
-            upper = WechatCursor.from_dict(plan["upper_bound"], "plan.upper_bound")
-            capture = self.capture_provider.capture(after, upper_bound=upper)
-            self._verify_capture_against_plan(capture, plan)
             status = self.run_store.status(run_id)
-            self._verify_plan_and_status(
+            self._load_active_capture_artifacts(
                 run_id,
-                capture,
                 plan,
                 status,
                 allow_pending_unknown_resolution=True,
@@ -8274,20 +8243,9 @@ class WechatDigestService:
                 raise WechatDigestError(
                     "Semantic ordinal212 recovery 只能绑定 frozen campaign。"
                 )
-            after = WechatCursor.from_dict(
-                plan["after_cursor"], "plan.after_cursor"
-            )
-            upper = WechatCursor.from_dict(
-                plan["upper_bound"], "plan.upper_bound"
-            )
-            capture = self.capture_provider.capture(
-                after, upper_bound=upper
-            )
-            self._verify_capture_against_plan(capture, plan)
             status = self.run_store.status(run_id)
-            self._verify_plan_and_status(
+            self._load_active_capture_artifacts(
                 run_id,
-                capture,
                 plan,
                 status,
                 allow_pending_unknown_resolution=True,
@@ -8344,18 +8302,13 @@ class WechatDigestService:
             after = WechatCursor.from_dict(
                 plan.get("after_cursor"), "plan.after_cursor"
             )
-            upper = WechatCursor.from_dict(
-                plan.get("upper_bound"), "plan.upper_bound"
-            )
             checkpoint = self.run_store.checkpoint()
             if checkpoint is not None and checkpoint != after:
                 raise WechatDigestError(
                     "Governance timeout 封存的 checkpoint binding 不一致。"
                 )
-            capture = self.capture_provider.capture(after, upper_bound=upper)
-            self._verify_capture_against_plan(capture, plan)
             status = self.run_store.status(run_id)
-            self._verify_plan_and_status(run_id, capture, plan, status)
+            self._load_active_capture_artifacts(run_id, plan, status)
             if status.get("checkpoint_published") is not False:
                 raise WechatDigestError(
                     "Governance timeout 封存不得发生在 checkpoint 推进后。"

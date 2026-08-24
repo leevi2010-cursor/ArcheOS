@@ -9,9 +9,11 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import closing, contextmanager
 from dataclasses import replace
 from pathlib import Path
@@ -214,6 +216,14 @@ class FailOnSecondCaptureProvider(SyntheticCaptureProvider):
         return super().capture(*args, **kwargs)
 
 
+class FailOnSecondFullCaptureProvider(SyntheticCaptureProvider):
+    def capture(self, *args, **kwargs):
+        full_calls = sum(not call[2] for call in self.calls)
+        if not kwargs.get("observe_only", False) and full_calls:
+            raise AssertionError("frozen window must not full capture twice")
+        return super().capture(*args, **kwargs)
+
+
 class SyntheticAnalysisProvider:
     name = "external-agent-codex-cli"
 
@@ -265,7 +275,7 @@ class SyntheticAnalysisProvider:
         )
 
 
-class SyntheticSemanticHandoff:
+class _SyntheticSemanticHandoffBase:
     def __init__(self, workspace: Path) -> None:
         self.workspace = workspace
         self.provider = SyntheticAnalysisProvider()
@@ -298,6 +308,9 @@ class SyntheticSemanticHandoff:
             (tuple(request.representation_id for request in requests), parallelism)
         )
         return {request.representation_id: 0 for request in requests}
+
+
+class SyntheticSemanticHandoff(_SyntheticSemanticHandoffBase):
 
     def execute(
         self,
@@ -1022,6 +1035,63 @@ class SyntheticSemanticHandoff:
                     )
             audit_path.write_text(json.dumps(audit), encoding="utf-8")
             os.chmod(audit_path, 0o600)
+
+
+class ObservedOutOfOrderSemanticHandoff(SyntheticSemanticHandoff):
+    """Synthetic result-only lanes with observed overlap and reverse completion."""
+
+    def __init__(self, workspace: Path) -> None:
+        super().__init__(workspace)
+        self.completion_orders: list[tuple[str, ...]] = []
+        self.last_prepare_metrics: dict[str, int] = {}
+
+    def prepare_results(self, requests, *, parallelism):
+        planned = tuple(request.representation_id for request in requests)
+        self.prepared_waves.append((planned, parallelism))
+        if not planned:
+            return {}
+        barrier = threading.Barrier(len(planned))
+        release = threading.Event()
+        state_lock = threading.Lock()
+        active = 0
+        peak = 0
+
+        def finish(representation_id: str, index: int) -> tuple[str, int]:
+            nonlocal active, peak
+            started = time.monotonic()
+            with state_lock:
+                active += 1
+                peak = max(peak, active)
+            try:
+                barrier.wait(timeout=5)
+                if len(planned) > 1 and index == 0:
+                    release.wait(timeout=5)
+                else:
+                    release.set()
+                return representation_id, round(
+                    (time.monotonic() - started) * 1000
+                )
+            finally:
+                with state_lock:
+                    active -= 1
+
+        elapsed: dict[str, int] = {}
+        completed: list[str] = []
+        with ThreadPoolExecutor(max_workers=parallelism) as executor:
+            futures = {
+                executor.submit(finish, representation_id, index)
+                for index, representation_id in enumerate(planned)
+            }
+            for future in as_completed(futures):
+                representation_id, elapsed_ms = future.result()
+                completed.append(representation_id)
+                elapsed[representation_id] = elapsed_ms
+        self.completion_orders.append(tuple(completed))
+        self.last_prepare_metrics = {
+            "semantic_peak_concurrency": peak,
+            "resume_provider_calls": 0,
+        }
+        return elapsed
 
 
 class NoStructuralChangeProvider:
@@ -3192,6 +3262,8 @@ class WechatDigestTests(unittest.TestCase):
         ).read_bytes()
         semantic_calls = self.semantic.provider.calls
         governance_calls = provider.calls
+        connector = FailOnSecondCaptureProvider(list(capture.messages))
+        service.capture_provider = connector
 
         continuation = service.install_semantic_maintenance_continuation(
             authority_ref=authority_ref
@@ -3202,6 +3274,7 @@ class WechatDigestTests(unittest.TestCase):
         self.assertEqual(continuation["authority_ref"], authority_ref)
         self.assertEqual(self.semantic.provider.calls, semantic_calls)
         self.assertEqual(provider.calls, governance_calls)
+        self.assertEqual(connector.calls, [])
         self.assertEqual(
             (service.run_store.runs_root / run_id / "status.json").read_bytes(),
             status_before,
@@ -3292,6 +3365,10 @@ class WechatDigestTests(unittest.TestCase):
         semantic_calls = self.semantic.provider.calls
         governance_calls = provider.calls
         binding = SimpleNamespace(reviewed_git_head="b" * 40)
+        original_capture = service.capture_provider
+        assert isinstance(original_capture, SyntheticCaptureProvider)
+        connector = FailOnSecondCaptureProvider(list(original_capture.messages))
+        service.capture_provider = connector
 
         with patch.object(service, "_verify_plan_and_status"), patch.object(
             service, "_semantic_authority_binding", return_value=binding
@@ -3306,6 +3383,7 @@ class WechatDigestTests(unittest.TestCase):
         self.assertEqual(status_path.read_bytes(), status_before)
         self.assertEqual(self.semantic.provider.calls, semantic_calls)
         self.assertEqual(provider.calls, governance_calls)
+        self.assertEqual(connector.calls, [])
 
     def test_segmented_gate_c_continuation_binds_current_safe_state_zero_calls(
         self,
@@ -3352,6 +3430,10 @@ class WechatDigestTests(unittest.TestCase):
         semantic_calls = self.semantic.provider.calls
         governance_calls = provider.calls
         binding = SimpleNamespace(reviewed_git_head="c" * 40)
+        original_capture = service.capture_provider
+        assert isinstance(original_capture, SyntheticCaptureProvider)
+        connector = FailOnSecondCaptureProvider(list(original_capture.messages))
+        service.capture_provider = connector
 
         with patch.object(service, "_verify_plan_and_status"), patch.object(
             service, "_semantic_authority_binding", return_value=binding
@@ -3368,6 +3450,7 @@ class WechatDigestTests(unittest.TestCase):
         self.assertEqual(status_path.read_bytes(), status_before)
         self.assertEqual(self.semantic.provider.calls, semantic_calls)
         self.assertEqual(provider.calls, governance_calls)
+        self.assertEqual(connector.calls, [])
 
     def test_governance_startup_failure_uses_latest_durable_status(self) -> None:
         self.create_object()
@@ -3409,6 +3492,10 @@ class WechatDigestTests(unittest.TestCase):
             "https://github.com/leevi2010-cursor/ArcheOS/issues/150"
             "#issuecomment-1234567890"
         )
+        original_capture = service.capture_provider
+        assert isinstance(original_capture, SyntheticCaptureProvider)
+        connector = FailOnSecondCaptureProvider(list(original_capture.messages))
+        service.capture_provider = connector
         manifest = service.build_governance_startup_recovery_manifest(
             authority_ref=authority_ref
         )
@@ -3429,6 +3516,7 @@ class WechatDigestTests(unittest.TestCase):
         self.assertFalse(receipt["retry_consumed"])
         self.assertEqual(self.semantic.provider.calls, semantic_calls)
         self.assertEqual(provider.attempts, governance_attempts)
+        self.assertEqual(connector.calls, [])
         self.assertEqual(self.governance_business_state(service), before_business)
         status = service.run_store.status(run_id)
         self.assertEqual(status["state"], "processing")
@@ -3676,7 +3764,7 @@ class WechatDigestTests(unittest.TestCase):
         manifest = service.build_multi_governance_startup_recovery_manifest(
             authority_ref=authority_ref
         )
-        self.assertEqual(len(capture.calls), 1)
+        self.assertEqual(len(capture.calls), 0)
         manifest_path = Path(self.temporary.name) / "issue-168-authority.json"
         manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
         os.chmod(manifest_path, 0o600)
@@ -3691,7 +3779,7 @@ class WechatDigestTests(unittest.TestCase):
         self.assertEqual(len(service.run_store.governance_startup_retries(run_id)), 1)
         self.assertEqual(provider.attempts, provider_attempts)
         self.assertEqual(self.semantic.provider.calls, semantic_calls)
-        self.assertEqual(len(capture.calls), 1)
+        self.assertEqual(len(capture.calls), 0)
         self.assertEqual(self.governance_business_state(service), before_business)
         self.assertEqual(service.run_store.status(run_id)["state"], "processing")
         self.assertEqual(
@@ -3702,7 +3790,7 @@ class WechatDigestTests(unittest.TestCase):
             receipt,
         )
         self.assertEqual(provider.attempts, provider_attempts)
-        self.assertEqual(len(capture.calls), 1)
+        self.assertEqual(len(capture.calls), 0)
 
         service.capture_provider = original_capture
         service.run(max_terminal_items=1)
@@ -5665,6 +5753,113 @@ class WechatDigestTests(unittest.TestCase):
         self.assertGreaterEqual(publish_ms, 0)
         self.assertGreaterEqual(readback_ms, 0)
 
+    def test_production_shaped_service_max3_uses_one_capture_and_serial_governance(
+        self,
+    ) -> None:
+        shared_object_id = self.create_object()
+        missing_attachments = {
+            number: attachment(
+                None,
+                f"service_fixture_{number:032x}",
+                status="missing",
+                filename=f"fixture-{number}.bin",
+            )
+            for number in range(100)
+        }
+        messages = [
+            message(
+                number + 1,
+                conversation=f"conversation_{number % 45:02d}",
+                attachments=(missing_attachments[number // 10],)
+                if number % 10 == 0
+                else (),
+            )
+            for number in range(1000)
+        ]
+        capture = FailOnSecondFullCaptureProvider(messages)
+        semantic = ObservedOutOfOrderSemanticHandoff(self.workspace)
+
+        class BoundedBenchmarkAnalysisProvider(SyntheticAnalysisProvider):
+            def analyze(self, batch):
+                self.mode = "four_one" if self.calls < 2 else "all_residue"
+                return super().analyze(batch)
+
+        semantic.provider = BoundedBenchmarkAnalysisProvider()
+        service = WechatDigestService(
+            workspace=self.workspace,
+            capture_provider=capture,
+            semantic_handoff_factory=lambda: semantic,
+            interpretation_provider=NoStructuralChangeProvider(),
+            semantic_parallelism=2,
+        )
+
+        full_capture_path_started = time.monotonic_ns()
+        results = [
+            service.run(all_history=True, max_terminal_items=3)
+        ]
+        full_capture_path_ns = time.monotonic_ns() - full_capture_path_started
+        run_id = results[0].run_id
+        readback_samples = []
+        for _ in range(7):
+            started = time.monotonic_ns()
+            service.run_store.load_capture_artifacts(run_id)
+            readback_samples.append(time.monotonic_ns() - started)
+        while service.run_store.active_run_id() is not None:
+            results.append(service.run(max_terminal_items=3))
+
+        median_readback_ns = sorted(readback_samples)[len(readback_samples) // 2]
+        self.assertLess(median_readback_ns, full_capture_path_ns)
+        self.assertEqual(sum(not call[2] for call in capture.calls), 1)
+        self.assertEqual(sum(item.capture_provider_calls for item in results), 1)
+        self.assertEqual(sum(item.upper_bound_probe_calls for item in results), 1)
+        self.assertTrue(all(item.completed_window_connector_replays == 0 for item in results))
+        self.assertTrue(all(item.segment_items_completed <= 3 for item in results))
+        self.assertEqual(results[-1].new_messages, 1000)
+        self.assertEqual(results[-1].new_attachments, 100)
+        self.assertGreater(results[-1].snapshot_bytes, 0)
+        self.assertEqual(max(item.semantic_parallelism for item in results), 2)
+        self.assertEqual(max(item.semantic_peak_concurrency for item in results), 2)
+        self.assertEqual(max(item.governance_peak_concurrency for item in results), 1)
+        self.assertEqual(sum(item.resume_provider_calls for item in results), 0)
+        self.assertTrue(
+            any(
+                completed != planned
+                for (planned, _parallelism), completed in zip(
+                    semantic.prepared_waves,
+                    semantic.completion_orders,
+                    strict=True,
+                )
+                if len(planned) > 1
+            )
+        )
+
+        information = service.information_store.list_atomic_information()
+        self.assertEqual(
+            len({item.atomic_information_id for item in information}),
+            len(information),
+        )
+        self.assertTrue(
+            all(shared_object_id in item.related_object_ids for item in information)
+        )
+        with SQLiteWorldModelRepository(service.database) as repository:
+            objects = repository.list_objects()
+            self.assertEqual([item.object_id for item in objects], [shared_object_id])
+            names = repository.list_names(shared_object_id)
+            roles = repository.list_roles(shared_object_id)
+            self.assertEqual(
+                len({(item.name, item.is_primary) for item in names}), len(names)
+            )
+            self.assertEqual(len({item.role for item in roles}), len(roles))
+        proposals = service.proposal_store.list_history()
+        journal = service.journal.list_changes()
+        self.assertEqual(proposals, ())
+        self.assertEqual(
+            len({item.proposal_id for item in proposals}), len(proposals)
+        )
+        self.assertEqual(
+            len({item.change_id for item in journal}), len(journal)
+        )
+
     def test_prepare_requires_active_run_without_capture(self) -> None:
         capture = SyntheticCaptureProvider([message(1)])
         with self.assertRaisesRegex(WechatDigestError, "不存在可恢复"):
@@ -6836,12 +7031,15 @@ class WechatDigestTests(unittest.TestCase):
         with self.assertRaises(WechatDigestError):
             service.run(all_history=True)
         provider_calls = self.semantic.provider.calls
+        connector = FailOnSecondCaptureProvider(list(capture.messages))
+        service.capture_provider = connector
         grant = service.install_semantic_authority(
             inventory_authority_file=Path("/private/authority-a.json"),
         )
         self.assertEqual(grant["baseline_total"], 80)
         self.assertEqual(grant["max_new"], 20)
         self.assertEqual(self.semantic.provider.calls, provider_calls)
+        self.assertEqual(connector.calls, [])
         self.assertEqual(
             service.install_semantic_authority(
                 inventory_authority_file=Path("/private/authority-a.json"),

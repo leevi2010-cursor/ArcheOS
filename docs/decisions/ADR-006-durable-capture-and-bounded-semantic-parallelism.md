@@ -14,7 +14,7 @@ Accepted-candidate — 2026-08-25
 
 新运行将完整 canonical capture 持久化为私有 Processing Derived Artifact：`snapshot.json`、`index.json`、`summary.json`，最后发布 `receipt.json`。运行计划绑定 capture receipt 与原 canonical capture fingerprint。所有 segment、resume 和 completed-window 验证只读这些 durable artifacts，不再调用 connector；Conversation Source 由 index 直接定位有序消息。
 
-Legacy active v3 运行允许一次 fixed-range capture 升级。只有能证明为 Provider 前 `ValueError` 的状态才恢复为 processing；已有结果继续 exact replay，unknown attempt 继续拒绝。
+Legacy active v3 运行允许一次 fixed-range capture 升级。升级完成后，authority、maintenance、Gate C 与 Governance recovery 等所有 active-run 安装和恢复入口必须同时读回 durable snapshot 与 index，禁止再次调用 connector。只有能证明为 Provider 前 `ValueError` 的状态才恢复为 processing；已有结果继续 exact replay，unknown attempt 继续拒绝。
 
 ### 2. 并行只产生隔离的语义结果
 
@@ -30,6 +30,7 @@ Legacy active v3 运行允许一次 fixed-range capture 升级。只有能证明
 
 - capture artifact 采用 atomic write、fsync、readback、receipt-last；任一 raw/canonical/index/summary/receipt/plan drift 在 Provider 或长期写入前拒绝；
 - Provider 前 reservation 以单个 durable attempt marker 原子表达；reserved-not-started 可安全启动，result bundle 已完整时 resume 的 Provider calls 为 0，started 且没有 terminal result 仍视为 unknown；
+- production-shaped service 基准以 max3 短段跑完整窗口，分别记录一次 full-capture 路径和多次 durable readback 的观测耗时中位数，并直接断言机器指标；
 - 并行度设为 1 可回退语义调度，但不会恢复重复 capture；
 - snapshot 是可替换的 Processing artifact，不是第二个 Source 或 Information authority；Managed Source 与 Evidence 规则不变。
 
