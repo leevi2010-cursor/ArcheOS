@@ -709,6 +709,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="零 Provider 恢复 Issue #154 历史失败校验阻塞。",
     )
     wechat_digest.add_argument(
+        "--resolve-multi-governance-startup-failure",
+        action="store_true",
+        help="零 Provider 安装 Issue #168 当前项目的独立 Governance 启动恢复。",
+    )
+    wechat_digest.add_argument(
         "--inventory-authority-file",
         type=Path,
         help="Private 0600 Lead-approved historical inventory authority manifest.",
@@ -737,6 +742,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--failed-closed-authority-file",
         type=Path,
         help="Private 0600 Lead-approved Issue #154 recovery authority manifest.",
+    )
+    wechat_digest.add_argument(
+        "--multi-governance-startup-authority-file",
+        type=Path,
+        help="Private 0600 Lead-approved Issue #168 startup authority manifest.",
     )
     wechat_digest.add_argument(
         "--authority-ref",
@@ -1290,6 +1300,7 @@ def _wechat_product_command(args: argparse.Namespace) -> int:
             args.seal_governance_timeout,
             args.resolve_governance_startup_failure,
             args.resolve_failed_closed_continuation,
+            args.resolve_multi_governance_startup_failure,
         )
     )
     if maintenance_count > 1 or (
@@ -1328,6 +1339,7 @@ def _wechat_product_command(args: argparse.Namespace) -> int:
         or args.activate_batch_governance
         or args.resolve_governance_startup_failure
         or args.resolve_failed_closed_continuation
+        or args.resolve_multi_governance_startup_failure
     ):
         if args.authority_ref is None:
             print("error: 安装 continuation 必须指定 authority ref。")
@@ -1355,6 +1367,13 @@ def _wechat_product_command(args: argparse.Namespace) -> int:
             return 2
     elif args.failed_closed_authority_file is not None:
         print("error: 历史失败恢复 authority file 只能与恢复入口一起使用。")
+        return 2
+    if args.resolve_multi_governance_startup_failure:
+        if args.multi_governance_startup_authority_file is None:
+            print("error: 多项目 Governance 启动恢复必须指定私有 authority file。")
+            return 2
+    elif args.multi_governance_startup_authority_file is not None:
+        print("error: 多项目 Governance authority file 只能与恢复入口一起使用。")
         return 2
     try:
         workspace = require_workspace(args.config).workspace
@@ -1603,6 +1622,36 @@ def _wechat_product_command(args: argparse.Namespace) -> int:
                         "message": (
                             "历史失败回执已重新纳入完整授权链；"
                             "当前项目已恢复为可续接状态，未处理下一项。"
+                        ),
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                )
+            )
+            return 0
+        if args.resolve_multi_governance_startup_failure:
+            resolution = service.resolve_multi_governance_startup_failure(
+                authority_ref=args.authority_ref,
+                authority_manifest_file=(
+                    args.multi_governance_startup_authority_file
+                ),
+            )
+            print(
+                json.dumps(
+                    {
+                        "semantic_provider_calls": 0,
+                        "governance_provider_calls": 0,
+                        "durable_information_preserved": 3,
+                        "previous_governance_model_turns": 0,
+                        "safe_restart_attempts_available": 1,
+                        "objects_created": 0,
+                        "checkpoint_published": False,
+                        "resolution_receipt_fingerprint": resolution[
+                            "receipt_fingerprint"
+                        ],
+                        "message": (
+                            "已保留现有长期信息；上次治理未进入模型判断；"
+                            "已允许一次安全续接；未推进checkpoint。"
                         ),
                     },
                     ensure_ascii=False,

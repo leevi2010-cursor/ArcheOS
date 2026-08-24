@@ -11630,7 +11630,7 @@ print("passed")
             failed_closed_status_fingerprint=unknown_166_status_fingerprint,
             resolution_id=unknown_166["resolution_id"],
         )
-        failed_closed_head = "f" * 40
+        failed_closed_head = "ce49d89355caab38da08b4522f416d248c60646b"
         failed_closed_authority_ref = (
             "https://github.com/leevi2010-cursor/ArcheOS/issues/154"
             "#issuecomment-5369000000"
@@ -11687,6 +11687,126 @@ print("passed")
             failed_closed_status_fingerprint=unknown_166_status_fingerprint,
             resolution_id=unknown_166["resolution_id"],
         )
+        failed_closed_window = replace(
+            gate_c_window, reviewed_git_head=failed_closed_head
+        )
+        latest_multi_handoff = handoff_298
+        for ordinal in range(299, 303):
+            item_root = root / f"ordinal-{ordinal:04d}"
+            ordinal_representation, ordinal_service = self.build_service(
+                root=item_root,
+                source_id=f"src_{ordinal:032x}",
+            )
+            latest_multi_handoff = ExternalAgentSemanticHandoffService(
+                ordinal_service,
+                JsonlAtomicInformationStore(item_root / "atomic.jsonl"),
+                handoff.audit_root,
+            )
+            ordinal_runner = FakeRunner()
+            latest_multi_handoff.execute(
+                ordinal_representation.representation_id,
+                CodexCliRepresentationAnalysisProvider(
+                    provider_version="0.147.0",
+                    timeout_seconds=300,
+                    runner=ordinal_runner,
+                    diagnostic_root=timeout_provider.diagnostic_root,
+                ),
+                privacy_binding=self.privacy_binding(),
+                authority_binding=failed_closed_window,
+            )
+            self.assertEqual(len(ordinal_runner.calls), 1)
+
+        multi_head = "e" * 40
+        multi_authority_ref = (
+            "https://github.com/leevi2010-cursor/ArcheOS/issues/168"
+            "#issuecomment-5370000000"
+        )
+        multi_runner = FakeRunner()
+        multi_continuation = (
+            latest_multi_handoff.install_multi_governance_startup_recovery_continuation(
+                CodexCliRepresentationAnalysisProvider(
+                    provider_version="0.147.0",
+                    timeout_seconds=300,
+                    runner=multi_runner,
+                    diagnostic_root=timeout_provider.diagnostic_root,
+                ),
+                window_binding=failed_closed_window,
+                reviewed_git_head=multi_head,
+                authority_ref=multi_authority_ref,
+                authority_manifest_fingerprint="sha256:" + "e" * 64,
+                authority_manifest_raw_fingerprint="sha256:" + "f" * 64,
+            )
+        )
+        self.assertEqual(multi_runner.calls, [])
+        self.assertEqual(multi_continuation["activation_total"], 302)
+        self.assertEqual(multi_continuation["next_global_ordinal"], 303)
+        self.assertEqual(
+            latest_multi_handoff.multi_governance_startup_recovery_continuation(
+                CodexCliRepresentationAnalysisProvider(
+                    provider_version="0.147.0",
+                    timeout_seconds=300,
+                    runner=FakeRunner(),
+                    diagnostic_root=timeout_provider.diagnostic_root,
+                ),
+                reviewed_git_head=multi_head,
+                authority_ref=multi_authority_ref,
+                authority_manifest_fingerprint="sha256:" + "e" * 64,
+                authority_manifest_raw_fingerprint="sha256:" + "f" * 64,
+            ),
+            multi_continuation,
+        )
+
+        ordinal_303_root = root / "ordinal-0303"
+        representation_303, service_303 = self.build_service(
+            root=ordinal_303_root,
+            source_id=f"src_{303:032x}",
+        )
+        handoff_303 = ExternalAgentSemanticHandoffService(
+            service_303,
+            JsonlAtomicInformationStore(ordinal_303_root / "atomic.jsonl"),
+            handoff.audit_root,
+        )
+        old_303_runner = FakeRunner()
+        with self.assertRaises(SemanticHandoffError):
+            handoff_303.execute(
+                representation_303.representation_id,
+                CodexCliRepresentationAnalysisProvider(
+                    provider_version="0.147.0",
+                    timeout_seconds=300,
+                    runner=old_303_runner,
+                    diagnostic_root=timeout_provider.diagnostic_root,
+                ),
+                privacy_binding=self.privacy_binding(),
+                authority_binding=failed_closed_window,
+            )
+        self.assertEqual(old_303_runner.calls, [])
+        runner_303 = FakeRunner()
+        handoff_303.execute(
+            representation_303.representation_id,
+            CodexCliRepresentationAnalysisProvider(
+                provider_version="0.147.0",
+                timeout_seconds=300,
+                runner=runner_303,
+                diagnostic_root=timeout_provider.diagnostic_root,
+            ),
+            privacy_binding=self.privacy_binding(),
+            authority_binding=replace(
+                failed_closed_window, reviewed_git_head=multi_head
+            ),
+        )
+        self.assertEqual(len(runner_303.calls), 1)
+        attempt_303 = next(
+            json.loads(path.read_text(encoding="utf-8"))
+            for path in handoff.audit_root.glob("semantic_run_*/attempts/*.json")
+            if json.loads(path.read_text(encoding="utf-8")).get(
+                "global_ordinal"
+            )
+            == 303
+        )
+        self.assertEqual(
+            attempt_303["global_authority_fingerprint"],
+            multi_continuation["continuation_fingerprint"],
+        )
         failed_closed_path = (
             handoff.audit_root
             / "semantic_global_authority"
@@ -11729,61 +11849,6 @@ print("passed")
                 resolution_id=unknown_166["resolution_id"],
             )
         unknown_path.write_bytes(unknown_bytes)
-
-        ordinal_299_root = root / "ordinal-0299"
-        representation_299, service_299 = self.build_service(
-            root=ordinal_299_root,
-            source_id=f"src_{299:032x}",
-        )
-        handoff_299 = ExternalAgentSemanticHandoffService(
-            service_299,
-            JsonlAtomicInformationStore(ordinal_299_root / "atomic.jsonl"),
-            handoff.audit_root,
-        )
-        old_299_runner = FakeRunner()
-        with self.assertRaises(SemanticHandoffError):
-            handoff_299.execute(
-                representation_299.representation_id,
-                CodexCliRepresentationAnalysisProvider(
-                    provider_version="0.147.0",
-                    timeout_seconds=300,
-                    runner=old_299_runner,
-                    diagnostic_root=timeout_provider.diagnostic_root,
-                ),
-                privacy_binding=self.privacy_binding(),
-                authority_binding=replace(
-                    gate_c_window, reviewed_git_head=startup_head
-                ),
-            )
-        self.assertEqual(old_299_runner.calls, [])
-        runner_299 = FakeRunner()
-        handoff_299.execute(
-            representation_299.representation_id,
-            CodexCliRepresentationAnalysisProvider(
-                provider_version="0.147.0",
-                timeout_seconds=300,
-                runner=runner_299,
-                diagnostic_root=timeout_provider.diagnostic_root,
-            ),
-            privacy_binding=self.privacy_binding(),
-            authority_binding=replace(
-                gate_c_window, reviewed_git_head=failed_closed_head
-            ),
-        )
-        self.assertEqual(len(runner_299.calls), 1)
-        attempt_299 = next(
-            json.loads(path.read_text(encoding="utf-8"))
-            for path in handoff.audit_root.glob("semantic_run_*/attempts/*.json")
-            if json.loads(path.read_text(encoding="utf-8")).get(
-                "global_ordinal"
-            )
-            == 299
-        )
-        self.assertEqual(
-            attempt_299["global_authority_fingerprint"],
-            failed_closed_continuation["continuation_fingerprint"],
-        )
-
 
 if __name__ == "__main__":
     unittest.main()
