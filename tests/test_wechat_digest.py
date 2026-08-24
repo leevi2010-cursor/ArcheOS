@@ -77,6 +77,7 @@ from archeos.wechat_digest import (
     WechatDigestRunStore,
     WechatDigestService,
     _build_plan,
+    _conversation_source_payload,
     _governance_atomic_fingerprint,
     _plan_fingerprint,
 )
@@ -5634,6 +5635,320 @@ class WechatDigestTests(unittest.TestCase):
 
         self.assertTrue(resumed.checkpoint_published)
         self.assertEqual(len(capture.calls), 2)
+
+    def _make_represented_pre_provider_value_error_run(
+        self, *, conversation_count: int = 27
+    ) -> tuple[
+        WechatDigestService,
+        SyntheticCaptureProvider,
+        str,
+        str,
+    ]:
+        messages = [
+            message(index, conversation=f"conversation_{index:02d}")
+            for index in range(1, conversation_count + 1)
+        ]
+        capture_provider = SyntheticCaptureProvider(messages)
+        capture = WechatCapture(
+            capture_provider.provider_version,
+            ZERO_CURSOR,
+            messages[-1].cursor,
+            tuple(messages),
+        )
+        plan, status = _build_plan(
+            capture,
+            clock=lambda: "2026-08-25T00:00:00Z",
+            all_history_upper_bound=messages[-1].cursor,
+        )
+        service = self.service(capture_provider)
+        service.run_store.create(plan, status)
+        conversation_plan = plan["conversations"][0]
+        assert isinstance(conversation_plan, dict)
+        item_id = f"conversation:{conversation_plan['conversation_key']}"
+        payload = _conversation_source_payload(
+            capture,
+            str(conversation_plan["conversation_key"]),
+            {},
+        )
+        representation_id = service._process_conversation(
+            str(plan["run_id"]),
+            status,
+            item_id,
+            conversation_plan,
+            payload,
+            prepare_only=True,
+        )
+        assert representation_id is not None
+        failed = service.run_store.status(str(plan["run_id"]))
+        failed["state"] = "failed"
+        failed["failure_category"] = "ValueError"
+        failed["updated_at"] = "2026-08-25T00:01:00Z"
+        service.run_store.update_status(str(plan["run_id"]), failed)
+        return service, capture_provider, str(plan["run_id"]), item_id
+
+    def test_capture_upgrade_recovers_one_represented_pre_provider_item(
+        self,
+    ) -> None:
+        service, capture_provider, run_id, item_id = (
+            self._make_represented_pre_provider_value_error_run()
+        )
+        before = service.run_store.status(run_id)
+        before_items = before["items"]
+        represented = before_items[item_id]
+        representation_id = represented["representation_id"]
+        representation_before = service.representation_repository.get(
+            representation_id
+        )
+
+        with service.run_store.lock():
+            _capture, upgraded_plan, upgraded = (
+                service._load_or_upgrade_active_capture(
+                    run_id,
+                    service.run_store.plan(run_id),
+                    before,
+                )
+            )
+
+        self.assertEqual(len(capture_provider.calls), 1)
+        self.assertEqual(self.semantic.provider.calls, 0)
+        self.assertEqual(upgraded_plan["schema_version"], "wechat-digest-run-plan/4.0")
+        self.assertEqual(upgraded["state"], "processing")
+        self.assertIsNone(upgraded["failure_category"])
+        self.assertFalse(upgraded["checkpoint_published"])
+        self.assertEqual(upgraded["items"], before_items)
+        self.assertEqual(
+            service.representation_repository.get(representation_id),
+            representation_before,
+        )
+        self.assertEqual(
+            Counter(item["state"] for item in upgraded["items"].values()),
+            Counter({"planned": 26, "represented": 1}),
+        )
+
+        first_capture_calls = len(capture_provider.calls)
+        first_status = service.run_store.status(run_id)
+        run_dir = service.run_store.runs_root / run_id
+        before_replay = {
+            path.relative_to(run_dir): path.read_bytes()
+            for path in run_dir.rglob("*")
+            if path.is_file()
+        }
+        with service.run_store.lock():
+            _capture, replay_plan, replay_status = (
+                service._load_or_upgrade_active_capture(
+                    run_id,
+                    service.run_store.plan(run_id),
+                    first_status,
+                )
+            )
+        self.assertEqual(len(capture_provider.calls), first_capture_calls)
+        self.assertEqual(self.semantic.provider.calls, 0)
+        self.assertEqual(replay_plan, upgraded_plan)
+        self.assertEqual(replay_status, first_status)
+        self.assertEqual(
+            {
+                path.relative_to(run_dir): path.read_bytes()
+                for path in run_dir.rglob("*")
+                if path.is_file()
+            },
+            before_replay,
+        )
+
+    def test_capture_upgrade_keeps_all_planned_value_error_recovery(self) -> None:
+        captured_message = message(1)
+        capture_provider = SyntheticCaptureProvider([captured_message])
+        capture = WechatCapture(
+            capture_provider.provider_version,
+            ZERO_CURSOR,
+            captured_message.cursor,
+            (captured_message,),
+        )
+        plan, status = _build_plan(
+            capture,
+            clock=lambda: "2026-08-25T00:00:00Z",
+        )
+        status["state"] = "failed"
+        status["failure_category"] = "ValueError"
+        service = self.service(capture_provider)
+        service.run_store.create(plan, status)
+
+        with service.run_store.lock():
+            _capture, _plan, upgraded = service._load_or_upgrade_active_capture(
+                str(plan["run_id"]), plan, status
+            )
+
+        self.assertEqual(upgraded["state"], "processing")
+        self.assertIsNone(upgraded["failure_category"])
+        self.assertFalse(upgraded["checkpoint_published"])
+        self.assertEqual(len(capture_provider.calls), 1)
+        self.assertEqual(self.semantic.provider.calls, 0)
+
+    def test_capture_upgrade_rejects_represented_semantic_or_governance_trace_before_write(
+        self,
+    ) -> None:
+        cases = (
+            "semantic_package",
+            "semantic_run_receipt",
+            "semantic_attempt",
+            "semantic_started",
+            "semantic_result",
+            "atomic_information",
+            "governance_receipt",
+            "governance_metrics",
+            "semantic_failure",
+            "governance_failure",
+        )
+        for index, case in enumerate(cases):
+            if index:
+                self.tearDown()
+                self.setUp()
+            with self.subTest(case=case):
+                service, capture_provider, run_id, item_id = (
+                    self._make_represented_pre_provider_value_error_run()
+                )
+                status_path = service.run_store.runs_root / run_id / "status.json"
+                status = json.loads(status_path.read_text(encoding="utf-8"))
+                item = status["items"][item_id]
+                representation_id = item["representation_id"]
+                if case == "semantic_package":
+                    (
+                        self.workspace
+                        / "02_processing"
+                        / "information"
+                        / representation_id
+                    ).mkdir(parents=True)
+                elif case.startswith("semantic_"):
+                    run_dir = (
+                        self.workspace
+                        / "02_processing"
+                        / "semantic_handoff_runs"
+                        / ("semantic_run_" + "a" * 32)
+                    )
+                    run_dir.mkdir(parents=True)
+                    (run_dir / "run-receipt.json").write_text(
+                        json.dumps(
+                            {
+                                "representation": {
+                                    "representation_id": representation_id
+                                }
+                            }
+                        ),
+                        encoding="utf-8",
+                    )
+                    marker_directories = {
+                        "semantic_attempt": "attempts",
+                        "semantic_started": "started",
+                        "semantic_result": "results/batch_0001",
+                    }
+                    marker_directory = marker_directories.get(case)
+                    if marker_directory is not None:
+                        marker_root = run_dir / marker_directory
+                        marker_root.mkdir(parents=True)
+                        (marker_root / "trace.json").write_text(
+                            json.dumps({"synthetic": True}),
+                            encoding="utf-8",
+                        )
+                elif case == "atomic_information":
+                    item["atomic_information_ids"] = ["info_" + "a" * 64]
+                else:
+                    item[case] = {"synthetic": True}
+                if case not in {"semantic_package", "semantic_run_receipt"}:
+                    status_path.write_text(json.dumps(status), encoding="utf-8")
+                run_dir = service.run_store.runs_root / run_id
+                before = {
+                    path.relative_to(run_dir): path.read_bytes()
+                    for path in run_dir.rglob("*")
+                    if path.is_file()
+                }
+
+                with service.run_store.lock(), self.assertRaises(WechatDigestError):
+                    service._load_or_upgrade_active_capture(
+                        run_id,
+                        service.run_store.plan(run_id),
+                        service.run_store.status(run_id),
+                    )
+
+                after = {
+                    path.relative_to(run_dir): path.read_bytes()
+                    for path in run_dir.rglob("*")
+                    if path.is_file()
+                }
+                self.assertEqual(after, before)
+                self.assertEqual(capture_provider.calls, [])
+                self.assertEqual(self.semantic.provider.calls, 0)
+
+    def test_capture_upgrade_rejects_unverified_or_ambiguous_pre_provider_shape(
+        self,
+    ) -> None:
+        cases = (
+            "source_drift",
+            "representation_drift",
+            "multiple_represented",
+            "unknown_state",
+        )
+        for index, case in enumerate(cases):
+            if index:
+                self.tearDown()
+                self.setUp()
+            with self.subTest(case=case):
+                service, capture_provider, run_id, item_id = (
+                    self._make_represented_pre_provider_value_error_run()
+                )
+                status_path = service.run_store.runs_root / run_id / "status.json"
+                status = json.loads(status_path.read_text(encoding="utf-8"))
+                if case == "source_drift":
+                    source_id = status["items"][item_id]["source_id"]
+                    source = service.source_repository.get(source_id)
+                    managed_path = (
+                        self.workspace / "01_inbox" / source.managed_locator
+                    )
+                    managed_path.write_bytes(managed_path.read_bytes() + b"x")
+                elif case == "representation_drift":
+                    representation = status["items"][item_id]["representation_id"]
+                    manifest_path = next(
+                        (
+                            self.workspace
+                            / "02_processing"
+                            / "representations"
+                        ).glob(f"*/{representation}/manifest.json")
+                    )
+                    manifest_path.write_bytes(manifest_path.read_bytes() + b"x")
+                elif case == "multiple_represented":
+                    second_id = next(
+                        key
+                        for key, item in status["items"].items()
+                        if key != item_id and item["state"] == "planned"
+                    )
+                    status["items"][second_id]["state"] = "represented"
+                    status["items"][second_id]["representation_id"] = status[
+                        "items"
+                    ][item_id]["representation_id"]
+                    status_path.write_text(json.dumps(status), encoding="utf-8")
+                else:
+                    status["items"][item_id]["state"] = "processing"
+                    status_path.write_text(json.dumps(status), encoding="utf-8")
+                run_dir = service.run_store.runs_root / run_id
+                before = {
+                    path.relative_to(run_dir): path.read_bytes()
+                    for path in run_dir.rglob("*")
+                    if path.is_file()
+                }
+
+                with service.run_store.lock(), self.assertRaises(WechatDigestError):
+                    service._load_or_upgrade_active_capture(
+                        run_id,
+                        service.run_store.plan(run_id),
+                        service.run_store.status(run_id),
+                    )
+
+                after = {
+                    path.relative_to(run_dir): path.read_bytes()
+                    for path in run_dir.rglob("*")
+                    if path.is_file()
+                }
+                self.assertEqual(after, before)
+                self.assertEqual(capture_provider.calls, [])
+                self.assertEqual(self.semantic.provider.calls, 0)
 
     def test_legacy_v3_capture_upgrade_adopts_every_artifact_breakpoint(self) -> None:
         hooks = (
