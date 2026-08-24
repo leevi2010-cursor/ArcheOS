@@ -43,6 +43,7 @@ from .digestion.providers import interpretation_to_dict, parse_interpretation
 from .emergence import IdentityEvidence, IdentityGateService
 from .representation import (
     LocalRepresentationRepository,
+    RepresentationError,
     RepresentationService,
     WechatConversationV2RepresentationAdapter,
 )
@@ -9563,8 +9564,118 @@ class WechatDigestService:
         self.run_store.create(plan, status)
         return plan, status
 
-    @staticmethod
-    def _value_error_was_pre_provider(status: Mapping[str, object]) -> bool:
+    def _semantic_trace_exists(self, representation_id: str) -> bool:
+        package = (
+            self.workspace
+            / "02_processing"
+            / "information"
+            / representation_id
+        )
+        if os.path.lexists(package):
+            return True
+        audit_root = (
+            self.workspace / "02_processing" / "semantic_handoff_runs"
+        )
+        if not os.path.lexists(audit_root):
+            return False
+        if not audit_root.is_dir():
+            raise WechatDigestError(
+                "微信 represented pre-provider Semantic inventory 损坏。"
+            )
+        try:
+            needle = representation_id.encode("utf-8")
+            return any(
+                needle in path.read_bytes()
+                for path in audit_root.rglob("*.json")
+                if path.is_file()
+            )
+        except OSError as exc:
+            raise WechatDigestError(
+                "微信 represented pre-provider Semantic inventory 不可读。"
+            ) from exc
+
+    def _verify_represented_pre_provider_item(
+        self,
+        plan: Mapping[str, object],
+        item: Mapping[str, object],
+    ) -> None:
+        source_id = item.get("source_id")
+        representation_id = item.get("representation_id")
+        if not isinstance(source_id, str) or not isinstance(
+            representation_id, str
+        ):
+            raise WechatDigestError(
+                "微信 represented pre-provider binding 损坏。"
+            )
+        expected_source = next(
+            (
+                candidate
+                for candidate in (
+                    _plan_sequence(plan.get("conversations"), "conversations")
+                    + _plan_sequence(plan.get("attachments"), "attachments")
+                )
+                if candidate.get("source_id") == source_id
+            ),
+            None,
+        )
+        if expected_source is None:
+            raise WechatDigestError(
+                "微信 represented pre-provider Source binding 损坏。"
+            )
+        try:
+            source = self.source_repository.get(source_id)
+            if (
+                source.content_hash != expected_source.get("content_hash")
+                or source.size_bytes != expected_source.get("size_bytes")
+                or not self.source_service.verify(source_id).verified
+            ):
+                raise WechatDigestError(
+                    "微信 represented pre-provider Source 读回失败。"
+                )
+            representation = self.representation_repository.get(
+                representation_id
+            )
+            if (
+                representation.source_id != source_id
+                or representation.status != "complete"
+                or representation.completeness != 1.0
+                or representation.warnings
+                or not self.representation_service.verify(
+                    representation_id
+                ).verified
+            ):
+                raise WechatDigestError(
+                    "微信 represented pre-provider Representation 读回失败。"
+                )
+            if self._semantic_trace_exists(representation_id):
+                raise WechatDigestError(
+                    "微信 represented item 已存在 Semantic 执行痕迹。"
+                )
+            if any(
+                revision.origin_source_id == source_id
+                for revision in self.information_store.list_atomic_information()
+            ):
+                raise WechatDigestError(
+                    "微信 represented item 已存在 Durable Atomic Information。"
+                )
+        except WechatDigestError:
+            raise
+        except (
+            OSError,
+            TypeError,
+            ValueError,
+            RepresentationError,
+            SourceNotFoundError,
+        ) as exc:
+            raise WechatDigestError(
+                "微信 represented pre-provider 证据未能完整读回。"
+            ) from exc
+
+    def _value_error_was_pre_provider(
+        self,
+        plan: Mapping[str, object],
+        status: Mapping[str, object],
+    ) -> bool:
         if (
             status.get("state") != "failed"
             or status.get("failure_category") != "ValueError"
@@ -9573,21 +9684,55 @@ class WechatDigestService:
             return False
         items = status.get("items")
         if not isinstance(items, dict):
-            return False
+            raise WechatDigestError("微信 pre-provider 恢复状态 items 损坏。")
+        represented: list[Mapping[str, object]] = []
         for item in items.values():
             if not isinstance(item, dict):
-                return False
+                raise WechatDigestError("微信 pre-provider 恢复 item 损坏。")
             if item.get("state") in TERMINAL_ITEM_STATES:
                 continue
             if (
-                item.get("state") != "planned"
-                or item.get("representation_id") is not None
-                or item.get("atomic_information_ids") != []
+                item.get("atomic_information_ids") != []
                 or item.get("governance_receipt") is not None
+                or item.get("governance_metrics") is not None
+                or item.get("governance_migration") is not None
                 or item.get("semantic_failure") is not None
                 or item.get("governance_failure") is not None
+                or item.get("pending_human") is not False
+                or item.get("context_object_ids") != []
             ):
-                return False
+                raise WechatDigestError(
+                    "微信 pre-provider 恢复存在 Semantic 或 Governance 痕迹。"
+                )
+            if item.get("state") == "planned":
+                if (
+                    item.get("representation_id") is not None
+                    or item.get("privacy_route") is not None
+                    or item.get("privacy_categories") != []
+                ):
+                    raise WechatDigestError(
+                        "微信 planned pre-provider item 形态损坏。"
+                    )
+                continue
+            if item.get("state") == "represented":
+                if (
+                    item.get("privacy_route") is not None
+                    or item.get("privacy_categories") != []
+                ):
+                    raise WechatDigestError(
+                        "微信 represented pre-provider privacy 形态损坏。"
+                    )
+                represented.append(item)
+                continue
+            raise WechatDigestError(
+                "微信 pre-provider 恢复存在未知非终态形态。"
+            )
+        if len(represented) > 1:
+            raise WechatDigestError(
+                "微信 pre-provider 恢复存在多个 represented item。"
+            )
+        if represented:
+            self._verify_represented_pre_provider_item(plan, represented[0])
         return True
 
     def _load_or_upgrade_active_capture(
@@ -9603,6 +9748,16 @@ class WechatDigestService:
         }:
             raise WechatDigestError(
                 "active legacy 微信运行必须先完成既有显式升级。"
+            )
+        normalize_pre_provider_failure = self._value_error_was_pre_provider(
+            plan, status
+        )
+        if normalize_pre_provider_failure:
+            self._verify_plan_and_status(
+                run_id,
+                None,
+                plan,
+                status,
             )
         previous_plan = (
             _capture_plan_projection(plan)
@@ -9672,7 +9827,7 @@ class WechatDigestService:
             raise WechatDigestError("微信 capture upgrade 与 v3 plan 不一致。")
         target_status = dict(status)
         target_status["plan_fingerprint"] = _plan_fingerprint(target_plan)
-        if self._value_error_was_pre_provider(target_status):
+        if normalize_pre_provider_failure:
             target_status["state"] = "processing"
             target_status["failure_category"] = None
             target_status["updated_at"] = self.clock()
