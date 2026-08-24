@@ -3280,7 +3280,11 @@ class WechatDigestService:
         return (cursor.timestamp, cursor.conversation_key, cursor.message_key)
 
     def _semantic_authority_binding(
-        self, run_id: str, *, allow_reviewed_head_extension: bool = False
+        self,
+        run_id: str,
+        *,
+        allow_reviewed_head_extension: bool = False,
+        replay_completed_window_captures: bool = True,
     ) -> SemanticWindowAuthorityBinding:
         plan = self.run_store.plan(run_id)
         receipt = self.run_store.plan_receipt(run_id)
@@ -3368,16 +3372,16 @@ class WechatDigestService:
                     continue
                 candidate_receipt = self.run_store.plan_receipt(path.name)
                 candidate_status = self.run_store.status(path.name)
-                candidate_capture = self.capture_provider.capture(
-                    candidate_after,
-                    upper_bound=candidate_upper,
-                )
-                self._verify_capture_against_plan(
-                    candidate_capture, candidate_plan
-                )
                 self._verify_plan_and_status(
                     path.name,
-                    candidate_capture,
+                    (
+                        self.capture_provider.capture(
+                            candidate_after,
+                            upper_bound=candidate_upper,
+                        )
+                        if replay_completed_window_captures
+                        else None
+                    ),
                     candidate_plan,
                     candidate_status,
                 )
@@ -4372,6 +4376,7 @@ class WechatDigestService:
         *,
         authority_ref: str,
         adopted_continuation: Mapping[str, object] | None = None,
+        replay_capture: bool = True,
     ) -> dict[str, object]:
         run_id = self.run_store.active_run_id()
         if run_id is None:
@@ -4380,10 +4385,17 @@ class WechatDigestService:
         plan_receipt = self.run_store.plan_receipt(run_id)
         after = WechatCursor.from_dict(plan.get("after_cursor"), "plan.after_cursor")
         upper = WechatCursor.from_dict(plan.get("upper_bound"), "plan.upper_bound")
-        capture = self.capture_provider.capture(after, upper_bound=upper)
-        self._verify_capture_against_plan(capture, plan)
         status = self.run_store.status(run_id)
-        self._verify_plan_and_status(run_id, capture, plan, status)
+        capture_fingerprint = plan.get("capture_fingerprint")
+        if not _sha256_value(capture_fingerprint):
+            raise WechatDigestError("多项目 Governance capture binding 损坏。")
+        if replay_capture:
+            capture = self.capture_provider.capture(after, upper_bound=upper)
+            self._verify_capture_against_plan(capture, plan)
+            self._verify_plan_and_status(run_id, capture, plan, status)
+            capture_fingerprint = _capture_fingerprint(capture)
+        else:
+            self._verify_plan_and_status(run_id, None, plan, status)
         checkpoint = self.run_store.checkpoint()
         if (
             self._plan_all_history_upper(plan) is None
@@ -4516,7 +4528,9 @@ class WechatDigestService:
         }:
             raise WechatDigestError("多项目 Governance Semantic ledger 不匹配。")
         window_binding = self._semantic_authority_binding(
-            run_id, allow_reviewed_head_extension=True
+            run_id,
+            allow_reviewed_head_extension=True,
+            replay_completed_window_captures=False,
         )
         if adopted_continuation is not None:
             previous_head = adopted_continuation.get("previous_reviewed_git_head")
@@ -4542,7 +4556,7 @@ class WechatDigestService:
             "status_fingerprint": _sha256_bytes(
                 _canonical_json(status).encode("utf-8")
             ),
-            "capture_fingerprint": _capture_fingerprint(capture),
+            "capture_fingerprint": capture_fingerprint,
             "checkpoint_fingerprint": _sha256_bytes(
                 _canonical_json(
                     None if checkpoint is None else checkpoint.to_dict()
@@ -4620,7 +4634,11 @@ class WechatDigestService:
             )
 
     def resolve_multi_governance_startup_failure(
-        self, *, authority_ref: str, authority_manifest_file: Path
+        self,
+        *,
+        authority_ref: str,
+        authority_manifest_file: Path,
+        progress: Callable[[str], None] | None = None,
     ) -> dict[str, object]:
         """Install one item-scoped Issue #168 recovery without Providers."""
 
@@ -4632,6 +4650,9 @@ class WechatDigestService:
         )
         if manifest.get("authority_ref") != authority_ref:
             raise WechatDigestError("多项目 Governance authority ref 不匹配。")
+        if progress is not None:
+            progress("capture_skipped")
+            progress("verify")
         with self.run_store.lock():
             binding = manifest["recovery_binding"]
             assert isinstance(binding, dict)
@@ -4684,16 +4705,21 @@ class WechatDigestService:
                     self._build_multi_governance_startup_recovery_manifest_unlocked(
                         authority_ref=authority_ref,
                         adopted_continuation=semantic_continuation,
+                        replay_capture=False,
                     )
                 )
                 if expected != manifest:
                     raise WechatDigestError("多项目 Governance manifest 与现场不匹配。")
+                if progress is not None:
+                    progress("write")
                 if semantic_continuation is None:
                     semantic_continuation = (
                         self._semantic_port()
                         .install_multi_governance_startup_recovery_continuation(
                             window_binding=self._semantic_authority_binding(
-                                run_id, allow_reviewed_head_extension=True
+                                run_id,
+                                allow_reviewed_head_extension=True,
+                                replay_completed_window_captures=False,
                             ),
                             authority_ref=authority_ref,
                             authority_manifest_fingerprint=str(
@@ -4734,6 +4760,10 @@ class WechatDigestService:
                         receipt=receipt,
                     )
                 )
+            elif progress is not None:
+                progress("write_skipped")
+            if progress is not None:
+                progress("readback")
             existing = _validated_governance_startup_recovery_receipt(existing)
             if (
                 existing.get("authority_ref") != authority_ref
@@ -4790,15 +4820,7 @@ class WechatDigestService:
             ):
                 raise WechatDigestError("多项目 Governance 历史 receipt 漂移。")
             plan = self.run_store.plan(run_id)
-            after = WechatCursor.from_dict(
-                plan.get("after_cursor"), "plan.after_cursor"
-            )
-            upper = WechatCursor.from_dict(
-                plan.get("upper_bound"), "plan.upper_bound"
-            )
-            capture = self.capture_provider.capture(after, upper_bound=upper)
-            self._verify_capture_against_plan(capture, plan)
-            self._verify_plan_and_status(run_id, capture, plan, status)
+            self._verify_plan_and_status(run_id, None, plan, status)
             source_id = str(binding["source_id"])
             representation_id = str(binding["representation_id"])
             source = self.source_repository.get(source_id)
@@ -4836,7 +4858,7 @@ class WechatDigestService:
                     )
                 )
                 != binding.get("plan_receipt_fingerprint")
-                or _capture_fingerprint(capture)
+                or plan.get("capture_fingerprint")
                 != binding.get("capture_fingerprint")
                 or _sha256_bytes(
                     _canonical_json(
@@ -8243,7 +8265,7 @@ class WechatDigestService:
     def _verify_plan_and_status(
         self,
         active_run_id: str,
-        capture: WechatCapture,
+        capture: WechatCapture | None,
         plan: dict[str, object],
         status: dict[str, object],
         *,
@@ -8295,23 +8317,24 @@ class WechatDigestService:
             expected_status_keys.add("plan_fingerprint")
         if set(status) != expected_status_keys:
             raise WechatDigestError("微信运行状态形态损坏。")
-        expected, _ = _build_plan(
-            capture,
-            clock=lambda: created_at,
-            run_id=run_id,
-            created_at=created_at,
-            semantic_batch_size=self._plan_batch_size(plan),
-            all_history_upper_bound=self._plan_all_history_upper(plan),
-        )
-        comparable = dict(plan)
-        if comparable.get("schema_version") == LEGACY_RUN_PLAN_SCHEMA_VERSION:
-            expected.pop("semantic_batch_size")
-            expected.pop("all_history_upper_bound")
-            expected["schema_version"] = LEGACY_RUN_PLAN_SCHEMA_VERSION
-        elif comparable.get("schema_version") == PREVIOUS_RUN_PLAN_SCHEMA_VERSION:
-            expected = _previous_plan_projection(expected)
-        if comparable != expected:
-            raise WechatDigestError("微信 durable plan 与 fixed capture 不一致。")
+        if capture is not None:
+            expected, _ = _build_plan(
+                capture,
+                clock=lambda: created_at,
+                run_id=run_id,
+                created_at=created_at,
+                semantic_batch_size=self._plan_batch_size(plan),
+                all_history_upper_bound=self._plan_all_history_upper(plan),
+            )
+            comparable = dict(plan)
+            if comparable.get("schema_version") == LEGACY_RUN_PLAN_SCHEMA_VERSION:
+                expected.pop("semantic_batch_size")
+                expected.pop("all_history_upper_bound")
+                expected["schema_version"] = LEGACY_RUN_PLAN_SCHEMA_VERSION
+            elif comparable.get("schema_version") == PREVIOUS_RUN_PLAN_SCHEMA_VERSION:
+                expected = _previous_plan_projection(expected)
+            if comparable != expected:
+                raise WechatDigestError("微信 durable plan 与 fixed capture 不一致。")
         items = status.get("items")
         if not isinstance(items, dict):
             raise WechatDigestError("微信运行状态 items 损坏。")

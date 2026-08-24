@@ -1630,10 +1630,20 @@ def _wechat_product_command(args: argparse.Namespace) -> int:
             )
             return 0
         if args.resolve_multi_governance_startup_failure:
+            progress_messages = {
+                "capture_skipped": "恢复安装：复用已持久化证据，无需重新读取微信历史。",
+                "verify": "恢复安装：正在核对持久化证据。",
+                "write": "恢复安装：证据已通过，正在写入恢复许可。",
+                "write_skipped": "恢复安装：恢复许可已存在，无需重复写入。",
+                "readback": "恢复安装：正在读回并确认恢复状态。",
+            }
             resolution = service.resolve_multi_governance_startup_failure(
                 authority_ref=args.authority_ref,
                 authority_manifest_file=(
                     args.multi_governance_startup_authority_file
+                ),
+                progress=lambda stage: print(
+                    progress_messages[stage], file=sys.stderr, flush=True
                 ),
             )
             print(
