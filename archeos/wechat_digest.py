@@ -15,6 +15,7 @@ import os
 import re
 import stat
 import subprocess
+import threading
 import tempfile
 import time
 from collections import Counter
@@ -4095,6 +4096,9 @@ class WechatDigestService:
         self._before_governance_provider_call: Callable[[], None] | None = None
         self._governance_resume_state: dict[str, object] | None = None
         self._governance_migration_state: dict[str, object] | None = None
+        self._governance_execution_lock = threading.Lock()
+        self._governance_observation_lock = threading.Lock()
+        self._governance_active = 0
         self._after_governance_batch_interpretation: Callable[
             [
                 tuple[str, ...],
@@ -10438,11 +10442,6 @@ class WechatDigestService:
             item_id,
             atomic_information_ids=list(atomic_ids),
         )
-        if atomic_ids:
-            self._segment_performance["governance_peak_concurrency"] = max(
-                self._segment_performance.get("governance_peak_concurrency", 0),
-                1,
-            )
         pending, object_ids = self._govern_item(
             run_id, status, item_id, atomic_ids
         )
@@ -10535,11 +10534,6 @@ class WechatDigestService:
             item_id,
             atomic_information_ids=list(atomic_ids),
         )
-        if atomic_ids:
-            self._segment_performance["governance_peak_concurrency"] = max(
-                self._segment_performance.get("governance_peak_concurrency", 0),
-                1,
-            )
         pending, object_ids = self._govern_item(
             run_id, status, item_id, atomic_ids
         )
@@ -10868,6 +10862,23 @@ class WechatDigestService:
             )
         return recovery
 
+    @contextmanager
+    def _governance_execution(self):
+        with self._governance_execution_lock:
+            with self._governance_observation_lock:
+                self._governance_active += 1
+                self._segment_performance["governance_peak_concurrency"] = max(
+                    self._segment_performance.get(
+                        "governance_peak_concurrency", 0
+                    ),
+                    self._governance_active,
+                )
+            try:
+                yield
+            finally:
+                with self._governance_observation_lock:
+                    self._governance_active -= 1
+
     def _govern_item(
         self,
         run_id: str,
@@ -10877,6 +10888,18 @@ class WechatDigestService:
     ) -> tuple[bool, tuple[str, ...]]:
         if not atomic_ids:
             return False, ()
+        with self._governance_execution():
+            return self._govern_item_active(
+                run_id, status, item_id, atomic_ids
+            )
+
+    def _govern_item_active(
+        self,
+        run_id: str,
+        status: dict[str, object],
+        item_id: str,
+        atomic_ids: Sequence[str],
+    ) -> tuple[bool, tuple[str, ...]]:
         atomic_fingerprint = _governance_atomic_fingerprint(atomic_ids)
         current = self.run_store.status(run_id)
         current_items = current.get("items")

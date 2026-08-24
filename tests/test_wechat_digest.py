@@ -5753,10 +5753,95 @@ class WechatDigestTests(unittest.TestCase):
         self.assertGreaterEqual(publish_ms, 0)
         self.assertGreaterEqual(readback_ms, 0)
 
+    def test_govern_item_serializes_two_real_thread_entries(self) -> None:
+        first_entered = threading.Event()
+        second_started = threading.Event()
+        second_entered = threading.Event()
+        release_first = threading.Event()
+        active_observations: list[int] = []
+
+        class ControlledGovernanceService(WechatDigestService):
+            def _govern_item_active(
+                self,
+                run_id,
+                status,
+                item_id,
+                atomic_ids,
+            ):
+                del run_id, status
+                with self._governance_observation_lock:
+                    active_observations.append(self._governance_active)
+                if item_id == "first":
+                    first_entered.set()
+                    if not release_first.wait(timeout=5):
+                        raise AssertionError("first governance entry was not released")
+                else:
+                    second_entered.set()
+                return False, tuple(atomic_ids)
+
+        service = ControlledGovernanceService(
+            workspace=self.workspace,
+            capture_provider=SyntheticCaptureProvider([]),
+            semantic_handoff_factory=lambda: self.semantic,
+            interpretation_provider=NoStructuralChangeProvider(),
+        )
+        results: dict[str, tuple[bool, tuple[str, ...]]] = {}
+
+        def invoke(item_id: str, atomic_id: str) -> None:
+            if item_id == "second":
+                second_started.set()
+            results[item_id] = service._govern_item(
+                "run_" + "1" * 32,
+                {},
+                item_id,
+                (atomic_id,),
+            )
+
+        first = threading.Thread(target=invoke, args=("first", "atomic_first"))
+        second = threading.Thread(target=invoke, args=("second", "atomic_second"))
+        first.start()
+        self.assertTrue(first_entered.wait(timeout=5))
+        second.start()
+        self.assertTrue(second_started.wait(timeout=5))
+        self.assertFalse(second_entered.wait(timeout=0.05))
+        with service._governance_observation_lock:
+            self.assertEqual(service._governance_active, 1)
+        self.assertEqual(
+            service._segment_performance["governance_peak_concurrency"], 1
+        )
+
+        release_first.set()
+        first.join(timeout=5)
+        second.join(timeout=5)
+
+        self.assertFalse(first.is_alive())
+        self.assertFalse(second.is_alive())
+        self.assertEqual(active_observations, [1, 1])
+        self.assertEqual(
+            results,
+            {
+                "first": (False, ("atomic_first",)),
+                "second": (False, ("atomic_second",)),
+            },
+        )
+        with service._governance_observation_lock:
+            self.assertEqual(service._governance_active, 0)
+        self.assertEqual(
+            service._segment_performance["governance_peak_concurrency"], 1
+        )
+
     def test_production_shaped_service_max3_uses_one_capture_and_serial_governance(
         self,
     ) -> None:
         shared_object_id = self.create_object()
+        with SQLiteWorldModelRepository(
+            self.workspace / "04_core" / "archeos.sqlite3"
+        ) as repository:
+            repository.add_role(shared_object_id, "brand")
+            objects_before = repository.list_objects()
+            names_before = repository.list_names(shared_object_id)
+            roles_before = repository.list_roles(shared_object_id)
+            apply_receipts_before = repository.list_apply_receipts()
         missing_attachments = {
             number: attachment(
                 None,
@@ -5792,23 +5877,13 @@ class WechatDigestTests(unittest.TestCase):
             interpretation_provider=NoStructuralChangeProvider(),
             semantic_parallelism=2,
         )
+        proposals_before = service.proposal_store.list_history()
+        journal_before = service.journal.list_changes()
 
-        full_capture_path_started = time.monotonic_ns()
-        results = [
-            service.run(all_history=True, max_terminal_items=3)
-        ]
-        full_capture_path_ns = time.monotonic_ns() - full_capture_path_started
-        run_id = results[0].run_id
-        readback_samples = []
-        for _ in range(7):
-            started = time.monotonic_ns()
-            service.run_store.load_capture_artifacts(run_id)
-            readback_samples.append(time.monotonic_ns() - started)
+        results = [service.run(all_history=True, max_terminal_items=3)]
         while service.run_store.active_run_id() is not None:
             results.append(service.run(max_terminal_items=3))
 
-        median_readback_ns = sorted(readback_samples)[len(readback_samples) // 2]
-        self.assertLess(median_readback_ns, full_capture_path_ns)
         self.assertEqual(sum(not call[2] for call in capture.calls), 1)
         self.assertEqual(sum(item.capture_provider_calls for item in results), 1)
         self.assertEqual(sum(item.upper_bound_probe_calls for item in results), 1)
@@ -5834,25 +5909,98 @@ class WechatDigestTests(unittest.TestCase):
         )
 
         information = service.information_store.list_atomic_information()
+        self.assertEqual(len(information), 8)
         self.assertEqual(
             len({item.atomic_information_id for item in information}),
             len(information),
+        )
+        revision_history = {
+            item.atomic_information_id: service.information_store.list_revisions(
+                item.atomic_information_id
+            )
+            for item in information
+        }
+        self.assertTrue(
+            all(len(revisions) == 2 for revisions in revision_history.values())
         )
         self.assertTrue(
             all(shared_object_id in item.related_object_ids for item in information)
         )
         with SQLiteWorldModelRepository(service.database) as repository:
             objects = repository.list_objects()
-            self.assertEqual([item.object_id for item in objects], [shared_object_id])
+            self.assertEqual(objects, objects_before)
             names = repository.list_names(shared_object_id)
             roles = repository.list_roles(shared_object_id)
-            self.assertEqual(
-                len({(item.name, item.is_primary) for item in names}), len(names)
-            )
-            self.assertEqual(len({item.role for item in roles}), len(roles))
+            self.assertEqual(names, names_before)
+            self.assertEqual(roles, roles_before)
+            apply_receipts = repository.list_apply_receipts()
+            effect_bindings = {
+                item.atomic_information_id: service._governance_effect_binding(
+                    repository, item.atomic_information_id
+                )
+                for item in information
+            }
         proposals = service.proposal_store.list_history()
         journal = service.journal.list_changes()
-        self.assertEqual(proposals, ())
+        self.assertEqual(proposals, proposals_before)
+        self.assertEqual(journal[: len(journal_before)], journal_before)
+        self.assertEqual(apply_receipts[: len(apply_receipts_before)], apply_receipts_before)
+        identity_bind_journal = tuple(
+            item
+            for item in journal[len(journal_before) :]
+            if item.operation == "bind_existing"
+        )
+        self.assertEqual(len(journal) - len(journal_before), 8)
+        self.assertEqual(len(identity_bind_journal), 8)
+        self.assertFalse(
+            any(item.operation == "bind_atomic_information" for item in journal)
+        )
+        self.assertEqual(
+            {item.atomic_information_id for item in identity_bind_journal},
+            set(revision_history),
+        )
+        new_apply_receipts = apply_receipts[len(apply_receipts_before) :]
+        self.assertEqual(len(new_apply_receipts), 8)
+        identity_receipt_records = [
+            json.loads(receipt.payload)["records"][0]
+            for receipt in new_apply_receipts
+        ]
+        self.assertTrue(
+            all(
+                record["operation"] == "bind_existing"
+                for record in identity_receipt_records
+            )
+        )
+        self.assertEqual(
+            {item.change_id for item in identity_bind_journal},
+            {record["change_id"] for record in identity_receipt_records},
+        )
+        self.assertEqual(
+            {
+                record["atomic_information_id"]
+                for record in identity_receipt_records
+            },
+            set(revision_history),
+        )
+        self.assertEqual(set(effect_bindings), set(revision_history))
+        self.assertEqual(
+            len(
+                {
+                    binding["effect_fingerprint"]
+                    for binding in effect_bindings.values()
+                }
+            ),
+            8,
+        )
+        self.assertTrue(
+            all(
+                binding["atomic_information_id"] == atomic_id
+                and binding["revision_count"] == 2
+                and binding["journal_count"] == 1
+                and binding["apply_receipt_count"] == 1
+                for atomic_id, binding in effect_bindings.items()
+            )
+        )
         self.assertEqual(
             len({item.proposal_id for item in proposals}), len(proposals)
         )
@@ -7730,6 +7878,12 @@ class WechatCaptureHelperTests(unittest.TestCase):
             )
         probe_full_scan.assert_not_called()
 
+        full_capture_samples: list[int] = []
+        captured_samples: list[dict[str, object]] = []
+        parsed_samples: list[WechatCapture] = []
+        after_cursor = WechatCursor(99, "", "")
+        parser = object.__new__(WechatCliCaptureProvider)
+        parser.provider_version = "0.5.0"
         with patch.dict(sys.modules, self.modules), patch.object(
             wechat_capture_helper,
             "_sessions",
@@ -7739,15 +7893,52 @@ class WechatCaptureHelperTests(unittest.TestCase):
             "_all_cursor_rows",
             wraps=_all_cursor_rows,
         ) as full_scan:
-            captured = capture_with_wechat_cli(
-                self.request(
-                    all_history_upper_bound=observed["observed_upper"],
-                    message_limit=1000,
+            for _ in range(7):
+                started = time.monotonic_ns()
+                captured = capture_with_wechat_cli(
+                    self.request(
+                        all_history_upper_bound=observed["observed_upper"],
+                        message_limit=1000,
+                    )
                 )
-            )
+                connector_payload = json.loads(
+                    json.dumps(captured, ensure_ascii=False, separators=(",", ":"))
+                )
+                parsed = parser._parse_capture(connector_payload, after_cursor)
+                full_capture_samples.append(time.monotonic_ns() - started)
+                captured_samples.append(captured)
+                parsed_samples.append(parsed)
+
+        captured = captured_samples[-1]
+        parsed_capture = parsed_samples[-1]
+        plan, _status = _build_plan(
+            parsed_capture,
+            clock=lambda: "2026-08-25T00:00:00Z",
+        )
+        store = WechatDigestRunStore(self.root / "production-capture-artifacts")
+        store.publish_capture_pending(plan, parsed_capture, capture_ms=1)
+        store.publish_capture_artifacts(
+            str(plan["run_id"]),
+            parsed_capture,
+            plan_binding_fingerprint=_plan_fingerprint(plan),
+            capture_ms=1,
+        )
+        readback_samples: list[int] = []
+        for _ in range(7):
+            started = time.monotonic_ns()
+            loaded, _receipt = store.load_capture_artifacts(str(plan["run_id"]))
+            readback_samples.append(time.monotonic_ns() - started)
+            self.assertEqual(loaded, parsed_capture)
+
+        median_full_capture = sorted(full_capture_samples)[3]
+        median_readback = sorted(readback_samples)[3]
 
         self.assertEqual(total_rows, 1000)
-        self.assertEqual(full_scan.call_count, 1)
+        self.assertEqual(full_scan.call_count, 7)
+        self.assertEqual(len(captured_samples), 7)
+        self.assertTrue(
+            all(len(item["messages"]) == 1000 for item in captured_samples)
+        )
         self.assertEqual(len(captured["messages"]), 1000)
         self.assertEqual(
             len({item["conversation_key"] for item in captured["messages"]}),
@@ -7757,6 +7948,7 @@ class WechatCaptureHelperTests(unittest.TestCase):
             sum(len(item["attachments"]) for item in captured["messages"]),
             100,
         )
+        self.assertLess(median_readback, median_full_capture)
 
     def test_unbounded_window_discovery_is_unchanged(self) -> None:
         request = self.request(message_limit=2)
