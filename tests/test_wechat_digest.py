@@ -268,6 +268,7 @@ class SyntheticSemanticHandoff:
         self.installed_segmented_gate_c_continuation = None
         self.installed_governance_startup_recovery_continuation = None
         self.installed_failed_closed_recovery_continuation = None
+        self.installed_multi_governance_startup_recovery_continuation = None
         self.unknown_resolution = None
         self.timeout_212_resolution = None
         self.before_unknown_commit = None
@@ -689,6 +690,81 @@ class SyntheticSemanticHandoff:
             or self.global_unknown != 0
         ):
             raise RuntimeError("synthetic failed-closed inspection drift")
+        return dict(observed)
+
+    def install_multi_governance_startup_recovery_continuation(
+        self,
+        *,
+        window_binding,
+        authority_ref,
+        authority_manifest_fingerprint,
+        authority_manifest_raw_fingerprint,
+    ):
+        expected = {
+            "authority_ref": authority_ref,
+            "authority_manifest_fingerprint": authority_manifest_fingerprint,
+            "authority_manifest_raw_fingerprint": (
+                authority_manifest_raw_fingerprint
+            ),
+            "previous_reviewed_git_head": (
+                "ce49d89355caab38da08b4522f416d248c60646b"
+            ),
+            "reviewed_git_head": self.reviewed_git_head,
+            "activation_total": 302,
+            "activation_unknown_count": 0,
+            "activation_last_global_ordinal": 302,
+            "next_global_ordinal": 303,
+            "absolute_cap": 1000,
+            "continuation_fingerprint": "sha256:" + "9" * 64,
+        }
+        if (
+            self.installed_multi_governance_startup_recovery_continuation
+            is not None
+            and self.installed_multi_governance_startup_recovery_continuation
+            != expected
+        ):
+            raise RuntimeError("synthetic multi startup continuation drift")
+        assert window_binding.reviewed_git_head in {
+            "ce49d89355caab38da08b4522f416d248c60646b",
+            self.reviewed_git_head,
+        }
+        self.installed_multi_governance_startup_recovery_continuation = expected
+        assert self.campaign_binding is not None
+        self.campaign_binding = SimpleNamespace(
+            created_at=self.campaign_binding.created_at,
+            lower_cursor=self.campaign_binding.lower_cursor,
+            frozen_global_upper_cursor=(
+                self.campaign_binding.frozen_global_upper_cursor
+            ),
+            capture_provider_version=self.campaign_binding.capture_provider_version,
+            semantic_batch_size=self.campaign_binding.semantic_batch_size,
+            reviewed_git_head=self.reviewed_git_head,
+        )
+        return expected
+
+    def multi_governance_startup_recovery_continuation(
+        self,
+        *,
+        authority_ref,
+        authority_manifest_fingerprint,
+        authority_manifest_raw_fingerprint,
+    ):
+        observed = (
+            self.installed_multi_governance_startup_recovery_continuation
+        )
+        if observed is None:
+            return None
+        if (
+            observed["authority_ref"] != authority_ref
+            or observed["authority_manifest_fingerprint"]
+            != authority_manifest_fingerprint
+            or observed["authority_manifest_raw_fingerprint"]
+            != authority_manifest_raw_fingerprint
+            or observed["reviewed_git_head"] != self.reviewed_git_head
+            or self.global_attempt_total != 302
+            or self.global_unknown != 0
+        ):
+            raise RuntimeError("synthetic multi startup inspection drift")
         return dict(observed)
 
     def global_campaign_binding(self):
@@ -1153,6 +1229,31 @@ class StartupFailOnceBatchProvider(NoStructuralChangeProvider):
         batch = tuple(items)
         self.attempts += 1
         if self.attempts == 1 or self.fail_restart:
+            self.events.append(("startup", "startup"))
+            raise RuntimeError("synthetic startup failure")
+        self.events.extend(
+            (("startup", None), ("thread", None), ("turn", None))
+        )
+        self.successful_calls += 1
+        return tuple(
+            InterpretationResult(
+                operations=(WorldModelOperation(kind="no_structural_change"),),
+                rationale="Synthetic recovered batch no-op.",
+                evidence_sufficient=True,
+                conflict=False,
+                ambiguous=False,
+            )
+            for _item in batch
+        )
+
+
+class StartupFailTwiceBatchProvider(StartupFailOnceBatchProvider):
+    """Fail before thread creation for the first and third business items."""
+
+    def interpret_batch(self, items):
+        batch = tuple(items)
+        self.attempts += 1
+        if self.attempts in {1, 3} or self.fail_restart:
             self.events.append(("startup", "startup"))
             raise RuntimeError("synthetic startup failure")
         self.events.extend(
@@ -1777,6 +1878,148 @@ class WechatDigestTests(unittest.TestCase):
         )
         self.semantic.reviewed_git_head = "a" * 40
         return service, provider, run_id, item_id, atomic_ids
+
+    def multi_governance_startup_recovery_fixture(
+        self, *, service_type=WechatDigestService
+    ):
+        self.create_object()
+        self.semantic.provider.mode = "four_one"
+        self.semantic.global_attempt_total = 298
+        conversations = sorted(
+            ("issue-168-history", "issue-168-current"),
+            key=lambda value: hashlib.sha256(value.encode()).hexdigest(),
+        )
+        capture = SyntheticCaptureProvider(
+            [
+                message(index, conversation=conversations[0])
+                for index in range(1, 6)
+            ]
+            + [
+                message(index, conversation=conversations[1])
+                for index in range(6, 9)
+            ]
+        )
+        provider = StartupFailTwiceBatchProvider()
+        service = service_type(
+            workspace=self.workspace,
+            capture_provider=capture,
+            semantic_handoff_factory=lambda: self.semantic,
+            interpretation_provider=provider,
+        )
+        if isinstance(service, FailAfterPersistedBatchProgressOnceService):
+            service.fail_progress = False
+        with self.assertRaises(WechatDigestError):
+            service.run(all_history=True)
+        run_id = service.run_store.active_run_id()
+        assert run_id is not None
+        plan = service.run_store.plan(run_id)
+        status = service.run_store.status(run_id)
+        historical_item_id = next(
+            item_id
+            for item_id, item in status["items"].items()
+            if isinstance(item, dict)
+            and isinstance(item.get("governance_receipt"), dict)
+            and item["governance_receipt"].get("phase") == "started"
+        )
+        historical_atomic_ids = list(
+            status["items"][historical_item_id]["atomic_information_ids"]
+        )
+        status["items"][historical_item_id]["atomic_information_ids"] = []
+        service.run_store.update_status(run_id, status)
+        self.semantic.latest_representation_id = status["items"][
+            historical_item_id
+        ]["representation_id"]
+        self.semantic.campaign_binding = SimpleNamespace(
+            created_at=plan["created_at"],
+            lower_cursor=(0, "", ""),
+            frozen_global_upper_cursor=(
+                plan["all_history_upper_bound"]["timestamp"],
+                plan["all_history_upper_bound"]["conversation_key"],
+                plan["all_history_upper_bound"]["message_key"],
+            ),
+            capture_provider_version=plan["provider_version"],
+            semantic_batch_size=plan["semantic_batch_size"],
+            reviewed_git_head=(
+                "67d159411e968c6b0c2f787f9063a22682c10fb9"
+            ),
+        )
+        self.semantic.reviewed_git_head = "a" * 40
+        historical_ref = (
+            "https://github.com/leevi2010-cursor/ArcheOS/issues/150"
+            "#issuecomment-1234567890"
+        )
+        historical_manifest = service.build_governance_startup_recovery_manifest(
+            authority_ref=historical_ref
+        )
+        historical_manifest_path = (
+            Path(self.temporary.name) / "issue-168-history.json"
+        )
+        historical_manifest_path.write_text(
+            json.dumps(historical_manifest), encoding="utf-8"
+        )
+        os.chmod(historical_manifest_path, 0o600)
+        service.resolve_governance_startup_failure(
+            authority_ref=historical_ref,
+            authority_manifest_file=historical_manifest_path,
+        )
+        service.run(max_terminal_items=1)
+        self.assertEqual(provider.attempts, 2)
+        self.assertEqual(
+            service.run_store.status(run_id)["items"][historical_item_id][
+                "atomic_information_ids"
+            ],
+            historical_atomic_ids,
+        )
+
+        self.semantic.provider.mode = "all_candidate"
+        self.semantic.global_attempt_total = 302
+        self.semantic.reviewed_git_head = (
+            "ce49d89355caab38da08b4522f416d248c60646b"
+        )
+        self.semantic.campaign_binding = SimpleNamespace(
+            created_at=self.semantic.campaign_binding.created_at,
+            lower_cursor=self.semantic.campaign_binding.lower_cursor,
+            frozen_global_upper_cursor=(
+                self.semantic.campaign_binding.frozen_global_upper_cursor
+            ),
+            capture_provider_version=(
+                self.semantic.campaign_binding.capture_provider_version
+            ),
+            semantic_batch_size=self.semantic.campaign_binding.semantic_batch_size,
+            reviewed_git_head=self.semantic.reviewed_git_head,
+        )
+        with self.assertRaises(WechatDigestError):
+            service.run(max_terminal_items=1)
+        with self.assertRaisesRegex(WechatDigestError, "completion 未知"):
+            service.run(max_terminal_items=1)
+        status = service.run_store.status(run_id)
+        current_item_id = next(
+            item_id
+            for item_id, item in status["items"].items()
+            if item_id != historical_item_id
+            and isinstance(item, dict)
+            and isinstance(item.get("governance_receipt"), dict)
+            and item["governance_receipt"].get("phase") == "started"
+        )
+        current_atomic_ids = list(
+            status["items"][current_item_id]["atomic_information_ids"]
+        )
+        self.assertEqual(len(current_atomic_ids), 3)
+        self.assertEqual(status["failure_category"], "WechatDigestError")
+        self.semantic.latest_representation_id = status["items"][current_item_id][
+            "representation_id"
+        ]
+        self.semantic.reviewed_git_head = "b" * 40
+        if isinstance(service, FailAfterPersistedBatchProgressOnceService):
+            service.fail_progress = True
+        return (
+            service,
+            provider,
+            run_id,
+            historical_item_id,
+            current_item_id,
+            current_atomic_ids,
+        )
 
     def failed_closed_recovery_fixture(self):
         self.create_object()
@@ -3381,6 +3624,341 @@ class WechatDigestTests(unittest.TestCase):
                 )
             )
         self.assertEqual(provider.attempts, 1)
+
+    def test_multi_governance_startup_recovery_preserves_history_and_resumes_once(
+        self,
+    ) -> None:
+        (
+            service,
+            provider,
+            run_id,
+            _historical_item_id,
+            current_item_id,
+            current_atomic_ids,
+        ) = self.multi_governance_startup_recovery_fixture()
+        authority_ref = (
+            "https://github.com/leevi2010-cursor/ArcheOS/issues/168"
+            "#issuecomment-1234567890"
+        )
+        run_dir = service.run_store.runs_root / run_id
+        historical_recovery_path = run_dir / "governance-startup-recovery.json"
+        historical_retry_path = run_dir / "governance-startup-retry.json"
+        historical_recovery_bytes = historical_recovery_path.read_bytes()
+        historical_retry_bytes = historical_retry_path.read_bytes()
+        before_business = self.governance_business_state(service)
+        provider_attempts = provider.attempts
+        semantic_calls = self.semantic.provider.calls
+
+        manifest = service.build_multi_governance_startup_recovery_manifest(
+            authority_ref=authority_ref
+        )
+        manifest_path = Path(self.temporary.name) / "issue-168-authority.json"
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+        os.chmod(manifest_path, 0o600)
+        receipt = service.resolve_multi_governance_startup_failure(
+            authority_ref=authority_ref,
+            authority_manifest_file=manifest_path,
+        )
+
+        self.assertEqual(historical_recovery_path.read_bytes(), historical_recovery_bytes)
+        self.assertEqual(historical_retry_path.read_bytes(), historical_retry_bytes)
+        self.assertEqual(len(service.run_store.governance_startup_recoveries(run_id)), 2)
+        self.assertEqual(len(service.run_store.governance_startup_retries(run_id)), 1)
+        self.assertEqual(provider.attempts, provider_attempts)
+        self.assertEqual(self.semantic.provider.calls, semantic_calls)
+        self.assertEqual(self.governance_business_state(service), before_business)
+        self.assertEqual(service.run_store.status(run_id)["state"], "processing")
+        self.assertEqual(
+            service.resolve_multi_governance_startup_failure(
+                authority_ref=authority_ref,
+                authority_manifest_file=manifest_path,
+            ),
+            receipt,
+        )
+        self.assertEqual(provider.attempts, provider_attempts)
+
+        service.run(max_terminal_items=1)
+
+        self.assertEqual(provider.attempts, provider_attempts + 1)
+        self.assertEqual(provider.successful_calls, 2)
+        self.assertEqual(self.semantic.provider.calls, semantic_calls)
+        self.assertEqual(len(service.run_store.governance_startup_recoveries(run_id)), 2)
+        self.assertEqual(len(service.run_store.governance_startup_retries(run_id)), 2)
+        status = service.run_store.status(run_id)
+        self.assertEqual(status["items"][current_item_id]["state"], "processed")
+        self.assertEqual(
+            status["items"][current_item_id]["atomic_information_ids"],
+            current_atomic_ids,
+        )
+
+    def test_multi_governance_startup_recovery_adopts_after_status_crash(
+        self,
+    ) -> None:
+        service, provider, run_id, *_rest = (
+            self.multi_governance_startup_recovery_fixture()
+        )
+        authority_ref = (
+            "https://github.com/leevi2010-cursor/ArcheOS/issues/168"
+            "#issuecomment-1234567890"
+        )
+        manifest = service.build_multi_governance_startup_recovery_manifest(
+            authority_ref=authority_ref
+        )
+        manifest_path = Path(self.temporary.name) / "issue-168-crash.json"
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+        os.chmod(manifest_path, 0o600)
+        with patch.object(
+            service.run_store,
+            "update_status",
+            side_effect=OSError("synthetic status interruption"),
+        ):
+            with self.assertRaises(OSError):
+                service.resolve_multi_governance_startup_failure(
+                    authority_ref=authority_ref,
+                    authority_manifest_file=manifest_path,
+                )
+        durable = service.run_store.governance_startup_recoveries(run_id)
+        self.assertEqual(len(durable), 2)
+        attempts = provider.attempts
+
+        observed = service.resolve_multi_governance_startup_failure(
+            authority_ref=authority_ref,
+            authority_manifest_file=manifest_path,
+        )
+
+        self.assertEqual(observed, durable[-1])
+        self.assertEqual(provider.attempts, attempts)
+        self.assertEqual(service.run_store.status(run_id)["state"], "processing")
+
+    def test_multi_governance_startup_rejects_corrupt_history_zero_provider(
+        self,
+    ) -> None:
+        service, provider, run_id, *_rest = (
+            self.multi_governance_startup_recovery_fixture()
+        )
+        directory = (
+            service.run_store.runs_root
+            / run_id
+            / "governance-startup-recoveries"
+        )
+        directory.mkdir(mode=0o700)
+        corrupt = directory / ("0" * 64 + ".json")
+        corrupt.write_text("{", encoding="utf-8")
+        os.chmod(corrupt, 0o600)
+        attempts = provider.attempts
+
+        with self.assertRaisesRegex(WechatDigestError, "receipt 损坏"):
+            service.build_multi_governance_startup_recovery_manifest(
+                authority_ref=(
+                    "https://github.com/leevi2010-cursor/ArcheOS/issues/168"
+                    "#issuecomment-1234567890"
+                )
+            )
+
+        self.assertEqual(provider.attempts, attempts)
+
+    def test_multi_governance_startup_rejects_duplicate_current_match(
+        self,
+    ) -> None:
+        service, provider, run_id, *_rest = (
+            self.multi_governance_startup_recovery_fixture()
+        )
+        authority_ref = (
+            "https://github.com/leevi2010-cursor/ArcheOS/issues/168"
+            "#issuecomment-1234567890"
+        )
+        manifest = service.build_multi_governance_startup_recovery_manifest(
+            authority_ref=authority_ref
+        )
+        manifest_path = Path(self.temporary.name) / "issue-168-duplicate.json"
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+        os.chmod(manifest_path, 0o600)
+        current = service.resolve_multi_governance_startup_failure(
+            authority_ref=authority_ref,
+            authority_manifest_file=manifest_path,
+        )
+        duplicate = dict(current)
+        duplicate["authority_ref"] = (
+            "https://github.com/leevi2010-cursor/ArcheOS/issues/168"
+            "#issuecomment-1234567891"
+        )
+        duplicate.pop("receipt_fingerprint")
+        duplicate["receipt_fingerprint"] = "sha256:" + hashlib.sha256(
+            json.dumps(
+                duplicate,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        directory = (
+            service.run_store.runs_root
+            / run_id
+            / "governance-startup-recoveries"
+        )
+        duplicate_path = directory / (
+            duplicate["receipt_fingerprint"].removeprefix("sha256:")
+            + ".json"
+        )
+        duplicate_path.write_text(
+            json.dumps(
+                duplicate,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        os.chmod(duplicate_path, 0o600)
+        attempts = provider.attempts
+
+        with self.assertRaisesRegex(WechatDigestError, "重复匹配"):
+            service.run(max_terminal_items=1)
+
+        self.assertEqual(provider.attempts, attempts)
+
+    def test_multi_governance_startup_manifest_drift_rejects_before_write(
+        self,
+    ) -> None:
+        service, provider, run_id, *_rest = (
+            self.multi_governance_startup_recovery_fixture()
+        )
+        authority_ref = (
+            "https://github.com/leevi2010-cursor/ArcheOS/issues/168"
+            "#issuecomment-1234567890"
+        )
+        manifest = service.build_multi_governance_startup_recovery_manifest(
+            authority_ref=authority_ref
+        )
+        attempts = provider.attempts
+        semantic_calls = self.semantic.provider.calls
+
+        def set_manifest_fingerprint(value):
+            value.pop("manifest_fingerprint", None)
+            value["manifest_fingerprint"] = "sha256:" + hashlib.sha256(
+                json.dumps(
+                    value,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            ).hexdigest()
+
+        cases = []
+        changed_decision = json.loads(json.dumps(manifest))
+        changed_decision["authority_ref"] = (
+            "https://github.com/leevi2010-cursor/ArcheOS/issues/168"
+            "#issuecomment-1234567891"
+        )
+        cases.append(("decision", changed_decision, authority_ref))
+        changed_item = json.loads(json.dumps(manifest))
+        changed_item["recovery_binding"]["item_id"] += "-drift"
+        cases.append(("item", changed_item, authority_ref))
+        changed_order = json.loads(json.dumps(manifest))
+        changed_order["recovery_binding"]["ordered_atomic_information_ids"].reverse()
+        cases.append(("atomic-order", changed_order, authority_ref))
+        changed_started = json.loads(json.dumps(manifest))
+        changed_started["recovery_binding"][
+            "governance_started_receipt_fingerprint"
+        ] = "sha256:" + "0" * 64
+        cases.append(("started", changed_started, authority_ref))
+        changed_effect = json.loads(json.dumps(manifest))
+        changed_effect["atomic_effect_bindings"][0]["effect_fingerprint"] = (
+            "sha256:" + "0" * 64
+        )
+        cases.append(("effect", changed_effect, authority_ref))
+        changed_head = json.loads(json.dumps(manifest))
+        changed_head["reviewed_git_head"] = "c" * 40
+        cases.append(("head", changed_head, authority_ref))
+        changed_ledger = json.loads(json.dumps(manifest))
+        changed_ledger["semantic_summary"]["global_attempt_total"] = 303
+        cases.append(("ledger", changed_ledger, authority_ref))
+
+        for index, (label, changed, changed_ref) in enumerate(cases):
+            with self.subTest(label=label):
+                set_manifest_fingerprint(changed)
+                path = Path(self.temporary.name) / f"issue-168-{index}.json"
+                path.write_text(json.dumps(changed), encoding="utf-8")
+                os.chmod(path, 0o600)
+                with self.assertRaises(WechatDigestError):
+                    service.resolve_multi_governance_startup_failure(
+                        authority_ref=changed_ref,
+                        authority_manifest_file=path,
+                    )
+                self.assertEqual(provider.attempts, attempts)
+                self.assertEqual(self.semantic.provider.calls, semantic_calls)
+                self.assertIsNone(
+                    self.semantic.installed_multi_governance_startup_recovery_continuation
+                )
+                self.assertEqual(
+                    len(service.run_store.governance_startup_recoveries(run_id)),
+                    1,
+                )
+
+    def test_multi_governance_startup_retry_failure_is_consumed(
+        self,
+    ) -> None:
+        service, provider, _run_id, *_rest = (
+            self.multi_governance_startup_recovery_fixture()
+        )
+        authority_ref = (
+            "https://github.com/leevi2010-cursor/ArcheOS/issues/168"
+            "#issuecomment-1234567890"
+        )
+        manifest = service.build_multi_governance_startup_recovery_manifest(
+            authority_ref=authority_ref
+        )
+        manifest_path = Path(self.temporary.name) / "issue-168-fail.json"
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+        os.chmod(manifest_path, 0o600)
+        service.resolve_multi_governance_startup_failure(
+            authority_ref=authority_ref,
+            authority_manifest_file=manifest_path,
+        )
+        provider.fail_restart = True
+
+        with self.assertRaises(WechatDigestError):
+            service.run(max_terminal_items=1)
+        attempts = provider.attempts
+        with self.assertRaisesRegex(WechatDigestError, "机会已消耗"):
+            service.run(max_terminal_items=1)
+        self.assertEqual(provider.attempts, attempts)
+
+    def test_multi_governance_startup_post_result_cursor_recovery_is_zero_provider(
+        self,
+    ) -> None:
+        (
+            service,
+            provider,
+            _run_id,
+            *_rest,
+        ) = self.multi_governance_startup_recovery_fixture(
+            service_type=FailAfterPersistedBatchProgressOnceService
+        )
+        authority_ref = (
+            "https://github.com/leevi2010-cursor/ArcheOS/issues/168"
+            "#issuecomment-1234567890"
+        )
+        manifest = service.build_multi_governance_startup_recovery_manifest(
+            authority_ref=authority_ref
+        )
+        manifest_path = Path(self.temporary.name) / "issue-168-cursor.json"
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+        os.chmod(manifest_path, 0o600)
+        service.resolve_multi_governance_startup_failure(
+            authority_ref=authority_ref,
+            authority_manifest_file=manifest_path,
+        )
+
+        with self.assertRaisesRegex(WechatDigestError, "未安全完成"):
+            service.run(max_terminal_items=1)
+        attempts = provider.attempts
+
+        result = service.run(max_terminal_items=1)
+
+        self.assertEqual(provider.attempts, attempts)
+        self.assertTrue(result.replayed)
 
     def test_failed_closed_recovery_is_zero_provider_and_idempotent(
         self,

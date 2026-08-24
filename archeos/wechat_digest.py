@@ -86,12 +86,17 @@ GOVERNANCE_MIGRATION_SCHEMA_VERSION = "wechat-governance-migration/1.0"
 GOVERNANCE_STARTUP_RECOVERY_MANIFEST_SCHEMA_VERSION = (
     "wechat-governance-startup-recovery-authority/1.0"
 )
+GOVERNANCE_MULTI_STARTUP_RECOVERY_MANIFEST_SCHEMA_VERSION = (
+    "wechat-governance-multi-startup-recovery-authority/1.0"
+)
 GOVERNANCE_STARTUP_RECOVERY_SCHEMA_VERSION = (
     "wechat-governance-startup-recovery/1.0"
 )
 GOVERNANCE_STARTUP_RETRY_SCHEMA_VERSION = (
     "wechat-governance-startup-retry/1.0"
 )
+GOVERNANCE_STARTUP_RECOVERY_DIRECTORY = "governance-startup-recoveries"
+GOVERNANCE_STARTUP_RETRY_DIRECTORY = "governance-startup-retries"
 FAILED_CLOSED_RECOVERY_MANIFEST_SCHEMA_VERSION = (
     "wechat-failed-closed-recovery-authority/1.0"
 )
@@ -298,6 +303,23 @@ class SemanticHandoffPort(Protocol):
     ) -> dict[str, object]: ...
 
     def governance_startup_recovery_continuation(
+        self,
+        *,
+        authority_ref: str,
+        authority_manifest_fingerprint: str,
+        authority_manifest_raw_fingerprint: str,
+    ) -> dict[str, object] | None: ...
+
+    def install_multi_governance_startup_recovery_continuation(
+        self,
+        *,
+        window_binding: SemanticWindowAuthorityBinding,
+        authority_ref: str,
+        authority_manifest_fingerprint: str,
+        authority_manifest_raw_fingerprint: str,
+    ) -> dict[str, object]: ...
+
+    def multi_governance_startup_recovery_continuation(
         self,
         *,
         authority_ref: str,
@@ -1042,6 +1064,209 @@ class WechatDigestRunStore:
             raise WechatDigestError("Governance 启动恢复 retry receipt 损坏。")
         return value
 
+    @staticmethod
+    def _private_receipt(path: Path, *, schema_version: str, label: str) -> dict[str, object]:
+        try:
+            path_stat = path.stat(follow_symlinks=False)
+        except OSError as exc:
+            raise WechatDigestError(f"{label} 不可读。") from exc
+        if (
+            not stat.S_ISREG(path_stat.st_mode)
+            or stat.S_IMODE(path_stat.st_mode) != 0o600
+            or path_stat.st_uid != os.getuid()
+            or path_stat.st_nlink != 1
+        ):
+            raise WechatDigestError(f"{label} 不是私有文件。")
+        try:
+            value = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise WechatDigestError(f"{label} 损坏。") from exc
+        if (
+            not isinstance(value, dict)
+            or value.get("schema_version") != schema_version
+        ):
+            raise WechatDigestError(f"{label} 损坏。")
+        return value
+
+    def _item_scoped_receipts(
+        self,
+        run_id: str,
+        *,
+        legacy_filename: str,
+        directory_name: str,
+        schema_version: str,
+        label: str,
+        scoped_filename_fingerprint_field: str,
+    ) -> tuple[dict[str, object], ...]:
+        run_dir = self.runs_root / run_id
+        paths: list[Path] = []
+        legacy = run_dir / legacy_filename
+        if os.path.lexists(legacy):
+            paths.append(legacy)
+        directory = run_dir / directory_name
+        if os.path.lexists(directory):
+            try:
+                directory_stat = directory.stat(follow_symlinks=False)
+            except OSError as exc:
+                raise WechatDigestError(f"{label}目录不可读。") from exc
+            if (
+                not stat.S_ISDIR(directory_stat.st_mode)
+                or stat.S_IMODE(directory_stat.st_mode) != 0o700
+                or directory_stat.st_uid != os.getuid()
+            ):
+                raise WechatDigestError(f"{label}目录不是私有目录。")
+            try:
+                children = sorted(directory.iterdir())
+            except OSError as exc:
+                raise WechatDigestError(f"{label}目录不可读。") from exc
+            for child in children:
+                if re.fullmatch(r"[0-9a-f]{64}\.json", child.name) is None:
+                    raise WechatDigestError(f"{label}目录 inventory 损坏。")
+                paths.append(child)
+        values: list[dict[str, object]] = []
+        for path in paths:
+            value = self._private_receipt(
+                path,
+                schema_version=schema_version,
+                label=label,
+            )
+            if path.parent.name == directory_name:
+                fingerprint = value.get(scoped_filename_fingerprint_field)
+                if (
+                    not _sha256_value(fingerprint)
+                    or path.name
+                    != f"{str(fingerprint).removeprefix('sha256:')}.json"
+                ):
+                    raise WechatDigestError(f"{label} filename binding 损坏。")
+            values.append(value)
+        return tuple(values)
+
+    def governance_startup_recoveries(
+        self, run_id: str
+    ) -> tuple[dict[str, object], ...]:
+        """Return every legacy and item-scoped startup recovery receipt."""
+
+        values = self._item_scoped_receipts(
+            run_id,
+            legacy_filename="governance-startup-recovery.json",
+            directory_name=GOVERNANCE_STARTUP_RECOVERY_DIRECTORY,
+            schema_version=GOVERNANCE_STARTUP_RECOVERY_SCHEMA_VERSION,
+            label="Governance 启动恢复 receipt",
+            scoped_filename_fingerprint_field="receipt_fingerprint",
+        )
+        return tuple(_validated_governance_startup_recovery_receipt(value) for value in values)
+
+    def governance_startup_retries(
+        self, run_id: str
+    ) -> tuple[dict[str, object], ...]:
+        """Return every legacy and item-scoped startup retry consumption."""
+
+        values = self._item_scoped_receipts(
+            run_id,
+            legacy_filename="governance-startup-retry.json",
+            directory_name=GOVERNANCE_STARTUP_RETRY_DIRECTORY,
+            schema_version=GOVERNANCE_STARTUP_RETRY_SCHEMA_VERSION,
+            label="Governance 启动恢复 retry receipt",
+            scoped_filename_fingerprint_field=(
+                "recovery_receipt_fingerprint"
+            ),
+        )
+        return tuple(_validated_governance_startup_retry_receipt(value) for value in values)
+
+    def publish_item_scoped_governance_startup_receipt(
+        self,
+        run_id: str,
+        *,
+        receipt: Mapping[str, object],
+    ) -> dict[str, object]:
+        """Publish one immutable receipt under its deterministic fingerprint."""
+
+        expected = json.loads(_canonical_json(receipt))
+        artifact_kind = expected.get("artifact_kind")
+        if artifact_kind == "governance_startup_recovery":
+            validated = _validated_governance_startup_recovery_receipt(expected)
+            directory_name = GOVERNANCE_STARTUP_RECOVERY_DIRECTORY
+            path_fingerprint = validated["receipt_fingerprint"]
+        elif artifact_kind == "governance_startup_retry_consumption":
+            validated = _validated_governance_startup_retry_receipt(expected)
+            directory_name = GOVERNANCE_STARTUP_RETRY_DIRECTORY
+            path_fingerprint = validated["recovery_receipt_fingerprint"]
+        else:
+            raise WechatDigestError("Governance 启动恢复 receipt 类型无效。")
+        assert isinstance(path_fingerprint, str)
+        directory = self.runs_root / run_id / directory_name
+        if os.path.lexists(directory):
+            directory_stat = directory.stat(follow_symlinks=False)
+            if (
+                not stat.S_ISDIR(directory_stat.st_mode)
+                or stat.S_IMODE(directory_stat.st_mode) != 0o700
+                or directory_stat.st_uid != os.getuid()
+            ):
+                raise WechatDigestError("Governance 启动恢复 receipt 目录损坏。")
+        else:
+            directory.mkdir(mode=0o700)
+            directory_fd = os.open(directory.parent, os.O_RDONLY)
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+        path = directory / f"{path_fingerprint.removeprefix('sha256:')}.json"
+        observed = self._publish_private_no_replace(path, expected)
+        if observed != validated:
+            raise WechatDigestError("Governance 启动恢复 receipt 读回失败。")
+        return observed
+
+    def _publish_private_no_replace(
+        self, path: Path, expected: Mapping[str, object]
+    ) -> dict[str, object]:
+        if os.path.lexists(path):
+            path_stat = path.stat(follow_symlinks=False)
+            if (
+                not stat.S_ISREG(path_stat.st_mode)
+                or stat.S_IMODE(path_stat.st_mode) != 0o600
+                or path_stat.st_uid != os.getuid()
+                or path_stat.st_nlink != 1
+            ):
+                raise WechatDigestError(
+                    "Governance 启动恢复 receipt 已存在但不是私有文件。"
+                )
+            observed = self._read_json(path)
+            if observed != expected:
+                raise WechatDigestError(
+                    "Governance 启动恢复 receipt 已存在且不一致。"
+                )
+            return observed
+        encoded = (_canonical_json(expected) + "\n").encode("utf-8")
+        descriptor, temporary_name = tempfile.mkstemp(
+            prefix=".governance-startup-", dir=path.parent
+        )
+        temporary_path = Path(temporary_name)
+        try:
+            os.fchmod(descriptor, 0o600)
+            with os.fdopen(descriptor, "wb") as handle:
+                handle.write(encoded)
+                handle.flush()
+                os.fsync(handle.fileno())
+            try:
+                os.link(temporary_path, path, follow_symlinks=False)
+            except FileExistsError:
+                if self._read_json(path) != expected:
+                    raise WechatDigestError(
+                        "Governance 启动恢复 receipt 已存在且不一致。"
+                    )
+        finally:
+            if temporary_path.exists():
+                temporary_path.unlink()
+        directory_fd = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+        observed = self._read_json(path)
+        if observed != expected or stat.S_IMODE(path.stat().st_mode) != 0o600:
+            raise WechatDigestError("Governance 启动恢复 receipt 读回失败。")
+        return observed
+
     def failed_closed_recovery(
         self, run_id: str
     ) -> dict[str, object] | None:
@@ -1504,6 +1729,42 @@ class ExistingSemanticHandoff:
         authority_manifest_raw_fingerprint: str,
     ) -> dict[str, object] | None:
         return self.service.governance_startup_recovery_continuation(
+            self.provider,
+            reviewed_git_head=self.reviewed_git_head,
+            authority_ref=authority_ref,
+            authority_manifest_fingerprint=authority_manifest_fingerprint,
+            authority_manifest_raw_fingerprint=(
+                authority_manifest_raw_fingerprint
+            ),
+        )
+
+    def install_multi_governance_startup_recovery_continuation(
+        self,
+        *,
+        window_binding: SemanticWindowAuthorityBinding,
+        authority_ref: str,
+        authority_manifest_fingerprint: str,
+        authority_manifest_raw_fingerprint: str,
+    ) -> dict[str, object]:
+        return self.service.install_multi_governance_startup_recovery_continuation(
+            self.provider,
+            window_binding=window_binding,
+            reviewed_git_head=self.reviewed_git_head,
+            authority_ref=authority_ref,
+            authority_manifest_fingerprint=authority_manifest_fingerprint,
+            authority_manifest_raw_fingerprint=(
+                authority_manifest_raw_fingerprint
+            ),
+        )
+
+    def multi_governance_startup_recovery_continuation(
+        self,
+        *,
+        authority_ref: str,
+        authority_manifest_fingerprint: str,
+        authority_manifest_raw_fingerprint: str,
+    ) -> dict[str, object] | None:
+        return self.service.multi_governance_startup_recovery_continuation(
             self.provider,
             reviewed_git_head=self.reviewed_git_head,
             authority_ref=authority_ref,
@@ -2139,6 +2400,135 @@ def _sha256_value(value: object) -> bool:
     )
 
 
+def _validated_governance_startup_recovery_receipt(
+    value: object,
+) -> dict[str, object]:
+    if not isinstance(value, dict):
+        raise WechatDigestError("Governance 启动恢复 receipt 损坏。")
+    projected = dict(value)
+    fingerprint = projected.pop("receipt_fingerprint", None)
+    binding = value.get("recovery_binding")
+    effect_bindings = value.get("atomic_effect_bindings")
+    ordered_ids = (
+        binding.get("ordered_atomic_information_ids")
+        if isinstance(binding, dict)
+        else None
+    )
+    if (
+        set(value)
+        != {
+            "schema_version",
+            "artifact_kind",
+            "authority_ref",
+            "authority_manifest_fingerprint",
+            "authority_manifest_raw_fingerprint",
+            "recovery_binding",
+            "atomic_effect_bindings",
+            "business_tree_fingerprint",
+            "semantic_continuation_fingerprint",
+            "provider_retry_permitted",
+            "max_retry_attempts",
+            "retry_consumed",
+            "receipt_fingerprint",
+        }
+        or value.get("schema_version")
+        != GOVERNANCE_STARTUP_RECOVERY_SCHEMA_VERSION
+        or value.get("artifact_kind") != "governance_startup_recovery"
+        or re.fullmatch(
+            r"https://github\.com/leevi2010-cursor/ArcheOS/issues/(150|168)"
+            r"#issuecomment-[0-9]+",
+            str(value.get("authority_ref")),
+        )
+        is None
+        or not _sha256_value(value.get("authority_manifest_fingerprint"))
+        or not _sha256_value(value.get("authority_manifest_raw_fingerprint"))
+        or not isinstance(binding, dict)
+        or re.fullmatch(r"run_[0-9a-f]{32}", str(binding.get("run_id")))
+        is None
+        or not isinstance(binding.get("item_id"), str)
+        or not binding["item_id"]
+        or not isinstance(ordered_ids, list)
+        or not ordered_ids
+        or len(set(ordered_ids)) != len(ordered_ids)
+        or any(not isinstance(item, str) for item in ordered_ids)
+        or not _sha256_value(
+            binding.get("governance_started_receipt_fingerprint")
+        )
+        or any(
+            not _sha256_value(field_value)
+            for field_name, field_value in binding.items()
+            if field_name.endswith("_fingerprint")
+        )
+        or not isinstance(effect_bindings, list)
+        or len(effect_bindings) != len(ordered_ids)
+        or not _sha256_value(value.get("business_tree_fingerprint"))
+        or not _sha256_value(value.get("semantic_continuation_fingerprint"))
+        or value.get("provider_retry_permitted") is not True
+        or value.get("max_retry_attempts") != 1
+        or value.get("retry_consumed") is not False
+        or not _sha256_value(fingerprint)
+        or fingerprint
+        != _sha256_bytes(_canonical_json(projected).encode("utf-8"))
+    ):
+        raise WechatDigestError("Governance 启动恢复 receipt 损坏。")
+    for effect_binding in effect_bindings:
+        if not isinstance(effect_binding, dict) or any(
+            not _sha256_value(effect_binding.get(field))
+            for field in (
+                "current_revision_fingerprint",
+                "revision_history_fingerprint",
+                "proposal_history_fingerprint",
+                "journal_fingerprint",
+                "apply_receipts_fingerprint",
+                "world_projection_fingerprint",
+                "effect_fingerprint",
+            )
+        ):
+            raise WechatDigestError("Governance 启动恢复 effect binding 损坏。")
+    return dict(value)
+
+
+def _validated_governance_startup_retry_receipt(
+    value: object,
+) -> dict[str, object]:
+    if not isinstance(value, dict):
+        raise WechatDigestError("Governance 启动恢复 retry receipt 损坏。")
+    projected = dict(value)
+    fingerprint = projected.pop("receipt_fingerprint", None)
+    if (
+        set(value)
+        != {
+            "schema_version",
+            "artifact_kind",
+            "recovery_receipt_fingerprint",
+            "run_id",
+            "item_id",
+            "atomic_information_fingerprint",
+            "retry_attempt",
+            "consumed_at",
+            "receipt_fingerprint",
+        }
+        or value.get("schema_version")
+        != GOVERNANCE_STARTUP_RETRY_SCHEMA_VERSION
+        or value.get("artifact_kind")
+        != "governance_startup_retry_consumption"
+        or not _sha256_value(value.get("recovery_receipt_fingerprint"))
+        or re.fullmatch(r"run_[0-9a-f]{32}", str(value.get("run_id")))
+        is None
+        or not isinstance(value.get("item_id"), str)
+        or not value["item_id"]
+        or not _sha256_value(value.get("atomic_information_fingerprint"))
+        or value.get("retry_attempt") != 1
+        or not isinstance(value.get("consumed_at"), str)
+        or not value["consumed_at"]
+        or not _sha256_value(fingerprint)
+        or fingerprint
+        != _sha256_bytes(_canonical_json(projected).encode("utf-8"))
+    ):
+        raise WechatDigestError("Governance 启动恢复 retry receipt 损坏。")
+    return dict(value)
+
+
 def _validated_governance_startup_recovery_manifest(
     value: object,
 ) -> dict[str, object]:
@@ -2241,6 +2631,128 @@ def _validated_governance_startup_recovery_manifest(
         )
     ):
         raise WechatDigestError("Governance 启动恢复 authority manifest 损坏。")
+    return dict(value)
+
+
+def _validated_multi_governance_startup_recovery_manifest(
+    value: object,
+) -> dict[str, object]:
+    if not isinstance(value, dict):
+        raise WechatDigestError("多项目 Governance 启动恢复 authority manifest 损坏。")
+    projected = dict(value)
+    fingerprint = projected.pop("manifest_fingerprint", None)
+    binding = value.get("recovery_binding")
+    semantic_summary = value.get("semantic_summary")
+    if (
+        set(value)
+        != {
+            "schema_version",
+            "authority_ref",
+            "recovery_binding",
+            "atomic_effect_bindings",
+            "business_tree_fingerprint",
+            "previous_reviewed_git_head",
+            "reviewed_git_head",
+            "execution_contract_unchanged",
+            "semantic_summary",
+            "manifest_fingerprint",
+        }
+        or value.get("schema_version")
+        != GOVERNANCE_MULTI_STARTUP_RECOVERY_MANIFEST_SCHEMA_VERSION
+        or re.fullmatch(
+            r"https://github\.com/leevi2010-cursor/ArcheOS/issues/168"
+            r"#issuecomment-[0-9]+",
+            str(value.get("authority_ref")),
+        )
+        is None
+        or not isinstance(binding, dict)
+        or not isinstance(value.get("atomic_effect_bindings"), list)
+        or not _sha256_value(value.get("business_tree_fingerprint"))
+        or value.get("previous_reviewed_git_head")
+        != "ce49d89355caab38da08b4522f416d248c60646b"
+        or re.fullmatch(r"[0-9a-f]{40}", str(value.get("reviewed_git_head")))
+        is None
+        or value.get("reviewed_git_head")
+        == value.get("previous_reviewed_git_head")
+        or value.get("execution_contract_unchanged") is not True
+        or semantic_summary
+        != {
+            "global_attempt_total": 302,
+            "global_unknown": 0,
+            "last_global_ordinal": 302,
+            "next_global_ordinal": 303,
+            "absolute_cap": 1000,
+        }
+        or not _sha256_value(fingerprint)
+        or fingerprint
+        != _sha256_bytes(_canonical_json(projected).encode("utf-8"))
+    ):
+        raise WechatDigestError("多项目 Governance 启动恢复 authority manifest 损坏。")
+    expected_binding = {
+        "run_id",
+        "plan_fingerprint",
+        "plan_receipt_fingerprint",
+        "status_fingerprint",
+        "capture_fingerprint",
+        "checkpoint_fingerprint",
+        "item_id",
+        "source_id",
+        "source_manifest_fingerprint",
+        "representation_id",
+        "representation_manifest_fingerprint",
+        "representation_artifact_inventory_fingerprint",
+        "semantic_package_fingerprint",
+        "candidate_count",
+        "residue_count",
+        "ordered_atomic_information_ids",
+        "ordered_atomic_revision_fingerprints",
+        "governance_started_receipt_fingerprint",
+        "governance_metrics_fingerprint",
+        "semantic_window_binding_fingerprint",
+        "startup_recovery_inventory_fingerprint",
+        "startup_retry_inventory_fingerprint",
+    }
+    ordered_ids = binding.get("ordered_atomic_information_ids")
+    revision_fingerprints = binding.get(
+        "ordered_atomic_revision_fingerprints"
+    )
+    if (
+        set(binding) != expected_binding
+        or binding.get("candidate_count") != 3
+        or isinstance(binding.get("residue_count"), bool)
+        or not isinstance(binding.get("residue_count"), int)
+        or binding["residue_count"] < 0
+        or not isinstance(ordered_ids, list)
+        or len(ordered_ids) != 3
+        or len(set(ordered_ids)) != 3
+        or any(not isinstance(item, str) for item in ordered_ids)
+        or not isinstance(revision_fingerprints, list)
+        or len(revision_fingerprints) != 3
+        or any(not _sha256_value(item) for item in revision_fingerprints)
+        or any(
+            not _sha256_value(binding.get(field))
+            for field in expected_binding
+            if field.endswith("_fingerprint")
+        )
+    ):
+        raise WechatDigestError("多项目 Governance 启动恢复 authority manifest 损坏。")
+    effect_bindings = value["atomic_effect_bindings"]
+    for effect_binding in effect_bindings:
+        if not isinstance(effect_binding, dict) or any(
+            not _sha256_value(effect_binding.get(field))
+            for field in (
+                "current_revision_fingerprint",
+                "revision_history_fingerprint",
+                "proposal_history_fingerprint",
+                "journal_fingerprint",
+                "apply_receipts_fingerprint",
+                "world_projection_fingerprint",
+                "effect_fingerprint",
+            )
+        ):
+            raise WechatDigestError(
+                "多项目 Governance authority effect binding 损坏。"
+            )
     return dict(value)
 
 
@@ -3853,6 +4365,555 @@ class WechatDigestService:
                 != ordered_ids
             ):
                 raise WechatDigestError("Governance 启动恢复状态读回失败。")
+            return existing
+
+    def _build_multi_governance_startup_recovery_manifest_unlocked(
+        self,
+        *,
+        authority_ref: str,
+        adopted_continuation: Mapping[str, object] | None = None,
+    ) -> dict[str, object]:
+        run_id = self.run_store.active_run_id()
+        if run_id is None:
+            raise WechatDigestError("不存在可恢复 Governance 启动失败的 active run。")
+        plan = self.run_store.plan(run_id)
+        plan_receipt = self.run_store.plan_receipt(run_id)
+        after = WechatCursor.from_dict(plan.get("after_cursor"), "plan.after_cursor")
+        upper = WechatCursor.from_dict(plan.get("upper_bound"), "plan.upper_bound")
+        capture = self.capture_provider.capture(after, upper_bound=upper)
+        self._verify_capture_against_plan(capture, plan)
+        status = self.run_store.status(run_id)
+        self._verify_plan_and_status(run_id, capture, plan, status)
+        checkpoint = self.run_store.checkpoint()
+        if (
+            self._plan_all_history_upper(plan) is None
+            or checkpoint not in {None, after}
+            or status.get("state") != "failed"
+            or status.get("failure_category") != "WechatDigestError"
+            or status.get("checkpoint_published") is not False
+        ):
+            raise WechatDigestError("多项目 Governance 启动恢复 stop 边界不匹配。")
+        items = status.get("items")
+        if not isinstance(items, dict):
+            raise WechatDigestError("微信运行状态 items 损坏。")
+        candidates: list[tuple[str, dict[str, object]]] = []
+        for item_id, item in items.items():
+            if not isinstance(item_id, str) or not isinstance(item, dict):
+                raise WechatDigestError("微信运行状态 items 损坏。")
+            receipt_value = item.get("governance_receipt")
+            if receipt_value is None:
+                continue
+            receipt = _validated_governance_receipt(receipt_value)
+            if item.get("state") == "represented" and receipt.get("phase") == "started":
+                candidates.append((item_id, item))
+        if len(candidates) != 1:
+            raise WechatDigestError("多项目 Governance 启动恢复必须唯一绑定 started item。")
+        item_id, item = candidates[0]
+        receipt = _validated_governance_receipt(item.get("governance_receipt"))
+        metrics = _validated_governance_metrics(item.get("governance_metrics"))
+        source_id = item.get("source_id")
+        representation_id = item.get("representation_id")
+        ordered_ids = item.get("atomic_information_ids")
+        if (
+            not isinstance(source_id, str)
+            or not isinstance(representation_id, str)
+            or not isinstance(ordered_ids, list)
+            or len(ordered_ids) != 3
+            or len(set(ordered_ids)) != 3
+            or any(not isinstance(value, str) for value in ordered_ids)
+            or receipt.get("schema_version") != GOVERNANCE_RECEIPT_SCHEMA_VERSION
+            or receipt.get("phase") != "started"
+            or receipt.get("atomic_information_fingerprint")
+            != _governance_atomic_fingerprint(ordered_ids)
+            or metrics.get("app_server_start_count") != 1
+            or metrics.get("thread_count") != 0
+            or metrics.get("turn_count") != 0
+            or metrics.get("timeout_count") != 0
+            or metrics.get("failure_count") != 1
+            or metrics.get("failure_categories") != {"startup": 1}
+        ):
+            raise WechatDigestError("多项目 Governance 启动失败证据不匹配。")
+        source = self.source_repository.get(source_id)
+        representation = self.representation_repository.get(representation_id)
+        if (
+            not self.source_repository.verify(source_id).verified
+            or not self.representation_repository.verify(representation_id).verified
+            or representation.source_id != source_id
+        ):
+            raise WechatDigestError("多项目 Governance Source/Representation 校验失败。")
+        package = self.workspace / "02_processing" / "information" / representation_id
+        package_manifest, _candidates = validate_representation_information_package(
+            package
+        )
+        counts = package_manifest.get("counts")
+        if (
+            not isinstance(counts, dict)
+            or counts.get("atomic_information_candidates") != 3
+            or isinstance(counts.get("residue_items"), bool)
+            or not isinstance(counts.get("residue_items"), int)
+            or counts["residue_items"] < 0
+        ):
+            raise WechatDigestError("多项目 Governance semantic package 数量不匹配。")
+        verified_ids = self._verify_semantic_receipts(representation_id, item)
+        if verified_ids != tuple(ordered_ids):
+            raise WechatDigestError("多项目 Governance Atomic Information 不匹配。")
+        artifact_inventory: list[dict[str, object]] = []
+        for artifact in representation.artifacts:
+            raw = self.representation_repository.read_artifact(
+                representation_id, artifact.artifact_id
+            )
+            if _sha256_bytes(raw) != artifact.content_hash or len(raw) != artifact.size_bytes:
+                raise WechatDigestError("多项目 Governance Representation artifact 漂移。")
+            artifact_inventory.append(
+                {
+                    "artifact_id": artifact.artifact_id,
+                    "content_hash": artifact.content_hash,
+                    "size_bytes": artifact.size_bytes,
+                }
+            )
+        with SQLiteWorldModelRepository(self.database) as repository:
+            atomic_effect_bindings = [
+                self._governance_effect_binding(repository, atomic_id)
+                for atomic_id in ordered_ids
+            ]
+            if any(
+                binding.get("revision_count") != 1
+                or binding.get("proposal_history_count") != 0
+                or binding.get("journal_count") != 0
+                or binding.get("apply_receipt_count") != 0
+                or self.information_store.get_current(atomic_id).related_object_ids
+                for atomic_id, binding in zip(
+                    ordered_ids, atomic_effect_bindings, strict=True
+                )
+            ):
+                raise WechatDigestError("多项目 Governance 恢复前业务效果已变化。")
+            business_tree_fingerprint = self._governance_business_tree_fingerprint(
+                repository
+            )
+        recoveries, retries = self._governance_startup_history(run_id)
+        if not any(
+            str(value.get("authority_ref", "")).startswith(
+                "https://github.com/leevi2010-cursor/ArcheOS/issues/150"
+            )
+            for value in recoveries
+        ) or not retries:
+            raise WechatDigestError("历史 Governance 启动恢复证据缺失。")
+        if self._startup_recovery_for_item(
+            run_id=run_id,
+            item_id=item_id,
+            atomic_ids=ordered_ids,
+            started_receipt=receipt,
+        ) is not None:
+            raise WechatDigestError("当前 Governance 启动恢复 receipt 已存在。")
+        semantic_summary = _validated_global_attempt_summary(
+            self._semantic_port().global_attempt_summary(representation_id)
+        )
+        if semantic_summary != {
+            "global_attempt_total": 302,
+            "global_unknown": 0,
+            "next_global_ordinal": 303,
+            "absolute_cap": 1000,
+        }:
+            raise WechatDigestError("多项目 Governance Semantic ledger 不匹配。")
+        window_binding = self._semantic_authority_binding(
+            run_id, allow_reviewed_head_extension=True
+        )
+        if adopted_continuation is not None:
+            previous_head = adopted_continuation.get("previous_reviewed_git_head")
+            reviewed_head = adopted_continuation.get("reviewed_git_head")
+            if (
+                previous_head != "ce49d89355caab38da08b4522f416d248c60646b"
+                or reviewed_head != self._semantic_port().reviewed_git_head
+            ):
+                raise WechatDigestError("多项目 Governance continuation head binding 漂移。")
+            window_binding = replace(
+                window_binding,
+                reviewed_git_head=str(previous_head),
+            )
+        else:
+            previous_head = window_binding.reviewed_git_head
+            reviewed_head = self._semantic_port().reviewed_git_head
+        recovery_binding = {
+            "run_id": run_id,
+            "plan_fingerprint": _plan_fingerprint(plan),
+            "plan_receipt_fingerprint": _sha256_bytes(
+                _canonical_json(plan_receipt).encode("utf-8")
+            ),
+            "status_fingerprint": _sha256_bytes(
+                _canonical_json(status).encode("utf-8")
+            ),
+            "capture_fingerprint": _capture_fingerprint(capture),
+            "checkpoint_fingerprint": _sha256_bytes(
+                _canonical_json(
+                    None if checkpoint is None else checkpoint.to_dict()
+                ).encode("utf-8")
+            ),
+            "item_id": item_id,
+            "source_id": source_id,
+            "source_manifest_fingerprint": _sha256_bytes(
+                _canonical_json(source.to_manifest_dict()).encode("utf-8")
+            ),
+            "representation_id": representation_id,
+            "representation_manifest_fingerprint": _sha256_bytes(
+                _canonical_json(representation.to_manifest_dict()).encode("utf-8")
+            ),
+            "representation_artifact_inventory_fingerprint": _sha256_bytes(
+                _canonical_json(artifact_inventory).encode("utf-8")
+            ),
+            "semantic_package_fingerprint": _package_fingerprint(package),
+            "candidate_count": 3,
+            "residue_count": counts["residue_items"],
+            "ordered_atomic_information_ids": list(ordered_ids),
+            "ordered_atomic_revision_fingerprints": [
+                _sha256_bytes(
+                    _canonical_json(
+                        asdict(self.information_store.get_current(atomic_id))
+                    ).encode("utf-8")
+                )
+                for atomic_id in ordered_ids
+            ],
+            "governance_started_receipt_fingerprint": _sha256_bytes(
+                _canonical_json(receipt).encode("utf-8")
+            ),
+            "governance_metrics_fingerprint": _sha256_bytes(
+                _canonical_json(metrics).encode("utf-8")
+            ),
+            "semantic_window_binding_fingerprint": _sha256_bytes(
+                _canonical_json(asdict(window_binding)).encode("utf-8")
+            ),
+            "startup_recovery_inventory_fingerprint": _sha256_bytes(
+                _canonical_json(recoveries).encode("utf-8")
+            ),
+            "startup_retry_inventory_fingerprint": _sha256_bytes(
+                _canonical_json(retries).encode("utf-8")
+            ),
+        }
+        candidate: dict[str, object] = {
+            "schema_version": (
+                GOVERNANCE_MULTI_STARTUP_RECOVERY_MANIFEST_SCHEMA_VERSION
+            ),
+            "authority_ref": authority_ref,
+            "recovery_binding": recovery_binding,
+            "atomic_effect_bindings": atomic_effect_bindings,
+            "business_tree_fingerprint": business_tree_fingerprint,
+            "previous_reviewed_git_head": previous_head,
+            "reviewed_git_head": reviewed_head,
+            "execution_contract_unchanged": True,
+            "semantic_summary": {
+                **semantic_summary,
+                "last_global_ordinal": 302,
+            },
+        }
+        candidate["manifest_fingerprint"] = _sha256_bytes(
+            _canonical_json(candidate).encode("utf-8")
+        )
+        return _validated_multi_governance_startup_recovery_manifest(candidate)
+
+    def build_multi_governance_startup_recovery_manifest(
+        self, *, authority_ref: str
+    ) -> dict[str, object]:
+        """Build the read-only Issue #168 recovery authority candidate."""
+
+        with self.run_store.lock():
+            return self._build_multi_governance_startup_recovery_manifest_unlocked(
+                authority_ref=authority_ref
+            )
+
+    def resolve_multi_governance_startup_failure(
+        self, *, authority_ref: str, authority_manifest_file: Path
+    ) -> dict[str, object]:
+        """Install one item-scoped Issue #168 recovery without Providers."""
+
+        manifest, raw_fingerprint = _read_private_json_manifest(
+            authority_manifest_file
+        )
+        manifest = _validated_multi_governance_startup_recovery_manifest(
+            manifest
+        )
+        if manifest.get("authority_ref") != authority_ref:
+            raise WechatDigestError("多项目 Governance authority ref 不匹配。")
+        with self.run_store.lock():
+            binding = manifest["recovery_binding"]
+            assert isinstance(binding, dict)
+            run_id = str(binding["run_id"])
+            item_id = str(binding["item_id"])
+            ordered_ids = list(binding["ordered_atomic_information_ids"])
+            if self.run_store.active_run_id() != run_id:
+                raise WechatDigestError("多项目 Governance active run 不匹配。")
+            status = self.run_store.status(run_id)
+            items = status.get("items")
+            if not isinstance(items, dict):
+                raise WechatDigestError("微信运行状态 items 损坏。")
+            item = self._item(items, item_id)
+            started_receipt = _validated_governance_receipt(
+                item.get("governance_receipt")
+            )
+            recoveries, retries = self._governance_startup_history(run_id)
+            existing_matches = [
+                value
+                for value in recoveries
+                if isinstance(value.get("recovery_binding"), dict)
+                and value["recovery_binding"].get("run_id") == run_id
+                and value["recovery_binding"].get("item_id") == item_id
+                and value["recovery_binding"].get(
+                    "ordered_atomic_information_ids"
+                )
+                == ordered_ids
+                and value["recovery_binding"].get(
+                    "governance_started_receipt_fingerprint"
+                )
+                == _sha256_bytes(
+                    _canonical_json(started_receipt).encode("utf-8")
+                )
+            ]
+            if len(existing_matches) > 1:
+                raise WechatDigestError("多项目 Governance recovery 重复匹配。")
+            existing = existing_matches[0] if existing_matches else None
+            if existing is None:
+                semantic_continuation = (
+                    self._semantic_port()
+                    .multi_governance_startup_recovery_continuation(
+                        authority_ref=authority_ref,
+                        authority_manifest_fingerprint=str(
+                            manifest["manifest_fingerprint"]
+                        ),
+                        authority_manifest_raw_fingerprint=raw_fingerprint,
+                    )
+                )
+                expected = (
+                    self._build_multi_governance_startup_recovery_manifest_unlocked(
+                        authority_ref=authority_ref,
+                        adopted_continuation=semantic_continuation,
+                    )
+                )
+                if expected != manifest:
+                    raise WechatDigestError("多项目 Governance manifest 与现场不匹配。")
+                if semantic_continuation is None:
+                    semantic_continuation = (
+                        self._semantic_port()
+                        .install_multi_governance_startup_recovery_continuation(
+                            window_binding=self._semantic_authority_binding(
+                                run_id, allow_reviewed_head_extension=True
+                            ),
+                            authority_ref=authority_ref,
+                            authority_manifest_fingerprint=str(
+                                manifest["manifest_fingerprint"]
+                            ),
+                            authority_manifest_raw_fingerprint=raw_fingerprint,
+                        )
+                    )
+                without_fingerprint: dict[str, object] = {
+                    "schema_version": GOVERNANCE_STARTUP_RECOVERY_SCHEMA_VERSION,
+                    "artifact_kind": "governance_startup_recovery",
+                    "authority_ref": authority_ref,
+                    "authority_manifest_fingerprint": manifest[
+                        "manifest_fingerprint"
+                    ],
+                    "authority_manifest_raw_fingerprint": raw_fingerprint,
+                    "recovery_binding": binding,
+                    "atomic_effect_bindings": manifest["atomic_effect_bindings"],
+                    "business_tree_fingerprint": manifest[
+                        "business_tree_fingerprint"
+                    ],
+                    "semantic_continuation_fingerprint": semantic_continuation[
+                        "continuation_fingerprint"
+                    ],
+                    "provider_retry_permitted": True,
+                    "max_retry_attempts": 1,
+                    "retry_consumed": False,
+                }
+                receipt = {
+                    **without_fingerprint,
+                    "receipt_fingerprint": _sha256_bytes(
+                        _canonical_json(without_fingerprint).encode("utf-8")
+                    ),
+                }
+                existing = (
+                    self.run_store.publish_item_scoped_governance_startup_receipt(
+                        run_id,
+                        receipt=receipt,
+                    )
+                )
+            existing = _validated_governance_startup_recovery_receipt(existing)
+            if (
+                existing.get("authority_ref") != authority_ref
+                or existing.get("authority_manifest_fingerprint")
+                != manifest.get("manifest_fingerprint")
+                or existing.get("authority_manifest_raw_fingerprint")
+                != raw_fingerprint
+                or existing.get("recovery_binding") != binding
+                or existing.get("atomic_effect_bindings")
+                != manifest.get("atomic_effect_bindings")
+                or existing.get("business_tree_fingerprint")
+                != manifest.get("business_tree_fingerprint")
+            ):
+                raise WechatDigestError("多项目 Governance recovery receipt 不匹配。")
+            observed_continuation = (
+                self._semantic_port()
+                .multi_governance_startup_recovery_continuation(
+                    authority_ref=authority_ref,
+                    authority_manifest_fingerprint=str(
+                        manifest["manifest_fingerprint"]
+                    ),
+                    authority_manifest_raw_fingerprint=raw_fingerprint,
+                )
+            )
+            if (
+                observed_continuation is None
+                or observed_continuation.get("continuation_fingerprint")
+                != existing.get("semantic_continuation_fingerprint")
+            ):
+                raise WechatDigestError("多项目 Governance continuation 读回失败。")
+            historical_recoveries, observed_retries = (
+                self._governance_startup_history(run_id)
+            )
+            historical_recoveries = tuple(
+                value
+                for value in historical_recoveries
+                if value.get("receipt_fingerprint")
+                != existing.get("receipt_fingerprint")
+            )
+            if (
+                _sha256_bytes(
+                    _canonical_json(historical_recoveries).encode("utf-8")
+                )
+                != binding.get("startup_recovery_inventory_fingerprint")
+                or _sha256_bytes(
+                    _canonical_json(observed_retries).encode("utf-8")
+                )
+                != binding.get("startup_retry_inventory_fingerprint")
+                or any(
+                    retry.get("recovery_receipt_fingerprint")
+                    == existing.get("receipt_fingerprint")
+                    for retry in observed_retries
+                )
+            ):
+                raise WechatDigestError("多项目 Governance 历史 receipt 漂移。")
+            plan = self.run_store.plan(run_id)
+            after = WechatCursor.from_dict(
+                plan.get("after_cursor"), "plan.after_cursor"
+            )
+            upper = WechatCursor.from_dict(
+                plan.get("upper_bound"), "plan.upper_bound"
+            )
+            capture = self.capture_provider.capture(after, upper_bound=upper)
+            self._verify_capture_against_plan(capture, plan)
+            self._verify_plan_and_status(run_id, capture, plan, status)
+            source_id = str(binding["source_id"])
+            representation_id = str(binding["representation_id"])
+            source = self.source_repository.get(source_id)
+            representation = self.representation_repository.get(
+                representation_id
+            )
+            artifact_inventory = [
+                {
+                    "artifact_id": artifact.artifact_id,
+                    "content_hash": artifact.content_hash,
+                    "size_bytes": artifact.size_bytes,
+                }
+                for artifact in representation.artifacts
+            ]
+            checkpoint = self.run_store.checkpoint()
+            metrics = _validated_governance_metrics(
+                item.get("governance_metrics")
+            )
+            if (
+                item.get("state") != "represented"
+                or item.get("atomic_information_ids") != ordered_ids
+                or item.get("source_id") != source_id
+                or item.get("representation_id") != representation_id
+                or started_receipt.get("phase") != "started"
+                or _sha256_bytes(
+                    _canonical_json(started_receipt).encode("utf-8")
+                )
+                != binding.get("governance_started_receipt_fingerprint")
+                or _sha256_bytes(_canonical_json(metrics).encode("utf-8"))
+                != binding.get("governance_metrics_fingerprint")
+                or _plan_fingerprint(plan) != binding.get("plan_fingerprint")
+                or _sha256_bytes(
+                    _canonical_json(self.run_store.plan_receipt(run_id)).encode(
+                        "utf-8"
+                    )
+                )
+                != binding.get("plan_receipt_fingerprint")
+                or _capture_fingerprint(capture)
+                != binding.get("capture_fingerprint")
+                or _sha256_bytes(
+                    _canonical_json(
+                        None if checkpoint is None else checkpoint.to_dict()
+                    ).encode("utf-8")
+                )
+                != binding.get("checkpoint_fingerprint")
+                or _sha256_bytes(
+                    _canonical_json(source.to_manifest_dict()).encode("utf-8")
+                )
+                != binding.get("source_manifest_fingerprint")
+                or not self.source_repository.verify(source_id).verified
+                or representation.source_id != source_id
+                or not self.representation_repository.verify(
+                    representation_id
+                ).verified
+                or _sha256_bytes(
+                    _canonical_json(representation.to_manifest_dict()).encode(
+                        "utf-8"
+                    )
+                )
+                != binding.get("representation_manifest_fingerprint")
+                or _sha256_bytes(
+                    _canonical_json(artifact_inventory).encode("utf-8")
+                )
+                != binding.get(
+                    "representation_artifact_inventory_fingerprint"
+                )
+                or _package_fingerprint(
+                    self.workspace
+                    / "02_processing"
+                    / "information"
+                    / representation_id
+                )
+                != binding.get("semantic_package_fingerprint")
+                or [
+                    _sha256_bytes(
+                        _canonical_json(
+                            asdict(
+                                self.information_store.get_current(atomic_id)
+                            )
+                        ).encode("utf-8")
+                    )
+                    for atomic_id in ordered_ids
+                ]
+                != binding.get("ordered_atomic_revision_fingerprints")
+                or status.get("state") not in {"failed", "processing"}
+                or status.get("state") == "failed"
+                and _sha256_bytes(_canonical_json(status).encode("utf-8"))
+                != binding.get("status_fingerprint")
+                or status.get("state") == "processing"
+                and status.get("failure_category") is not None
+            ):
+                raise WechatDigestError("多项目 Governance durable binding 漂移。")
+            with SQLiteWorldModelRepository(self.database) as repository:
+                if (
+                    [
+                        self._governance_effect_binding(repository, atomic_id)
+                        for atomic_id in ordered_ids
+                    ]
+                    != manifest.get("atomic_effect_bindings")
+                    or self._governance_business_tree_fingerprint(repository)
+                    != manifest.get("business_tree_fingerprint")
+                ):
+                    raise WechatDigestError("多项目 Governance 业务状态漂移。")
+            if status.get("state") == "failed":
+                status["state"] = "processing"
+                status["failure_category"] = None
+                status["updated_at"] = self.clock()
+                self.run_store.update_status(run_id, status)
+            observed = self.run_store.status(run_id)
+            if (
+                observed.get("state") != "processing"
+                or observed.get("failure_category") is not None
+                or observed.get("checkpoint_published") is not False
+            ):
+                raise WechatDigestError("多项目 Governance 状态读回失败。")
             return existing
 
     def _historical_failed_closed_summary(
@@ -8467,6 +9528,87 @@ class WechatDigestService:
                     raise WechatDigestError("受影响 Object 的 Context 读回不一致。")
         return pending, tuple(sorted(affected))
 
+    def _governance_startup_history(
+        self, run_id: str
+    ) -> tuple[tuple[dict[str, object], ...], tuple[dict[str, object], ...]]:
+        recoveries = self.run_store.governance_startup_recoveries(run_id)
+        retries = self.run_store.governance_startup_retries(run_id)
+        by_fingerprint: dict[str, list[dict[str, object]]] = {}
+        for recovery in recoveries:
+            fingerprint = str(recovery["receipt_fingerprint"])
+            by_fingerprint.setdefault(fingerprint, []).append(recovery)
+        for retry in retries:
+            matches = by_fingerprint.get(
+                str(retry["recovery_receipt_fingerprint"]), []
+            )
+            if len(matches) != 1:
+                raise WechatDigestError(
+                    "Governance 启动恢复 retry 历史无法唯一绑定。"
+                )
+            binding = matches[0]["recovery_binding"]
+            assert isinstance(binding, dict)
+            if (
+                retry.get("run_id") != run_id
+                or retry.get("item_id") != binding.get("item_id")
+                or retry.get("atomic_information_fingerprint")
+                != _governance_atomic_fingerprint(
+                    binding.get("ordered_atomic_information_ids", [])
+                )
+            ):
+                raise WechatDigestError(
+                    "Governance 启动恢复 retry 历史 binding 损坏。"
+                )
+        return recoveries, retries
+
+    def _startup_recovery_for_item(
+        self,
+        *,
+        run_id: str,
+        item_id: str,
+        atomic_ids: Sequence[str],
+        started_receipt: Mapping[str, object],
+    ) -> dict[str, object] | None:
+        recoveries, retries = self._governance_startup_history(run_id)
+        started_fingerprint = _sha256_bytes(
+            _canonical_json(started_receipt).encode("utf-8")
+        )
+        matching: list[dict[str, object]] = []
+        for recovery in recoveries:
+            binding = recovery["recovery_binding"]
+            assert isinstance(binding, dict)
+            if (
+                binding.get("run_id") == run_id
+                and binding.get("item_id") == item_id
+                and binding.get("ordered_atomic_information_ids")
+                == list(atomic_ids)
+                and binding.get("governance_started_receipt_fingerprint")
+                == started_fingerprint
+            ):
+                matching.append(recovery)
+        if len(matching) > 1:
+            raise WechatDigestError(
+                "Governance 启动恢复 receipt 重复匹配当前项目。"
+            )
+        if not matching:
+            return None
+        recovery = matching[0]
+        recovery_fingerprint = recovery["receipt_fingerprint"]
+        matching_retries = [
+            retry
+            for retry in retries
+            if retry.get("recovery_receipt_fingerprint")
+            == recovery_fingerprint
+        ]
+        if len(matching_retries) > 1:
+            raise WechatDigestError(
+                "Governance 启动恢复 retry receipt 重复匹配。"
+            )
+        if matching_retries:
+            raise WechatDigestError(
+                "Governance 启动恢复机会已消耗；禁止再次调用 Provider。"
+            )
+        return recovery
+
     def _govern_item(
         self,
         run_id: str,
@@ -8508,109 +9650,24 @@ class WechatDigestService:
             if receipt["atomic_information_fingerprint"] != atomic_fingerprint:
                 raise WechatDigestError("微信 Governance receipt binding 不一致。")
             if receipt["phase"] == "started":
-                recovery_value = self.run_store.governance_startup_recovery(
-                    run_id
+                recovery_value = self._startup_recovery_for_item(
+                    run_id=run_id,
+                    item_id=item_id,
+                    atomic_ids=atomic_ids,
+                    started_receipt=receipt,
                 )
                 if recovery_value is not None:
-                    recovery_projected = dict(recovery_value)
-                    recovery_fingerprint = recovery_projected.pop(
-                        "receipt_fingerprint", None
-                    )
                     recovery_binding = recovery_value.get("recovery_binding")
                     effect_bindings = recovery_value.get(
                         "atomic_effect_bindings"
                     )
                     if (
-                        set(recovery_value)
-                        != {
-                            "schema_version",
-                            "artifact_kind",
-                            "authority_ref",
-                            "authority_manifest_fingerprint",
-                            "authority_manifest_raw_fingerprint",
-                            "recovery_binding",
-                            "atomic_effect_bindings",
-                            "business_tree_fingerprint",
-                            "semantic_continuation_fingerprint",
-                            "provider_retry_permitted",
-                            "max_retry_attempts",
-                            "retry_consumed",
-                            "receipt_fingerprint",
-                        }
-                        or recovery_value.get("schema_version")
-                        != GOVERNANCE_STARTUP_RECOVERY_SCHEMA_VERSION
-                        or recovery_value.get("artifact_kind")
-                        != "governance_startup_recovery"
-                        or not isinstance(recovery_binding, dict)
-                        or recovery_binding.get("run_id") != run_id
-                        or recovery_binding.get("item_id") != item_id
-                        or recovery_binding.get(
-                            "ordered_atomic_information_ids"
-                        )
-                        != list(atomic_ids)
-                        or recovery_binding.get(
-                            "governance_started_receipt_fingerprint"
-                        )
-                        != _sha256_bytes(
-                            _canonical_json(receipt).encode("utf-8")
-                        )
+                        not isinstance(recovery_binding, dict)
                         or not isinstance(effect_bindings, list)
                         or len(effect_bindings) != len(atomic_ids)
-                        or recovery_value.get("provider_retry_permitted")
-                        is not True
-                        or recovery_value.get("max_retry_attempts") != 1
-                        or recovery_value.get("retry_consumed") is not False
-                        or not _sha256_value(recovery_fingerprint)
-                        or recovery_fingerprint
-                        != _sha256_bytes(
-                            _canonical_json(recovery_projected).encode("utf-8")
-                        )
                     ):
                         raise WechatDigestError(
                             "Governance 启动恢复 receipt binding 损坏。"
-                        )
-                    retry = self.run_store.governance_startup_retry(run_id)
-                    if retry is not None:
-                        retry_projected = dict(retry)
-                        retry_fingerprint = retry_projected.pop(
-                            "receipt_fingerprint", None
-                        )
-                        if (
-                            set(retry)
-                            != {
-                                "schema_version",
-                                "artifact_kind",
-                                "recovery_receipt_fingerprint",
-                                "run_id",
-                                "item_id",
-                                "atomic_information_fingerprint",
-                                "retry_attempt",
-                                "consumed_at",
-                                "receipt_fingerprint",
-                            }
-                            or retry.get("schema_version")
-                            != GOVERNANCE_STARTUP_RETRY_SCHEMA_VERSION
-                            or retry.get("artifact_kind")
-                            != "governance_startup_retry_consumption"
-                            or retry.get("recovery_receipt_fingerprint")
-                            != recovery_fingerprint
-                            or retry.get("run_id") != run_id
-                            or retry.get("item_id") != item_id
-                            or retry.get("atomic_information_fingerprint")
-                            != atomic_fingerprint
-                            or retry.get("retry_attempt") != 1
-                            or not isinstance(retry.get("consumed_at"), str)
-                            or not _sha256_value(retry_fingerprint)
-                            or retry_fingerprint
-                            != _sha256_bytes(
-                                _canonical_json(retry_projected).encode("utf-8")
-                            )
-                        ):
-                            raise WechatDigestError(
-                                "Governance 启动恢复 retry receipt 损坏。"
-                            )
-                        raise WechatDigestError(
-                            "Governance 启动恢复机会已消耗；禁止再次调用 Provider。"
                         )
                     with SQLiteWorldModelRepository(self.database) as repository:
                         current_bindings = [
@@ -8725,11 +9782,20 @@ class WechatDigestService:
                         _canonical_json(without_fingerprint).encode("utf-8")
                     ),
                 }
-                self.run_store.publish_governance_startup_receipt(
-                    run_id,
-                    filename="governance-startup-retry.json",
-                    receipt=consumption,
-                )
+                authority_ref = str(startup_recovery.get("authority_ref", ""))
+                if authority_ref.startswith(
+                    "https://github.com/leevi2010-cursor/ArcheOS/issues/150"
+                ):
+                    self.run_store.publish_governance_startup_receipt(
+                        run_id,
+                        filename="governance-startup-retry.json",
+                        receipt=consumption,
+                    )
+                else:
+                    self.run_store.publish_item_scoped_governance_startup_receipt(
+                        run_id,
+                        receipt=consumption,
+                    )
                 provider_started = True
                 return
             self._update_item(

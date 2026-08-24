@@ -332,6 +332,78 @@ class CliTest(unittest.TestCase):
         digest_service.return_value.run.assert_not_called()
         capture_provider.assert_called_once()
 
+    @patch("archeos.cli.WechatDigestService")
+    @patch("archeos.cli.WechatCliCaptureProvider")
+    @patch("archeos.cli.require_workspace")
+    def test_wechat_digest_resolves_multi_governance_startup_zero_calls(
+        self,
+        require_workspace: Mock,
+        capture_provider: Mock,
+        digest_service: Mock,
+    ) -> None:
+        require_workspace.return_value = WorkspaceConfig(
+            Path("/workspace"), Path("/config")
+        )
+        method = (
+            digest_service.return_value.resolve_multi_governance_startup_failure
+        )
+        method.return_value = {
+            "receipt_fingerprint": "sha256:" + "d" * 64,
+        }
+        authority_ref = (
+            "https://github.com/leevi2010-cursor/ArcheOS/issues/168"
+            "#issuecomment-1234567890"
+        )
+        authority = Path("/private/issue-168-authority.json")
+        output = StringIO()
+        with redirect_stdout(output):
+            result = main(
+                [
+                    "wechat",
+                    "digest",
+                    "--resolve-multi-governance-startup-failure",
+                    "--multi-governance-startup-authority-file",
+                    str(authority),
+                    "--authority-ref",
+                    authority_ref,
+                ]
+            )
+        self.assertEqual(result, 0)
+        payload = json.loads(output.getvalue())
+        self.assertEqual(payload["semantic_provider_calls"], 0)
+        self.assertEqual(payload["governance_provider_calls"], 0)
+        self.assertEqual(payload["durable_information_preserved"], 3)
+        self.assertEqual(payload["safe_restart_attempts_available"], 1)
+        self.assertFalse(payload["checkpoint_published"])
+        method.assert_called_once_with(
+            authority_ref=authority_ref,
+            authority_manifest_file=authority,
+        )
+        digest_service.return_value.run.assert_not_called()
+        capture_provider.assert_called_once()
+
+    @patch("archeos.cli.require_workspace")
+    def test_multi_governance_startup_cli_requires_private_manifest(
+        self, require_workspace: Mock
+    ) -> None:
+        output = StringIO()
+        with redirect_stdout(output):
+            result = main(
+                [
+                    "wechat",
+                    "digest",
+                    "--resolve-multi-governance-startup-failure",
+                    "--authority-ref",
+                    (
+                        "https://github.com/leevi2010-cursor/ArcheOS/issues/168"
+                        "#issuecomment-1234567890"
+                    ),
+                ]
+            )
+        self.assertEqual(result, 2)
+        self.assertIn("必须指定私有 authority file", output.getvalue())
+        require_workspace.assert_not_called()
+
     @patch("archeos.cli.require_workspace")
     def test_failed_closed_recovery_cli_requires_exact_private_manifest(
         self, require_workspace: Mock
