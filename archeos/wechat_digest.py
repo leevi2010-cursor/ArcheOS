@@ -1055,6 +1055,21 @@ class WechatDigestRunStore:
                 run_dir / "plan.json"
             ):
                 continue
+            loaded = self.pending_capture_for_run(run_dir.name)
+            if loaded is not None:
+                pending.append(loaded)
+        if len(pending) > 1:
+            raise WechatDigestError("存在多个未提交的微信 capture snapshot。")
+        return pending[0] if pending else None
+
+    def pending_capture_for_run(
+        self, run_id: str
+    ) -> tuple[WechatCapture, dict[str, object]] | None:
+        run_dir = self.runs_root / run_id
+        pending_path = run_dir / "capture-pending.json"
+        if not os.path.lexists(pending_path):
+            return None
+        try:
             value = self._private_receipt(
                 pending_path,
                 schema_version=CAPTURE_PENDING_SCHEMA_VERSION,
@@ -1119,10 +1134,9 @@ class WechatDigestRunStore:
                 or int(value["capture_ms"]) < 0
             ):
                 raise WechatDigestError("微信 capture pending 漂移。")
-            pending.append((capture, value))
-        if len(pending) > 1:
-            raise WechatDigestError("存在多个未提交的微信 capture snapshot。")
-        return pending[0] if pending else None
+            return capture, value
+        except (TypeError, ValueError) as exc:
+            raise WechatDigestError("微信 capture pending 损坏。") from exc
 
     def publish_capture_artifacts(
         self,
@@ -1323,6 +1337,107 @@ class WechatDigestRunStore:
         ):
             raise WechatDigestError("微信 capture receipt 与 snapshot 不一致。")
         return capture, receipt
+
+    def load_capture_summary_receipt(
+        self,
+        run_id: str,
+        *,
+        plan: Mapping[str, object] | None = None,
+    ) -> tuple[dict[str, object], dict[str, object]]:
+        """Validate completed-window metadata without reading snapshot/index."""
+
+        receipt = self.capture_receipt(run_id)
+        if receipt is None:
+            raise WechatDigestError("微信 capture receipt 缺失。")
+        projected = dict(receipt)
+        receipt_fingerprint = projected.pop("receipt_fingerprint", None)
+        if receipt_fingerprint != _sha256_bytes(
+            _canonical_json(projected).encode("utf-8")
+        ):
+            raise WechatDigestError("微信 capture receipt fingerprint 损坏。")
+        if plan is not None and (
+            plan.get("run_id") != run_id
+            or plan.get("schema_version") != SNAPSHOT_RUN_PLAN_SCHEMA_VERSION
+            or plan.get("capture_receipt_fingerprint") != receipt_fingerprint
+            or receipt.get("plan_binding_fingerprint")
+            != _plan_fingerprint(_capture_plan_projection(plan))
+        ):
+            raise WechatDigestError("微信 completed plan/capture binding 损坏。")
+        path = self.runs_root / run_id / "capture" / "summary.json"
+        raw = path.read_bytes()
+        summary = self._private_receipt(
+            path,
+            schema_version=CAPTURE_SUMMARY_SCHEMA_VERSION,
+            label="微信 capture summary",
+        )
+        if (
+            _sha256_bytes(raw) != receipt.get("summary_raw_fingerprint")
+            or summary.get("provider_version")
+            != receipt.get("provider_version")
+            or summary.get("after_cursor") != receipt.get("after_cursor")
+            or summary.get("upper_bound") != receipt.get("upper_bound")
+            or summary.get("message_count") != receipt.get("message_count")
+            or summary.get("conversation_count")
+            != receipt.get("conversation_count")
+            or summary.get("attachment_count")
+            != receipt.get("attachment_count")
+        ):
+            raise WechatDigestError("微信 capture summary/receipt 漂移。")
+        return summary, receipt
+
+    def load_capture_index(
+        self,
+        run_id: str,
+        *,
+        capture: WechatCapture,
+    ) -> dict[str, object]:
+        receipt = self.capture_receipt(run_id)
+        if receipt is None:
+            raise WechatDigestError("微信 capture receipt 缺失。")
+        path = self.runs_root / run_id / "capture" / "index.json"
+        raw = path.read_bytes()
+        index = self._private_receipt(
+            path,
+            schema_version=CAPTURE_INDEX_SCHEMA_VERSION,
+            label="微信 capture index",
+        )
+        if _sha256_bytes(raw) != receipt.get("index_raw_fingerprint"):
+            raise WechatDigestError("微信 capture index fingerprint 漂移。")
+        conversations = _plan_sequence(
+            index.get("conversations"), "capture.index.conversations"
+        )
+        attachments = _plan_sequence(
+            index.get("attachments"), "capture.index.attachments"
+        )
+        ordered_indexes: list[int] = []
+        conversation_keys: set[str] = set()
+        for conversation in conversations:
+            key = conversation.get("conversation_key")
+            message_indexes = conversation.get("message_indexes")
+            if (
+                not isinstance(key, str)
+                or key in conversation_keys
+                or not isinstance(message_indexes, list)
+                or any(
+                    isinstance(index, bool) or not isinstance(index, int)
+                    for index in message_indexes
+                )
+            ):
+                raise WechatDigestError("微信 capture index 会话范围损坏。")
+            conversation_keys.add(key)
+            ordered_indexes.extend(message_indexes)
+        if (
+            len(ordered_indexes) != len(capture.messages)
+            or sorted(ordered_indexes) != list(range(len(capture.messages)))
+            or any(
+                not isinstance(entry.get("message_index"), int)
+                or isinstance(entry.get("message_index"), bool)
+                or not 0 <= int(entry["message_index"]) < len(capture.messages)
+                for entry in attachments
+            )
+        ):
+            raise WechatDigestError("微信 capture index 范围损坏。")
+        return index
 
     def create(self, plan: dict[str, object], status: dict[str, object]) -> None:
         run_id = str(plan["run_id"])
@@ -2056,11 +2171,15 @@ class ExistingSemanticHandoff:
         providers = tuple(
             self._new_provider(request.representation_id) for request in requests
         )
-        return self.service.prepare_results(
+        elapsed = self.service.prepare_results(
             requests,
             providers,
             concurrency=parallelism,
         )
+        self.last_prepare_metrics = dict(
+            getattr(self.service, "last_result_only_metrics", {})
+        )
+        return elapsed
 
     def install_global_authority(
         self,
@@ -3572,13 +3691,12 @@ def _capture_from_snapshot(value: object) -> WechatCapture:
 
 
 def _capture_index_payload(capture: WechatCapture) -> dict[str, object]:
+    indexes_by_conversation: dict[str, list[int]] = {}
+    for index, message in enumerate(capture.messages):
+        indexes_by_conversation.setdefault(message.conversation_key, []).append(index)
     conversations: list[dict[str, object]] = []
-    for conversation_key in sorted({item.conversation_key for item in capture.messages}):
-        indexes = [
-            index
-            for index, message in enumerate(capture.messages)
-            if message.conversation_key == conversation_key
-        ]
+    for conversation_key in sorted(indexes_by_conversation):
+        indexes = indexes_by_conversation[conversation_key]
         conversations.append(
             {
                 "conversation_key": conversation_key,
@@ -4096,6 +4214,12 @@ class WechatDigestService:
                     continue
                 candidate_receipt = self.run_store.plan_receipt(path.name)
                 candidate_status = self.run_store.status(path.name)
+                if replay_completed_window_captures:
+                    self._segment_performance[
+                        "completed_window_connector_replays"
+                    ] = self._segment_performance.get(
+                        "completed_window_connector_replays", 0
+                    ) + 1
                 self._verify_plan_and_status(
                     path.name,
                     (
@@ -4108,6 +4232,9 @@ class WechatDigestService:
                     ),
                     candidate_plan,
                     candidate_status,
+                    lightweight_capture=(
+                        not replay_completed_window_captures
+                    ),
                 )
                 if (
                     candidate_status.get("state") != "completed"
@@ -8890,12 +9017,20 @@ class WechatDigestService:
             )
             for item in attachments
         }
+        capture_index = self.run_store.load_capture_index(
+            run_id, capture=capture
+        )
         captured_attachments = {
-            attachment.attachment_key: attachment
-            for message in capture.messages
-            for attachment in message.attachments
+            str(entry["attachment_key"]): next(
+                attachment
+                for attachment in capture.messages[int(entry["message_index"])].attachments
+                if attachment.attachment_key == entry["attachment_key"]
+            )
+            for entry in _plan_sequence(
+                capture_index.get("attachments"),
+                "capture.index.attachments",
+            )
         }
-        capture_index = _capture_index_payload(capture)
         conversation_indexes = {
             str(value["conversation_key"]): tuple(value["message_indexes"])
             for value in _plan_sequence(
@@ -9009,18 +9144,24 @@ class WechatDigestService:
         require_receipt: bool = True,
         allow_legacy_status: bool = False,
         allow_pending_unknown_resolution: bool = False,
+        lightweight_capture: bool = False,
     ) -> None:
         run_id = plan.get("run_id")
         created_at = plan.get("created_at")
         if not isinstance(run_id, str) or run_id != active_run_id or not isinstance(created_at, str):
             raise WechatDigestError("微信运行计划损坏。")
         if plan.get("schema_version") == SNAPSHOT_RUN_PLAN_SCHEMA_VERSION:
-            durable_capture, _ = self.run_store.load_capture_artifacts(
-                active_run_id,
-                plan=plan,
-            )
-            if capture is not None and durable_capture != capture:
-                raise WechatDigestError("微信 durable capture 读回不一致。")
+            if lightweight_capture:
+                self.run_store.load_capture_summary_receipt(
+                    active_run_id, plan=plan
+                )
+            else:
+                durable_capture, _ = self.run_store.load_capture_artifacts(
+                    active_run_id,
+                    plan=plan,
+                )
+                if capture is not None and durable_capture != capture:
+                    raise WechatDigestError("微信 durable capture 读回不一致。")
         plan_is_legacy = plan.get("schema_version") == LEGACY_RUN_PLAN_SCHEMA_VERSION
         if plan.get("schema_version") not in {
             SNAPSHOT_RUN_PLAN_SCHEMA_VERSION,
@@ -9514,18 +9655,29 @@ class WechatDigestService:
         previous_fingerprint = _plan_fingerprint(previous_plan)
         existing_receipt = self.run_store.capture_receipt(run_id)
         if existing_receipt is None:
-            after = WechatCursor.from_dict(
-                previous_plan["after_cursor"], "plan.after_cursor"
-            )
-            upper = WechatCursor.from_dict(
-                previous_plan["upper_bound"], "plan.upper_bound"
-            )
-            started = time.monotonic()
-            capture = self.capture_provider.capture(after, upper_bound=upper)
-            if self._segment_performance:
-                self._segment_performance["capture_provider_calls"] += 1
-            capture_ms = round((time.monotonic() - started) * 1000)
-            self._verify_capture_against_plan(capture, previous_plan)
+            pending = self.run_store.pending_capture_for_run(run_id)
+            if pending is None:
+                after = WechatCursor.from_dict(
+                    previous_plan["after_cursor"], "plan.after_cursor"
+                )
+                upper = WechatCursor.from_dict(
+                    previous_plan["upper_bound"], "plan.upper_bound"
+                )
+                started = time.monotonic()
+                capture = self.capture_provider.capture(after, upper_bound=upper)
+                if self._segment_performance:
+                    self._segment_performance["capture_provider_calls"] += 1
+                capture_ms = round((time.monotonic() - started) * 1000)
+                self._verify_capture_against_plan(capture, previous_plan)
+                self.run_store.publish_capture_pending(
+                    previous_plan,
+                    capture,
+                    capture_ms=capture_ms,
+                )
+            else:
+                capture, pending_receipt = pending
+                capture_ms = int(pending_receipt["capture_ms"])
+                self._verify_capture_against_plan(capture, previous_plan)
             existing_receipt = self.run_store.publish_capture_artifacts(
                 run_id,
                 capture,
@@ -9600,6 +9752,9 @@ class WechatDigestService:
             "semantic_peak_concurrency": 0,
             "semantic_wall_ms": 0,
             "semantic_serial_estimate_ms": 0,
+            "governance_peak_concurrency": 0,
+            "resume_provider_calls": 0,
+            "completed_window_connector_replays": 0,
         }
         checkpoint = self.run_store.checkpoint()
         active_run_id = self.run_store.active_run_id()
@@ -9807,13 +9962,21 @@ class WechatDigestService:
             )
             for item in attachment_plans
         }
-        by_attachment = {
-            attachment.attachment_key: attachment
-            for message in capture.messages
-            for attachment in message.attachments
-        }
         slice_started = time.monotonic()
-        capture_index = _capture_index_payload(capture)
+        capture_index = self.run_store.load_capture_index(
+            run_id, capture=capture
+        )
+        by_attachment = {
+            str(entry["attachment_key"]): next(
+                attachment
+                for attachment in capture.messages[int(entry["message_index"])].attachments
+                if attachment.attachment_key == entry["attachment_key"]
+            )
+            for entry in _plan_sequence(
+                capture_index.get("attachments"),
+                "capture.index.attachments",
+            )
+        }
         conversation_indexes = {
             str(value["conversation_key"]): tuple(value["message_indexes"])
             for value in _plan_sequence(
@@ -9957,7 +10120,8 @@ class WechatDigestService:
             if prepared:
                 authority_binding = self._semantic_authority_binding(run_id)
                 semantic_started = time.monotonic()
-                elapsed_by_representation = self._semantic_port().prepare_results(
+                semantic_port = self._semantic_port()
+                elapsed_by_representation = semantic_port.prepare_results(
                     tuple(
                         SemanticResultOnlyRequest(
                             representation_id=representation_id,
@@ -9980,10 +10144,17 @@ class WechatDigestService:
                 self._segment_performance["semantic_serial_estimate_ms"] += sum(
                     elapsed_by_representation.values()
                 )
+                observed_metrics = getattr(
+                    semantic_port, "last_prepare_metrics", {}
+                )
                 self._segment_performance["semantic_peak_concurrency"] = max(
                     self._segment_performance["semantic_peak_concurrency"],
-                    len(prepared),
+                    int(observed_metrics.get("semantic_peak_concurrency", 0)),
                 )
+                if replayed:
+                    self._segment_performance["resume_provider_calls"] += int(
+                        observed_metrics.get("resume_provider_calls", 0)
+                    )
                 for (
                     conversation_plan,
                     item_id,
@@ -10314,6 +10485,11 @@ class WechatDigestService:
             item_id,
             atomic_information_ids=list(atomic_ids),
         )
+        if atomic_ids:
+            self._segment_performance["governance_peak_concurrency"] = max(
+                self._segment_performance.get("governance_peak_concurrency", 0),
+                1,
+            )
         pending, object_ids = self._govern_item(
             run_id, status, item_id, atomic_ids
         )
@@ -10406,6 +10582,11 @@ class WechatDigestService:
             item_id,
             atomic_information_ids=list(atomic_ids),
         )
+        if atomic_ids:
+            self._segment_performance["governance_peak_concurrency"] = max(
+                self._segment_performance.get("governance_peak_concurrency", 0),
+                1,
+            )
         pending, object_ids = self._govern_item(
             run_id, status, item_id, atomic_ids
         )
@@ -11229,7 +11410,9 @@ class WechatDigestService:
             capture_provider_calls=sum(
                 result.capture_provider_calls for result in results
             ),
-            completed_window_connector_replays=0,
+            completed_window_connector_replays=sum(
+                result.completed_window_connector_replays for result in results
+            ),
             snapshot_bytes=max(result.snapshot_bytes for result in results),
             capture_ms=max(result.capture_ms for result in results),
             snapshot_publish_ms=sum(
@@ -11252,7 +11435,9 @@ class WechatDigestService:
             governance_peak_concurrency=max(
                 result.governance_peak_concurrency for result in results
             ),
-            resume_provider_calls=0,
+            resume_provider_calls=sum(
+                result.resume_provider_calls for result in results
+            ),
         )
 
     def _result(
@@ -11359,7 +11544,9 @@ class WechatDigestService:
             capture_provider_calls=self._segment_performance.get(
                 "capture_provider_calls", 0
             ),
-            completed_window_connector_replays=0,
+            completed_window_connector_replays=self._segment_performance.get(
+                "completed_window_connector_replays", 0
+            ),
             snapshot_bytes=snapshot_bytes,
             capture_ms=int(summary.get("capture_ms", 0)),
             snapshot_publish_ms=self._segment_performance.get(
@@ -11377,6 +11564,10 @@ class WechatDigestService:
             semantic_serial_estimate_ms=self._segment_performance.get(
                 "semantic_serial_estimate_ms", 0
             ),
-            governance_peak_concurrency=1 if atomic_ids else 0,
-            resume_provider_calls=0,
+            governance_peak_concurrency=self._segment_performance.get(
+                "governance_peak_concurrency", 0
+            ),
+            resume_provider_calls=self._segment_performance.get(
+                "resume_provider_calls", 0
+            ),
         )

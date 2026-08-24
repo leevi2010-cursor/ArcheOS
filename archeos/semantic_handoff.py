@@ -10,6 +10,7 @@ import re
 import secrets
 import stat
 import tempfile
+import threading
 import time
 from collections import Counter
 from collections.abc import Callable, Mapping, Sequence
@@ -144,6 +145,8 @@ class SemanticCampaignAuthorityBinding:
 _RECOVERY_RUN_SCHEMA = "semantic-handoff-run-receipt/2.0"
 _RECOVERY_ATTEMPT_SCHEMA = "semantic-handoff-attempt-receipt/2.0"
 _GLOBAL_ATTEMPT_SCHEMA = "semantic-handoff-attempt-receipt/3.0"
+_GLOBAL_RESERVED_ATTEMPT_SCHEMA = "semantic-handoff-attempt-receipt/4.0"
+_GLOBAL_COMMIT_CURSOR_SCHEMA = "semantic-handoff-global-commit-cursor/1.0"
 _RECOVERY_RESULT_SCHEMA = "semantic-handoff-batch-result-receipt/2.0"
 _RECOVERY_RESULT_PHASE_SCHEMA = "semantic-handoff-batch-result-phase/1.0"
 _RECOVERY_ATTEMPT_STARTED_SCHEMA = "semantic-handoff-attempt-started/1.0"
@@ -189,6 +192,7 @@ _INVENTORY_AUTHORITY_SCHEMA = "semantic-handoff-inventory-authority/1.0"
 _GLOBAL_AUTHORITY_DIRECTORY = "semantic_global_authority"
 _GLOBAL_AUTHORITY_GRANT = "grant.json"
 _GLOBAL_AUTHORITY_EXTENSION = "extension-cap-1000.json"
+_GLOBAL_COMMIT_CURSOR = "commit-cursor.json"
 _MAINTENANCE_CONTINUATION_RECEIPT = "maintenance-continuation.json"
 _BATCH_GOVERNANCE_CONTINUATION_RECEIPT = (
     "batch-governance-continuation.json"
@@ -528,6 +532,7 @@ def _validate_global_authority_directory(path: Path) -> None:
         _GOVERNANCE_STARTUP_RECOVERY_CONTINUATION_RECEIPT,
         _FAILED_CLOSED_RECOVERY_CONTINUATION_RECEIPT,
         _MULTI_GOVERNANCE_STARTUP_RECOVERY_CONTINUATION_RECEIPT,
+        _GLOBAL_COMMIT_CURSOR,
     }:
         raise SemanticHandoffError("Semantic global authority inventory 损坏。")
     lock_path = children.get(_GLOBAL_AUTHORITY_LOCK)
@@ -575,6 +580,9 @@ def _validate_global_authority_directory(path: Path) -> None:
     )
     if multi_startup_recovery_path is not None:
         _require_private_file(multi_startup_recovery_path)
+    commit_cursor_path = children.get(_GLOBAL_COMMIT_CURSOR)
+    if commit_cursor_path is not None:
+        _require_private_file(commit_cursor_path)
 
 
 def _validate_shared_recovery_root(root: Path, *, create: bool) -> bool:
@@ -916,6 +924,7 @@ class _SemanticRecoveryRun:
         *,
         global_authority: _SemanticGlobalAuthority | None = None,
         window_binding: SemanticWindowAuthorityBinding | None = None,
+        complete_context: bool = False,
     ) -> None:
         if (
             not isinstance(privacy, SemanticPrivacyBinding)
@@ -935,6 +944,7 @@ class _SemanticRecoveryRun:
             os.path.abspath(Path(audit_root).expanduser())
         )
         self.provider = provider
+        self.complete_context = complete_context
         self.privacy = privacy
         self.global_authority = global_authority
         self.window_binding = window_binding
@@ -953,8 +963,14 @@ class _SemanticRecoveryRun:
             representation,
             representation_service.representation_repository,
         )
-        self.batches = _analysis_batches(
+        canonical_batches = _analysis_batches(
             self.units, representation_service.batch_size
+        )
+        eligible_units = tuple(unit for unit in self.units if unit.analysis_eligible)
+        self.batches = (
+            (RepresentationAnalysisBatch(anchor_units=eligible_units),)
+            if complete_context and eligible_units
+            else canonical_batches
         )
         if not self.batches:
             raise SemanticHandoffError("Semantic recovery 没有可执行的 canonical batch。")
@@ -999,7 +1015,7 @@ class _SemanticRecoveryRun:
                 ordinal,
                 protocol_version=EXTERNAL_AGENT_PROTOCOL_V3_1,
             )
-            for ordinal, batch in enumerate(self.batches, start=1)
+            for ordinal, batch in enumerate(canonical_batches, start=1)
         )
         historical_identity = self._execution_identity(
             protocol_version=EXTERNAL_AGENT_PROTOCOL_V3_1,
@@ -1019,7 +1035,7 @@ class _SemanticRecoveryRun:
                 ordinal,
                 protocol_version=EXTERNAL_AGENT_PROTOCOL_V3_2,
             )
-            for ordinal, batch in enumerate(self.batches, start=1)
+            for ordinal, batch in enumerate(canonical_batches, start=1)
         )
         historical_v32_identity = self._execution_identity(
             protocol_version=EXTERNAL_AGENT_PROTOCOL_V3_2,
@@ -1051,7 +1067,7 @@ class _SemanticRecoveryRun:
                 ordinal,
                 protocol_version=EXTERNAL_AGENT_PROTOCOL_V3_3,
             )
-            for ordinal, batch in enumerate(self.batches, start=1)
+            for ordinal, batch in enumerate(canonical_batches, start=1)
         )
         historical_v33_identity = self._execution_identity(
             protocol_version=EXTERNAL_AGENT_PROTOCOL_V3_3,
@@ -1192,6 +1208,16 @@ class _SemanticRecoveryRun:
     @property
     def exists(self) -> bool:
         return os.path.lexists(self.run_dir)
+
+    @property
+    def result_only_wave(self) -> bool:
+        if not os.path.lexists(self.attempts_dir):
+            return False
+        return any(
+            _private_json_exact(path).get("schema_version")
+            == _GLOBAL_RESERVED_ATTEMPT_SCHEMA
+            for path in self.attempts_dir.iterdir()
+        )
 
     def ensure_run_receipt(self) -> None:
         _validate_shared_recovery_root(self.audit_root, create=True)
@@ -1359,7 +1385,10 @@ class _SemanticRecoveryRun:
 
     def _load_attempt(self, ordinal: int) -> dict[str, object]:
         payload = _private_json_exact(self._attempt_path(ordinal))
-        if payload.get("schema_version") == _GLOBAL_ATTEMPT_SCHEMA:
+        if payload.get("schema_version") in {
+            _GLOBAL_ATTEMPT_SCHEMA,
+            _GLOBAL_RESERVED_ATTEMPT_SCHEMA,
+        }:
             observed_window = _authority_window_from_payload(payload.get("window"))
             if self.window_binding is None:
                 global_authority = self.global_authority or _SemanticGlobalAuthority(
@@ -1491,6 +1520,10 @@ class _SemanticRecoveryRun:
                 global_ordinal=payload.get("global_ordinal"),
                 grant=grant,
                 window=self.window_binding,
+                reservation=(
+                    payload.get("schema_version")
+                    == _GLOBAL_RESERVED_ATTEMPT_SCHEMA
+                ),
             )
             if not _payloads_exactly_equal(payload, expected):
                 raise SemanticHandoffError(
@@ -1512,6 +1545,7 @@ class _SemanticRecoveryRun:
         global_ordinal: object,
         grant: Mapping[str, object],
         window: SemanticWindowAuthorityBinding,
+        reservation: bool = False,
     ) -> dict[str, object]:
         if (
             not isinstance(attempt_nonce, str)
@@ -1533,7 +1567,11 @@ class _SemanticRecoveryRun:
             ).encode()
         ).hexdigest()[:32]
         without_fingerprint: dict[str, object] = {
-            "schema_version": _GLOBAL_ATTEMPT_SCHEMA,
+            "schema_version": (
+                _GLOBAL_RESERVED_ATTEMPT_SCHEMA
+                if reservation
+                else _GLOBAL_ATTEMPT_SCHEMA
+            ),
             "artifact_kind": "semantic_handoff_attempt",
             "attempt_id": attempt_id,
             "attempt_nonce": attempt_nonce,
@@ -1544,7 +1582,7 @@ class _SemanticRecoveryRun:
                 "batch_contract_fingerprint"
             ],
             "input_fingerprint": batch_receipt["input_fingerprint"],
-            "state": "consumed",
+            "state": "reserved_not_started" if reservation else "consumed",
             "global_authority_fingerprint": authority_fingerprint,
             "global_ordinal": global_ordinal,
             "window": _authority_window_payload(window),
@@ -1561,6 +1599,7 @@ class _SemanticRecoveryRun:
         grant: Mapping[str, object],
         global_ordinal: int,
         window: SemanticWindowAuthorityBinding,
+        reservation: bool = False,
     ) -> dict[str, object]:
         self._validate_inventory()
         _ensure_private_directory(self.attempts_dir)
@@ -1571,6 +1610,7 @@ class _SemanticRecoveryRun:
             global_ordinal=global_ordinal,
             grant=grant,
             window=window,
+            reservation=reservation,
         )
         try:
             _publish_private_json_marker(path, expected)
@@ -1812,14 +1852,23 @@ class _SemanticRecoveryRun:
             loaded.append(None)
             if attempt_exists:
                 self._load_attempt(ordinal)
-                if (
-                    self._load_started(ordinal) is not None
-                    or self._load_reserved(ordinal) is None
+                attempt = self._load_attempt(ordinal)
+                if self._load_started(ordinal) is not None or (
+                    attempt.get("schema_version")
+                    != _GLOBAL_RESERVED_ATTEMPT_SCHEMA
+                    and self._load_reserved(ordinal) is None
                 ):
                     unknown += 1
             if any(
-                os.path.lexists(self._attempt_path(later))
-                or os.path.lexists(self._result_path(later))
+                (
+                    os.path.lexists(self._result_path(later))
+                    or (
+                        os.path.lexists(self._attempt_path(later))
+                        and self._load_attempt(later).get("schema_version")
+                        != _GLOBAL_RESERVED_ATTEMPT_SCHEMA
+                    )
+                    or os.path.lexists(self._started_path(later))
+                )
                 for later in range(ordinal + 1, len(self.batches) + 1)
             ):
                 raise SemanticHandoffError(
@@ -3460,10 +3509,15 @@ class _SemanticGlobalAuthority:
                     raise SemanticHandoffError(
                         "Semantic global authority historical result 路径损坏。"
                     )
-            if tuple(result_ordinals) not in {
-                tuple(attempt_ordinals),
-                tuple(attempt_ordinals[:-1]),
-            }:
+            if (
+                result_ordinals != attempt_ordinals[: len(result_ordinals)]
+                or len(result_ordinals) < len(attempt_ordinals) - 1
+                and any(
+                    _private_json_exact(path).get("schema_version")
+                    != _GLOBAL_RESERVED_ATTEMPT_SCHEMA
+                    for path in attempt_paths[len(result_ordinals) :]
+                )
+            ):
                 raise SemanticHandoffError(
                     "Semantic global authority historical attempt/result 顺序损坏。"
                 )
@@ -3473,6 +3527,7 @@ class _SemanticGlobalAuthority:
                 if attempt_schema not in {
                     _RECOVERY_ATTEMPT_SCHEMA,
                     _GLOBAL_ATTEMPT_SCHEMA,
+                    _GLOBAL_RESERVED_ATTEMPT_SCHEMA,
                 }:
                     raise SemanticHandoffError(
                         "Semantic global authority legacy attempt 无法解释。"
@@ -3612,7 +3667,10 @@ class _SemanticGlobalAuthority:
             if linked_run_id is not None:
                 linked_audits.add(linked_run_id)
                 linked_attempts[linked_run_id] = str(node["attempt_identity"])
-            if node["attempt_schema"] == _GLOBAL_ATTEMPT_SCHEMA:
+            if node["attempt_schema"] in {
+                _GLOBAL_ATTEMPT_SCHEMA,
+                _GLOBAL_RESERVED_ATTEMPT_SCHEMA,
+            }:
                 continue
             entry = dict(node["entry"])  # type: ignore[arg-type]
             entry["processing_audit_sha256"] = (
@@ -9610,7 +9668,7 @@ class _SemanticGlobalAuthority:
                 (path, payload)
                 for path in sorted(attempts_dir.iterdir())
                 if (payload := _private_json_exact(path)).get("schema_version")
-                == _GLOBAL_ATTEMPT_SCHEMA
+                in {_GLOBAL_ATTEMPT_SCHEMA, _GLOBAL_RESERVED_ATTEMPT_SCHEMA}
             )
             if not global_entries:
                 continue
@@ -9860,7 +9918,13 @@ class _SemanticGlobalAuthority:
                         "attempt_receipt_fingerprint",
                     }
                     or payload.get("artifact_kind") != "semantic_handoff_attempt"
-                    or payload.get("state") != "consumed"
+                    or payload.get("state")
+                    != (
+                        "reserved_not_started"
+                        if payload.get("schema_version")
+                        == _GLOBAL_RESERVED_ATTEMPT_SCHEMA
+                        else "consumed"
+                    )
                     or payload.get("semantic_run_id") != run.name
                     or match is None
                     or not isinstance(batch_receipt, dict)
@@ -9938,6 +10002,13 @@ class _SemanticGlobalAuthority:
                                 "Semantic global started receipt 损坏。"
                             )
                         unknown = True
+                    elif (
+                        payload.get("schema_version")
+                        == _GLOBAL_RESERVED_ATTEMPT_SCHEMA
+                    ):
+                        # The single durable attempt marker is the reservation.
+                        # With no started marker the Provider provably never ran.
+                        continue
                     else:
                         reserved_path = (
                             run
@@ -10495,6 +10566,7 @@ class _SemanticGlobalAuthority:
         grant: Mapping[str, object],
         window: SemanticWindowAuthorityBinding,
         provider: CodexCliRepresentationAnalysisProvider,
+        reservation: bool = False,
     ) -> dict[str, object]:
         current = self._guard_grant
         global_ordinal = self._guard_next_ordinal
@@ -10515,6 +10587,7 @@ class _SemanticGlobalAuthority:
             grant=current,
             global_ordinal=global_ordinal,
             window=window,
+            reservation=reservation,
         )
         self._guard_next_ordinal = global_ordinal + 1
         return published
@@ -10554,10 +10627,158 @@ class _SemanticGlobalAuthority:
                     grant=grant,
                     window=window,
                     provider=provider,
+                    reservation=True,
                 )
-                recovery.publish_reserved(ordinal)
                 published.append(attempt)
             return tuple(published)
+
+    def _commit_cursor_path(self) -> Path:
+        return self.root / _GLOBAL_COMMIT_CURSOR
+
+    def _commit_cursor_payload(
+        self,
+        *,
+        committed_global_ordinal: int,
+        attempt_receipt_fingerprint: str | None,
+    ) -> dict[str, object]:
+        without_fingerprint: dict[str, object] = {
+            "schema_version": _GLOBAL_COMMIT_CURSOR_SCHEMA,
+            "artifact_kind": "semantic_handoff_global_commit_cursor",
+            "committed_global_ordinal": committed_global_ordinal,
+            "attempt_receipt_fingerprint": attempt_receipt_fingerprint,
+        }
+        return {
+            **without_fingerprint,
+            "commit_cursor_fingerprint": _fingerprint(without_fingerprint),
+        }
+
+    def _read_commit_cursor(self, baseline: int) -> dict[str, object]:
+        path = self._commit_cursor_path()
+        if not os.path.lexists(path):
+            return self._commit_cursor_payload(
+                committed_global_ordinal=baseline,
+                attempt_receipt_fingerprint=None,
+            )
+        payload = _private_json_exact(path)
+        projected = dict(payload)
+        fingerprint = projected.pop("commit_cursor_fingerprint", None)
+        ordinal = payload.get("committed_global_ordinal")
+        if (
+            set(payload)
+            != {
+                "schema_version",
+                "artifact_kind",
+                "committed_global_ordinal",
+                "attempt_receipt_fingerprint",
+                "commit_cursor_fingerprint",
+            }
+            or payload.get("schema_version") != _GLOBAL_COMMIT_CURSOR_SCHEMA
+            or payload.get("artifact_kind")
+            != "semantic_handoff_global_commit_cursor"
+            or isinstance(ordinal, bool)
+            or not isinstance(ordinal, int)
+            or ordinal < baseline
+            or fingerprint != _fingerprint(projected)
+        ):
+            raise SemanticHandoffError("Semantic global commit cursor 损坏。")
+        return payload
+
+    def commit_range(
+        self,
+        recovery: _SemanticRecoveryRun,
+        *,
+        window: SemanticWindowAuthorityBinding,
+        provider: CodexCliRepresentationAnalysisProvider,
+        commit: bool,
+    ) -> tuple[int, int]:
+        """Validate, then optionally advance, one Representation commit range."""
+
+        with self._locked():
+            grant = self._load_grant(window, provider)
+            attempts, unknown = self._global_attempts(grant)
+            if unknown:
+                raise SemanticHandoffError(
+                    "Semantic global authority 存在 outcome unknown；禁止 commit。"
+                )
+            selected = [
+                attempt
+                for attempt in attempts
+                if attempt.get("semantic_run_id") == recovery.semantic_run_id
+            ]
+            if not selected:
+                raise SemanticHandoffError("Semantic global commit range 缺失。")
+            ordinals = [int(attempt["global_ordinal"]) for attempt in selected]
+            if all(
+                attempt.get("schema_version") != _GLOBAL_RESERVED_ATTEMPT_SCHEMA
+                for attempt in selected
+            ):
+                return min(ordinals), max(ordinals)
+            if ordinals != list(range(min(ordinals), max(ordinals) + 1)):
+                raise SemanticHandoffError("Semantic global commit range 不连续。")
+            baseline = int(grant["baseline_total"])
+            if not os.path.lexists(self._commit_cursor_path()):
+                completed_processing_runs = {
+                    str(audit.get("processing_run_id"))
+                    for path in self.audit_root.glob(
+                        "run_*/processing-run-audit.json"
+                    )
+                    for audit in (_private_json_exact(path),)
+                    if audit.get("durable_ingestion_status") == "completed"
+                    and audit.get("handoff_status") == "completed"
+                }
+                for attempt in attempts:
+                    ordinal = int(attempt["global_ordinal"])
+                    if ordinal != baseline + 1:
+                        break
+                    result_receipt_path = (
+                        self.audit_root
+                        / str(attempt["semantic_run_id"])
+                        / "results"
+                        / f"batch_{int(attempt['batch_ordinal']):04d}"
+                        / "result-receipt.json"
+                    )
+                    durably_committed = False
+                    if os.path.lexists(result_receipt_path):
+                        result_receipt = _private_json_exact(
+                            result_receipt_path
+                        )
+                        durably_committed = str(
+                            result_receipt.get("processing_run_id")
+                        ) in completed_processing_runs
+                    if (
+                        attempt.get("schema_version")
+                        != _GLOBAL_RESERVED_ATTEMPT_SCHEMA
+                        or durably_committed
+                    ):
+                        baseline = ordinal
+                        continue
+                    break
+            cursor = self._read_commit_cursor(baseline)
+            current = int(cursor["committed_global_ordinal"])
+            lower, upper = min(ordinals), max(ordinals)
+            if current >= upper:
+                return lower, upper
+            if current + 1 != lower:
+                raise SemanticHandoffError(
+                    "Semantic global commit 不得越过更早 ordinal。"
+                )
+            if commit:
+                final_attempt = selected[-1]
+                payload = self._commit_cursor_payload(
+                    committed_global_ordinal=upper,
+                    attempt_receipt_fingerprint=str(
+                        final_attempt["attempt_receipt_fingerprint"]
+                    ),
+                )
+                _private_json_write(self._commit_cursor_path(), payload)
+                if not _payloads_exactly_equal(
+                    self._read_commit_cursor(baseline),
+                    payload,
+                ):
+                    raise SemanticHandoffError(
+                        "Semantic global commit cursor 读回失败。"
+                    )
+            return lower, upper
 
 
 class _RecoveryAwareProvider:
@@ -10592,6 +10813,16 @@ class _RecoveryAwareProvider:
             tuple[RepresentationAnalysisResult, ExternalAgentExecutionRecord]
             | None
         ] | None = None
+
+    def analysis_batches(
+        self,
+        units: Sequence[object],
+        batch_size: int,
+    ) -> tuple[RepresentationAnalysisBatch, ...]:
+        """Replay the durable complete-context partition for this Representation."""
+
+        del units, batch_size
+        return self.recovery.batches
 
     def _enter_authority_guard(self) -> None:
         if self._authority_guard is not None:
@@ -12018,13 +12249,29 @@ class ExternalAgentSemanticHandoffService:
                         else None
                     ),
                     window_binding=None,
+                    complete_context=True,
                 )
+                if not recovery.exists or not recovery.result_only_wave:
+                    recovery = _SemanticRecoveryRun(
+                        self.representation_service,
+                        self.audit_root,
+                        representation_id,
+                        provider,
+                        privacy_binding,
+                        global_authority=(
+                            _SemanticGlobalAuthority(self.audit_root)
+                            if authority_binding is not None
+                            else None
+                        ),
+                        window_binding=None,
+                    )
                 if recovery.exists:
                     return self._resume_recovery_package(
                         representation_id,
                         package,
                         provider,
                         recovery,
+                        authority_binding=authority_binding,
                     )
             try:
                 manifest = self._verify_replay_input(representation_id, package)
@@ -12083,7 +12330,20 @@ class ExternalAgentSemanticHandoffService:
                     global_authority if authority_binding is not None else None
                 ),
                 window_binding=authority_binding,
+                complete_context=True,
             )
+            if not recovery.exists or not recovery.result_only_wave:
+                recovery = _SemanticRecoveryRun(
+                    self.representation_service,
+                    self.audit_root,
+                    representation_id,
+                    provider,
+                    privacy_binding,
+                    global_authority=(
+                        global_authority if authority_binding is not None else None
+                    ),
+                    window_binding=authority_binding,
+                )
             preflight = recovery.preflight()
             if preflight.conservatively_counted_attempts:
                 raise SemanticHandoffError(
@@ -12142,6 +12402,17 @@ class ExternalAgentSemanticHandoffService:
             finally:
                 if isinstance(analysis_provider, _RecoveryAwareProvider):
                     analysis_provider._close_authority_guard()
+            if (
+                recovery is not None
+                and recovery.complete_context
+                and authority_binding is not None
+            ):
+                installed_global_authority.commit_range(
+                    recovery,
+                    window=authority_binding,
+                    provider=provider,
+                    commit=False,
+                )
             manifest = self._verify_replay_input(representation_id, package)
             if manifest.get("provider") != _provider_manifest(provider):
                 raise SemanticHandoffError(
@@ -12153,10 +12424,22 @@ class ExternalAgentSemanticHandoffService:
                 if recovery is not None
                 else provider.execution_records[record_offset:]
             )
-            expected_batches = self._expected_batch_contracts(
-                representation_id,
-                manifest,
-                protocol_version=EXTERNAL_AGENT_PROTOCOL_VERSION,
+            expected_batches = (
+                tuple(
+                    (
+                        tuple(receipt["anchor_unit_ids"]),
+                        str(receipt["input_fingerprint"]),
+                    )
+                    for contract in recovery.batch_contracts
+                    for receipt in (contract["receipt"],)
+                    if isinstance(receipt, dict)
+                )
+                if recovery is not None
+                else self._expected_batch_contracts(
+                    representation_id,
+                    manifest,
+                    protocol_version=EXTERNAL_AGENT_PROTOCOL_VERSION,
+                )
             )
             self._validate_execution_records(records, expected_batches, provider)
             audit_paths = self._persist_audits(
@@ -12176,6 +12459,17 @@ class ExternalAgentSemanticHandoffService:
             ingestion = ingest_processing_package(package, self.store)
             self._mark_durable_write(audit_paths)
             self._readback_store(ingestion)
+            if (
+                recovery is not None
+                and recovery.complete_context
+                and authority_binding is not None
+            ):
+                installed_global_authority.commit_range(
+                    recovery,
+                    window=authority_binding,
+                    provider=provider,
+                    commit=True,
+                )
         except (
             OSError,
             ValueError,
@@ -12747,6 +13041,7 @@ class ExternalAgentSemanticHandoffService:
                 request.privacy_binding,
                 global_authority=authority,
                 window_binding=request.authority_binding,
+                complete_context=True,
             )
             preflight = recovery.preflight()
             if preflight.conservatively_counted_attempts:
@@ -12767,75 +13062,82 @@ class ExternalAgentSemanticHandoffService:
                     ),
                 )
             )
-        while True:
-            wave: list[
-                tuple[
-                    SemanticResultOnlyRequest,
-                    _SemanticRecoveryRun,
-                    _RecoveryAwareProvider,
-                    int,
-                    RepresentationAnalysisBatch,
-                ]
-            ] = []
-            for request, recovery, wrapper in work:
-                loaded, unknown = recovery.inspect()
-                if unknown:
-                    raise SemanticHandoffError(
-                        "Semantic recovery 存在 outcome unknown；LEAD_DECISION_REQUIRED。"
-                    )
-                missing = next(
-                    (
-                        index
-                        for index, item in enumerate(loaded, start=1)
-                        if item is None
-                    ),
-                    None,
+        lanes: list[
+            tuple[
+                SemanticResultOnlyRequest,
+                _SemanticRecoveryRun,
+                _RecoveryAwareProvider,
+                tuple[int, ...],
+            ]
+        ] = []
+        reservations: list[
+            tuple[
+                _SemanticRecoveryRun,
+                int,
+                SemanticWindowAuthorityBinding,
+                CodexCliRepresentationAnalysisProvider,
+            ]
+        ] = []
+        for request, recovery, wrapper in work:
+            loaded, unknown = recovery.inspect()
+            if unknown:
+                raise SemanticHandoffError(
+                    "Semantic recovery 存在 outcome unknown；LEAD_DECISION_REQUIRED。"
                 )
-                if missing is not None:
-                    wave.append(
-                        (
-                            request,
-                            recovery,
-                            wrapper,
-                            missing,
-                            recovery.batches[missing - 1],
-                        )
-                    )
-                if len(wave) == concurrency:
-                    break
-            if not wave:
-                break
-            new_reservations = tuple(
+            missing = tuple(
+                ordinal
+                for ordinal, item in enumerate(loaded, start=1)
+                if item is None
+            )
+            lanes.append((request, recovery, wrapper, missing))
+            reservations.extend(
                 (
                     recovery,
                     ordinal,
                     request.authority_binding,
                     wrapper.provider,
                 )
-                for request, recovery, wrapper, ordinal, _batch in wave
+                for ordinal in missing
                 if not os.path.lexists(recovery._attempt_path(ordinal))
             )
-            authority.publish_attempts(new_reservations)
-            failures: list[BaseException] = []
+        # Reserve complete Representation ranges in plan order. Global ordinals
+        # therefore cannot interleave A/B while packages later commit A then B.
+        authority.publish_attempts(tuple(reservations))
+        failures: list[BaseException] = []
+        active = 0
+        peak = 0
+        metric_lock = threading.Lock()
 
-            def run_one(
-                request: SemanticResultOnlyRequest,
-                wrapper: _RecoveryAwareProvider,
-                ordinal: int,
-                batch: RepresentationAnalysisBatch,
-            ) -> tuple[str, int]:
-                started = time.monotonic()
-                wrapper.analyze_pre_reserved(batch, ordinal=ordinal)
-                return (
-                    request.representation_id,
-                    max(0, round((time.monotonic() - started) * 1000)),
-                )
+        def run_lane(
+            request: SemanticResultOnlyRequest,
+            recovery: _SemanticRecoveryRun,
+            wrapper: _RecoveryAwareProvider,
+            ordinals: tuple[int, ...],
+        ) -> tuple[str, int]:
+            nonlocal active, peak
+            started = time.monotonic()
+            with metric_lock:
+                active += 1
+                peak = max(peak, active)
+            try:
+                for ordinal in ordinals:
+                    wrapper.analyze_pre_reserved(
+                        recovery.batches[ordinal - 1], ordinal=ordinal
+                    )
+            finally:
+                with metric_lock:
+                    active -= 1
+            return (
+                request.representation_id,
+                max(0, round((time.monotonic() - started) * 1000)),
+            )
 
-            with ThreadPoolExecutor(max_workers=len(wave)) as executor:
-                futures = [
-                    executor.submit(run_one, request, wrapper, ordinal, batch)
-                    for request, _recovery, wrapper, ordinal, batch in wave
-                ]
+        runnable = [lane for lane in lanes if lane[3]]
+        if runnable:
+            with ThreadPoolExecutor(
+                max_workers=min(concurrency, len(runnable))
+            ) as executor:
+                futures = [executor.submit(run_lane, *lane) for lane in runnable]
                 wait(futures)
                 for future in futures:
                     try:
@@ -12843,10 +13145,19 @@ class ExternalAgentSemanticHandoffService:
                         elapsed[representation_id] += duration
                     except BaseException as exc:  # noqa: BLE001
                         failures.append(exc)
-            if failures:
-                raise SemanticHandoffError(
-                    "Semantic result-only wave 失败；已停止新调度。"
-                ) from failures[0]
+        self.last_result_only_metrics = {
+            "semantic_parallelism": concurrency,
+            "semantic_peak_concurrency": peak,
+            "semantic_wall_ms": max(elapsed.values(), default=0),
+            "semantic_serial_estimate_ms": sum(elapsed.values()),
+            "resume_provider_calls": sum(
+                wrapper.new_calls for _request, _recovery, wrapper, _missing in lanes
+            ),
+        }
+        if failures:
+            raise SemanticHandoffError(
+                "Semantic result-only wave 失败；后续 durable bundle 保留。"
+            ) from failures[0]
         for _request, recovery, _wrapper in work:
             loaded, unknown = recovery.inspect()
             if unknown or any(item is None for item in loaded):
@@ -12861,8 +13172,20 @@ class ExternalAgentSemanticHandoffService:
         package: Path,
         provider: CodexCliRepresentationAnalysisProvider,
         recovery: _SemanticRecoveryRun,
+        *,
+        authority_binding: SemanticWindowAuthorityBinding | None = None,
     ) -> SemanticHandoffResult:
         try:
+            if recovery.complete_context and authority_binding is not None:
+                authority = recovery.global_authority or _SemanticGlobalAuthority(
+                    self.audit_root
+                )
+                authority.commit_range(
+                    recovery,
+                    window=authority_binding,
+                    provider=provider,
+                    commit=False,
+                )
             loaded, unknown = recovery.inspect()
             if unknown or any(item is None for item in loaded):
                 raise SemanticHandoffError(
@@ -12875,10 +13198,14 @@ class ExternalAgentSemanticHandoffService:
                     "当前 recovery 信息包 Provider execution profile 不匹配。"
                 )
             package_fingerprint = _package_fingerprint(package)
-            expected_batches = self._expected_batch_contracts(
-                representation_id,
-                manifest,
-                protocol_version=EXTERNAL_AGENT_PROTOCOL_VERSION,
+            expected_batches = tuple(
+                (
+                    tuple(receipt["anchor_unit_ids"]),
+                    str(receipt["input_fingerprint"]),
+                )
+                for contract in recovery.batch_contracts
+                for receipt in (contract["receipt"],)
+                if isinstance(receipt, dict)
             )
             self._validate_execution_records(records, expected_batches, provider)
             audit_paths = self._matching_audit_paths(package_fingerprint)
@@ -12905,6 +13232,13 @@ class ExternalAgentSemanticHandoffService:
             self._mark_durable_write(audit_paths)
             self._readback_store(ingestion)
             self._finalize_audits(audit_paths)
+            if recovery.complete_context and authority_binding is not None:
+                authority.commit_range(
+                    recovery,
+                    window=authority_binding,
+                    provider=provider,
+                    commit=True,
+                )
         except (
             OSError,
             ValueError,

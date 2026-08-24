@@ -20,16 +20,16 @@ Legacy active v3 运行允许一次 fixed-range capture 升级。只有能证明
 
 串行 planner 每轮选择最多 2 个完整、不同的 Representation；配置可在受控基准通过后调整为 1–4。每个 lane 使用独立 Provider adapter、诊断目录和 mutable state。在全局 authority lock 内按计划顺序预留连续 ordinal 后，lane 只读取 Source / Representation 并把严格验证结果写入各自 recovery bundle。
 
-同一会话、文档或 Representation 的有序 Analysis Units 不跨 lane 拆分。Provider、model、timeout、batch、cap、retry 与 fallback contract 不变。
+同一会话、文档或 Representation 的有序 Analysis Units 不跨 lane 拆分；一个完整 Representation 在一次有界模型调用中得到完整结果，不把上下文拆成多个 ephemeral 调用。Provider、model、timeout、cap、retry 与 fallback contract 不变。
 
 ### 3. 长期状态严格串行
 
-结果收敛后，系统仍按 plan / ordinal 顺序执行 package publish、Atomic Information ingestion、Governance、Identity Gate、Proposal / Journal / World Model apply、item terminal state 与 checkpoint。后续 lane 的成功结果可以先保存，但不得越过更早项提交。
+结果收敛后，系统仍按 plan / ordinal 顺序执行 package publish、Atomic Information ingestion、Governance、Identity Gate、Proposal / Journal / World Model apply、item terminal state 与 checkpoint。预留顺序按 Representation 整包连续，durable global commit cursor 绑定已提交 ordinal；后续 lane 的成功结果可以先保存，但不得越过更早项提交。
 
 ## Recovery 与回滚
 
 - capture artifact 采用 atomic write、fsync、readback、receipt-last；任一 raw/canonical/index/summary/receipt/plan drift 在 Provider 或长期写入前拒绝；
-- result bundle 已完整时 resume 的 Provider calls 为 0；started 且没有 terminal result 仍视为 unknown；
+- Provider 前 reservation 以单个 durable attempt marker 原子表达；reserved-not-started 可安全启动，result bundle 已完整时 resume 的 Provider calls 为 0，started 且没有 terminal result 仍视为 unknown；
 - 并行度设为 1 可回退语义调度，但不会恢复重复 capture；
 - snapshot 是可替换的 Processing artifact，不是第二个 Source 或 Information authority；Managed Source 与 Evidence 规则不变。
 

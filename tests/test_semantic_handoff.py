@@ -11955,7 +11955,7 @@ print("passed")
         wall_ms = (time.monotonic() - wall_started) * 1000
 
         self.assertEqual(maximum_active, 2)
-        self.assertEqual([len(runner.calls) for runner in runners], [2, 2])
+        self.assertEqual([len(runner.calls) for runner in runners], [1, 1])
         self.assertEqual(set(elapsed), {item.representation_id for item in built})
         self.assertLessEqual(wall_ms, sum(elapsed.values()) * 0.70)
         self.assertFalse((root / "information").exists())
@@ -11970,11 +11970,37 @@ print("passed")
             key=lambda item: item["global_ordinal"],
         )
         self.assertEqual(
-            [item["global_ordinal"] for item in attempts], [81, 82, 83, 84]
+            [item["global_ordinal"] for item in attempts], [81, 82]
+        )
+        self.assertTrue(
+            all(
+                item["schema_version"]
+                == "semantic-handoff-attempt-receipt/4.0"
+                and item["state"] == "reserved_not_started"
+                for item in attempts
+            )
         )
 
+        out_of_order_runner = FakeRunner()
+        with self.assertRaises(SemanticHandoffError):
+            handoff.execute(
+                built[1].representation_id,
+                CodexCliRepresentationAnalysisProvider(
+                    provider_version="0.147.0",
+                    timeout_seconds=300,
+                    runner=out_of_order_runner,
+                    diagnostic_root=root / "out-of-order-diagnostics",
+                ),
+                privacy_binding=self.privacy_binding(),
+                authority_binding=binding,
+            )
+        self.assertEqual(out_of_order_runner.calls, [])
+        self.assertFalse((root / "atomic.jsonl").exists())
+
         replay_runners = (FakeRunner(), FakeRunner())
-        for representation, runner in zip(built, replay_runners, strict=True):
+        for expected_ordinal, representation, runner in zip(
+            (81, 82), built, replay_runners, strict=True
+        ):
             handoff.execute(
                 representation.representation_id,
                 CodexCliRepresentationAnalysisProvider(
@@ -11987,12 +12013,23 @@ print("passed")
                 authority_binding=binding,
             )
             self.assertEqual(runner.calls, [])
+            commit_cursor = json.loads(
+                (
+                    root
+                    / "audits"
+                    / "semantic_global_authority"
+                    / "commit-cursor.json"
+                ).read_text(encoding="utf-8")
+            )
+            self.assertEqual(
+                commit_cursor["committed_global_ordinal"], expected_ordinal
+            )
         self.assertEqual(
             len(
                 JsonlAtomicInformationStore(root / "atomic.jsonl")
                 .list_atomic_information()
             ),
-            4,
+            2,
         )
 
     def test_result_only_parallelism_four_meets_controlled_delay_ratio(self) -> None:

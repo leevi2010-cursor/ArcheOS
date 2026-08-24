@@ -85,7 +85,7 @@ Managed Source 是后续 Processing、Evidence 和 Normalized Representation 的
 
 Conversation 也遵循相同原则：Conversation 是一种 Representation / Processing 形态，不是新的业务 Core。WeChat、Codex、ChatGPT 等 provider 只负责 capture / mapping；长期信息仍进入统一 Atomic Information / Evidence 生命周期。
 
-Conversation connector 对一个冻结窗口只执行一次 full capture。完整 capture、conversation index 与匿名 summary 作为私有 Processing Derived Artifact 持久化，并由 receipt-last 的运行计划绑定；分段恢复和历史验证只读 durable snapshot。不同完整 Conversation / Representation 可以进行 1–4 路（默认 2）result-only 语义分析，但同一会话的有序 Analysis Units 不跨 lane 拆分。详见 [ADR-006](../decisions/ADR-006-durable-capture-and-bounded-semantic-parallelism.md)。
+Conversation connector 对一个冻结窗口只执行一次 full capture。完整 capture、conversation index 与匿名 summary 作为私有 Processing Derived Artifact 持久化，并由 receipt-last 的运行计划绑定；分段恢复和历史验证只读 durable snapshot。不同完整 Conversation / Representation 可以进行 1–4 路（默认 2）result-only 语义分析，但同一会话的有序 Analysis Units 不跨 lane 拆分，并在一次有界模型调用中完整理解。详见 [ADR-006](../decisions/ADR-006-durable-capture-and-bounded-semantic-parallelism.md)。
 
 ---
 
@@ -177,7 +177,7 @@ World Model
 
 ## 5. Information Digestion / Governance Boundary
 
-语义并行的边界止于完整、严格验证并持久化的 recovery result bundle。Package publish、Atomic Information ingestion、Identity Gate、Interpretation / Governance、Proposal / Journal / World Model apply、item terminal state 与 checkpoint 必须按 durable plan 顺序串行执行。后续 lane 可以先完成结果，但不能越过更早项提交；每次长期应用仍重读当前状态并沿用既有冲突与 Human Judgment 门。
+语义并行的边界止于完整、严格验证并持久化的 recovery result bundle。Package publish、Atomic Information ingestion、Identity Gate、Interpretation / Governance、Proposal / Journal / World Model apply、item terminal state 与 checkpoint 必须按 durable plan 顺序串行执行，并由 global commit cursor 证明未越过更早 ordinal。后续 lane 可以先完成结果，但不能越过更早项提交；每次长期应用仍重读当前状态并沿用既有冲突与 Human Judgment 门。
 
 Atomic Information 与 World Model 之间存在独立的信息消化与治理边界。
 

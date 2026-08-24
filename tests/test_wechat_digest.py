@@ -5547,13 +5547,57 @@ class WechatDigestTests(unittest.TestCase):
         self.assertTrue(resumed.checkpoint_published)
         self.assertEqual(len(capture.calls), 2)
 
-    def test_production_shaped_capture_snapshot_benchmark_contract(self) -> None:
-        partitions = []
-        for index in range(4):
-            partition = Path(self.temporary.name) / f"message-{index}.db"
-            with closing(sqlite3.connect(partition)) as connection:
-                connection.execute("CREATE TABLE fixture (id INTEGER PRIMARY KEY)")
-            partitions.append(partition)
+    def test_legacy_v3_capture_upgrade_adopts_every_artifact_breakpoint(self) -> None:
+        hooks = (
+            "after_capture_snapshot_write",
+            "after_capture_index_write",
+            "after_capture_summary_write",
+            "after_capture_receipt_write",
+            "before_upgrade_status_write",
+        )
+        for index, hook_name in enumerate(hooks):
+            with self.subTest(hook=hook_name):
+                capture = SyntheticCaptureProvider([message(1)])
+                canonical = WechatCapture(
+                    capture.provider_version,
+                    ZERO_CURSOR,
+                    capture.messages[0].cursor,
+                    tuple(capture.messages),
+                )
+                plan, status = _build_plan(
+                    canonical,
+                    clock=lambda: "2026-08-25T00:00:00Z",
+                )
+                failed = [True]
+
+                def interrupt(failed: list[bool] = failed) -> None:
+                    if failed.pop():
+                        raise RuntimeError("synthetic legacy capture breakpoint")
+
+                run_store = WechatDigestRunStore(
+                    self.workspace
+                    / "02_processing"
+                    / f"wechat_digest_legacy_capture_{index}",
+                    **{hook_name: interrupt},
+                )
+                run_store.create(plan, status)
+                service = self.service(capture, run_store=run_store)
+                with self.assertRaises((WechatDigestError, RuntimeError)):
+                    service.run()
+                self.assertEqual(len(capture.calls), 1)
+                setattr(run_store, hook_name, None)
+                self.semantic.failures_remaining = 1
+                try:
+                    service.run()
+                except WechatDigestError:
+                    pass
+                self.assertEqual(len(capture.calls), 1)
+                self.assertEqual(
+                    run_store.plan(str(plan["run_id"]))["schema_version"],
+                    "wechat-digest-run-plan/4.0",
+                )
+
+    def test_production_shaped_durable_snapshot_benchmark_contract(self) -> None:
         missing_attachments = {
             number: attachment(
                 None,
@@ -5602,7 +5646,6 @@ class WechatDigestTests(unittest.TestCase):
         )
         readback_ms = round((time.monotonic() - readback_started) * 1000)
 
-        self.assertEqual(len(partitions), 4)
         self.assertEqual(len(loaded.messages), 1000)
         self.assertEqual(receipt["conversation_count"], 45)
         self.assertEqual(receipt["attachment_count"], 100)
@@ -6904,6 +6947,91 @@ class WechatDigestTests(unittest.TestCase):
         )
         self.assertIsNone(service.run_store.active_run_id())
 
+    def test_completed_window_w_1_5_10_is_summary_only_and_connector_zero(
+        self,
+    ) -> None:
+        for window_count in (1, 5, 10):
+            with self.subTest(windows=window_count):
+                root = (
+                    self.workspace
+                    / "02_processing"
+                    / f"wechat_digest_completed_w_{window_count}"
+                )
+                run_store = WechatDigestRunStore(root)
+                messages = [
+                    message(
+                        index + 1,
+                        timestamp=1_700_000_000 + index,
+                        conversation=f"conversation_{index:02d}",
+                    )
+                    for index in range(window_count + 1)
+                ]
+                global_upper = messages[-1].cursor
+                after = ZERO_CURSOR
+                previous_run_id = ""
+                previous_cursor = ZERO_CURSOR
+                for index, captured_message in enumerate(messages):
+                    capture = WechatCapture(
+                        "synthetic/1.0",
+                        after,
+                        captured_message.cursor,
+                        (captured_message,),
+                    )
+                    legacy_plan, _ = _build_plan(
+                        capture,
+                        clock=lambda: "2026-08-25T00:00:00Z",
+                        all_history_upper_bound=global_upper,
+                    )
+                    run_store.publish_capture_pending(
+                        legacy_plan, capture, capture_ms=1
+                    )
+                    receipt = run_store.publish_capture_artifacts(
+                        str(legacy_plan["run_id"]),
+                        capture,
+                        plan_binding_fingerprint=_plan_fingerprint(legacy_plan),
+                        capture_ms=1,
+                    )
+                    plan, status = _build_plan(
+                        capture,
+                        clock=lambda: "2026-08-25T00:00:00Z",
+                        run_id=str(legacy_plan["run_id"]),
+                        created_at="2026-08-25T00:00:00Z",
+                        all_history_upper_bound=global_upper,
+                        capture_receipt_fingerprint=str(
+                            receipt["receipt_fingerprint"]
+                        ),
+                    )
+                    if index < window_count:
+                        status["state"] = "completed"
+                        status["checkpoint_published"] = True
+                        for item in status["items"].values():
+                            item["state"] = "unsupported"
+                    run_store.create(plan, status)
+                    if index < window_count:
+                        run_store.clear_active()
+                        previous_run_id = str(plan["run_id"])
+                        previous_cursor = captured_message.cursor
+                    after = captured_message.cursor
+
+                run_store.publish_checkpoint(previous_run_id, previous_cursor)
+
+                capture_provider = SyntheticCaptureProvider(messages)
+                service = self.service(
+                    capture_provider, run_store=run_store
+                )
+                with patch.object(
+                    run_store,
+                    "load_capture_artifacts",
+                    side_effect=AssertionError(
+                        "completed history must not deep-read snapshot"
+                    ),
+                ):
+                    binding = service._semantic_authority_binding(
+                        str(plan["run_id"])
+                    )
+                self.assertEqual(len(binding.completed_window_chain), window_count)
+                self.assertEqual(capture_provider.calls, [])
+
     def test_upgrade_rejects_tampered_legacy_binding_before_any_write(self) -> None:
         capture = SyntheticCaptureProvider([message(1)])
         service, run_id = self._make_active_legacy_run(capture)
@@ -7307,12 +7435,130 @@ class WechatCaptureHelperTests(unittest.TestCase):
         with self.capture_runtime(), patch.object(
             wechat_capture_helper,
             "_all_cursor_rows",
-            wraps=_all_cursor_rows,
+            side_effect=AssertionError("observe-only must not scan cursor rows"),
         ) as discovery:
             result = capture_with_wechat_cli(request)
-        self.assertEqual(discovery.call_args.kwargs["end_timestamp"], upper[0])
+        discovery.assert_not_called()
         self.assertEqual(result["observed_upper"], self.cursor_dict(upper))
         self.assertEqual(result["messages"], [])
+
+    def test_observe_only_unknown_upper_uses_database_max_not_all_rows(self) -> None:
+        request = self.request(observe_only=True)
+        with self.capture_runtime(), patch.object(
+            wechat_capture_helper,
+            "_all_cursor_rows",
+            side_effect=AssertionError("observe-only must not scan cursor rows"),
+        ) as discovery, patch.object(
+            wechat_capture_helper,
+            "_upper_cursor_rows",
+            wraps=wechat_capture_helper._upper_cursor_rows,
+        ) as upper_query:
+            result = capture_with_wechat_cli(request)
+        discovery.assert_not_called()
+        upper_query.assert_called_once()
+        self.assertEqual(
+            result["observed_upper"], self.cursor_dict(max(self.cursors.values()))
+        )
+        self.assertEqual(result["messages"], [])
+
+    def test_production_shaped_probe_reads_only_table_maxima(self) -> None:
+        located: dict[str, tuple[tuple[str, str, str, bool, str], ...]] = {}
+        sessions: list[tuple[str, str, bool]] = []
+        total_rows = 0
+        for partition_index in range(4):
+            database = self.root / f"production-{partition_index}.db"
+            tables: list[tuple[str, str, str, bool, str]] = []
+            with closing(sqlite3.connect(database)) as connection:
+                for conversation_index in range(partition_index, 45, 4):
+                    username = f"wxid_fixture_{conversation_index:02d}"
+                    table = "Msg_" + hashlib.md5(username.encode()).hexdigest()
+                    connection.execute(
+                        f"CREATE TABLE [{table}] ("
+                        "local_id INTEGER PRIMARY KEY, local_type INTEGER, "
+                        "create_time INTEGER, real_sender_id TEXT, "
+                        "raw_content TEXT, compression INTEGER)"
+                    )
+                    rows = [
+                        (
+                            row + 1,
+                            3 if (total_rows + row) % 10 == 0 else 1,
+                            1_700_000_000 + row,
+                            "sender",
+                            f"message-{conversation_index}-{row}",
+                            0,
+                        )
+                        for row in range(22 + (conversation_index < 10))
+                    ]
+                    total_rows += len(rows)
+                    connection.executemany(
+                        f"INSERT INTO [{table}] VALUES (?, ?, ?, ?, ?, ?)", rows
+                    )
+                    sessions.append(
+                        (
+                            username,
+                            f"Conversation {conversation_index}",
+                            False,
+                        )
+                    )
+                    tables.append(
+                        (
+                            f"msg/production-{partition_index}.db",
+                            username,
+                            f"Conversation {conversation_index}",
+                            False,
+                            table,
+                        )
+                    )
+                connection.commit()
+            located[str(database)] = tuple(tables)
+
+        self.app.cache = {
+            rows[0][0]: database
+            for database, rows in located.items()
+            if rows
+        }
+        self.app.msg_db_keys = tuple(self.app.cache)
+        with patch.dict(sys.modules, self.modules), patch.object(
+            wechat_capture_helper,
+            "_sessions",
+            return_value=tuple(sessions),
+        ), patch.object(
+            wechat_capture_helper,
+            "_all_cursor_rows",
+            side_effect=AssertionError("probe must not scan all rows"),
+        ) as probe_full_scan:
+            observed = capture_with_wechat_cli(
+                self.request(observe_only=True)
+            )
+        probe_full_scan.assert_not_called()
+
+        with patch.dict(sys.modules, self.modules), patch.object(
+            wechat_capture_helper,
+            "_sessions",
+            return_value=tuple(sessions),
+        ), patch.object(
+            wechat_capture_helper,
+            "_all_cursor_rows",
+            wraps=_all_cursor_rows,
+        ) as full_scan:
+            captured = capture_with_wechat_cli(
+                self.request(
+                    all_history_upper_bound=observed["observed_upper"],
+                    message_limit=1000,
+                )
+            )
+
+        self.assertEqual(total_rows, 1000)
+        self.assertEqual(full_scan.call_count, 1)
+        self.assertEqual(len(captured["messages"]), 1000)
+        self.assertEqual(
+            len({item["conversation_key"] for item in captured["messages"]}),
+            45,
+        )
+        self.assertEqual(
+            sum(len(item["attachments"]) for item in captured["messages"]),
+            100,
+        )
 
     def test_unbounded_window_discovery_is_unchanged(self) -> None:
         request = self.request(message_limit=2)
