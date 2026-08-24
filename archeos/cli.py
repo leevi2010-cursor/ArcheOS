@@ -9,16 +9,8 @@ from pathlib import Path
 
 from .analysis import FileAnalysisProvider
 from .atomic_information import JsonlAtomicInformationStore, ingest_processing_package
-from .codex_app_server import CodexAnalysisProvider
+from .codex_app_server import CodexAnalysisProvider, _load_sdk
 from .context import ContextBuilder, ContextRequest
-from .codex_app_server import _load_sdk
-from .timeline import (
-    CodexTimelineProvider,
-    TimelineError,
-    build_timelines,
-    evidence_view_refs,
-    load_selection,
-)
 from .digestion import (
     AtomicInformationDigestionService,
     BusinessLanguageHumanJudgmentPort,
@@ -55,6 +47,13 @@ from .source import (
     SourceError,
 )
 from .speakers import FileSpeakerProvider
+from .timeline import (
+    CodexTimelineProvider,
+    TimelineError,
+    build_timelines,
+    evidence_view_refs,
+    load_selection,
+)
 from .transcription import FileTranscriptionProvider, MlxWhisperTranscriptionProvider
 from .wechat_digest import (
     ExistingSemanticHandoff,
@@ -631,6 +630,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     wechat_digest.add_argument(
         "--batch-size", type=int, default=DEFAULT_EXTERNAL_AGENT_BATCH_SIZE
+    )
+    wechat_digest.add_argument(
+        "--semantic-parallelism",
+        type=int,
+        choices=(1, 2, 3, 4),
+        default=2,
+        help="不同完整会话的只读语义分析并行度；长期写入仍保持串行。",
     )
     wechat_digest.add_argument(
         "--max-items-per-run",
@@ -1414,6 +1420,7 @@ def _wechat_product_command(args: argparse.Namespace) -> int:
             semantic_handoff_factory=semantic_handoff,
             interpretation_provider=CodexAtomicInformationInterpretationProvider(),
             semantic_batch_size=args.batch_size,
+            semantic_parallelism=args.semantic_parallelism,
         )
         if args.prepare_next_semantic:
             prepared = service.prepare_next_semantic(batch_size=args.batch_size)
@@ -1790,6 +1797,35 @@ def _wechat_product_command(args: argparse.Namespace) -> int:
     print(
         "治理 timeout / failure："
         f"{result.governance_timeouts} / {result.governance_failures}"
+    )
+    print(
+        "性能指标："
+        + json.dumps(
+            {
+                "upper_bound_probe_calls": result.upper_bound_probe_calls,
+                "capture_provider_calls": result.capture_provider_calls,
+                "completed_window_connector_replays": (
+                    result.completed_window_connector_replays
+                ),
+                "snapshot_bytes": result.snapshot_bytes,
+                "capture_ms": result.capture_ms,
+                "snapshot_publish_ms": result.snapshot_publish_ms,
+                "snapshot_readback_ms": result.snapshot_readback_ms,
+                "slice_build_ms": result.slice_build_ms,
+                "semantic_parallelism": result.semantic_parallelism,
+                "semantic_peak_concurrency": result.semantic_peak_concurrency,
+                "semantic_wall_ms": result.semantic_wall_ms,
+                "semantic_serial_estimate_ms": (
+                    result.semantic_serial_estimate_ms
+                ),
+                "governance_peak_concurrency": (
+                    result.governance_peak_concurrency
+                ),
+                "resume_provider_calls": result.resume_provider_calls,
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+        )
     )
     print(f"checkpoint：{checkpoint}")
     if result.segment_safe_stopped:

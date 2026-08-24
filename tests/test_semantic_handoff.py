@@ -57,9 +57,11 @@ from archeos.semantic_handoff import (
     SemanticCompletedWindowBinding,
     SemanticHandoffError,
     SemanticPrivacyBinding,
+    SemanticResultOnlyRequest,
     SemanticWindowAuthorityBinding,
-    _SemanticGlobalAuthority,
     _package_fingerprint,
+    _SemanticGlobalAuthority,
+    _SemanticRecoveryRun,
     validate_completed_published_audits,
 )
 from archeos.source import LocalManagedSourceRepository
@@ -11849,6 +11851,241 @@ print("passed")
                 resolution_id=unknown_166["resolution_id"],
             )
         unknown_path.write_bytes(unknown_bytes)
+
+    def test_result_only_concurrency_overlaps_and_serial_replay_is_zero_call(
+        self,
+    ) -> None:
+        root = self.root / "result-only-concurrency"
+        root.mkdir(parents=True)
+        source_ids = iter(("src_" + "1" * 32, "src_" + "2" * 32))
+        sources = LocalManagedSourceRepository(
+            root / "managed",
+            id_factory=lambda: next(source_ids),
+            clock=lambda: "2026-08-20T00:00:00.000Z",
+        )
+        representations = LocalRepresentationRepository(root / "representations")
+        representation_service = RepresentationService(sources, representations)
+        built = []
+        for index in (1, 2):
+            external = root / f"synthetic-{index}.txt"
+            external.write_text(f"synthetic-{index}", encoding="utf-8")
+            source = sources.admit(
+                external, metadata={"media_type": "application/synthetic"}
+            ).source
+            built.append(
+                representation_service.build(
+                    source.source_id, JsonAdapter(blocks=2)
+                ).representation
+            )
+        information_service = RepresentationInformationService(
+            sources,
+            representations,
+            root / "information",
+            batch_size=1,
+            clock=lambda: "2026-08-20T00:00:00.000Z",
+        )
+        handoff = ExternalAgentSemanticHandoffService(
+            information_service,
+            JsonlAtomicInformationStore(root / "atomic.jsonl"),
+            root / "audits",
+        )
+
+        barrier = threading.Barrier(2)
+        state_lock = threading.Lock()
+        active = 0
+        maximum_active = 0
+
+        class BlockingRunner(FakeRunner):
+            def __call__(self, command, **kwargs):
+                inner = super().__call__(command, **kwargs)
+
+                class BlockingProcess:
+                    pid = inner.pid
+
+                    @property
+                    def returncode(self):
+                        return inner.returncode
+
+                    def communicate(self, **communicate_kwargs):
+                        nonlocal active, maximum_active
+                        with state_lock:
+                            active += 1
+                            maximum_active = max(maximum_active, active)
+                        try:
+                            barrier.wait(timeout=5)
+                            time.sleep(0.15)
+                            return inner.communicate(**communicate_kwargs)
+                        finally:
+                            with state_lock:
+                                active -= 1
+
+                return BlockingProcess()
+
+        runners = (BlockingRunner(), BlockingRunner())
+        providers = tuple(
+            CodexCliRepresentationAnalysisProvider(
+                provider_version="0.147.0",
+                timeout_seconds=300,
+                runner=runner,
+                diagnostic_root=root / f"diagnostics-{index}",
+            )
+            for index, runner in enumerate(runners)
+        )
+        binding = self.semantic_window_binding(batch_size=1)
+        self.install_authority(handoff, providers[0], binding)
+        requests = tuple(
+            SemanticResultOnlyRequest(
+                representation.representation_id,
+                self.privacy_binding(),
+                binding,
+            )
+            for representation in built
+        )
+
+        with patch.object(
+            _SemanticRecoveryRun,
+            "publish_started",
+            side_effect=OSError("synthetic reserved interruption"),
+        ), self.assertRaises(SemanticHandoffError):
+            handoff.prepare_results(requests, providers, concurrency=2)
+        self.assertEqual([len(runner.calls) for runner in runners], [0, 0])
+
+        wall_started = time.monotonic()
+        elapsed = handoff.prepare_results(requests, providers, concurrency=2)
+        wall_ms = (time.monotonic() - wall_started) * 1000
+
+        self.assertEqual(maximum_active, 2)
+        self.assertEqual([len(runner.calls) for runner in runners], [2, 2])
+        self.assertEqual(set(elapsed), {item.representation_id for item in built})
+        self.assertLessEqual(wall_ms, sum(elapsed.values()) * 0.70)
+        self.assertFalse((root / "information").exists())
+        self.assertFalse((root / "atomic.jsonl").exists())
+        attempts = sorted(
+            (
+                json.loads(path.read_text(encoding="utf-8"))
+                for path in (root / "audits").glob(
+                    "semantic_run_*/attempts/*.json"
+                )
+            ),
+            key=lambda item: item["global_ordinal"],
+        )
+        self.assertEqual(
+            [item["global_ordinal"] for item in attempts], [81, 82, 83, 84]
+        )
+
+        replay_runners = (FakeRunner(), FakeRunner())
+        for representation, runner in zip(built, replay_runners, strict=True):
+            handoff.execute(
+                representation.representation_id,
+                CodexCliRepresentationAnalysisProvider(
+                    provider_version="0.147.0",
+                    timeout_seconds=300,
+                    runner=runner,
+                    diagnostic_root=root / "replay-diagnostics",
+                ),
+                privacy_binding=self.privacy_binding(),
+                authority_binding=binding,
+            )
+            self.assertEqual(runner.calls, [])
+        self.assertEqual(
+            len(
+                JsonlAtomicInformationStore(root / "atomic.jsonl")
+                .list_atomic_information()
+            ),
+            4,
+        )
+
+    def test_result_only_parallelism_four_meets_controlled_delay_ratio(self) -> None:
+        root = self.root / "result-only-concurrency-four"
+        root.mkdir(parents=True)
+        source_ids = iter(f"src_{index:032x}" for index in range(1, 5))
+        sources = LocalManagedSourceRepository(
+            root / "managed",
+            id_factory=lambda: next(source_ids),
+            clock=lambda: "2026-08-25T00:00:00.000Z",
+        )
+        representations = LocalRepresentationRepository(root / "representations")
+        builder = RepresentationService(sources, representations)
+        built = []
+        for index in range(4):
+            external = root / f"synthetic-{index}.txt"
+            external.write_text(f"synthetic-{index}", encoding="utf-8")
+            source = sources.admit(
+                external, metadata={"media_type": "application/synthetic"}
+            ).source
+            built.append(
+                builder.build(source.source_id, JsonAdapter(blocks=1)).representation
+            )
+        handoff = ExternalAgentSemanticHandoffService(
+            RepresentationInformationService(
+                sources,
+                representations,
+                root / "information",
+                batch_size=1,
+                clock=lambda: "2026-08-25T00:00:00.000Z",
+            ),
+            JsonlAtomicInformationStore(root / "atomic.jsonl"),
+            root / "audits",
+        )
+        barrier = threading.Barrier(4)
+        lock = threading.Lock()
+        active = 0
+        peak = 0
+
+        class FourLaneRunner(FakeRunner):
+            def __call__(self, command, **kwargs):
+                inner = super().__call__(command, **kwargs)
+
+                class Process:
+                    pid = inner.pid
+
+                    @property
+                    def returncode(self):
+                        return inner.returncode
+
+                    def communicate(self, **communicate_kwargs):
+                        nonlocal active, peak
+                        with lock:
+                            active += 1
+                            peak = max(peak, active)
+                        try:
+                            barrier.wait(timeout=5)
+                            time.sleep(0.15)
+                            return inner.communicate(**communicate_kwargs)
+                        finally:
+                            with lock:
+                                active -= 1
+
+                return Process()
+
+        runners = tuple(FourLaneRunner() for _ in range(4))
+        providers = tuple(
+            CodexCliRepresentationAnalysisProvider(
+                provider_version="0.147.0",
+                timeout_seconds=300,
+                runner=runner,
+                diagnostic_root=root / f"diagnostics-{index}",
+            )
+            for index, runner in enumerate(runners)
+        )
+        binding = self.semantic_window_binding(batch_size=1)
+        self.install_authority(handoff, providers[0], binding)
+        requests = tuple(
+            SemanticResultOnlyRequest(
+                representation.representation_id,
+                self.privacy_binding(),
+                binding,
+            )
+            for representation in built
+        )
+
+        wall_started = time.monotonic()
+        elapsed = handoff.prepare_results(requests, providers, concurrency=4)
+        wall_ms = (time.monotonic() - wall_started) * 1000
+
+        self.assertEqual(peak, 4)
+        self.assertEqual([len(runner.calls) for runner in runners], [1, 1, 1, 1])
+        self.assertLessEqual(wall_ms, sum(elapsed.values()) * 0.45)
 
 if __name__ == "__main__":
     unittest.main()

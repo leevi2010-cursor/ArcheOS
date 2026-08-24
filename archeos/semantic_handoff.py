@@ -10,8 +10,10 @@ import re
 import secrets
 import stat
 import tempfile
+import time
 from collections import Counter
 from collections.abc import Callable, Mapping, Sequence
+from concurrent.futures import ThreadPoolExecutor, wait
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -88,6 +90,15 @@ class SemanticRecoveryPreflight:
 
 
 @dataclass(frozen=True)
+class SemanticResultOnlyRequest:
+    """One complete Representation prepared without durable Information writes."""
+
+    representation_id: str
+    privacy_binding: SemanticPrivacyBinding
+    authority_binding: SemanticWindowAuthorityBinding
+
+
+@dataclass(frozen=True)
 class SemanticCompletedWindowBinding:
     """Caller-proved completed digest window in the frozen campaign chain."""
 
@@ -135,6 +146,8 @@ _RECOVERY_ATTEMPT_SCHEMA = "semantic-handoff-attempt-receipt/2.0"
 _GLOBAL_ATTEMPT_SCHEMA = "semantic-handoff-attempt-receipt/3.0"
 _RECOVERY_RESULT_SCHEMA = "semantic-handoff-batch-result-receipt/2.0"
 _RECOVERY_RESULT_PHASE_SCHEMA = "semantic-handoff-batch-result-phase/1.0"
+_RECOVERY_ATTEMPT_STARTED_SCHEMA = "semantic-handoff-attempt-started/1.0"
+_RECOVERY_ATTEMPT_RESERVED_SCHEMA = "semantic-handoff-attempt-reserved/1.0"
 _V31_LOCAL_VALIDATOR_CONTRACT_VERSION = "external-agent-local-validator/3.1"
 _V32_LOCAL_VALIDATOR_CONTRACT_VERSION = "external-agent-local-validator/3.2"
 _V33_LOCAL_VALIDATOR_CONTRACT_VERSION = "external-agent-local-validator/3.3"
@@ -447,6 +460,8 @@ def _validate_recovery_artifact_directory(path: Path) -> None:
         "run-commit.json",
         "run-commit-unknown.json",
         "attempts",
+        "reserved",
+        "started",
         "results",
     }
     if "run-receipt.json" not in children or not set(children) <= allowed:
@@ -463,6 +478,24 @@ def _validate_recovery_artifact_directory(path: Path) -> None:
             if re.fullmatch(r"batch_\d{4}\.json", child.name) is None:
                 raise SemanticHandoffError(
                     "Semantic recovery attempt inventory 损坏。"
+                )
+            _require_private_file(child)
+    started = children.get("started")
+    if started is not None:
+        _require_private_directory(started)
+        for child in started.iterdir():
+            if re.fullmatch(r"batch_\d{4}\.json", child.name) is None:
+                raise SemanticHandoffError(
+                    "Semantic started inventory 损坏。"
+                )
+            _require_private_file(child)
+    reserved = children.get("reserved")
+    if reserved is not None:
+        _require_private_directory(reserved)
+        for child in reserved.iterdir():
+            if re.fullmatch(r"batch_\d{4}\.json", child.name) is None:
+                raise SemanticHandoffError(
+                    "Semantic reserved inventory 损坏。"
                 )
             _require_private_file(child)
     results = children.get("results")
@@ -945,6 +978,8 @@ class _SemanticRecoveryRun:
         )
         self.run_dir = self.audit_root / self.semantic_run_id
         self.attempts_dir = self.run_dir / "attempts"
+        self.reserved_dir = self.run_dir / "reserved"
+        self.started_dir = self.run_dir / "started"
         self.results_dir = self.run_dir / "results"
         self.contract_fingerprint, self.expected_run_receipt = (
             self._expected_run_receipt(
@@ -1190,7 +1225,13 @@ class _SemanticRecoveryRun:
     def _validate_run_receipt_payload(self) -> None:
         _validate_shared_recovery_root(self.audit_root, create=False)
         _require_private_directory(self.run_dir)
-        allowed = {"run-receipt.json", "attempts", "results"}
+        allowed = {
+            "run-receipt.json",
+            "attempts",
+            "reserved",
+            "started",
+            "results",
+        }
         try:
             inventory = {path.name for path in self.run_dir.iterdir()}
         except OSError as exc:
@@ -1575,6 +1616,127 @@ class _SemanticRecoveryRun:
             raise SemanticHandoffError("Semantic recovery attempt 读回不一致。")
         return expected
 
+    def _started_path(self, ordinal: int) -> Path:
+        return self.started_dir / f"batch_{ordinal:04d}.json"
+
+    def _reserved_path(self, ordinal: int) -> Path:
+        return self.reserved_dir / f"batch_{ordinal:04d}.json"
+
+    def publish_reserved(self, ordinal: int) -> dict[str, object]:
+        attempt = self._load_attempt(ordinal)
+        without_fingerprint: dict[str, object] = {
+            "schema_version": _RECOVERY_ATTEMPT_RESERVED_SCHEMA,
+            "artifact_kind": "semantic_handoff_attempt_reserved",
+            "semantic_run_id": self.semantic_run_id,
+            "batch_ordinal": ordinal,
+            "attempt_receipt_fingerprint": attempt[
+                "attempt_receipt_fingerprint"
+            ],
+            "state": "reserved_not_started",
+        }
+        payload = {
+            **without_fingerprint,
+            "reserved_receipt_fingerprint": _fingerprint(
+                without_fingerprint
+            ),
+        }
+        _ensure_private_directory(self.reserved_dir)
+        _publish_private_json_marker(self._reserved_path(ordinal), payload)
+        if not _payloads_exactly_equal(
+            _private_json_exact(self._reserved_path(ordinal)), payload
+        ):
+            raise SemanticHandoffError("Semantic reserved receipt 读回漂移。")
+        return payload
+
+    def _load_reserved(self, ordinal: int) -> dict[str, object] | None:
+        path = self._reserved_path(ordinal)
+        if not os.path.lexists(path):
+            return None
+        value = _private_json_exact(path)
+        projected = dict(value)
+        fingerprint = projected.pop("reserved_receipt_fingerprint", None)
+        attempt = self._load_attempt(ordinal)
+        if (
+            value.get("schema_version") != _RECOVERY_ATTEMPT_RESERVED_SCHEMA
+            or value.get("artifact_kind")
+            != "semantic_handoff_attempt_reserved"
+            or value.get("semantic_run_id") != self.semantic_run_id
+            or value.get("batch_ordinal") != ordinal
+            or value.get("attempt_receipt_fingerprint")
+            != attempt.get("attempt_receipt_fingerprint")
+            or value.get("state") != "reserved_not_started"
+            or fingerprint != _fingerprint(projected)
+        ):
+            raise SemanticHandoffError("Semantic reserved receipt 损坏。")
+        return value
+
+    def publish_started(self, ordinal: int) -> dict[str, object]:
+        attempt = self._load_attempt(ordinal)
+        if os.path.lexists(self._result_path(ordinal)):
+            raise SemanticHandoffError(
+                "Semantic recovery 已有 terminal result；不得再次启动。"
+            )
+        payload_without_fingerprint: dict[str, object] = {
+            "schema_version": _RECOVERY_ATTEMPT_STARTED_SCHEMA,
+            "artifact_kind": "semantic_handoff_attempt_started",
+            "semantic_run_id": self.semantic_run_id,
+            "batch_ordinal": ordinal,
+            "attempt_receipt_fingerprint": attempt[
+                "attempt_receipt_fingerprint"
+            ],
+            "state": "started",
+        }
+        payload = {
+            **payload_without_fingerprint,
+            "started_receipt_fingerprint": _fingerprint(
+                payload_without_fingerprint
+            ),
+        }
+        _ensure_private_directory(self.started_dir)
+        try:
+            _publish_private_json_marker(self._started_path(ordinal), payload)
+        except FileExistsError as exc:
+            raise SemanticHandoffError(
+                "Semantic Provider 已标记 started 且 outcome unknown；禁止重试。"
+            ) from exc
+        if not _payloads_exactly_equal(
+            _private_json_exact(self._started_path(ordinal)), payload
+        ):
+            raise SemanticHandoffError("Semantic started receipt 读回漂移。")
+        return payload
+
+    def _load_started(self, ordinal: int) -> dict[str, object] | None:
+        path = self._started_path(ordinal)
+        if not os.path.lexists(path):
+            return None
+        value = _private_json_exact(path)
+        projected = dict(value)
+        fingerprint = projected.pop("started_receipt_fingerprint", None)
+        attempt = self._load_attempt(ordinal)
+        if (
+            set(value)
+            != {
+                "schema_version",
+                "artifact_kind",
+                "semantic_run_id",
+                "batch_ordinal",
+                "attempt_receipt_fingerprint",
+                "state",
+                "started_receipt_fingerprint",
+            }
+            or value.get("schema_version") != _RECOVERY_ATTEMPT_STARTED_SCHEMA
+            or value.get("artifact_kind")
+            != "semantic_handoff_attempt_started"
+            or value.get("semantic_run_id") != self.semantic_run_id
+            or value.get("batch_ordinal") != ordinal
+            or value.get("attempt_receipt_fingerprint")
+            != attempt.get("attempt_receipt_fingerprint")
+            or value.get("state") != "started"
+            or fingerprint != _fingerprint(projected)
+        ):
+            raise SemanticHandoffError("Semantic started receipt 损坏。")
+        return value
+
     def _validate_inventory(self) -> None:
         self._converge_run_receipt()
         total = len(self.batches)
@@ -1590,6 +1752,18 @@ class _SemanticRecoveryRun:
             result_names = {path.name for path in self.results_dir.iterdir()}
             if not result_names <= expected_names:
                 raise SemanticHandoffError("Semantic recovery result inventory 损坏。")
+        if os.path.lexists(self.started_dir):
+            _require_private_directory(self.started_dir)
+            started_names = {path.name for path in self.started_dir.iterdir()}
+            expected_started = {f"{name}.json" for name in expected_names}
+            if not started_names <= expected_started:
+                raise SemanticHandoffError("Semantic started inventory 损坏。")
+        if os.path.lexists(self.reserved_dir):
+            _require_private_directory(self.reserved_dir)
+            reserved_names = {path.name for path in self.reserved_dir.iterdir()}
+            expected_reserved = {f"{name}.json" for name in expected_names}
+            if not reserved_names <= expected_reserved:
+                raise SemanticHandoffError("Semantic reserved inventory 损坏。")
 
     def inspect(
         self,
@@ -1638,7 +1812,11 @@ class _SemanticRecoveryRun:
             loaded.append(None)
             if attempt_exists:
                 self._load_attempt(ordinal)
-                unknown += 1
+                if (
+                    self._load_started(ordinal) is not None
+                    or self._load_reserved(ordinal) is None
+                ):
+                    unknown += 1
             if any(
                 os.path.lexists(self._attempt_path(later))
                 or os.path.lexists(self._result_path(later))
@@ -3224,7 +3402,13 @@ class _SemanticGlobalAuthority:
             if (
                 "run-receipt.json" not in children
                 or not set(children)
-                <= {"run-receipt.json", "attempts", "results"}
+                <= {
+                    "run-receipt.json",
+                    "attempts",
+                    "reserved",
+                    "started",
+                    "results",
+                }
             ):
                 raise SemanticHandoffError(
                     "Semantic global authority historical run inventory 损坏。"
@@ -9725,7 +9909,69 @@ class _SemanticGlobalAuthority:
                         and payload.get("global_ordinal") == 212
                     ):
                         continue
-                    unknown = True
+                    started_path = (
+                        run
+                        / "started"
+                        / f"batch_{int(match.group(1)):04d}.json"
+                    )
+                    if os.path.lexists(started_path):
+                        started = _private_json_exact(started_path)
+                        projected_started = dict(started)
+                        started_fingerprint = projected_started.pop(
+                            "started_receipt_fingerprint", None
+                        )
+                        if (
+                            started.get("schema_version")
+                            != _RECOVERY_ATTEMPT_STARTED_SCHEMA
+                            or started.get("artifact_kind")
+                            != "semantic_handoff_attempt_started"
+                            or started.get("semantic_run_id") != run.name
+                            or started.get("batch_ordinal")
+                            != int(match.group(1))
+                            or started.get("attempt_receipt_fingerprint")
+                            != payload.get("attempt_receipt_fingerprint")
+                            or started.get("state") != "started"
+                            or started_fingerprint
+                            != _fingerprint(projected_started)
+                        ):
+                            raise SemanticHandoffError(
+                                "Semantic global started receipt 损坏。"
+                            )
+                        unknown = True
+                    else:
+                        reserved_path = (
+                            run
+                            / "reserved"
+                            / f"batch_{int(match.group(1)):04d}.json"
+                        )
+                        if not os.path.lexists(reserved_path):
+                            unknown = True
+                        else:
+                            reserved = _private_json_exact(reserved_path)
+                            projected_reserved = dict(reserved)
+                            reserved_fingerprint = projected_reserved.pop(
+                                "reserved_receipt_fingerprint", None
+                            )
+                            if (
+                                reserved.get("schema_version")
+                                != _RECOVERY_ATTEMPT_RESERVED_SCHEMA
+                                or reserved.get("artifact_kind")
+                                != "semantic_handoff_attempt_reserved"
+                                or reserved.get("semantic_run_id") != run.name
+                                or reserved.get("batch_ordinal")
+                                != int(match.group(1))
+                                or reserved.get(
+                                    "attempt_receipt_fingerprint"
+                                )
+                                != payload.get("attempt_receipt_fingerprint")
+                                or reserved.get("state")
+                                != "reserved_not_started"
+                                or reserved_fingerprint
+                                != _fingerprint(projected_reserved)
+                            ):
+                                raise SemanticHandoffError(
+                                    "Semantic global reserved receipt 损坏。"
+                                )
                 else:
                     self._validate_global_result(
                         result,
@@ -10273,6 +10519,46 @@ class _SemanticGlobalAuthority:
         self._guard_next_ordinal = global_ordinal + 1
         return published
 
+    def publish_attempts(
+        self,
+        entries: Sequence[
+            tuple[
+                _SemanticRecoveryRun,
+                int,
+                SemanticWindowAuthorityBinding,
+                CodexCliRepresentationAnalysisProvider,
+            ]
+        ],
+    ) -> tuple[dict[str, object], ...]:
+        """Reserve one bounded wave under the authority lock, receipt first."""
+
+        if not entries:
+            return ()
+        first_window = entries[0][2]
+        first_provider = entries[0][3]
+        with self.execution_guard(
+            window=first_window,
+            provider=first_provider,
+            required_new_calls=len(entries),
+        ) as grant:
+            published: list[dict[str, object]] = []
+            for recovery, ordinal, window, provider in entries:
+                observed = self._load_grant(window, provider)
+                if not _payloads_exactly_equal(observed, grant):
+                    raise SemanticHandoffError(
+                        "Semantic wave authority grant 发生漂移。"
+                    )
+                attempt = self.publish_attempt(
+                    recovery,
+                    ordinal,
+                    grant=grant,
+                    window=window,
+                    provider=provider,
+                )
+                recovery.publish_reserved(ordinal)
+                published.append(attempt)
+            return tuple(published)
+
 
 class _RecoveryAwareProvider:
     """Feeds exact recovered batches into the unchanged complete package builder."""
@@ -10431,6 +10717,9 @@ class _RecoveryAwareProvider:
             self.records.append(record)
             return result
         try:
+            if os.path.lexists(self.recovery._attempt_path(self._ordinal)):
+                self.recovery.publish_started(self._ordinal)
+                return self._analyze_reserved(batch)
             self._enter_authority_guard()
             assert (
                 self._global_grant is not None
@@ -10444,6 +10733,17 @@ class _RecoveryAwareProvider:
                 window=self.window_binding,
                 provider=self.provider,
             )
+            self.recovery.publish_started(self._ordinal)
+            return self._analyze_reserved(batch)
+        except Exception:
+            self._close_authority_guard()
+            raise
+
+    def _analyze_reserved(
+        self,
+        batch: RepresentationAnalysisBatch,
+    ) -> RepresentationAnalysisResult:
+        try:
             self.new_calls += 1
             record_offset = len(self.provider.execution_records)
             result_offset = len(self.provider._successful_results)
@@ -10476,6 +10776,33 @@ class _RecoveryAwareProvider:
         except Exception:
             self._close_authority_guard()
             raise
+
+    def analyze_pre_reserved(
+        self,
+        batch: RepresentationAnalysisBatch,
+        *,
+        ordinal: int,
+    ) -> RepresentationAnalysisResult:
+        """Execute a batch whose global attempt receipt was already reserved."""
+
+        if ordinal < 1 or ordinal > len(self.recovery.batches):
+            raise SemanticHandoffError("Semantic recovery batch 超出 canonical plan。")
+        if batch != self.recovery.batches[ordinal - 1]:
+            raise SemanticHandoffError("Semantic recovery batch boundary 漂移。")
+        loaded, unknown = self.recovery.inspect()
+        if loaded[ordinal - 1] is not None:
+            raise SemanticHandoffError("Semantic recovery batch 已有 strict result。")
+        if unknown:
+            raise SemanticHandoffError(
+                "Semantic Provider 已 started 且 outcome unknown；禁止重试。"
+            )
+        attempt = self.recovery._load_attempt(ordinal)
+        if attempt.get("batch_ordinal") != ordinal:
+            raise SemanticHandoffError("Semantic recovery attempt 绑定漂移。")
+        self.recovery.publish_started(ordinal)
+        self._ordinal = ordinal
+        self._loaded_results = list(loaded)
+        return self._analyze_reserved(batch)
 
 
 _COMPLETED_AUDIT_BASE_FIELDS = {
@@ -12379,6 +12706,154 @@ class ExternalAgentSemanticHandoffService:
             ),
             window_binding=authority_binding,
         ).preflight()
+
+    def prepare_results(
+        self,
+        requests: Sequence[SemanticResultOnlyRequest],
+        providers: Sequence[CodexCliRepresentationAnalysisProvider],
+        *,
+        concurrency: int,
+    ) -> dict[str, int]:
+        """Persist strict result bundles only; package and Information stay serial."""
+
+        if concurrency not in {1, 2, 3, 4}:
+            raise SemanticHandoffError("semantic parallelism 只允许 1 到 4。")
+        if len(requests) != len(providers) or len(requests) > concurrency:
+            raise SemanticHandoffError("Semantic result-only wave 边界无效。")
+        representation_ids = [request.representation_id for request in requests]
+        if len(set(representation_ids)) != len(representation_ids):
+            raise SemanticHandoffError(
+                "Semantic result-only 不得拆分同一 Representation。"
+            )
+        authority = _SemanticGlobalAuthority(self.audit_root)
+        work: list[
+            tuple[
+                SemanticResultOnlyRequest,
+                _SemanticRecoveryRun,
+                _RecoveryAwareProvider,
+            ]
+        ] = []
+        elapsed = {representation_id: 0 for representation_id in representation_ids}
+        for request, provider in zip(requests, providers, strict=True):
+            package = self.representation_service.output_root / request.representation_id
+            if os.path.lexists(package):
+                self._verify_replay_input(request.representation_id, package)
+                continue
+            recovery = _SemanticRecoveryRun(
+                self.representation_service,
+                self.audit_root,
+                request.representation_id,
+                provider,
+                request.privacy_binding,
+                global_authority=authority,
+                window_binding=request.authority_binding,
+            )
+            preflight = recovery.preflight()
+            if preflight.conservatively_counted_attempts:
+                raise SemanticHandoffError(
+                    "Semantic recovery 存在 outcome unknown；LEAD_DECISION_REQUIRED。"
+                )
+            recovery.ensure_run_receipt()
+            work.append(
+                (
+                    request,
+                    recovery,
+                    _RecoveryAwareProvider(
+                        provider,
+                        recovery,
+                        authority,
+                        request.authority_binding,
+                        preflight.required_new_calls,
+                    ),
+                )
+            )
+        while True:
+            wave: list[
+                tuple[
+                    SemanticResultOnlyRequest,
+                    _SemanticRecoveryRun,
+                    _RecoveryAwareProvider,
+                    int,
+                    RepresentationAnalysisBatch,
+                ]
+            ] = []
+            for request, recovery, wrapper in work:
+                loaded, unknown = recovery.inspect()
+                if unknown:
+                    raise SemanticHandoffError(
+                        "Semantic recovery 存在 outcome unknown；LEAD_DECISION_REQUIRED。"
+                    )
+                missing = next(
+                    (
+                        index
+                        for index, item in enumerate(loaded, start=1)
+                        if item is None
+                    ),
+                    None,
+                )
+                if missing is not None:
+                    wave.append(
+                        (
+                            request,
+                            recovery,
+                            wrapper,
+                            missing,
+                            recovery.batches[missing - 1],
+                        )
+                    )
+                if len(wave) == concurrency:
+                    break
+            if not wave:
+                break
+            new_reservations = tuple(
+                (
+                    recovery,
+                    ordinal,
+                    request.authority_binding,
+                    wrapper.provider,
+                )
+                for request, recovery, wrapper, ordinal, _batch in wave
+                if not os.path.lexists(recovery._attempt_path(ordinal))
+            )
+            authority.publish_attempts(new_reservations)
+            failures: list[BaseException] = []
+
+            def run_one(
+                request: SemanticResultOnlyRequest,
+                wrapper: _RecoveryAwareProvider,
+                ordinal: int,
+                batch: RepresentationAnalysisBatch,
+            ) -> tuple[str, int]:
+                started = time.monotonic()
+                wrapper.analyze_pre_reserved(batch, ordinal=ordinal)
+                return (
+                    request.representation_id,
+                    max(0, round((time.monotonic() - started) * 1000)),
+                )
+
+            with ThreadPoolExecutor(max_workers=len(wave)) as executor:
+                futures = [
+                    executor.submit(run_one, request, wrapper, ordinal, batch)
+                    for request, _recovery, wrapper, ordinal, batch in wave
+                ]
+                wait(futures)
+                for future in futures:
+                    try:
+                        representation_id, duration = future.result()
+                        elapsed[representation_id] += duration
+                    except BaseException as exc:  # noqa: BLE001
+                        failures.append(exc)
+            if failures:
+                raise SemanticHandoffError(
+                    "Semantic result-only wave 失败；已停止新调度。"
+                ) from failures[0]
+        for _request, recovery, _wrapper in work:
+            loaded, unknown = recovery.inspect()
+            if unknown or any(item is None for item in loaded):
+                raise SemanticHandoffError(
+                    "Semantic result-only 未完成 strict convergence。"
+                )
+        return elapsed
 
     def _resume_recovery_package(
         self,

@@ -639,7 +639,7 @@ Product Owner 真实人工验收
 Human View / Frontend                    仅在对象—事件—时间线 read contract 获得真实验收后，启动最小业务 View；不先建设大而全前端
 #42 Protocol 驱动的决策增强实验          Product Stage 2；当前 blocked
 Protocol / Pattern Governance            Stage 2 后置规划，不启动
-#106 增量微信消化                         暂停以“清空队列”为目标；剩余输入转为新主线的受控验证集
+#106 增量微信消化                         由 #172 冻结 capture + 有界语义并行性能门阻塞；门通过后仅恢复 Stage 1 受控验证集
 #122 整体审查与正式生产门                 Deferred；Stage 1 业务评估前不启动
 ```
 
