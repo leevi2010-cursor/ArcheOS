@@ -3188,6 +3188,9 @@ class RepresentationInformationService:
             finalized_outputs = finalization.outputs
             if finalize_results is not None:
                 canonical_batches = _analysis_batches(units, self.batch_size)
+                provider_planner = getattr(provider, "analysis_batches", None)
+                if callable(provider_planner):
+                    canonical_batches = provider_planner(units, self.batch_size)
                 self._validate_finalized_outputs(
                     canonical_batches, finalized_outputs
                 )
@@ -3272,7 +3275,11 @@ class RepresentationInformationService:
             raise RepresentationInformationError("Representation analysis provider must have a name")
         outputs: list[RepresentationAnalysisResult] = []
         batches: list[dict[str, object]] = []
-        for batch in _analysis_batches(units, self.batch_size):
+        planned_batches = _analysis_batches(units, self.batch_size)
+        provider_planner = getattr(provider, "analysis_batches", None)
+        if callable(provider_planner):
+            planned_batches = provider_planner(units, self.batch_size)
+        for batch in planned_batches:
             try:
                 result = provider.analyze(batch)
             except Exception as exc:

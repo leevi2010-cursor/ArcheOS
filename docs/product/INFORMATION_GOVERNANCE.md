@@ -111,6 +111,8 @@ Hypothesis 是 Atomic Information 的 canonical 语义形态，用于保存**尚
 
 当同一文档、会话或其他边界清楚的输入形成多条 Atomic Information 时，默认把这些相关信息作为一个有序批次交给同一个 Interpretation Provider 理解，而不是每条信息单独调用一次模型。
 
+同一相关批次仍由一个 Agent 在完整有界上下文中理解，不按消息或片段拆给多个 Agent。不同、完整且彼此独立的会话或 Representation 可以有限并行进行只读语义分析；并行只生成隔离、可恢复的结果。Information 保存、Identity 判断、Governance、Object / Relationship 更新、Proposal / Journal 与 checkpoint 始终按来源计划顺序串行执行。该执行边界不得降低 Evidence、冲突、不确定性或 Human Judgment 要求。
+
 批量理解必须同时满足：
 
 - 一次 Provider 调用返回与输入 `atomic_information_id` 顺序严格一致的一组判断，不得缺失、重复、乱序或混入未知 ID；

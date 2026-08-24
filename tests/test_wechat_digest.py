@@ -9,14 +9,18 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 import unittest
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import closing, contextmanager
 from dataclasses import replace
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 from unittest.mock import patch
 
+from archeos import wechat_capture_helper
 from archeos.atomic_information import (
     ClaimAttribution,
     JsonlAtomicInformationStore,
@@ -50,12 +54,15 @@ from archeos.representation_information import (
 )
 from archeos.semantic_handoff import _package_fingerprint
 from archeos.source import LocalManagedSourceRepository
-from archeos import wechat_capture_helper
 from archeos.wechat_capture_helper import (
     _all_cursor_rows,
-    _capture as capture_with_wechat_cli,
-    _digest as capture_digest,
     _window_upper,
+)
+from archeos.wechat_capture_helper import (
+    _capture as capture_with_wechat_cli,
+)
+from archeos.wechat_capture_helper import (
+    _digest as capture_digest,
 )
 from archeos.wechat_digest import (
     TERMINAL_ITEM_STATES,
@@ -209,6 +216,14 @@ class FailOnSecondCaptureProvider(SyntheticCaptureProvider):
         return super().capture(*args, **kwargs)
 
 
+class FailOnSecondFullCaptureProvider(SyntheticCaptureProvider):
+    def capture(self, *args, **kwargs):
+        full_calls = sum(not call[2] for call in self.calls)
+        if not kwargs.get("observe_only", False) and full_calls:
+            raise AssertionError("frozen window must not full capture twice")
+        return super().capture(*args, **kwargs)
+
+
 class SyntheticAnalysisProvider:
     name = "external-agent-codex-cli"
 
@@ -260,7 +275,7 @@ class SyntheticAnalysisProvider:
         )
 
 
-class SyntheticSemanticHandoff:
+class _SyntheticSemanticHandoffBase:
     def __init__(self, workspace: Path) -> None:
         self.workspace = workspace
         self.provider = SyntheticAnalysisProvider()
@@ -286,6 +301,16 @@ class SyntheticSemanticHandoff:
         self.global_unknown = 0
         self.absolute_cap = 1000
         self.latest_representation_id = None
+        self.prepared_waves = []
+
+    def prepare_results(self, requests, *, parallelism):
+        self.prepared_waves.append(
+            (tuple(request.representation_id for request in requests), parallelism)
+        )
+        return {request.representation_id: 0 for request in requests}
+
+
+class SyntheticSemanticHandoff(_SyntheticSemanticHandoffBase):
 
     def execute(
         self,
@@ -1010,6 +1035,63 @@ class SyntheticSemanticHandoff:
                     )
             audit_path.write_text(json.dumps(audit), encoding="utf-8")
             os.chmod(audit_path, 0o600)
+
+
+class ObservedOutOfOrderSemanticHandoff(SyntheticSemanticHandoff):
+    """Synthetic result-only lanes with observed overlap and reverse completion."""
+
+    def __init__(self, workspace: Path) -> None:
+        super().__init__(workspace)
+        self.completion_orders: list[tuple[str, ...]] = []
+        self.last_prepare_metrics: dict[str, int] = {}
+
+    def prepare_results(self, requests, *, parallelism):
+        planned = tuple(request.representation_id for request in requests)
+        self.prepared_waves.append((planned, parallelism))
+        if not planned:
+            return {}
+        barrier = threading.Barrier(len(planned))
+        release = threading.Event()
+        state_lock = threading.Lock()
+        active = 0
+        peak = 0
+
+        def finish(representation_id: str, index: int) -> tuple[str, int]:
+            nonlocal active, peak
+            started = time.monotonic()
+            with state_lock:
+                active += 1
+                peak = max(peak, active)
+            try:
+                barrier.wait(timeout=5)
+                if len(planned) > 1 and index == 0:
+                    release.wait(timeout=5)
+                else:
+                    release.set()
+                return representation_id, round(
+                    (time.monotonic() - started) * 1000
+                )
+            finally:
+                with state_lock:
+                    active -= 1
+
+        elapsed: dict[str, int] = {}
+        completed: list[str] = []
+        with ThreadPoolExecutor(max_workers=parallelism) as executor:
+            futures = {
+                executor.submit(finish, representation_id, index)
+                for index, representation_id in enumerate(planned)
+            }
+            for future in as_completed(futures):
+                representation_id, elapsed_ms = future.result()
+                completed.append(representation_id)
+                elapsed[representation_id] = elapsed_ms
+        self.completion_orders.append(tuple(completed))
+        self.last_prepare_metrics = {
+            "semantic_peak_concurrency": peak,
+            "resume_provider_calls": 0,
+        }
+        return elapsed
 
 
 class NoStructuralChangeProvider:
@@ -3180,6 +3262,8 @@ class WechatDigestTests(unittest.TestCase):
         ).read_bytes()
         semantic_calls = self.semantic.provider.calls
         governance_calls = provider.calls
+        connector = FailOnSecondCaptureProvider(list(capture.messages))
+        service.capture_provider = connector
 
         continuation = service.install_semantic_maintenance_continuation(
             authority_ref=authority_ref
@@ -3190,6 +3274,7 @@ class WechatDigestTests(unittest.TestCase):
         self.assertEqual(continuation["authority_ref"], authority_ref)
         self.assertEqual(self.semantic.provider.calls, semantic_calls)
         self.assertEqual(provider.calls, governance_calls)
+        self.assertEqual(connector.calls, [])
         self.assertEqual(
             (service.run_store.runs_root / run_id / "status.json").read_bytes(),
             status_before,
@@ -3280,6 +3365,10 @@ class WechatDigestTests(unittest.TestCase):
         semantic_calls = self.semantic.provider.calls
         governance_calls = provider.calls
         binding = SimpleNamespace(reviewed_git_head="b" * 40)
+        original_capture = service.capture_provider
+        assert isinstance(original_capture, SyntheticCaptureProvider)
+        connector = FailOnSecondCaptureProvider(list(original_capture.messages))
+        service.capture_provider = connector
 
         with patch.object(service, "_verify_plan_and_status"), patch.object(
             service, "_semantic_authority_binding", return_value=binding
@@ -3294,6 +3383,7 @@ class WechatDigestTests(unittest.TestCase):
         self.assertEqual(status_path.read_bytes(), status_before)
         self.assertEqual(self.semantic.provider.calls, semantic_calls)
         self.assertEqual(provider.calls, governance_calls)
+        self.assertEqual(connector.calls, [])
 
     def test_segmented_gate_c_continuation_binds_current_safe_state_zero_calls(
         self,
@@ -3340,6 +3430,10 @@ class WechatDigestTests(unittest.TestCase):
         semantic_calls = self.semantic.provider.calls
         governance_calls = provider.calls
         binding = SimpleNamespace(reviewed_git_head="c" * 40)
+        original_capture = service.capture_provider
+        assert isinstance(original_capture, SyntheticCaptureProvider)
+        connector = FailOnSecondCaptureProvider(list(original_capture.messages))
+        service.capture_provider = connector
 
         with patch.object(service, "_verify_plan_and_status"), patch.object(
             service, "_semantic_authority_binding", return_value=binding
@@ -3356,6 +3450,7 @@ class WechatDigestTests(unittest.TestCase):
         self.assertEqual(status_path.read_bytes(), status_before)
         self.assertEqual(self.semantic.provider.calls, semantic_calls)
         self.assertEqual(provider.calls, governance_calls)
+        self.assertEqual(connector.calls, [])
 
     def test_governance_startup_failure_uses_latest_durable_status(self) -> None:
         self.create_object()
@@ -3397,6 +3492,10 @@ class WechatDigestTests(unittest.TestCase):
             "https://github.com/leevi2010-cursor/ArcheOS/issues/150"
             "#issuecomment-1234567890"
         )
+        original_capture = service.capture_provider
+        assert isinstance(original_capture, SyntheticCaptureProvider)
+        connector = FailOnSecondCaptureProvider(list(original_capture.messages))
+        service.capture_provider = connector
         manifest = service.build_governance_startup_recovery_manifest(
             authority_ref=authority_ref
         )
@@ -3417,6 +3516,7 @@ class WechatDigestTests(unittest.TestCase):
         self.assertFalse(receipt["retry_consumed"])
         self.assertEqual(self.semantic.provider.calls, semantic_calls)
         self.assertEqual(provider.attempts, governance_attempts)
+        self.assertEqual(connector.calls, [])
         self.assertEqual(self.governance_business_state(service), before_business)
         status = service.run_store.status(run_id)
         self.assertEqual(status["state"], "processing")
@@ -3664,7 +3764,7 @@ class WechatDigestTests(unittest.TestCase):
         manifest = service.build_multi_governance_startup_recovery_manifest(
             authority_ref=authority_ref
         )
-        self.assertEqual(len(capture.calls), 1)
+        self.assertEqual(len(capture.calls), 0)
         manifest_path = Path(self.temporary.name) / "issue-168-authority.json"
         manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
         os.chmod(manifest_path, 0o600)
@@ -3679,7 +3779,7 @@ class WechatDigestTests(unittest.TestCase):
         self.assertEqual(len(service.run_store.governance_startup_retries(run_id)), 1)
         self.assertEqual(provider.attempts, provider_attempts)
         self.assertEqual(self.semantic.provider.calls, semantic_calls)
-        self.assertEqual(len(capture.calls), 1)
+        self.assertEqual(len(capture.calls), 0)
         self.assertEqual(self.governance_business_state(service), before_business)
         self.assertEqual(service.run_store.status(run_id)["state"], "processing")
         self.assertEqual(
@@ -3690,7 +3790,7 @@ class WechatDigestTests(unittest.TestCase):
             receipt,
         )
         self.assertEqual(provider.attempts, provider_attempts)
-        self.assertEqual(len(capture.calls), 1)
+        self.assertEqual(len(capture.calls), 0)
 
         service.capture_provider = original_capture
         service.run(max_terminal_items=1)
@@ -5476,15 +5576,437 @@ class WechatDigestTests(unittest.TestCase):
         )
         self.assertNotIn(".codex/worktrees", text)
 
-    def test_capture_fingerprint_change_fails_closed(self) -> None:
+    def test_resume_uses_durable_capture_when_connector_content_changes(self) -> None:
         self.create_object()
         capture = SyntheticCaptureProvider([message(1)])
         self.semantic.failures_remaining = 1
         with self.assertRaises(WechatDigestError):
             self.service(capture).run(all_history=True)
+        calls_after_initial_capture = len(capture.calls)
         capture.messages[0] = replace(capture.messages[0], visible_content="changed")
-        with self.assertRaisesRegex(WechatDigestError, "重放内容发生变化"):
+        result = self.service(capture).run()
+        self.assertTrue(result.replayed)
+        self.assertEqual(len(capture.calls), calls_after_initial_capture)
+
+    def test_durable_capture_snapshot_drift_fails_closed_before_resume(self) -> None:
+        self.create_object()
+        capture = SyntheticCaptureProvider([message(1)])
+        self.semantic.failures_remaining = 1
+        service = self.service(capture)
+        with self.assertRaises(WechatDigestError):
+            service.run(all_history=True)
+        run_id = service.run_store.active_run_id()
+        assert run_id is not None
+        snapshot = (
+            self.workspace
+            / "02_processing"
+            / "wechat_digest"
+            / "runs"
+            / run_id
+            / "capture"
+            / "snapshot.json"
+        )
+        snapshot.write_bytes(snapshot.read_bytes() + b" ")
+        calls_before_resume = len(capture.calls)
+
+        with self.assertRaisesRegex(WechatDigestError, "fingerprint"):
             self.service(capture).run()
+
+        self.assertEqual(len(capture.calls), calls_before_resume)
+
+    def test_snapshot_publish_interruption_resumes_without_second_capture(self) -> None:
+        capture = SyntheticCaptureProvider([message(1)])
+
+        def interrupt() -> None:
+            raise OSError("synthetic snapshot interruption")
+
+        interrupted_store = WechatDigestRunStore(
+            self.workspace / "02_processing" / "wechat_digest",
+            after_capture_snapshot_write=interrupt,
+        )
+        with self.assertRaises(WechatDigestError):
+            self.service(capture, run_store=interrupted_store).run(
+                all_history=True
+            )
+        self.assertEqual(len(capture.calls), 2)
+
+        resumed = self.service(capture).run()
+
+        self.assertTrue(resumed.checkpoint_published)
+        self.assertEqual(len(capture.calls), 2)
+
+    def test_legacy_v3_capture_upgrade_adopts_every_artifact_breakpoint(self) -> None:
+        hooks = (
+            "after_capture_snapshot_write",
+            "after_capture_index_write",
+            "after_capture_summary_write",
+            "after_capture_receipt_write",
+            "before_upgrade_status_write",
+        )
+        for index, hook_name in enumerate(hooks):
+            with self.subTest(hook=hook_name):
+                capture = SyntheticCaptureProvider([message(1)])
+                canonical = WechatCapture(
+                    capture.provider_version,
+                    ZERO_CURSOR,
+                    capture.messages[0].cursor,
+                    tuple(capture.messages),
+                )
+                plan, status = _build_plan(
+                    canonical,
+                    clock=lambda: "2026-08-25T00:00:00Z",
+                )
+                failed = [True]
+
+                def interrupt(failed: list[bool] = failed) -> None:
+                    if failed.pop():
+                        raise RuntimeError("synthetic legacy capture breakpoint")
+
+                run_store = WechatDigestRunStore(
+                    self.workspace
+                    / "02_processing"
+                    / f"wechat_digest_legacy_capture_{index}",
+                    **{hook_name: interrupt},
+                )
+                run_store.create(plan, status)
+                service = self.service(capture, run_store=run_store)
+                with self.assertRaises((WechatDigestError, RuntimeError)):
+                    service.run()
+                self.assertEqual(len(capture.calls), 1)
+                setattr(run_store, hook_name, None)
+                self.semantic.failures_remaining = 1
+                try:
+                    service.run()
+                except WechatDigestError:
+                    pass
+                self.assertEqual(len(capture.calls), 1)
+                self.assertEqual(
+                    run_store.plan(str(plan["run_id"]))["schema_version"],
+                    "wechat-digest-run-plan/4.0",
+                )
+
+    def test_production_shaped_durable_snapshot_benchmark_contract(self) -> None:
+        missing_attachments = {
+            number: attachment(
+                None,
+                f"missing_{number:032x}",
+                status="missing",
+                filename=f"fixture-{number}.bin",
+            )
+            for number in range(100)
+        }
+        messages = [
+            message(
+                number + 1,
+                conversation=f"conversation_{number % 45:02d}",
+                attachments=(missing_attachments[number // 10],)
+                if number % 10 == 0
+                else (),
+            )
+            for number in range(1000)
+        ]
+        capture = WechatCapture(
+            "synthetic-production-shape/1.0",
+            ZERO_CURSOR,
+            messages[-1].cursor,
+            tuple(messages),
+        )
+        plan, _status = _build_plan(
+            capture,
+            clock=lambda: "2026-08-25T00:00:00Z",
+        )
+        store = WechatDigestRunStore(
+            self.workspace / "02_processing" / "wechat-digest-benchmark"
+        )
+        started = time.monotonic()
+        store.publish_capture_pending(plan, capture, capture_ms=1)
+        receipt = store.publish_capture_artifacts(
+            str(plan["run_id"]),
+            capture,
+            plan_binding_fingerprint=_plan_fingerprint(plan),
+            capture_ms=1,
+        )
+        publish_ms = round((time.monotonic() - started) * 1000)
+        readback_started = time.monotonic()
+        loaded, loaded_receipt = store.load_capture_artifacts(
+            str(plan["run_id"]),
+            expected_plan_binding=_plan_fingerprint(plan),
+        )
+        readback_ms = round((time.monotonic() - readback_started) * 1000)
+
+        self.assertEqual(len(loaded.messages), 1000)
+        self.assertEqual(receipt["conversation_count"], 45)
+        self.assertEqual(receipt["attachment_count"], 100)
+        self.assertEqual(loaded_receipt, receipt)
+        self.assertGreater(
+            (
+                self.workspace
+                / "02_processing"
+                / "wechat-digest-benchmark"
+                / "runs"
+                / str(plan["run_id"])
+                / "capture"
+                / "snapshot.json"
+            ).stat().st_size,
+            0,
+        )
+        self.assertGreaterEqual(publish_ms, 0)
+        self.assertGreaterEqual(readback_ms, 0)
+
+    def test_govern_item_serializes_two_real_thread_entries(self) -> None:
+        first_entered = threading.Event()
+        second_started = threading.Event()
+        second_entered = threading.Event()
+        release_first = threading.Event()
+        active_observations: list[int] = []
+
+        class ControlledGovernanceService(WechatDigestService):
+            def _govern_item_active(
+                self,
+                run_id,
+                status,
+                item_id,
+                atomic_ids,
+            ):
+                del run_id, status
+                with self._governance_observation_lock:
+                    active_observations.append(self._governance_active)
+                if item_id == "first":
+                    first_entered.set()
+                    if not release_first.wait(timeout=5):
+                        raise AssertionError("first governance entry was not released")
+                else:
+                    second_entered.set()
+                return False, tuple(atomic_ids)
+
+        service = ControlledGovernanceService(
+            workspace=self.workspace,
+            capture_provider=SyntheticCaptureProvider([]),
+            semantic_handoff_factory=lambda: self.semantic,
+            interpretation_provider=NoStructuralChangeProvider(),
+        )
+        results: dict[str, tuple[bool, tuple[str, ...]]] = {}
+
+        def invoke(item_id: str, atomic_id: str) -> None:
+            if item_id == "second":
+                second_started.set()
+            results[item_id] = service._govern_item(
+                "run_" + "1" * 32,
+                {},
+                item_id,
+                (atomic_id,),
+            )
+
+        first = threading.Thread(target=invoke, args=("first", "atomic_first"))
+        second = threading.Thread(target=invoke, args=("second", "atomic_second"))
+        first.start()
+        self.assertTrue(first_entered.wait(timeout=5))
+        second.start()
+        self.assertTrue(second_started.wait(timeout=5))
+        self.assertFalse(second_entered.wait(timeout=0.05))
+        with service._governance_observation_lock:
+            self.assertEqual(service._governance_active, 1)
+        self.assertEqual(
+            service._segment_performance["governance_peak_concurrency"], 1
+        )
+
+        release_first.set()
+        first.join(timeout=5)
+        second.join(timeout=5)
+
+        self.assertFalse(first.is_alive())
+        self.assertFalse(second.is_alive())
+        self.assertEqual(active_observations, [1, 1])
+        self.assertEqual(
+            results,
+            {
+                "first": (False, ("atomic_first",)),
+                "second": (False, ("atomic_second",)),
+            },
+        )
+        with service._governance_observation_lock:
+            self.assertEqual(service._governance_active, 0)
+        self.assertEqual(
+            service._segment_performance["governance_peak_concurrency"], 1
+        )
+
+    def test_production_shaped_service_max3_uses_one_capture_and_serial_governance(
+        self,
+    ) -> None:
+        shared_object_id = self.create_object()
+        with SQLiteWorldModelRepository(
+            self.workspace / "04_core" / "archeos.sqlite3"
+        ) as repository:
+            repository.add_role(shared_object_id, "brand")
+            objects_before = repository.list_objects()
+            names_before = repository.list_names(shared_object_id)
+            roles_before = repository.list_roles(shared_object_id)
+            apply_receipts_before = repository.list_apply_receipts()
+        missing_attachments = {
+            number: attachment(
+                None,
+                f"service_fixture_{number:032x}",
+                status="missing",
+                filename=f"fixture-{number}.bin",
+            )
+            for number in range(100)
+        }
+        messages = [
+            message(
+                number + 1,
+                conversation=f"conversation_{number % 45:02d}",
+                attachments=(missing_attachments[number // 10],)
+                if number % 10 == 0
+                else (),
+            )
+            for number in range(1000)
+        ]
+        capture = FailOnSecondFullCaptureProvider(messages)
+        semantic = ObservedOutOfOrderSemanticHandoff(self.workspace)
+
+        class BoundedBenchmarkAnalysisProvider(SyntheticAnalysisProvider):
+            def analyze(self, batch):
+                self.mode = "four_one" if self.calls < 2 else "all_residue"
+                return super().analyze(batch)
+
+        semantic.provider = BoundedBenchmarkAnalysisProvider()
+        service = WechatDigestService(
+            workspace=self.workspace,
+            capture_provider=capture,
+            semantic_handoff_factory=lambda: semantic,
+            interpretation_provider=NoStructuralChangeProvider(),
+            semantic_parallelism=2,
+        )
+        proposals_before = service.proposal_store.list_history()
+        journal_before = service.journal.list_changes()
+
+        results = [service.run(all_history=True, max_terminal_items=3)]
+        while service.run_store.active_run_id() is not None:
+            results.append(service.run(max_terminal_items=3))
+
+        self.assertEqual(sum(not call[2] for call in capture.calls), 1)
+        self.assertEqual(sum(item.capture_provider_calls for item in results), 1)
+        self.assertEqual(sum(item.upper_bound_probe_calls for item in results), 1)
+        self.assertTrue(all(item.completed_window_connector_replays == 0 for item in results))
+        self.assertTrue(all(item.segment_items_completed <= 3 for item in results))
+        self.assertEqual(results[-1].new_messages, 1000)
+        self.assertEqual(results[-1].new_attachments, 100)
+        self.assertGreater(results[-1].snapshot_bytes, 0)
+        self.assertEqual(max(item.semantic_parallelism for item in results), 2)
+        self.assertEqual(max(item.semantic_peak_concurrency for item in results), 2)
+        self.assertEqual(max(item.governance_peak_concurrency for item in results), 1)
+        self.assertEqual(sum(item.resume_provider_calls for item in results), 0)
+        self.assertTrue(
+            any(
+                completed != planned
+                for (planned, _parallelism), completed in zip(
+                    semantic.prepared_waves,
+                    semantic.completion_orders,
+                    strict=True,
+                )
+                if len(planned) > 1
+            )
+        )
+
+        information = service.information_store.list_atomic_information()
+        self.assertEqual(len(information), 8)
+        self.assertEqual(
+            len({item.atomic_information_id for item in information}),
+            len(information),
+        )
+        revision_history = {
+            item.atomic_information_id: service.information_store.list_revisions(
+                item.atomic_information_id
+            )
+            for item in information
+        }
+        self.assertTrue(
+            all(len(revisions) == 2 for revisions in revision_history.values())
+        )
+        self.assertTrue(
+            all(shared_object_id in item.related_object_ids for item in information)
+        )
+        with SQLiteWorldModelRepository(service.database) as repository:
+            objects = repository.list_objects()
+            self.assertEqual(objects, objects_before)
+            names = repository.list_names(shared_object_id)
+            roles = repository.list_roles(shared_object_id)
+            self.assertEqual(names, names_before)
+            self.assertEqual(roles, roles_before)
+            apply_receipts = repository.list_apply_receipts()
+            effect_bindings = {
+                item.atomic_information_id: service._governance_effect_binding(
+                    repository, item.atomic_information_id
+                )
+                for item in information
+            }
+        proposals = service.proposal_store.list_history()
+        journal = service.journal.list_changes()
+        self.assertEqual(proposals, proposals_before)
+        self.assertEqual(journal[: len(journal_before)], journal_before)
+        self.assertEqual(apply_receipts[: len(apply_receipts_before)], apply_receipts_before)
+        identity_bind_journal = tuple(
+            item
+            for item in journal[len(journal_before) :]
+            if item.operation == "bind_existing"
+        )
+        self.assertEqual(len(journal) - len(journal_before), 8)
+        self.assertEqual(len(identity_bind_journal), 8)
+        self.assertFalse(
+            any(item.operation == "bind_atomic_information" for item in journal)
+        )
+        self.assertEqual(
+            {item.atomic_information_id for item in identity_bind_journal},
+            set(revision_history),
+        )
+        new_apply_receipts = apply_receipts[len(apply_receipts_before) :]
+        self.assertEqual(len(new_apply_receipts), 8)
+        identity_receipt_records = [
+            json.loads(receipt.payload)["records"][0]
+            for receipt in new_apply_receipts
+        ]
+        self.assertTrue(
+            all(
+                record["operation"] == "bind_existing"
+                for record in identity_receipt_records
+            )
+        )
+        self.assertEqual(
+            {item.change_id for item in identity_bind_journal},
+            {record["change_id"] for record in identity_receipt_records},
+        )
+        self.assertEqual(
+            {
+                record["atomic_information_id"]
+                for record in identity_receipt_records
+            },
+            set(revision_history),
+        )
+        self.assertEqual(set(effect_bindings), set(revision_history))
+        self.assertEqual(
+            len(
+                {
+                    binding["effect_fingerprint"]
+                    for binding in effect_bindings.values()
+                }
+            ),
+            8,
+        )
+        self.assertTrue(
+            all(
+                binding["atomic_information_id"] == atomic_id
+                and binding["revision_count"] == 2
+                and binding["journal_count"] == 1
+                and binding["apply_receipt_count"] == 1
+                for atomic_id, binding in effect_bindings.items()
+            )
+        )
+        self.assertEqual(
+            len({item.proposal_id for item in proposals}), len(proposals)
+        )
+        self.assertEqual(
+            len({item.change_id for item in journal}), len(journal)
+        )
 
     def test_prepare_requires_active_run_without_capture(self) -> None:
         capture = SyntheticCaptureProvider([message(1)])
@@ -5742,15 +6264,17 @@ class WechatDigestTests(unittest.TestCase):
         self.assertEqual(next(iter(service.run_store.status(run_id)["items"].values()))["state"], "represented")
         self.assertEqual(self.semantic.provider.calls, 0)
 
-    def test_prepare_fingerprint_change_fails_before_provider(self) -> None:
+    def test_prepare_ignores_connector_drift_and_uses_durable_capture(self) -> None:
         capture = SyntheticCaptureProvider([message(1)])
         self.semantic.failures_remaining = 1
         service = self.service(capture)
         with self.assertRaises(WechatDigestError):
             service.run(all_history=True)
+        calls_before_prepare = len(capture.calls)
         capture.messages[0] = replace(capture.messages[0], visible_content="changed")
-        with self.assertRaisesRegex(WechatDigestError, "重放内容发生变化"):
-            service.prepare_next_semantic()
+        prepared = service.prepare_next_semantic()
+        self.assertTrue(prepared.representation_id)
+        self.assertEqual(len(capture.calls), calls_before_prepare)
         self.assertEqual(self.semantic.provider.calls, 0)
 
     def test_prepare_rejects_tampered_plan_and_status_before_provider(self) -> None:
@@ -5804,6 +6328,7 @@ class WechatDigestTests(unittest.TestCase):
         plan["schema_version"] = "wechat-digest-run-plan/1.0"
         plan.pop("semantic_batch_size")
         plan.pop("all_history_upper_bound")
+        plan.pop("capture_receipt_fingerprint", None)
         plan_path.write_text(json.dumps(plan), encoding="utf-8")
         status = json.loads(status_path.read_text(encoding="utf-8"))
         status.pop("plan_fingerprint")
@@ -5830,6 +6355,8 @@ class WechatDigestTests(unittest.TestCase):
         plan = json.loads(plan_path.read_text(encoding="utf-8"))
         plan["schema_version"] = "wechat-digest-run-plan/2.0"
         plan.pop("all_history_upper_bound")
+        plan.pop("capture_receipt_fingerprint", None)
+        plan.pop("capture_receipt_fingerprint", None)
         fingerprint = _plan_fingerprint(plan)
         status = json.loads(status_path.read_text(encoding="utf-8"))
         status["plan_fingerprint"] = fingerprint
@@ -5894,6 +6421,7 @@ class WechatDigestTests(unittest.TestCase):
         plan = json.loads(plan_path.read_text(encoding="utf-8"))
         plan["schema_version"] = "wechat-digest-run-plan/2.0"
         plan.pop("all_history_upper_bound")
+        plan.pop("capture_receipt_fingerprint", None)
         fingerprint = _plan_fingerprint(plan)
         status = json.loads(status_path.read_text(encoding="utf-8"))
         status["plan_fingerprint"] = fingerprint
@@ -6651,12 +7179,15 @@ class WechatDigestTests(unittest.TestCase):
         with self.assertRaises(WechatDigestError):
             service.run(all_history=True)
         provider_calls = self.semantic.provider.calls
+        connector = FailOnSecondCaptureProvider(list(capture.messages))
+        service.capture_provider = connector
         grant = service.install_semantic_authority(
             inventory_authority_file=Path("/private/authority-a.json"),
         )
         self.assertEqual(grant["baseline_total"], 80)
         self.assertEqual(grant["max_new"], 20)
         self.assertEqual(self.semantic.provider.calls, provider_calls)
+        self.assertEqual(connector.calls, [])
         self.assertEqual(
             service.install_semantic_authority(
                 inventory_authority_file=Path("/private/authority-a.json"),
@@ -6761,6 +7292,91 @@ class WechatDigestTests(unittest.TestCase):
             checkpoint["run_id"], plans[-1][1]
         )
         self.assertIsNone(service.run_store.active_run_id())
+
+    def test_completed_window_w_1_5_10_is_summary_only_and_connector_zero(
+        self,
+    ) -> None:
+        for window_count in (1, 5, 10):
+            with self.subTest(windows=window_count):
+                root = (
+                    self.workspace
+                    / "02_processing"
+                    / f"wechat_digest_completed_w_{window_count}"
+                )
+                run_store = WechatDigestRunStore(root)
+                messages = [
+                    message(
+                        index + 1,
+                        timestamp=1_700_000_000 + index,
+                        conversation=f"conversation_{index:02d}",
+                    )
+                    for index in range(window_count + 1)
+                ]
+                global_upper = messages[-1].cursor
+                after = ZERO_CURSOR
+                previous_run_id = ""
+                previous_cursor = ZERO_CURSOR
+                for index, captured_message in enumerate(messages):
+                    capture = WechatCapture(
+                        "synthetic/1.0",
+                        after,
+                        captured_message.cursor,
+                        (captured_message,),
+                    )
+                    legacy_plan, _ = _build_plan(
+                        capture,
+                        clock=lambda: "2026-08-25T00:00:00Z",
+                        all_history_upper_bound=global_upper,
+                    )
+                    run_store.publish_capture_pending(
+                        legacy_plan, capture, capture_ms=1
+                    )
+                    receipt = run_store.publish_capture_artifacts(
+                        str(legacy_plan["run_id"]),
+                        capture,
+                        plan_binding_fingerprint=_plan_fingerprint(legacy_plan),
+                        capture_ms=1,
+                    )
+                    plan, status = _build_plan(
+                        capture,
+                        clock=lambda: "2026-08-25T00:00:00Z",
+                        run_id=str(legacy_plan["run_id"]),
+                        created_at="2026-08-25T00:00:00Z",
+                        all_history_upper_bound=global_upper,
+                        capture_receipt_fingerprint=str(
+                            receipt["receipt_fingerprint"]
+                        ),
+                    )
+                    if index < window_count:
+                        status["state"] = "completed"
+                        status["checkpoint_published"] = True
+                        for item in status["items"].values():
+                            item["state"] = "unsupported"
+                    run_store.create(plan, status)
+                    if index < window_count:
+                        run_store.clear_active()
+                        previous_run_id = str(plan["run_id"])
+                        previous_cursor = captured_message.cursor
+                    after = captured_message.cursor
+
+                run_store.publish_checkpoint(previous_run_id, previous_cursor)
+
+                capture_provider = SyntheticCaptureProvider(messages)
+                service = self.service(
+                    capture_provider, run_store=run_store
+                )
+                with patch.object(
+                    run_store,
+                    "load_capture_artifacts",
+                    side_effect=AssertionError(
+                        "completed history must not deep-read snapshot"
+                    ),
+                ):
+                    binding = service._semantic_authority_binding(
+                        str(plan["run_id"])
+                    )
+                self.assertEqual(len(binding.completed_window_chain), window_count)
+                self.assertEqual(capture_provider.calls, [])
 
     def test_upgrade_rejects_tampered_legacy_binding_before_any_write(self) -> None:
         capture = SyntheticCaptureProvider([message(1)])
@@ -7165,12 +7781,174 @@ class WechatCaptureHelperTests(unittest.TestCase):
         with self.capture_runtime(), patch.object(
             wechat_capture_helper,
             "_all_cursor_rows",
-            wraps=_all_cursor_rows,
+            side_effect=AssertionError("observe-only must not scan cursor rows"),
         ) as discovery:
             result = capture_with_wechat_cli(request)
-        self.assertEqual(discovery.call_args.kwargs["end_timestamp"], upper[0])
+        discovery.assert_not_called()
         self.assertEqual(result["observed_upper"], self.cursor_dict(upper))
         self.assertEqual(result["messages"], [])
+
+    def test_observe_only_unknown_upper_uses_database_max_not_all_rows(self) -> None:
+        request = self.request(observe_only=True)
+        with self.capture_runtime(), patch.object(
+            wechat_capture_helper,
+            "_all_cursor_rows",
+            side_effect=AssertionError("observe-only must not scan cursor rows"),
+        ) as discovery, patch.object(
+            wechat_capture_helper,
+            "_upper_cursor_rows",
+            wraps=wechat_capture_helper._upper_cursor_rows,
+        ) as upper_query:
+            result = capture_with_wechat_cli(request)
+        discovery.assert_not_called()
+        upper_query.assert_called_once()
+        self.assertEqual(
+            result["observed_upper"], self.cursor_dict(max(self.cursors.values()))
+        )
+        self.assertEqual(result["messages"], [])
+
+    def test_production_shaped_probe_reads_only_table_maxima(self) -> None:
+        located: dict[str, tuple[tuple[str, str, str, bool, str], ...]] = {}
+        sessions: list[tuple[str, str, bool]] = []
+        total_rows = 0
+        for partition_index in range(4):
+            database = self.root / f"production-{partition_index}.db"
+            tables: list[tuple[str, str, str, bool, str]] = []
+            with closing(sqlite3.connect(database)) as connection:
+                for conversation_index in range(partition_index, 45, 4):
+                    username = f"wxid_fixture_{conversation_index:02d}"
+                    table = "Msg_" + hashlib.md5(username.encode()).hexdigest()
+                    connection.execute(
+                        f"CREATE TABLE [{table}] ("
+                        "local_id INTEGER PRIMARY KEY, local_type INTEGER, "
+                        "create_time INTEGER, real_sender_id TEXT, "
+                        "raw_content TEXT, compression INTEGER)"
+                    )
+                    rows = [
+                        (
+                            row + 1,
+                            3 if (total_rows + row) % 10 == 0 else 1,
+                            1_700_000_000 + row,
+                            "sender",
+                            f"message-{conversation_index}-{row}",
+                            0,
+                        )
+                        for row in range(22 + (conversation_index < 10))
+                    ]
+                    total_rows += len(rows)
+                    connection.executemany(
+                        f"INSERT INTO [{table}] VALUES (?, ?, ?, ?, ?, ?)", rows
+                    )
+                    sessions.append(
+                        (
+                            username,
+                            f"Conversation {conversation_index}",
+                            False,
+                        )
+                    )
+                    tables.append(
+                        (
+                            f"msg/production-{partition_index}.db",
+                            username,
+                            f"Conversation {conversation_index}",
+                            False,
+                            table,
+                        )
+                    )
+                connection.commit()
+            located[str(database)] = tuple(tables)
+
+        self.app.cache = {
+            rows[0][0]: database
+            for database, rows in located.items()
+            if rows
+        }
+        self.app.msg_db_keys = tuple(self.app.cache)
+        with patch.dict(sys.modules, self.modules), patch.object(
+            wechat_capture_helper,
+            "_sessions",
+            return_value=tuple(sessions),
+        ), patch.object(
+            wechat_capture_helper,
+            "_all_cursor_rows",
+            side_effect=AssertionError("probe must not scan all rows"),
+        ) as probe_full_scan:
+            observed = capture_with_wechat_cli(
+                self.request(observe_only=True)
+            )
+        probe_full_scan.assert_not_called()
+
+        full_capture_samples: list[int] = []
+        captured_samples: list[dict[str, object]] = []
+        parsed_samples: list[WechatCapture] = []
+        after_cursor = WechatCursor(99, "", "")
+        parser = object.__new__(WechatCliCaptureProvider)
+        parser.provider_version = "0.5.0"
+        with patch.dict(sys.modules, self.modules), patch.object(
+            wechat_capture_helper,
+            "_sessions",
+            return_value=tuple(sessions),
+        ), patch.object(
+            wechat_capture_helper,
+            "_all_cursor_rows",
+            wraps=_all_cursor_rows,
+        ) as full_scan:
+            for _ in range(7):
+                started = time.monotonic_ns()
+                captured = capture_with_wechat_cli(
+                    self.request(
+                        all_history_upper_bound=observed["observed_upper"],
+                        message_limit=1000,
+                    )
+                )
+                connector_payload = json.loads(
+                    json.dumps(captured, ensure_ascii=False, separators=(",", ":"))
+                )
+                parsed = parser._parse_capture(connector_payload, after_cursor)
+                full_capture_samples.append(time.monotonic_ns() - started)
+                captured_samples.append(captured)
+                parsed_samples.append(parsed)
+
+        captured = captured_samples[-1]
+        parsed_capture = parsed_samples[-1]
+        plan, _status = _build_plan(
+            parsed_capture,
+            clock=lambda: "2026-08-25T00:00:00Z",
+        )
+        store = WechatDigestRunStore(self.root / "production-capture-artifacts")
+        store.publish_capture_pending(plan, parsed_capture, capture_ms=1)
+        store.publish_capture_artifacts(
+            str(plan["run_id"]),
+            parsed_capture,
+            plan_binding_fingerprint=_plan_fingerprint(plan),
+            capture_ms=1,
+        )
+        readback_samples: list[int] = []
+        for _ in range(7):
+            started = time.monotonic_ns()
+            loaded, _receipt = store.load_capture_artifacts(str(plan["run_id"]))
+            readback_samples.append(time.monotonic_ns() - started)
+            self.assertEqual(loaded, parsed_capture)
+
+        median_full_capture = sorted(full_capture_samples)[3]
+        median_readback = sorted(readback_samples)[3]
+
+        self.assertEqual(total_rows, 1000)
+        self.assertEqual(full_scan.call_count, 7)
+        self.assertEqual(len(captured_samples), 7)
+        self.assertTrue(
+            all(len(item["messages"]) == 1000 for item in captured_samples)
+        )
+        self.assertEqual(len(captured["messages"]), 1000)
+        self.assertEqual(
+            len({item["conversation_key"] for item in captured["messages"]}),
+            45,
+        )
+        self.assertEqual(
+            sum(len(item["attachments"]) for item in captured["messages"]),
+            100,
+        )
+        self.assertLess(median_readback, median_full_capture)
 
     def test_unbounded_window_discovery_is_unchanged(self) -> None:
         request = self.request(message_limit=2)

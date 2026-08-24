@@ -256,6 +256,44 @@ def _all_cursor_rows(
     return rows
 
 
+def _upper_cursor_rows(
+    located_tables: dict[str, tuple[tuple[str, str, str, bool, str], ...]],
+    *,
+    start_timestamp: int,
+    end_timestamp: int | None = None,
+) -> list[tuple[str, str, object, object]]:
+    """Read only each table's maximum timestamp and exact tie rows."""
+
+    rows: list[tuple[str, str, object, object]] = []
+    for database, tables in located_tables.items():
+        try:
+            with closing(sqlite3.connect(database)) as connection:
+                for relative_key, username, _label, _group, table_name in tables:
+                    bounds = "create_time >= ?"
+                    parameters: tuple[int, ...] = (start_timestamp,)
+                    if end_timestamp is not None:
+                        bounds += " AND create_time <= ?"
+                        parameters += (end_timestamp,)
+                    maximum = connection.execute(
+                        f"SELECT MAX(create_time) FROM [{table_name}] WHERE {bounds}",
+                        parameters,
+                    ).fetchone()
+                    timestamp = maximum[0] if maximum is not None else None
+                    if isinstance(timestamp, bool) or not isinstance(timestamp, int):
+                        continue
+                    values = connection.execute(
+                        f"SELECT local_id, create_time FROM [{table_name}] "
+                        "WHERE create_time = ?",
+                        (timestamp,),
+                    ).fetchall()
+                    rows.extend(
+                        (username, relative_key, *value) for value in values
+                    )
+        except sqlite3.Error:
+            raise RuntimeError("message upper cursor query failed") from None
+    return rows
+
+
 def _all_message_rows(
     located_tables: dict[str, tuple[tuple[str, str, str, bool, str], ...]],
     *,
@@ -344,19 +382,23 @@ def _capture(request: dict[str, object]) -> dict[str, object]:
     table_locations = _message_table_locations(app)
     located_tables = _located_session_tables(sessions, table_locations)
     cursor_query_upper = fixed_upper or all_history_upper
-    all_cursor_rows = _all_cursor_rows(
-        located_tables,
-        start_timestamp=after[0],
-        end_timestamp=(
-            None if cursor_query_upper is None else cursor_query_upper[0]
-        ),
-    )
     if request["observe_only"]:
+        if cursor_query_upper is not None:
+            observed_upper = cursor_query_upper
+            return {
+                "schema_version": "wechat-cli-capture/1.0",
+                "observed_upper": _cursor_dict(observed_upper),
+                "messages": [],
+            }
+        upper_cursor_rows = _upper_cursor_rows(
+            located_tables,
+            start_timestamp=after[0],
+        )
         cursors = [
             (create_time, _digest("wechat_conversation", username), _digest(
                 "wechat_message", username, database_key, local_id, create_time
             ))
-            for username, database_key, local_id, create_time in all_cursor_rows
+            for username, database_key, local_id, create_time in upper_cursor_rows
             if isinstance(create_time, int) and not isinstance(create_time, bool)
         ]
         bounded = [
@@ -376,6 +418,13 @@ def _capture(request: dict[str, object]) -> dict[str, object]:
             "observed_upper": _cursor_dict(observed_upper),
             "messages": [],
         }
+    all_cursor_rows = _all_cursor_rows(
+        located_tables,
+        start_timestamp=after[0],
+        end_timestamp=(
+            None if cursor_query_upper is None else cursor_query_upper[0]
+        ),
+    )
     cursor_rows = [
         (
             create_time,
