@@ -30,7 +30,7 @@ from archeos.digestion import (
 )
 from archeos.digestion.providers import CodexInterpretationTimeout
 from archeos.emergence import IdentityEvidence, IdentityGateService
-from archeos.representation import LocalRepresentationRepository
+from archeos.representation import LocalRepresentationRepository, RepresentationError
 from archeos.representation_information import (
     EXTERNAL_AGENT_PROTOCOL_V1,
     EXTERNAL_AGENT_PROTOCOL_V2,
@@ -41,6 +41,7 @@ from archeos.representation_information import (
     EXTERNAL_AGENT_PROTOCOL_V3_4,
     RepresentationAnalysisResult,
     RepresentationCandidateDraft,
+    RepresentationInformationError,
     RepresentationInformationService,
     RepresentationResidueDraft,
     _analysis_batches_for_anchor_unit_ids,
@@ -199,6 +200,13 @@ class SyntheticCaptureProvider:
         )
         self.outputs.append(capture)
         return capture
+
+
+class FailOnSecondCaptureProvider(SyntheticCaptureProvider):
+    def capture(self, *args, **kwargs):
+        if self.calls:
+            raise AssertionError("resolve must not capture after manifest build")
+        return super().capture(*args, **kwargs)
 
 
 class SyntheticAnalysisProvider:
@@ -3648,10 +3656,15 @@ class WechatDigestTests(unittest.TestCase):
         before_business = self.governance_business_state(service)
         provider_attempts = provider.attempts
         semantic_calls = self.semantic.provider.calls
+        original_capture = service.capture_provider
+        assert isinstance(original_capture, SyntheticCaptureProvider)
+        capture = FailOnSecondCaptureProvider(list(original_capture.messages))
+        service.capture_provider = capture
 
         manifest = service.build_multi_governance_startup_recovery_manifest(
             authority_ref=authority_ref
         )
+        self.assertEqual(len(capture.calls), 1)
         manifest_path = Path(self.temporary.name) / "issue-168-authority.json"
         manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
         os.chmod(manifest_path, 0o600)
@@ -3666,6 +3679,7 @@ class WechatDigestTests(unittest.TestCase):
         self.assertEqual(len(service.run_store.governance_startup_retries(run_id)), 1)
         self.assertEqual(provider.attempts, provider_attempts)
         self.assertEqual(self.semantic.provider.calls, semantic_calls)
+        self.assertEqual(len(capture.calls), 1)
         self.assertEqual(self.governance_business_state(service), before_business)
         self.assertEqual(service.run_store.status(run_id)["state"], "processing")
         self.assertEqual(
@@ -3676,7 +3690,9 @@ class WechatDigestTests(unittest.TestCase):
             receipt,
         )
         self.assertEqual(provider.attempts, provider_attempts)
+        self.assertEqual(len(capture.calls), 1)
 
+        service.capture_provider = original_capture
         service.run(max_terminal_items=1)
 
         self.assertEqual(provider.attempts, provider_attempts + 1)
@@ -3895,6 +3911,174 @@ class WechatDigestTests(unittest.TestCase):
                     len(service.run_store.governance_startup_recoveries(run_id)),
                     1,
                 )
+
+    def test_multi_governance_startup_durable_drift_rejects_before_write(
+        self,
+    ) -> None:
+        def change_plan(case, service, run_id, _item_id, _atomic_ids):
+            path = service.run_store.runs_root / run_id / "plan.json"
+            value = json.loads(path.read_text(encoding="utf-8"))
+            value["capture_fingerprint"] = "sha256:" + "0" * 64
+            path.write_text(json.dumps(value), encoding="utf-8")
+
+        def change_plan_receipt(case, service, run_id, _item_id, _atomic_ids):
+            path = service.run_store.runs_root / run_id / "run-plan-receipt.json"
+            value = json.loads(path.read_text(encoding="utf-8"))
+            value["plan_fingerprint"] = "sha256:" + "0" * 64
+            path.write_text(json.dumps(value), encoding="utf-8")
+
+        def change_status(case, service, run_id, _item_id, _atomic_ids):
+            status = service.run_store.status(run_id)
+            status["updated_at"] = "2099-01-01T00:00:00Z"
+            service.run_store.update_status(run_id, status)
+
+        def change_checkpoint(case, service, run_id, _item_id, _atomic_ids):
+            plan = service.run_store.plan(run_id)
+            service.run_store.checkpoint_path.write_text(
+                json.dumps(
+                    {
+                        "schema_version": "wechat-digest-checkpoint/1.0",
+                        "cursor": plan["upper_bound"],
+                        "published_at": "2099-01-01T00:00:00Z",
+                        "run_id": run_id,
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+        def change_source(case, service, _run_id, item_id, _atomic_ids):
+            item = service.run_store.status(
+                service.run_store.active_run_id()
+            )["items"][item_id]
+            source = service.source_repository.get(item["source_id"])
+            path = service.source_repository.managed_root / source.managed_locator
+            path.write_bytes(path.read_bytes() + b"drift")
+
+        def change_representation(case, service, run_id, item_id, _atomic_ids):
+            item = service.run_store.status(run_id)["items"][item_id]
+            representation = service.representation_repository.get(
+                item["representation_id"]
+            )
+            directory = (
+                service.representation_repository.representation_root
+                / representation.source_id
+                / representation.representation_id
+            )
+            (directory / "unexpected-drift.txt").write_text(
+                "drift", encoding="utf-8"
+            )
+
+        def change_package(case, service, run_id, item_id, _atomic_ids):
+            item = service.run_store.status(run_id)["items"][item_id]
+            package = (
+                service.workspace
+                / "02_processing"
+                / "information"
+                / item["representation_id"]
+            )
+            (package / "unexpected-drift.txt").write_text(
+                "drift", encoding="utf-8"
+            )
+
+        def change_atomic(case, service, _run_id, _item_id, atomic_ids):
+            case.append_information_drift(service, atomic_ids[0])
+
+        def change_business(case, service, _run_id, _item_id, _atomic_ids):
+            with SQLiteWorldModelRepository(service.database) as repository:
+                repository.create_object("Synthetic durable drift")
+
+        def change_history(case, service, run_id, _item_id, _atomic_ids):
+            legacy = service.run_store.governance_startup_recovery(run_id)
+            assert legacy is not None
+            directory = (
+                service.run_store.runs_root
+                / run_id
+                / "governance-startup-recoveries"
+            )
+            directory.mkdir(mode=0o700)
+            path = directory / (
+                legacy["receipt_fingerprint"].removeprefix("sha256:") + ".json"
+            )
+            path.write_text(json.dumps(legacy) + "\n", encoding="utf-8")
+            os.chmod(path, 0o600)
+
+        def change_ledger(case, _service, _run_id, _item_id, _atomic_ids):
+            case.semantic.global_attempt_total = 303
+
+        cases = {
+            "plan": change_plan,
+            "plan-receipt": change_plan_receipt,
+            "status": change_status,
+            "checkpoint": change_checkpoint,
+            "source": change_source,
+            "representation": change_representation,
+            "package": change_package,
+            "atomic": change_atomic,
+            "business": change_business,
+            "history": change_history,
+            "ledger": change_ledger,
+        }
+        for label, mutate in cases.items():
+            with self.subTest(label=label):
+                case = type(self)(methodName=self._testMethodName)
+                case.setUp()
+                try:
+                    (
+                        service,
+                        provider,
+                        run_id,
+                        _historical_item_id,
+                        current_item_id,
+                        atomic_ids,
+                    ) = case.multi_governance_startup_recovery_fixture()
+                    authority_ref = (
+                        "https://github.com/leevi2010-cursor/ArcheOS/issues/168"
+                        "#issuecomment-1234567890"
+                    )
+                    manifest = (
+                        service.build_multi_governance_startup_recovery_manifest(
+                            authority_ref=authority_ref
+                        )
+                    )
+                    path = Path(case.temporary.name) / f"{label}-authority.json"
+                    path.write_text(json.dumps(manifest), encoding="utf-8")
+                    os.chmod(path, 0o600)
+                    attempts = provider.attempts
+                    semantic_calls = case.semantic.provider.calls
+                    mutate(
+                        case,
+                        service,
+                        run_id,
+                        current_item_id,
+                        atomic_ids,
+                    )
+                    recovery_count = len(
+                        service.run_store.governance_startup_recoveries(run_id)
+                    )
+
+                    with self.assertRaises(
+                        (
+                            WechatDigestError,
+                            RepresentationInformationError,
+                            RepresentationError,
+                        )
+                    ):
+                        service.resolve_multi_governance_startup_failure(
+                            authority_ref=authority_ref,
+                            authority_manifest_file=path,
+                        )
+
+                    self.assertEqual(provider.attempts, attempts)
+                    self.assertEqual(case.semantic.provider.calls, semantic_calls)
+                    self.assertIsNone(
+                        case.semantic.installed_multi_governance_startup_recovery_continuation
+                    )
+                    self.assertEqual(
+                        len(service.run_store.governance_startup_recoveries(run_id)),
+                        recovery_count,
+                    )
+                finally:
+                    case.tearDown()
 
     def test_multi_governance_startup_retry_failure_is_consumed(
         self,

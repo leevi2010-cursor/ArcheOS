@@ -347,16 +347,20 @@ class CliTest(unittest.TestCase):
         method = (
             digest_service.return_value.resolve_multi_governance_startup_failure
         )
-        method.return_value = {
-            "receipt_fingerprint": "sha256:" + "d" * 64,
-        }
+        def resolve(**kwargs):
+            for stage in ("capture_skipped", "verify", "write", "readback"):
+                kwargs["progress"](stage)
+            return {"receipt_fingerprint": "sha256:" + "d" * 64}
+
+        method.side_effect = resolve
         authority_ref = (
             "https://github.com/leevi2010-cursor/ArcheOS/issues/168"
             "#issuecomment-1234567890"
         )
         authority = Path("/private/issue-168-authority.json")
         output = StringIO()
-        with redirect_stdout(output):
+        progress = StringIO()
+        with redirect_stdout(output), redirect_stderr(progress):
             result = main(
                 [
                     "wechat",
@@ -375,10 +379,15 @@ class CliTest(unittest.TestCase):
         self.assertEqual(payload["durable_information_preserved"], 3)
         self.assertEqual(payload["safe_restart_attempts_available"], 1)
         self.assertFalse(payload["checkpoint_published"])
-        method.assert_called_once_with(
-            authority_ref=authority_ref,
-            authority_manifest_file=authority,
-        )
+        method.assert_called_once()
+        called = method.call_args.kwargs
+        self.assertEqual(called["authority_ref"], authority_ref)
+        self.assertEqual(called["authority_manifest_file"], authority)
+        self.assertTrue(callable(called["progress"]))
+        self.assertIn("无需重新读取微信历史", progress.getvalue())
+        self.assertIn("正在核对持久化证据", progress.getvalue())
+        self.assertIn("正在写入恢复许可", progress.getvalue())
+        self.assertIn("正在读回并确认恢复状态", progress.getvalue())
         digest_service.return_value.run.assert_not_called()
         capture_provider.assert_called_once()
 
