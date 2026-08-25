@@ -20,6 +20,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 
 from .atomic_information import IngestionResult, ingest_processing_package
+from .atomic_information.ingestion import _load_candidates
 from .atomic_information.store import AtomicInformationStore
 from .filesystem import publish_directory_no_replace, publish_file_no_replace
 from .representation.identity import require_representation_id
@@ -12082,6 +12083,106 @@ class _SemanticGlobalAuthority:
             raise SemanticHandoffError("Semantic global commit cursor 损坏。")
         return payload
 
+    def _current_commit_cursor(
+        self,
+        grant: Mapping[str, object],
+        attempts: Sequence[Mapping[str, object]],
+    ) -> dict[str, object]:
+        baseline = int(grant["baseline_total"])
+        if not os.path.lexists(self._commit_cursor_path()):
+            completed_processing_runs = {
+                str(audit.get("processing_run_id"))
+                for path in self.audit_root.glob(
+                    "run_*/processing-run-audit.json"
+                )
+                for audit in (_private_json_exact(path),)
+                if audit.get("durable_ingestion_status") == "completed"
+                and audit.get("handoff_status") == "completed"
+            }
+            for attempt in attempts:
+                ordinal = int(attempt["global_ordinal"])
+                if ordinal != baseline + 1:
+                    break
+                result_receipt_path = (
+                    self.audit_root
+                    / str(attempt["semantic_run_id"])
+                    / "results"
+                    / f"batch_{int(attempt['batch_ordinal']):04d}"
+                    / "result-receipt.json"
+                )
+                durably_committed = False
+                if os.path.lexists(result_receipt_path):
+                    result_receipt = _private_json_exact(result_receipt_path)
+                    durably_committed = str(
+                        result_receipt.get("processing_run_id")
+                    ) in completed_processing_runs
+                if (
+                    attempt.get("schema_version")
+                    != _GLOBAL_RESERVED_ATTEMPT_SCHEMA
+                    or durably_committed
+                ):
+                    baseline = ordinal
+                    continue
+                break
+        return self._read_commit_cursor(baseline)
+
+    def validate_commit_wave(
+        self,
+        recoveries: Sequence[_SemanticRecoveryRun],
+        *,
+        window: SemanticWindowAuthorityBinding,
+        provider: CodexCliRepresentationAnalysisProvider,
+    ) -> tuple[tuple[int, int], ...]:
+        """Read one ordered committed-result wave without advancing its cursor."""
+
+        if not recoveries:
+            return ()
+        with self._locked():
+            grant = self._load_grant(window, provider)
+            attempts, unknown = self._global_attempts(grant)
+            if unknown:
+                raise SemanticHandoffError(
+                    "Semantic global authority 存在 outcome unknown；禁止恢复。"
+                )
+            current = int(
+                self._current_commit_cursor(grant, attempts)[
+                    "committed_global_ordinal"
+                ]
+            )
+            ranges: list[tuple[int, int]] = []
+            seen: set[str] = set()
+            for recovery in recoveries:
+                if recovery.semantic_run_id in seen:
+                    raise SemanticHandoffError(
+                        "Semantic committed-result wave identity 重复。"
+                    )
+                seen.add(recovery.semantic_run_id)
+                selected = [
+                    attempt
+                    for attempt in attempts
+                    if attempt.get("semantic_run_id") == recovery.semantic_run_id
+                ]
+                if not selected or any(
+                    attempt.get("schema_version")
+                    != _GLOBAL_RESERVED_ATTEMPT_SCHEMA
+                    for attempt in selected
+                ):
+                    raise SemanticHandoffError(
+                        "Semantic committed-result wave attempt binding 缺失。"
+                    )
+                ordinals = [int(attempt["global_ordinal"]) for attempt in selected]
+                lower, upper = min(ordinals), max(ordinals)
+                if (
+                    ordinals != list(range(lower, upper + 1))
+                    or lower != current + 1
+                ):
+                    raise SemanticHandoffError(
+                        "Semantic committed-result wave global ordinal 不连续。"
+                    )
+                ranges.append((lower, upper))
+                current = upper
+            return tuple(ranges)
+
     def commit_range(
         self,
         recovery: _SemanticRecoveryRun,
@@ -12114,48 +12215,30 @@ class _SemanticGlobalAuthority:
                 return min(ordinals), max(ordinals)
             if ordinals != list(range(min(ordinals), max(ordinals) + 1)):
                 raise SemanticHandoffError("Semantic global commit range 不连续。")
-            baseline = int(grant["baseline_total"])
-            if not os.path.lexists(self._commit_cursor_path()):
-                completed_processing_runs = {
-                    str(audit.get("processing_run_id"))
-                    for path in self.audit_root.glob(
-                        "run_*/processing-run-audit.json"
-                    )
-                    for audit in (_private_json_exact(path),)
-                    if audit.get("durable_ingestion_status") == "completed"
-                    and audit.get("handoff_status") == "completed"
-                }
-                for attempt in attempts:
-                    ordinal = int(attempt["global_ordinal"])
-                    if ordinal != baseline + 1:
-                        break
-                    result_receipt_path = (
-                        self.audit_root
-                        / str(attempt["semantic_run_id"])
-                        / "results"
-                        / f"batch_{int(attempt['batch_ordinal']):04d}"
-                        / "result-receipt.json"
-                    )
-                    durably_committed = False
-                    if os.path.lexists(result_receipt_path):
-                        result_receipt = _private_json_exact(
-                            result_receipt_path
-                        )
-                        durably_committed = str(
-                            result_receipt.get("processing_run_id")
-                        ) in completed_processing_runs
-                    if (
-                        attempt.get("schema_version")
-                        != _GLOBAL_RESERVED_ATTEMPT_SCHEMA
-                        or durably_committed
-                    ):
-                        baseline = ordinal
-                        continue
-                    break
-            cursor = self._read_commit_cursor(baseline)
+            cursor = self._current_commit_cursor(grant, attempts)
             current = int(cursor["committed_global_ordinal"])
             lower, upper = min(ordinals), max(ordinals)
             if current >= upper:
+                if (
+                    commit
+                    and current == upper
+                    and not os.path.lexists(self._commit_cursor_path())
+                ):
+                    final_attempt = selected[-1]
+                    payload = self._commit_cursor_payload(
+                        committed_global_ordinal=upper,
+                        attempt_receipt_fingerprint=str(
+                            final_attempt["attempt_receipt_fingerprint"]
+                        ),
+                    )
+                    _private_json_write(self._commit_cursor_path(), payload)
+                    if not _payloads_exactly_equal(
+                        self._read_commit_cursor(int(grant["baseline_total"])),
+                        payload,
+                    ):
+                        raise SemanticHandoffError(
+                            "Semantic global commit cursor 读回失败。"
+                        )
                 return lower, upper
             if current + 1 != lower:
                 raise SemanticHandoffError(
@@ -12171,7 +12254,7 @@ class _SemanticGlobalAuthority:
                 )
                 _private_json_write(self._commit_cursor_path(), payload)
                 if not _payloads_exactly_equal(
-                    self._read_commit_cursor(baseline),
+                    self._current_commit_cursor(grant, attempts),
                     payload,
                 ):
                     raise SemanticHandoffError(
@@ -13753,10 +13836,12 @@ class ExternalAgentSemanticHandoffService:
                         window_binding=None,
                     )
                 )
-                unique_candidates = {
-                    candidate.semantic_run_id: candidate
-                    for candidate in recovery_candidates
-                }
+                unique_candidates: dict[str, _SemanticRecoveryRun] = {}
+                for candidate in recovery_candidates:
+                    unique_candidates.setdefault(
+                        candidate.semantic_run_id,
+                        candidate,
+                    )
                 existing_candidates = tuple(
                     candidate
                     for candidate in unique_candidates.values()
@@ -14580,6 +14665,215 @@ class ExternalAgentSemanticHandoffService:
             ),
             window_binding=authority_binding,
         ).preflight()
+
+    def inspect_recovery_wave(
+        self,
+        requests: Sequence[SemanticResultOnlyRequest],
+        providers: Sequence[CodexCliRepresentationAnalysisProvider],
+    ) -> tuple[dict[str, object], ...]:
+        """Classify an ordered tail without Provider calls or durable writes."""
+
+        if not requests or len(requests) != len(providers):
+            raise SemanticHandoffError(
+                "Semantic recovery inspect wave 边界无效。"
+            )
+        representation_ids = [request.representation_id for request in requests]
+        if len(representation_ids) != len(set(representation_ids)):
+            raise SemanticHandoffError(
+                "Semantic recovery inspect wave Representation 重复。"
+            )
+        authority = _SemanticGlobalAuthority(self.audit_root)
+        recoveries: list[_SemanticRecoveryRun] = []
+        inspections: list[dict[str, object]] = []
+        for request, provider in zip(requests, providers, strict=True):
+            recovery = _SemanticRecoveryRun(
+                self.representation_service,
+                self.audit_root,
+                request.representation_id,
+                provider,
+                request.privacy_binding,
+                global_authority=authority,
+                window_binding=request.authority_binding,
+                complete_context=True,
+            )
+            package = (
+                self.representation_service.output_root
+                / request.representation_id
+            )
+            loaded, unknown = recovery.inspect()
+            if unknown:
+                raise SemanticHandoffError(
+                    "Semantic recovery inspect 存在 outcome unknown。"
+                )
+            if all(item is None for item in loaded):
+                if os.path.lexists(package):
+                    raise SemanticHandoffError(
+                        "Semantic pre-provider inspect 意外存在 package。"
+                    )
+                if recovery.exists:
+                    recovery.validate_run_receipt_only()
+                else:
+                    with authority._locked(blocking=False):
+                        grant = authority._load_grant(
+                            request.authority_binding,
+                            provider,
+                        )
+                        attempts, global_unknown = authority._global_attempts(
+                            grant
+                        )
+                        if global_unknown or any(
+                            attempt.get("semantic_run_id")
+                            == recovery.semantic_run_id
+                            for attempt in attempts
+                        ):
+                            raise SemanticHandoffError(
+                                "Semantic pre-provider global inventory 非空。"
+                            )
+                inspections.append(
+                    {
+                        "classification": "pre_provider",
+                        "representation_id": request.representation_id,
+                        "phase": None,
+                        "atomic_information_ids": [],
+                        "package_fingerprint": None,
+                        "global_ordinal_range": None,
+                    }
+                )
+                continue
+            if any(item is None for item in loaded) or not recovery.result_only_wave:
+                raise SemanticHandoffError(
+                    "Semantic recovery inspect 不是完整 committed result。"
+                )
+            recoveries.append(recovery)
+            try:
+                phase = self._inspect_committed_package_phase(
+                    request.representation_id,
+                    package,
+                    provider,
+                    recovery,
+                )
+            except (
+                OSError,
+                ValueError,
+                TypeError,
+                RepresentationInformationError,
+            ) as exc:
+                raise SemanticHandoffError(
+                    "Semantic committed package inspect 失败。"
+                ) from exc
+            inspections.append(
+                {
+                    "classification": "recoverable_committed_result_wave",
+                    "representation_id": request.representation_id,
+                    **phase,
+                    "global_ordinal_range": None,
+                }
+            )
+        if recoveries and len(recoveries) != len(inspections):
+            raise SemanticHandoffError(
+                "Semantic recovery inspect 不接受混合 pre-provider/committed wave。"
+            )
+        if recoveries:
+            ranges = authority.validate_commit_wave(
+                recoveries,
+                window=requests[0].authority_binding,
+                provider=providers[0],
+            )
+            for inspection, ordinal_range in zip(
+                inspections, ranges, strict=True
+            ):
+                inspection["global_ordinal_range"] = list(ordinal_range)
+        return tuple(inspections)
+
+    def _inspect_committed_package_phase(
+        self,
+        representation_id: str,
+        package: Path,
+        provider: CodexCliRepresentationAnalysisProvider,
+        recovery: _SemanticRecoveryRun,
+    ) -> dict[str, object]:
+        if not os.path.lexists(package):
+            return {
+                "phase": "result_pending_package",
+                "atomic_information_ids": [],
+                "package_fingerprint": None,
+            }
+        self._validate_recovery_package_candidate(
+            representation_id,
+            package,
+            provider,
+            recovery,
+        )
+        manifest, _ = validate_representation_information_package(package)
+        source = manifest.get("source")
+        schema_version = manifest.get("schema_version")
+        if (
+            not isinstance(source, dict)
+            or not isinstance(source.get("id"), str)
+            or not isinstance(schema_version, str)
+        ):
+            raise SemanticHandoffError(
+                "Semantic committed package Information binding 损坏。"
+            )
+        source_id = str(source["id"])
+        expected = _load_candidates(package, schema_version, source_id)
+        expected_by_id = {
+            revision.atomic_information_id: revision for revision in expected
+        }
+        if len(expected_by_id) != len(expected):
+            raise SemanticHandoffError(
+                "Semantic committed package Atomic Information identity 冲突。"
+            )
+        observed_for_source = tuple(
+            revision
+            for revision in self.store.list_atomic_information()
+            if revision.origin_source_id == source_id
+        )
+        observed_by_id = {
+            revision.atomic_information_id: revision
+            for revision in observed_for_source
+        }
+        if len(observed_by_id) != len(observed_for_source):
+            raise SemanticHandoffError(
+                "Semantic committed package Atomic Information revision 漂移。"
+            )
+        if observed_by_id and observed_by_id != expected_by_id:
+            raise SemanticHandoffError(
+                "Semantic committed package Atomic Information 不匹配。"
+            )
+        package_fingerprint = _package_fingerprint(package)
+        audit_paths = self._matching_audit_paths(package_fingerprint)
+        durable_states = tuple(
+            str(_private_json_exact(path).get("durable_ingestion_status"))
+            for path in audit_paths
+        )
+        if any(state == "pending" for state in durable_states) and observed_by_id:
+            raise SemanticHandoffError(
+                "Semantic committed package Information 早于 durable attempt。"
+            )
+        if any(
+            state in {"written_readback_pending", "completed"}
+            for state in durable_states
+        ) and observed_by_id != expected_by_id:
+            raise SemanticHandoffError(
+                "Semantic committed package durable Information 缺失。"
+            )
+        already_ingested = bool(observed_by_id) or (
+            not expected
+            and any(
+                state in {"written_readback_pending", "completed"}
+                for state in durable_states
+            )
+        )
+        return {
+            "phase": (
+                "already_ingested_pending_status"
+                if already_ingested
+                else "package_pending_ingestion"
+            ),
+            "atomic_information_ids": list(expected_by_id),
+            "package_fingerprint": package_fingerprint,
+        }
 
     def prepare_results(
         self,

@@ -43,6 +43,7 @@ from archeos.representation_information import (
     EXTERNAL_AGENT_PROTOCOL_V3_2,
     EXTERNAL_AGENT_PROTOCOL_V3_3,
     EXTERNAL_AGENT_PROTOCOL_V3_4,
+    CodexCliRepresentationAnalysisProvider,
     RepresentationAnalysisResult,
     RepresentationCandidateDraft,
     RepresentationInformationError,
@@ -52,7 +53,12 @@ from archeos.representation_information import (
     _external_agent_request,
     _units_from_representation,
 )
-from archeos.semantic_handoff import SemanticHandoffError, _package_fingerprint
+from archeos.semantic_handoff import (
+    SemanticHandoffError,
+    _fingerprint,
+    _package_fingerprint,
+    _SemanticGlobalAuthority,
+)
 from archeos.source import LocalManagedSourceRepository
 from archeos.wechat_capture_helper import (
     _all_cursor_rows,
@@ -70,6 +76,7 @@ from archeos.wechat_digest import (
     CapturedAttachment,
     CapturedMessage,
     DeterministicPrivacyGate,
+    ExistingSemanticHandoff,
     WechatCapture,
     WechatCliCaptureProvider,
     WechatCursor,
@@ -212,6 +219,91 @@ class SyntheticCaptureProvider:
         return capture
 
 
+class SuccessfulV34Process:
+    def __init__(self, command: list[str], calls: list[list[str]]) -> None:
+        self.command = command
+        self.pid = 99_999_999
+        self.returncode: int | None = None
+        calls.append(command)
+
+    def communicate(
+        self,
+        *,
+        input: str | None = None,
+        timeout: float | None = None,
+    ) -> tuple[str, str]:
+        del timeout
+        assert input is not None
+        request = json.loads(input.split("Request:\n", 1)[1])
+        result = {
+            "protocol_version": request["protocol_version"],
+            "input_fingerprint": request["input_fingerprint"],
+            "anchor_results": {
+                unit["unit_id"]: {
+                    "classification": "candidate",
+                    "records": [
+                        {
+                            "statement": "Synthetic committed wave statement.",
+                            "semantic_type": "observation",
+                            "concerns": ["Synthetic"],
+                            "supporting_evidence_unit_ids": [],
+                            "context": "Synthetic complete conversation context.",
+                            "confidence": 0.9,
+                        }
+                    ],
+                }
+                for unit in request["anchor_units"]
+            },
+        }
+        result_path = Path(
+            self.command[self.command.index("--output-last-message") + 1]
+        )
+        result_path.write_text(json.dumps(result), encoding="utf-8")
+        self.returncode = 0
+        return "", ""
+
+
+class SuccessfulV34Runner:
+    def __init__(self) -> None:
+        self.calls: list[list[str]] = []
+
+    def __call__(self, command, **_kwargs):
+        return SuccessfulV34Process(list(command), self.calls)
+
+
+class RunnerBackedExistingSemanticHandoff(ExistingSemanticHandoff):
+    def __init__(self, *, workspace: Path, runner: SuccessfulV34Runner) -> None:
+        self._test_runner = runner
+        super().__init__(
+            source_repository=LocalManagedSourceRepository(
+                workspace / "01_inbox"
+            ),
+            representation_repository=LocalRepresentationRepository(
+                workspace / "02_processing" / "representations"
+            ),
+            information_root=workspace / "02_processing" / "information",
+            information_store=JsonlAtomicInformationStore(
+                workspace / "03_information" / "atomic_information.jsonl"
+            ),
+            audit_root=(
+                workspace / "02_processing" / "semantic_handoff_runs"
+            ),
+            codex_binary="codex",
+            provider_version="0.147.0",
+            timeout_seconds=300,
+            batch_size=50,
+            reviewed_git_head="6" * 40,
+        )
+
+    def _new_provider(self, lane: str) -> CodexCliRepresentationAnalysisProvider:
+        lane_fingerprint = hashlib.sha256(lane.encode()).hexdigest()[:16]
+        return CodexCliRepresentationAnalysisProvider(
+            **self._provider_config,
+            runner=self._test_runner,
+            diagnostic_root=self._diagnostic_root / lane_fingerprint,
+        )
+
+
 class FailOnSecondCaptureProvider(SyntheticCaptureProvider):
     def capture(self, *args, **kwargs):
         if self.calls:
@@ -309,12 +401,28 @@ class _SyntheticSemanticHandoffBase:
         self.latest_representation_id = None
         self.prepared_waves = []
         self.pre_attempt_inventories = {}
+        self.recovery_inspections = None
 
     def prepare_results(self, requests, *, parallelism):
         self.prepared_waves.append(
             (tuple(request.representation_id for request in requests), parallelism)
         )
         return {request.representation_id: 0 for request in requests}
+
+    def inspect_recovery_wave(self, requests):
+        if self.recovery_inspections is not None:
+            return tuple(dict(item) for item in self.recovery_inspections)
+        return tuple(
+            {
+                "classification": "pre_provider",
+                "representation_id": request.representation_id,
+                "phase": None,
+                "atomic_information_ids": [],
+                "package_fingerprint": None,
+                "global_ordinal_range": None,
+            }
+            for request in requests
+        )
 
     def validate_pre_attempt_inventory(
         self, representation_id, *, privacy_binding
@@ -1267,6 +1375,85 @@ class ObservedOutOfOrderSemanticHandoff(SyntheticSemanticHandoff):
             "resume_provider_calls": 0,
         }
         return elapsed
+
+
+class InterruptedCommittedWaveSemanticHandoff(SyntheticSemanticHandoff):
+    """Two paid packages with a first-item post-ingest interruption."""
+
+    def __init__(self, workspace: Path) -> None:
+        super().__init__(workspace)
+        self.fail_after_first_ingest = True
+        self.inspect_calls = 0
+        self.inspection_drift: str | None = None
+
+    def prepare_results(self, requests, *, parallelism):
+        elapsed = super().prepare_results(requests, parallelism=parallelism)
+        information = RepresentationInformationService(
+            LocalManagedSourceRepository(self.workspace / "01_inbox"),
+            LocalRepresentationRepository(
+                self.workspace / "02_processing" / "representations"
+            ),
+            self.workspace / "02_processing" / "information",
+        )
+        for request in requests:
+            package = (
+                self.workspace
+                / "02_processing"
+                / "information"
+                / request.representation_id
+            )
+            if not package.exists():
+                information.extract(request.representation_id, self.provider)
+        return elapsed
+
+    def inspect_recovery_wave(self, requests):
+        self.inspect_calls += 1
+        inspections = [
+            {
+                "classification": "recoverable_committed_result_wave",
+                "representation_id": request.representation_id,
+                "phase": (
+                    "already_ingested_pending_status"
+                    if index == 0
+                    else "package_pending_ingestion"
+                ),
+                "atomic_information_ids": [],
+                "package_fingerprint": "sha256:" + f"{index + 1:x}" * 64,
+                "global_ordinal_range": [177 + index, 177 + index],
+            }
+            for index, request in enumerate(requests)
+        ]
+        if self.inspection_drift == "phase":
+            inspections[-1]["phase"] = "unknown-phase"
+        elif self.inspection_drift == "ordinal":
+            inspections[-1]["global_ordinal_range"] = [179, 179]
+        return tuple(inspections)
+
+    def execute(
+        self,
+        representation_id: str,
+        *,
+        privacy_binding=None,
+        authority_binding=None,
+    ):
+        result = super().execute(
+            representation_id,
+            privacy_binding=privacy_binding,
+            authority_binding=authority_binding,
+        )
+        package = (
+            self.workspace
+            / "02_processing"
+            / "information"
+            / representation_id
+        )
+        self._write_success_audits(package, representation_id)
+        if self.fail_after_first_ingest:
+            self.fail_after_first_ingest = False
+            raise SemanticHandoffError(
+                "synthetic committed-result status interruption"
+            )
+        return result
 
 
 class NoStructuralChangeProvider:
@@ -6965,6 +7152,326 @@ class WechatDigestTests(unittest.TestCase):
         self.assertEqual(
             len({item.change_id for item in journal}), len(journal)
         )
+
+    def test_failed_two_lane_committed_wave_resumes_without_provider_calls(
+        self,
+    ) -> None:
+        capture = SyntheticCaptureProvider(
+            [
+                message(1, conversation="committed-wave-a"),
+                message(2, conversation="committed-wave-b"),
+            ]
+        )
+        semantic = InterruptedCommittedWaveSemanticHandoff(self.workspace)
+        self.semantic = semantic
+        service = self.service(capture)
+
+        with self.assertRaises(WechatDigestError):
+            service.run(all_history=True, max_terminal_items=2)
+        run_id = service.run_store.active_run_id()
+        assert run_id is not None
+        failed = service.run_store.status(run_id)
+        self.assertEqual(failed["state"], "failed")
+        self.assertEqual(failed["failure_category"], "SemanticHandoffError")
+        self.assertEqual(
+            [item["state"] for item in failed["items"].values()],
+            ["represented", "planned"],
+        )
+        provider_calls = semantic.provider.calls
+        atomic_before = service.information_store.list_atomic_information()
+        self.assertTrue(atomic_before)
+
+        result = service.run(max_terminal_items=2)
+
+        self.assertEqual(semantic.provider.calls, provider_calls)
+        self.assertEqual(semantic.inspect_calls, 1)
+        self.assertEqual(result.resume_provider_calls, 0)
+        final = service.run_store.status(run_id)
+        self.assertEqual(final["state"], "completed")
+        self.assertTrue(final["checkpoint_published"])
+        self.assertTrue(
+            all(
+                item["state"] in {"processed", "pending_human"}
+                for item in final["items"].values()
+            )
+        )
+        information = service.information_store.list_atomic_information()
+        self.assertGreater(len(information), len(atomic_before))
+        self.assertEqual(
+            len({item.atomic_information_id for item in information}),
+            len(information),
+        )
+
+    def test_real_package_result_wave_resumes_one_cursor_at_a_time(self) -> None:
+        self.workspace = self.workspace.resolve()
+        self.workspace.chmod(0o700)
+        for directory in (
+            "01_inbox",
+            "02_processing",
+            "03_information",
+            "04_core",
+        ):
+            (self.workspace / directory).chmod(0o700)
+        capture_provider = SyntheticCaptureProvider(
+            [
+                message(1, conversation="real-wave-a"),
+                message(2, conversation="real-wave-b"),
+            ]
+        )
+        runner = SuccessfulV34Runner()
+        semantic = RunnerBackedExistingSemanticHandoff(
+            workspace=self.workspace,
+            runner=runner,
+        )
+        service = WechatDigestService(
+            workspace=self.workspace,
+            capture_provider=capture_provider,
+            semantic_handoff_factory=lambda: semantic,
+            interpretation_provider=NoStructuralChangeProvider(),
+            semantic_batch_size=50,
+            semantic_parallelism=2,
+        )
+        capture = capture_provider.capture(ZERO_CURSOR)
+        plan, _status = service._persist_new_capture_plan(
+            capture,
+            all_history_upper_bound=None,
+        )
+        run_id = str(plan["run_id"])
+        binding = service._semantic_authority_binding(run_id)
+        authority = _SemanticGlobalAuthority(semantic.service.audit_root)
+        _total, inventory_fingerprint, counts = authority._legacy_inventory(())
+        manifest = {
+            "schema_version": "semantic-handoff-inventory-authority/1.0",
+            "artifact_kind": "semantic_handoff_inventory_authority",
+            "authority_ref": "sha256:" + "5" * 64,
+            "reviewed_git_head": binding.reviewed_git_head,
+            "campaign": {
+                "created_at": binding.campaign_created_at,
+                "lower_cursor": list(binding.campaign_lower_cursor),
+                "frozen_global_upper_cursor": list(
+                    binding.frozen_global_upper_cursor
+                ),
+                "capture_provider_version": binding.capture_provider_version,
+                "semantic_batch_size": binding.semantic_batch_size,
+            },
+            "expected_raw_provider_labels": [],
+            "historical_provider_version_counts": counts,
+            "local_total": 0,
+            "legacy_inventory_fingerprint": inventory_fingerprint,
+            "baseline_total": 80,
+            "max_new": 20,
+            "absolute_cap": 100,
+        }
+        manifest["payload_fingerprint"] = _fingerprint(manifest)
+        authority_file = self.workspace / "synthetic-inventory-authority.json"
+        authority_file.write_text(json.dumps(manifest), encoding="utf-8")
+        authority_file.chmod(0o600)
+        semantic.install_global_authority(
+            inventory_authority_file=authority_file,
+            window_binding=binding,
+        )
+
+        original_persist = semantic.service._persist_audits
+        persist_calls = 0
+
+        def interrupt_after_first_package(*args, **kwargs):
+            nonlocal persist_calls
+            persist_calls += 1
+            if persist_calls == 1:
+                raise OSError("synthetic package durable interruption")
+            return original_persist(*args, **kwargs)
+
+        with patch.object(
+            semantic.service,
+            "_persist_audits",
+            side_effect=interrupt_after_first_package,
+        ), self.assertRaises(WechatDigestError):
+            service.run(max_terminal_items=2)
+
+        failed = service.run_store.status(run_id)
+        self.assertEqual(failed["failure_category"], "SemanticHandoffError")
+        self.assertEqual(
+            [item["state"] for item in failed["items"].values()],
+            ["represented", "planned"],
+        )
+        inspections = service._inspect_committed_result_wave(
+            run_id,
+            plan,
+            failed,
+        )
+        assert inspections is not None
+        self.assertEqual(
+            [item["phase"] for item in inspections.values()],
+            ["package_pending_ingestion", "result_pending_package"],
+        )
+        representation_ids = [
+            str(item["representation_id"])
+            for item in inspections.values()
+        ]
+        package_root = self.workspace / "02_processing" / "information"
+        first_package = package_root / representation_ids[0]
+        second_package = package_root / representation_ids[1]
+        first_package_bytes = {
+            path.relative_to(first_package).as_posix(): path.read_bytes()
+            for path in sorted(first_package.rglob("*"))
+            if path.is_file()
+        }
+        self.assertTrue(first_package_bytes)
+        self.assertFalse(second_package.exists())
+        self.assertEqual(len(runner.calls), 2)
+        self.assertEqual(service.information_store.list_atomic_information(), ())
+        self.assertEqual(len(capture_provider.calls), 1)
+        attempt_summary = semantic.service.global_attempt_summary(
+            representation_ids[1]
+        )
+        self.assertEqual(
+            attempt_summary,
+            {
+                "global_attempt_total": 82,
+                "global_unknown": 0,
+                "next_global_ordinal": 83,
+                "absolute_cap": 100,
+            },
+        )
+        source_ids = [str(item["source_id"]) for item in plan["conversations"]]
+        self.assertEqual(len(service.source_repository.list_sources()), 2)
+        self.assertEqual(
+            sum(
+                len(service.representation_repository.list_for_source(source_id))
+                for source_id in source_ids
+            ),
+            2,
+        )
+
+        first_resume = service.run(max_terminal_items=1)
+
+        self.assertEqual(first_resume.resume_provider_calls, 0)
+        self.assertEqual(len(runner.calls), 2)
+        self.assertEqual(len(capture_provider.calls), 1)
+        self.assertEqual(
+            semantic.service.global_attempt_summary(representation_ids[1]),
+            attempt_summary,
+        )
+        after_first = service.run_store.status(run_id)
+        cursor_path = (
+            semantic.service.audit_root
+            / "semantic_global_authority"
+            / "commit-cursor.json"
+        )
+        self.assertTrue(cursor_path.exists())
+        cursor = json.loads(cursor_path.read_text(encoding="utf-8"))
+        self.assertEqual(cursor["committed_global_ordinal"], 81)
+        first_item_after = next(
+            dict(item)
+            for item in after_first["items"].values()
+            if item["state"] in TERMINAL_ITEM_STATES
+        )
+        self.assertEqual(
+            {
+                path.relative_to(first_package).as_posix(): path.read_bytes()
+                for path in sorted(first_package.rglob("*"))
+                if path.is_file()
+            },
+            first_package_bytes,
+        )
+        self.assertFalse(second_package.exists())
+        first_atomic = service.information_store.list_atomic_information()
+        self.assertEqual(len(first_atomic), 1)
+
+        second_resume = service.run(max_terminal_items=1)
+
+        self.assertEqual(second_resume.resume_provider_calls, 0)
+        self.assertEqual(len(runner.calls), 2)
+        self.assertEqual(len(capture_provider.calls), 1)
+        self.assertEqual(
+            semantic.service.global_attempt_summary(representation_ids[1]),
+            attempt_summary,
+        )
+        cursor = json.loads(cursor_path.read_text(encoding="utf-8"))
+        self.assertEqual(cursor["committed_global_ordinal"], 82)
+        final = service.run_store.status(run_id)
+        final_first_item = next(
+            dict(item)
+            for item in final["items"].values()
+            if item.get("representation_id") == representation_ids[0]
+        )
+        self.assertEqual(final_first_item, first_item_after)
+        self.assertTrue(second_package.is_dir())
+        self.assertEqual(
+            {
+                path.relative_to(first_package).as_posix(): path.read_bytes()
+                for path in sorted(first_package.rglob("*"))
+                if path.is_file()
+            },
+            first_package_bytes,
+        )
+        information = service.information_store.list_atomic_information()
+        self.assertEqual(len(information), 2)
+        self.assertEqual(
+            len({item.atomic_information_id for item in information}),
+            2,
+        )
+        self.assertEqual(len(service.source_repository.list_sources()), 2)
+        self.assertEqual(
+            sum(
+                len(service.representation_repository.list_for_source(source_id))
+                for source_id in source_ids
+            ),
+            2,
+        )
+        self.assertEqual(service.proposal_store.list_history(), ())
+        self.assertEqual(service.journal.list_changes(), ())
+
+    def test_committed_wave_drift_fails_before_recovery_status_write(self) -> None:
+        for case in ("phase", "ordinal", "status"):
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as temporary:
+                workspace = Path(temporary) / "workspace"
+                for directory in (
+                    "01_inbox",
+                    "02_processing",
+                    "03_information",
+                    "04_core",
+                ):
+                    (workspace / directory).mkdir(parents=True, exist_ok=True)
+                capture = SyntheticCaptureProvider(
+                    [
+                        message(1, conversation=f"{case}-a"),
+                        message(2, conversation=f"{case}-b"),
+                    ]
+                )
+                semantic = InterruptedCommittedWaveSemanticHandoff(workspace)
+                service = WechatDigestService(
+                    workspace=workspace,
+                    capture_provider=capture,
+                    semantic_handoff_factory=lambda: semantic,
+                    interpretation_provider=NoStructuralChangeProvider(),
+                )
+                with self.assertRaises(WechatDigestError):
+                    service.run(all_history=True, max_terminal_items=2)
+                run_id = service.run_store.active_run_id()
+                assert run_id is not None
+                status_path = service.run_store.runs_root / run_id / "status.json"
+                if case == "status":
+                    status = json.loads(status_path.read_text(encoding="utf-8"))
+                    next(
+                        item
+                        for item in status["items"].values()
+                        if item["state"] == "planned"
+                    )["atomic_information_ids"] = [
+                        "atomic_info_" + "0" * 32
+                    ]
+                    status_path.write_text(json.dumps(status), encoding="utf-8")
+                else:
+                    semantic.inspection_drift = case
+                before = status_path.read_bytes()
+                provider_calls = semantic.provider.calls
+
+                with self.assertRaises(WechatDigestError):
+                    service.run(max_terminal_items=2)
+
+                self.assertEqual(status_path.read_bytes(), before)
+                self.assertEqual(semantic.provider.calls, provider_calls)
+                self.assertIsNone(service.run_store.checkpoint())
 
     def test_prepare_requires_active_run_without_capture(self) -> None:
         capture = SyntheticCaptureProvider([message(1)])

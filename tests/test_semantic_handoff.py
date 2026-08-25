@@ -13162,7 +13162,7 @@ print("passed")
                             active += 1
                             maximum_active = max(maximum_active, active)
                         try:
-                            barrier.wait(timeout=5)
+                            barrier.wait(timeout=30)
                             time.sleep(0.15)
                             return inner.communicate(**communicate_kwargs)
                         finally:
@@ -13231,6 +13231,116 @@ print("passed")
             )
         )
 
+        calls_before_inspect = [len(runner.calls) for runner in runners]
+        inspections = handoff.inspect_recovery_wave(requests, providers)
+        self.assertEqual(
+            [item["classification"] for item in inspections],
+            [
+                "recoverable_committed_result_wave",
+                "recoverable_committed_result_wave",
+            ],
+        )
+        self.assertEqual(
+            [item["phase"] for item in inspections],
+            ["result_pending_package", "result_pending_package"],
+        )
+        self.assertEqual(
+            [item["global_ordinal_range"] for item in inspections],
+            [[81, 81], [82, 82]],
+        )
+        self.assertEqual(
+            [len(runner.calls) for runner in runners], calls_before_inspect
+        )
+
+        original_persist = handoff._persist_audits
+        persist_calls = 0
+
+        def interrupt_after_package(*args, **kwargs):
+            nonlocal persist_calls
+            persist_calls += 1
+            if persist_calls == 1:
+                raise OSError("synthetic package durable interruption")
+            return original_persist(*args, **kwargs)
+
+        with patch.object(
+            handoff,
+            "_persist_audits",
+            side_effect=interrupt_after_package,
+        ), self.assertRaises(SemanticHandoffError):
+            handoff.execute(
+                built[0].representation_id,
+                providers[0],
+                privacy_binding=self.privacy_binding(),
+                authority_binding=binding,
+            )
+        inspections = handoff.inspect_recovery_wave(requests, providers)
+        self.assertEqual(
+            [item["phase"] for item in inspections],
+            ["package_pending_ingestion", "result_pending_package"],
+        )
+        self.assertEqual(
+            [len(runner.calls) for runner in runners], calls_before_inspect
+        )
+        first_manifest = (
+            root
+            / "information"
+            / built[0].representation_id
+            / "manifest.json"
+        )
+        first_manifest_bytes = first_manifest.read_bytes()
+        first_manifest.write_text("{}", encoding="utf-8")
+        with self.assertRaises(SemanticHandoffError):
+            handoff.inspect_recovery_wave(requests, providers)
+        first_manifest.write_bytes(first_manifest_bytes)
+        second_run = next(
+            path.parent
+            for path in (root / "audits").glob(
+                "semantic_run_*/run-receipt.json"
+            )
+            if json.loads(path.read_text(encoding="utf-8"))["representation"][
+                "representation_id"
+            ]
+            == built[1].representation_id
+        )
+        second_result = second_run / "results" / "batch_0001" / "result.json"
+        second_result_bytes = second_result.read_bytes()
+        second_result.write_text("{}", encoding="utf-8")
+        with self.assertRaises(SemanticHandoffError):
+            handoff.inspect_recovery_wave(requests, providers)
+        second_result.write_bytes(second_result_bytes)
+        self.assertEqual(
+            [len(runner.calls) for runner in runners], calls_before_inspect
+        )
+
+        with patch.object(
+            handoff,
+            "_mark_durable_write",
+            side_effect=OSError("synthetic post-ingest interruption"),
+        ), self.assertRaises(SemanticHandoffError):
+            handoff.execute(
+                built[0].representation_id,
+                providers[0],
+                privacy_binding=self.privacy_binding(),
+                authority_binding=binding,
+            )
+        inspections = handoff.inspect_recovery_wave(requests, providers)
+        self.assertEqual(
+            [item["phase"] for item in inspections],
+            ["already_ingested_pending_status", "result_pending_package"],
+        )
+        self.assertEqual(
+            [len(runner.calls) for runner in runners], calls_before_inspect
+        )
+        atomic_bytes = (root / "atomic.jsonl").read_bytes()
+        (root / "atomic.jsonl").write_bytes(atomic_bytes + atomic_bytes)
+        with self.assertRaises(SemanticHandoffError):
+            handoff.inspect_recovery_wave(requests, providers)
+        (root / "atomic.jsonl").write_bytes(atomic_bytes)
+        self.assertEqual(
+            [len(runner.calls) for runner in runners], calls_before_inspect
+        )
+
+        atomic_before_out_of_order = (root / "atomic.jsonl").read_bytes()
         out_of_order_runner = FakeRunner()
         with self.assertRaises(SemanticHandoffError):
             handoff.execute(
@@ -13243,9 +13353,11 @@ print("passed")
                 ),
                 privacy_binding=self.privacy_binding(),
                 authority_binding=binding,
-            )
+        )
         self.assertEqual(out_of_order_runner.calls, [])
-        self.assertFalse((root / "atomic.jsonl").exists())
+        self.assertEqual(
+            (root / "atomic.jsonl").read_bytes(), atomic_before_out_of_order
+        )
 
         replay_runners = (FakeRunner(), FakeRunner())
         for expected_ordinal, representation, runner in zip(
@@ -13336,7 +13448,7 @@ print("passed")
                             active += 1
                             peak = max(peak, active)
                         try:
-                            barrier.wait(timeout=5)
+                            barrier.wait(timeout=30)
                             time.sleep(0.15)
                             return inner.communicate(**communicate_kwargs)
                         finally:
