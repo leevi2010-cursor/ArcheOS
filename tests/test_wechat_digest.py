@@ -306,12 +306,30 @@ class _SyntheticSemanticHandoffBase:
         self.absolute_cap = 1000
         self.latest_representation_id = None
         self.prepared_waves = []
+        self.pre_attempt_inventories = {}
 
     def prepare_results(self, requests, *, parallelism):
         self.prepared_waves.append(
             (tuple(request.representation_id for request in requests), parallelism)
         )
         return {request.representation_id: 0 for request in requests}
+
+    def validate_pre_attempt_inventory(
+        self, representation_id, *, privacy_binding
+    ):
+        del privacy_binding
+        inventory = self.pre_attempt_inventories.get(representation_id)
+        if inventory is None:
+            return {
+                "inventory_kind": "absent",
+                "semantic_run_id": "semantic_run_" + "0" * 32,
+                "run_receipt_fingerprint": None,
+                "attempt_count": 0,
+                "reserved_count": 0,
+                "started_count": 0,
+                "result_count": 0,
+            }
+        return dict(inventory)
 
     def install_reviewed_head_continuation(
         self,
@@ -5893,6 +5911,167 @@ class WechatDigestTests(unittest.TestCase):
             },
             business_before,
         )
+
+    def test_semantic_handoff_pre_attempt_normalizes_two_represented_then_installs(
+        self,
+    ) -> None:
+        service, capture_provider, run_id, first_item_id = (
+            self._make_represented_pre_provider_value_error_run()
+        )
+        with service.run_store.lock():
+            capture, plan, status = service._load_or_upgrade_active_capture(
+                run_id,
+                service.run_store.plan(run_id),
+                service.run_store.status(run_id),
+            )
+        second_plan = plan["conversations"][1]
+        assert isinstance(second_plan, dict)
+        second_item_id = f"conversation:{second_plan['conversation_key']}"
+        second_payload = _conversation_source_payload(
+            capture,
+            str(second_plan["conversation_key"]),
+            {},
+        )
+        second_representation_id = service._process_conversation(
+            run_id,
+            status,
+            second_item_id,
+            second_plan,
+            second_payload,
+            prepare_only=True,
+        )
+        assert second_representation_id is not None
+        failed = service.run_store.status(run_id)
+        first_representation_id = failed["items"][first_item_id][
+            "representation_id"
+        ]
+        assert isinstance(first_representation_id, str)
+        failed["state"] = "failed"
+        failed["failure_category"] = "SemanticHandoffError"
+        failed["updated_at"] = "2026-08-25T00:02:00Z"
+        service.run_store.update_status(run_id, failed)
+
+        semantic_run_id = "semantic_run_" + "a" * 32
+        semantic_run = (
+            self.workspace
+            / "02_processing"
+            / "semantic_handoff_runs"
+            / semantic_run_id
+        )
+        semantic_run.mkdir(parents=True)
+        (semantic_run / "run-receipt.json").write_text(
+            json.dumps(
+                {
+                    "representation": {
+                        "representation_id": first_representation_id
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+        self.semantic.pre_attempt_inventories[first_representation_id] = {
+            "inventory_kind": "run_receipt_only",
+            "semantic_run_id": semantic_run_id,
+            "run_receipt_fingerprint": "sha256:" + "b" * 64,
+            "attempt_count": 0,
+            "reserved_count": 0,
+            "started_count": 0,
+            "result_count": 0,
+        }
+        before_items = failed["items"]
+        capture_calls_before = len(capture_provider.calls)
+
+        prepared = service.prepare_next_semantic()
+
+        normalized = service.run_store.status(run_id)
+        self.assertEqual(prepared.representation_id, first_representation_id)
+        self.assertEqual(normalized["state"], "processing")
+        self.assertIsNone(normalized["failure_category"])
+        self.assertEqual(normalized["items"], before_items)
+        self.assertFalse(normalized["checkpoint_published"])
+        self.assertEqual(len(capture_provider.calls), capture_calls_before)
+        self.assertEqual(self.semantic.provider.calls, 0)
+        self.assertEqual(
+            Counter(item["state"] for item in normalized["items"].values()),
+            Counter({"planned": 25, "represented": 2}),
+        )
+
+        self.semantic.global_attempt_total = 361
+        self.semantic.reviewed_git_head = "a" * 40
+        self.semantic.campaign_binding = SimpleNamespace(
+            created_at=plan["created_at"],
+            lower_cursor=service._cursor_tuple(
+                WechatCursor.from_dict(plan["after_cursor"])
+            ),
+            frozen_global_upper_cursor=service._cursor_tuple(
+                WechatCursor.from_dict(plan["all_history_upper_bound"])
+            ),
+            capture_provider_version=plan["provider_version"],
+            semantic_batch_size=plan["semantic_batch_size"],
+            reviewed_git_head="9" * 40,
+        )
+        continuation = service.install_semantic_reviewed_head_continuation(
+            authority_ref=(
+                "https://github.com/leevi2010-cursor/ArcheOS/issues/180"
+                "#issuecomment-5403529548"
+            )
+        )
+        self.assertEqual(continuation["activation_total"], 361)
+        self.assertEqual(continuation["next_global_ordinal"], 362)
+        self.assertEqual(self.semantic.provider.calls, 0)
+        self.assertEqual(len(capture_provider.calls), capture_calls_before)
+
+    def test_value_error_pre_provider_accepts_two_absent_representations(
+        self,
+    ) -> None:
+        service, capture_provider, run_id, _first_item_id = (
+            self._make_represented_pre_provider_value_error_run()
+        )
+        plan = service.run_store.plan(run_id)
+        capture = WechatCapture(
+            capture_provider.provider_version,
+            ZERO_CURSOR,
+            capture_provider.messages[-1].cursor,
+            tuple(capture_provider.messages),
+        )
+        status = service.run_store.status(run_id)
+        second_plan = plan["conversations"][1]
+        assert isinstance(second_plan, dict)
+        second_item_id = f"conversation:{second_plan['conversation_key']}"
+        second_representation_id = service._process_conversation(
+            run_id,
+            status,
+            second_item_id,
+            second_plan,
+            _conversation_source_payload(
+                capture,
+                str(second_plan["conversation_key"]),
+                {},
+            ),
+            prepare_only=True,
+        )
+        assert second_representation_id is not None
+        failed = service.run_store.status(run_id)
+        failed["state"] = "failed"
+        failed["failure_category"] = "ValueError"
+        service.run_store.update_status(run_id, failed)
+
+        with service.run_store.lock():
+            _capture, _plan, normalized = (
+                service._load_or_upgrade_active_capture(
+                    run_id,
+                    service.run_store.plan(run_id),
+                    service.run_store.status(run_id),
+                )
+            )
+
+        self.assertEqual(normalized["state"], "processing")
+        self.assertIsNone(normalized["failure_category"])
+        self.assertEqual(
+            Counter(item["state"] for item in normalized["items"].values()),
+            Counter({"planned": 25, "represented": 2}),
+        )
+        self.assertEqual(self.semantic.provider.calls, 0)
 
     def _make_reviewed_head_multi_window_run(
         self,
