@@ -11343,6 +11343,316 @@ print("passed")
             )
         self.assertEqual(retry_runner.calls, [])
 
+    def test_reviewed_head_continuations_bridge_plan_receipts_before_attempts(
+        self,
+    ) -> None:
+        root = self.root / "reviewed-head-plan-bridges"
+        first_representation, first_service = self.build_service(
+            root=root / "first",
+            source_id="src_" + "1" * 32,
+        )
+        audit_root = root / "audits"
+        first_handoff = ExternalAgentSemanticHandoffService(
+            first_service,
+            JsonlAtomicInformationStore(root / "first-atomic.jsonl"),
+            audit_root,
+        )
+        initial_window = self.semantic_window_binding()
+        first_runner = FakeRunner()
+        first_provider = CodexCliRepresentationAnalysisProvider(
+            provider_version="0.147.0",
+            timeout_seconds=300,
+            runner=first_runner,
+        )
+        self.install_authority(first_handoff, first_provider, initial_window)
+        first_handoff.execute(
+            first_representation.representation_id,
+            first_provider,
+            privacy_binding=self.privacy_binding(),
+            authority_binding=initial_window,
+        )
+        self.assertEqual(len(first_runner.calls), 1)
+
+        first_head = "a" * 40
+        first_bridge = replace(
+            initial_window,
+            window_plan_fingerprint="sha256:" + "a" * 64,
+            window_plan_receipt_fingerprint="sha256:" + "b" * 64,
+        )
+        first_continuation = first_handoff.install_reviewed_head_continuation(
+            CodexCliRepresentationAnalysisProvider(
+                provider_version="0.147.0",
+                timeout_seconds=300,
+                runner=FakeRunner(),
+            ),
+            window_binding=first_bridge,
+            reviewed_git_head=first_head,
+            authority_ref=(
+                "https://github.com/leevi2010-cursor/ArcheOS/issues/180"
+                "#issuecomment-5403529548"
+            ),
+            active_run_binding={
+                "run_id": first_bridge.window_run_id,
+                "plan_fingerprint": first_bridge.window_plan_fingerprint,
+                "capture_receipt_fingerprint": "sha256:" + "c" * 64,
+                "status_fingerprint": "sha256:" + "d" * 64,
+            },
+        )
+
+        drift_windows = (
+            replace(
+                first_bridge,
+                reviewed_git_head=first_head,
+                window_plan_fingerprint="sha256:" + "0" * 64,
+            ),
+            replace(
+                first_bridge,
+                reviewed_git_head=first_head,
+                window_upper_cursor=(2, "drift", "drift"),
+            ),
+            replace(
+                first_bridge,
+                reviewed_git_head=first_head,
+                window_run_id="run_" + "0" * 32,
+            ),
+        )
+        for index, drift_window in enumerate(drift_windows, start=4):
+            drift_representation, drift_service = self.build_service(
+                root=root / f"drift-{index}",
+                source_id="src_" + f"{index:x}" * 32,
+            )
+            drift_handoff = ExternalAgentSemanticHandoffService(
+                drift_service,
+                JsonlAtomicInformationStore(
+                    root / f"drift-{index}-atomic.jsonl"
+                ),
+                audit_root,
+            )
+            drift_runner = FakeRunner()
+            with self.subTest(drift=index), self.assertRaises(
+                SemanticHandoffError
+            ):
+                drift_handoff.execute(
+                    drift_representation.representation_id,
+                    CodexCliRepresentationAnalysisProvider(
+                        provider_version="0.147.0",
+                        timeout_seconds=300,
+                        runner=drift_runner,
+                    ),
+                    privacy_binding=self.privacy_binding(),
+                    authority_binding=drift_window,
+                )
+            self.assertEqual(drift_runner.calls, [])
+
+        second_representation, second_service = self.build_service(
+            root=root / "second",
+            source_id="src_" + "2" * 32,
+        )
+        second_handoff = ExternalAgentSemanticHandoffService(
+            second_service,
+            JsonlAtomicInformationStore(root / "second-atomic.jsonl"),
+            audit_root,
+        )
+        second_window = replace(first_bridge, reviewed_git_head=first_head)
+        second_runner = FakeRunner()
+        second_provider = CodexCliRepresentationAnalysisProvider(
+            provider_version="0.147.0",
+            timeout_seconds=300,
+            runner=second_runner,
+        )
+        second_handoff.execute(
+            second_representation.representation_id,
+            second_provider,
+            privacy_binding=self.privacy_binding(),
+            authority_binding=second_window,
+        )
+        self.assertEqual(len(second_runner.calls), 1)
+
+        second_head = "b" * 40
+        second_bridge = replace(
+            second_window,
+            window_plan_fingerprint="sha256:" + "e" * 64,
+            window_plan_receipt_fingerprint="sha256:" + "f" * 64,
+        )
+        second_continuation = second_handoff.install_reviewed_head_continuation(
+            CodexCliRepresentationAnalysisProvider(
+                provider_version="0.147.0",
+                timeout_seconds=300,
+                runner=FakeRunner(),
+            ),
+            window_binding=second_bridge,
+            reviewed_git_head=second_head,
+            authority_ref=(
+                "https://github.com/leevi2010-cursor/ArcheOS/issues/180"
+                "#issuecomment-5403529549"
+            ),
+            active_run_binding={
+                "run_id": second_bridge.window_run_id,
+                "plan_fingerprint": second_bridge.window_plan_fingerprint,
+                "capture_receipt_fingerprint": "sha256:" + "1" * 64,
+                "status_fingerprint": "sha256:" + "2" * 64,
+            },
+        )
+
+        third_representation, third_service = self.build_service(
+            root=root / "third",
+            source_id="src_" + "3" * 32,
+        )
+        third_handoff = ExternalAgentSemanticHandoffService(
+            third_service,
+            JsonlAtomicInformationStore(root / "third-atomic.jsonl"),
+            audit_root,
+        )
+        third_runner = FakeRunner()
+        third_handoff.execute(
+            third_representation.representation_id,
+            CodexCliRepresentationAnalysisProvider(
+                provider_version="0.147.0",
+                timeout_seconds=300,
+                runner=third_runner,
+            ),
+            privacy_binding=self.privacy_binding(),
+            authority_binding=replace(
+                second_bridge, reviewed_git_head=second_head
+            ),
+        )
+        self.assertEqual(len(third_runner.calls), 1)
+        attempts = sorted(
+            (
+                json.loads(path.read_text(encoding="utf-8"))
+                for path in audit_root.glob("semantic_run_*/attempts/*.json")
+            ),
+            key=lambda value: value["global_ordinal"],
+        )
+        self.assertEqual(
+            [attempt["global_ordinal"] for attempt in attempts],
+            [81, 82, 83],
+        )
+        self.assertEqual(
+            attempts[1]["global_authority_fingerprint"],
+            first_continuation["continuation_fingerprint"],
+        )
+        self.assertEqual(
+            attempts[2]["global_authority_fingerprint"],
+            second_continuation["continuation_fingerprint"],
+        )
+
+    def test_pre_attempt_inventory_distinguishes_run_receipt_from_reservation(
+        self,
+    ) -> None:
+        root = self.root / "pre-attempt-inventory"
+        representation, representation_service = self.build_service(root=root)
+        audit_root = root / "audits"
+        handoff = ExternalAgentSemanticHandoffService(
+            representation_service,
+            JsonlAtomicInformationStore(root / "atomic.jsonl"),
+            audit_root,
+        )
+        binding = self.semantic_window_binding()
+        runner = FakeRunner()
+        provider = CodexCliRepresentationAnalysisProvider(
+            provider_version="0.147.0",
+            timeout_seconds=300,
+            runner=runner,
+        )
+        privacy = self.privacy_binding()
+        self.install_authority(handoff, provider, binding)
+        recovery = _SemanticRecoveryRun(
+            representation_service,
+            audit_root,
+            representation.representation_id,
+            provider,
+            privacy,
+            global_authority=_SemanticGlobalAuthority(audit_root),
+            window_binding=binding,
+            complete_context=True,
+        )
+        absent = handoff.validate_pre_attempt_inventory(
+            representation.representation_id,
+            provider,
+            privacy,
+        )
+        self.assertEqual(absent["inventory_kind"], "absent")
+        self.assertIsNone(absent["run_receipt_fingerprint"])
+        recovery.ensure_run_receipt()
+
+        inventory = handoff.validate_pre_attempt_inventory(
+            representation.representation_id,
+            provider,
+            privacy,
+        )
+        self.assertEqual(inventory["inventory_kind"], "run_receipt_only")
+        self.assertEqual(
+            {
+                "attempt_count": inventory["attempt_count"],
+                "reserved_count": inventory["reserved_count"],
+                "started_count": inventory["started_count"],
+                "result_count": inventory["result_count"],
+            },
+            {
+                "attempt_count": 0,
+                "reserved_count": 0,
+                "started_count": 0,
+                "result_count": 0,
+            },
+        )
+        self.assertEqual(runner.calls, [])
+
+        recovery.attempts_dir.mkdir(mode=0o700)
+        self.assertEqual(
+            handoff.validate_pre_attempt_inventory(
+                representation.representation_id,
+                provider,
+                privacy,
+            )["inventory_kind"],
+            "run_receipt_only",
+        )
+        receipt_path = recovery.run_dir / "run-receipt.json"
+        receipt_bytes = receipt_path.read_bytes()
+        tampered = json.loads(receipt_bytes)
+        tampered["representation"]["representation_id"] = (
+            "repr_" + "0" * 64
+        )
+        receipt_path.write_text(json.dumps(tampered), encoding="utf-8")
+        with self.assertRaises(SemanticHandoffError):
+            handoff.validate_pre_attempt_inventory(
+                representation.representation_id,
+                provider,
+                privacy,
+            )
+        receipt_path.write_bytes(receipt_bytes)
+        package = (
+            representation_service.output_root
+            / representation.representation_id
+        )
+        package.mkdir(parents=True)
+        with self.assertRaisesRegex(SemanticHandoffError, "package 已存在"):
+            handoff.validate_pre_attempt_inventory(
+                representation.representation_id,
+                provider,
+                privacy,
+            )
+        package.rmdir()
+
+        authority = _SemanticGlobalAuthority(audit_root)
+        authority.publish_attempts(((recovery, 1, binding, provider),))
+        recovery.publish_reserved(1)
+        with authority._locked(blocking=False):
+            _base, effective, _continuations = (
+                authority._current_effective_authority()
+            )
+            _attempts, unknown = authority._global_attempts(effective)
+        self.assertFalse(unknown)
+        with self.assertRaisesRegex(
+            SemanticHandoffError, "execution inventory 非空"
+        ):
+            handoff.validate_pre_attempt_inventory(
+                representation.representation_id,
+                provider,
+                privacy,
+            )
+        self.assertEqual(runner.calls, [])
+
     def test_issue_135_continuation_is_zero_call_and_starts_at_221(
         self,
     ) -> None:

@@ -1295,6 +1295,43 @@ class _SemanticRecoveryRun:
         )
         self._validate_run_receipt_payload()
 
+    def validate_run_receipt_only(self) -> dict[str, object]:
+        """Read back an exact run receipt with no execution inventory."""
+
+        if not self.exists:
+            raise SemanticHandoffError(
+                "Semantic pre-attempt run receipt 缺失。"
+            )
+        self._validate_run_receipt_payload()
+        for directory in (
+            self.attempts_dir,
+            self.reserved_dir,
+            self.started_dir,
+            self.results_dir,
+        ):
+            if not os.path.lexists(directory):
+                continue
+            _require_private_directory(directory)
+            try:
+                if any(directory.iterdir()):
+                    raise SemanticHandoffError(
+                        "Semantic pre-attempt execution inventory 非空。"
+                    )
+            except OSError as exc:
+                raise SemanticHandoffError(
+                    "Semantic pre-attempt execution inventory 不可读。"
+                ) from exc
+        return {
+            "semantic_run_id": self.semantic_run_id,
+            "run_receipt_fingerprint": self.expected_run_receipt[
+                "run_receipt_fingerprint"
+            ],
+            "attempt_count": 0,
+            "reserved_count": 0,
+            "started_count": 0,
+            "result_count": 0,
+        }
+
     def _attempt_path(self, ordinal: int) -> Path:
         return self.attempts_dir / f"batch_{ordinal:04d}.json"
 
@@ -4000,24 +4037,19 @@ class _SemanticGlobalAuthority:
     ) -> bool:
         if not continuations:
             return False
-        previous_without_head = dict(previous)
-        current_without_head = dict(current)
-        previous_head = previous_without_head.pop("reviewed_git_head", None)
-        current_head = current_without_head.pop("reviewed_git_head", None)
-        if not _payloads_exactly_equal(
-            previous_without_head, current_without_head
-        ):
-            return False
-        cursor = previous_head
+        cursor_window = dict(previous)
+        current_window = dict(current)
+        cursor = cursor_window.get("reviewed_git_head")
         started = False
         if (
             previous_continuation is not None
             and continuations[0].get("previous_reviewed_git_head")
             == previous_continuation.get("reviewed_git_head")
-            and previous_head
+            and cursor
             == previous_continuation.get("previous_reviewed_git_head")
         ):
             cursor = previous_continuation.get("reviewed_git_head")
+            cursor_window["reviewed_git_head"] = cursor
             started = True
         for continuation in continuations:
             if not started:
@@ -4026,8 +4058,32 @@ class _SemanticGlobalAuthority:
                 started = True
             elif continuation.get("previous_reviewed_git_head") != cursor:
                 return False
+            receipt_window = continuation.get("window")
+            if not isinstance(receipt_window, dict):
+                return False
+            previous_bridge = dict(cursor_window)
+            receipt_bridge = dict(receipt_window)
+            previous_head = previous_bridge.pop("reviewed_git_head", None)
+            receipt_head = receipt_bridge.pop("reviewed_git_head", None)
+            if (
+                previous_head
+                != continuation.get("previous_reviewed_git_head")
+                or receipt_head
+                != continuation.get("previous_reviewed_git_head")
+            ):
+                return False
+            for key in (
+                "window_plan_fingerprint",
+                "window_plan_receipt_fingerprint",
+            ):
+                previous_bridge.pop(key, None)
+                receipt_bridge.pop(key, None)
+            if not _payloads_exactly_equal(previous_bridge, receipt_bridge):
+                return False
             cursor = continuation.get("reviewed_git_head")
-            if cursor == current_head:
+            cursor_window = dict(receipt_window)
+            cursor_window["reviewed_git_head"] = cursor
+            if _payloads_exactly_equal(cursor_window, current_window):
                 return True
         return False
 
@@ -13241,6 +13297,78 @@ class ExternalAgentSemanticHandoffService:
         self,
     ) -> SemanticCampaignAuthorityBinding | None:
         return _SemanticGlobalAuthority(self.audit_root).campaign_binding()
+
+    def validate_pre_attempt_inventory(
+        self,
+        representation_id: str,
+        provider: CodexCliRepresentationAnalysisProvider,
+        privacy_binding: SemanticPrivacyBinding,
+    ) -> dict[str, object]:
+        """Validate a representation-specific run-receipt-only boundary."""
+
+        package = self.representation_service.output_root / representation_id
+        if os.path.lexists(package):
+            raise SemanticHandoffError(
+                "Semantic pre-attempt package 已存在。"
+            )
+        recovery = _SemanticRecoveryRun(
+            self.representation_service,
+            self.audit_root,
+            representation_id,
+            provider,
+            privacy_binding,
+            complete_context=True,
+        )
+        _validate_shared_recovery_root(self.audit_root, create=False)
+        matching_runs: list[str] = []
+        for run in sorted(self.audit_root.glob("semantic_run_*")):
+            receipt = _private_json_exact(run / "run-receipt.json")
+            representation = receipt.get("representation")
+            if (
+                isinstance(representation, dict)
+                and representation.get("representation_id")
+                == representation_id
+            ):
+                matching_runs.append(run.name)
+        if recovery.exists:
+            if matching_runs != [recovery.semantic_run_id]:
+                raise SemanticHandoffError(
+                    "Semantic pre-attempt run identity 不唯一。"
+                )
+            inventory = {
+                "inventory_kind": "run_receipt_only",
+                **recovery.validate_run_receipt_only(),
+            }
+        else:
+            if matching_runs:
+                raise SemanticHandoffError(
+                    "Semantic pre-attempt historical run 已存在。"
+                )
+            inventory = {
+                "inventory_kind": "absent",
+                "semantic_run_id": recovery.semantic_run_id,
+                "run_receipt_fingerprint": None,
+                "attempt_count": 0,
+                "reserved_count": 0,
+                "started_count": 0,
+                "result_count": 0,
+            }
+        authority = _SemanticGlobalAuthority(self.audit_root)
+        if not authority.exists:
+            raise SemanticHandoffError("Semantic global authority 未安装。")
+        with authority._locked(blocking=False):
+            _base, effective, _continuations = (
+                authority._current_effective_authority()
+            )
+            attempts, _unknown = authority._global_attempts(effective)
+            if any(
+                attempt.get("semantic_run_id") == recovery.semantic_run_id
+                for attempt in attempts
+            ):
+                raise SemanticHandoffError(
+                    "Semantic pre-attempt global attempt 已存在。"
+                )
+        return inventory
 
     def global_attempt_summary(self, representation_id: str) -> dict[str, int]:
         """Read the validated global attempt ledger without starting a Provider."""

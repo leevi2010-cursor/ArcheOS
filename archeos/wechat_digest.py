@@ -268,6 +268,13 @@ class SemanticHandoffPort(Protocol):
         parallelism: int,
     ) -> dict[str, int]: ...
 
+    def validate_pre_attempt_inventory(
+        self,
+        representation_id: str,
+        *,
+        privacy_binding: SemanticPrivacyBinding,
+    ) -> dict[str, object]: ...
+
     def install_global_authority(
         self,
         *,
@@ -2190,6 +2197,18 @@ class ExistingSemanticHandoff:
             getattr(self.service, "last_result_only_metrics", {})
         )
         return elapsed
+
+    def validate_pre_attempt_inventory(
+        self,
+        representation_id: str,
+        *,
+        privacy_binding: SemanticPrivacyBinding,
+    ) -> dict[str, object]:
+        return self.service.validate_pre_attempt_inventory(
+            representation_id,
+            self.provider,
+            privacy_binding,
+        )
 
     def install_global_authority(
         self,
@@ -4570,7 +4589,11 @@ class WechatDigestService:
                 raise WechatDigestError(
                     "Semantic reviewed-head continuation active run 状态不匹配。"
                 )
-            self._verify_pre_provider_items(plan, status)
+            self._verify_pre_provider_items(
+                plan,
+                status,
+                allow_run_receipt_only=True,
+            )
             plan_fingerprint = _plan_fingerprint(plan)
             capture_receipt_fingerprint = plan.get(
                 "capture_receipt_fingerprint"
@@ -8777,15 +8800,34 @@ class WechatDigestService:
                 effective_batch_size = self._plan_batch_size(plan)
                 if batch_size != effective_batch_size:
                     raise WechatDigestError("semantic batch size 与 durable run 不一致。")
+                pre_attempt_representation_ids: tuple[str, ...] = ()
+                persisted_status = self.run_store.status(run_id)
+                if self._semantic_handoff_error_was_pre_provider(
+                    plan, persisted_status
+                ):
+                    persisted_items = persisted_status.get("items")
+                    assert isinstance(persisted_items, dict)
+                    pre_attempt_representation_ids = tuple(
+                        str(item["representation_id"])
+                        for item in persisted_items.values()
+                        if isinstance(item, dict)
+                        and item.get("state") == "represented"
+                    )
                 capture, plan, status = self._load_or_upgrade_active_capture(
                     run_id,
                     plan,
-                    self.run_store.status(run_id),
+                    persisted_status,
                 )
                 self._verify_capture_against_plan(capture, plan)
                 self._verify_plan_and_status(
                     run_id, capture, plan, status
                 )
+                if pre_attempt_representation_ids:
+                    return self._prepared_batch(
+                        run_id,
+                        pre_attempt_representation_ids[0],
+                        effective_batch_size,
+                    )
                 return self._prepare_next_semantic_locked(
                     run_id,
                     capture,
@@ -9707,7 +9749,9 @@ class WechatDigestService:
         self,
         plan: Mapping[str, object],
         item: Mapping[str, object],
-    ) -> None:
+        *,
+        allow_run_receipt_only: bool = False,
+    ) -> str:
         source_id = item.get("source_id")
         representation_id = item.get("representation_id")
         if not isinstance(source_id, str) or not isinstance(
@@ -9756,10 +9800,71 @@ class WechatDigestService:
                 raise WechatDigestError(
                     "微信 represented pre-provider Representation 读回失败。"
                 )
-            if self._semantic_trace_exists(representation_id):
+            trace_exists = self._semantic_trace_exists(representation_id)
+            inventory_kind = "absent"
+            if trace_exists and not allow_run_receipt_only:
                 raise WechatDigestError(
                     "微信 represented item 已存在 Semantic 执行痕迹。"
                 )
+            if allow_run_receipt_only:
+                privacy = self.privacy_gate.evaluate(
+                    self._representation_texts(representation_id),
+                    semantic_completeness_known=True,
+                )
+                inventory = self._semantic_port().validate_pre_attempt_inventory(
+                    representation_id,
+                    privacy_binding=self._semantic_privacy_binding(
+                        representation_id, privacy
+                    ),
+                )
+                if (
+                    set(inventory)
+                    != {
+                        "inventory_kind",
+                        "semantic_run_id",
+                        "run_receipt_fingerprint",
+                        "attempt_count",
+                        "reserved_count",
+                        "started_count",
+                        "result_count",
+                    }
+                    or re.fullmatch(
+                        r"semantic_run_[0-9a-f]{32}",
+                        str(inventory.get("semantic_run_id")),
+                    )
+                    is None
+                    or inventory.get("inventory_kind")
+                    not in {"absent", "run_receipt_only"}
+                    or trace_exists
+                    != (
+                        inventory.get("inventory_kind")
+                        == "run_receipt_only"
+                    )
+                    or (
+                        inventory.get("inventory_kind") == "absent"
+                        and inventory.get("run_receipt_fingerprint") is not None
+                    )
+                    or (
+                        inventory.get("inventory_kind")
+                        == "run_receipt_only"
+                        and not _sha256_value(
+                            inventory.get("run_receipt_fingerprint")
+                        )
+                    )
+                    or any(
+                        inventory.get(key) != 0
+                        for key in (
+                            "attempt_count",
+                            "reserved_count",
+                            "started_count",
+                            "result_count",
+                        )
+                    )
+                ):
+                    raise WechatDigestError(
+                        "微信 represented pre-attempt inventory 损坏。"
+                    )
+                inventory_kind = str(inventory["inventory_kind"])
             if any(
                 revision.origin_source_id == source_id
                 for revision in self.information_store.list_atomic_information()
@@ -9767,6 +9872,7 @@ class WechatDigestService:
                 raise WechatDigestError(
                     "微信 represented item 已存在 Durable Atomic Information。"
                 )
+            return inventory_kind
         except WechatDigestError:
             raise
         except (
@@ -9774,6 +9880,7 @@ class WechatDigestService:
             TypeError,
             ValueError,
             RepresentationError,
+            SemanticHandoffError,
             SourceNotFoundError,
         ) as exc:
             raise WechatDigestError(
@@ -9784,7 +9891,9 @@ class WechatDigestService:
         self,
         plan: Mapping[str, object],
         status: Mapping[str, object],
-    ) -> None:
+        *,
+        allow_run_receipt_only: bool = False,
+    ) -> tuple[str, ...]:
         items = status.get("items")
         if not isinstance(items, dict):
             raise WechatDigestError("微信 pre-provider 恢复状态 items 损坏。")
@@ -9830,12 +9939,14 @@ class WechatDigestService:
             raise WechatDigestError(
                 "微信 pre-provider 恢复存在未知非终态形态。"
             )
-        if len(represented) > 1:
-            raise WechatDigestError(
-                "微信 pre-provider 恢复存在多个 represented item。"
+        return tuple(
+            self._verify_represented_pre_provider_item(
+                plan,
+                item,
+                allow_run_receipt_only=allow_run_receipt_only,
             )
-        if represented:
-            self._verify_represented_pre_provider_item(plan, represented[0])
+            for item in represented
+        )
 
     def _value_error_was_pre_provider(
         self,
@@ -9851,6 +9962,24 @@ class WechatDigestService:
         self._verify_pre_provider_items(plan, status)
         return True
 
+    def _semantic_handoff_error_was_pre_provider(
+        self,
+        plan: Mapping[str, object],
+        status: Mapping[str, object],
+    ) -> bool:
+        if (
+            status.get("state") != "failed"
+            or status.get("failure_category") != "SemanticHandoffError"
+            or status.get("checkpoint_published") is not False
+        ):
+            return False
+        inventories = self._verify_pre_provider_items(
+            plan,
+            status,
+            allow_run_receipt_only=True,
+        )
+        return bool(inventories) and "run_receipt_only" in inventories
+
     def _load_or_upgrade_active_capture(
         self,
         run_id: str,
@@ -9865,8 +9994,9 @@ class WechatDigestService:
             raise WechatDigestError(
                 "active legacy 微信运行必须先完成既有显式升级。"
             )
-        normalize_pre_provider_failure = self._value_error_was_pre_provider(
-            plan, status
+        normalize_pre_provider_failure = (
+            self._value_error_was_pre_provider(plan, status)
+            or self._semantic_handoff_error_was_pre_provider(plan, status)
         )
         if normalize_pre_provider_failure:
             self._verify_plan_and_status(
@@ -9918,6 +10048,25 @@ class WechatDigestService:
                 expected_plan_binding=previous_fingerprint,
             )
         self._verify_capture_against_plan(capture, previous_plan)
+        if schema == SNAPSHOT_RUN_PLAN_SCHEMA_VERSION:
+            self._verify_plan_and_status(run_id, capture, plan, status)
+            normalized_status = dict(status)
+            if normalize_pre_provider_failure:
+                normalized_status["state"] = "processing"
+                normalized_status["failure_category"] = None
+                normalized_status["updated_at"] = self.clock()
+                self.run_store.update_status(run_id, normalized_status)
+                if self.run_store.status(run_id) != normalized_status:
+                    raise WechatDigestError(
+                        "微信 pre-provider failure 规范化读回失败。"
+                    )
+            self._verify_plan_and_status(
+                run_id,
+                capture,
+                plan,
+                normalized_status,
+            )
+            return capture, plan, normalized_status
         if schema == RUN_PLAN_SCHEMA_VERSION:
             self._verify_plan_and_status(
                 run_id,
