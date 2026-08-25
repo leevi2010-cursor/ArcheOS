@@ -12146,6 +12146,102 @@ class _SemanticGlobalAuthority:
                 break
         return self._read_commit_cursor(baseline)
 
+    def _effective_committed_ordinal(
+        self,
+        grant: Mapping[str, object],
+        attempts: Sequence[Mapping[str, object]],
+    ) -> int:
+        """Read the durable cursor plus consecutive resolved failures."""
+
+        durable = int(
+            self._current_commit_cursor(grant, attempts)[
+                "committed_global_ordinal"
+            ]
+        )
+        attempt_by_ordinal = {
+            int(attempt["global_ordinal"]): attempt for attempt in attempts
+        }
+        if len(attempt_by_ordinal) != len(attempts):
+            raise SemanticHandoffError(
+                "Semantic global commit attempt ordinal 重复。"
+            )
+        resolution_by_ordinal: dict[int, Mapping[str, object]] = {}
+        for resolution in self._read_attempt_resolutions(previous=grant):
+            ordinal = int(resolution["global_ordinal"])
+            if ordinal in resolution_by_ordinal:
+                raise SemanticHandoffError(
+                    "Semantic global commit resolution ordinal 重复。"
+                )
+            attempt = attempt_by_ordinal.get(ordinal)
+            semantic_attempt = resolution.get("semantic_attempt")
+            if attempt is None or not isinstance(semantic_attempt, dict):
+                raise SemanticHandoffError(
+                    "Semantic global commit resolution attempt 缺失。"
+                )
+            run_id = str(attempt["semantic_run_id"])
+            batch_ordinal = int(attempt["batch_ordinal"])
+            run = self.audit_root / run_id
+            run_receipt = _private_json_exact(run / "run-receipt.json")
+            started = _private_json_exact(
+                run / "started" / f"batch_{batch_ordinal:04d}.json"
+            )
+            projected_started = dict(started)
+            started_fingerprint = projected_started.pop(
+                "started_receipt_fingerprint", None
+            )
+            result = run / "results" / f"batch_{batch_ordinal:04d}"
+            expected_semantic_attempt = {
+                "semantic_run_id": run_id,
+                "run_receipt_fingerprint": run_receipt.get(
+                    "run_receipt_fingerprint"
+                ),
+                "run_contract_fingerprint": attempt.get(
+                    "run_contract_fingerprint"
+                ),
+                "batch_ordinal": batch_ordinal,
+                "batch_contract_fingerprint": attempt.get(
+                    "batch_contract_fingerprint"
+                ),
+                "input_fingerprint": attempt.get("input_fingerprint"),
+                "attempt_id": attempt.get("attempt_id"),
+                "attempt_nonce": attempt.get("attempt_nonce"),
+                "attempt_receipt_fingerprint": attempt.get(
+                    "attempt_receipt_fingerprint"
+                ),
+                "started_receipt_fingerprint": started_fingerprint,
+                "result_present": False,
+            }
+            digest = resolution.get("digest")
+            if (
+                not _payloads_exactly_equal(
+                    semantic_attempt, expected_semantic_attempt
+                )
+                or started.get("schema_version")
+                != _RECOVERY_ATTEMPT_STARTED_SCHEMA
+                or started.get("artifact_kind")
+                != "semantic_handoff_attempt_started"
+                or started.get("semantic_run_id") != run_id
+                or started.get("batch_ordinal") != batch_ordinal
+                or started.get("attempt_receipt_fingerprint")
+                != attempt.get("attempt_receipt_fingerprint")
+                or started.get("state") != "started"
+                or started_fingerprint != _fingerprint(projected_started)
+                or os.path.lexists(result)
+                or not isinstance(digest, dict)
+                or not _sha256_fingerprint(
+                    digest.get("failed_closed_status_fingerprint")
+                )
+            ):
+                raise SemanticHandoffError(
+                    "Semantic global commit resolution binding 漂移。"
+                )
+            resolution_by_ordinal[ordinal] = resolution
+
+        effective = durable
+        while effective + 1 in resolution_by_ordinal:
+            effective += 1
+        return effective
+
     def validate_commit_wave(
         self,
         recoveries: Sequence[_SemanticRecoveryRun],
@@ -12173,11 +12269,7 @@ class _SemanticGlobalAuthority:
                 raise SemanticHandoffError(
                     "Semantic global authority 存在 outcome unknown；禁止恢复。"
                 )
-            current = int(
-                self._current_commit_cursor(grant, attempts)[
-                    "committed_global_ordinal"
-                ]
-            )
+            current = self._effective_committed_ordinal(grant, attempts)
             ranges: list[tuple[int, int]] = []
             seen: set[str] = set()
             previous_upper: int | None = None
@@ -12269,8 +12361,7 @@ class _SemanticGlobalAuthority:
                 return min(ordinals), max(ordinals)
             if ordinals != list(range(min(ordinals), max(ordinals) + 1)):
                 raise SemanticHandoffError("Semantic global commit range 不连续。")
-            cursor = self._current_commit_cursor(grant, attempts)
-            current = int(cursor["committed_global_ordinal"])
+            current = self._effective_committed_ordinal(grant, attempts)
             lower, upper = min(ordinals), max(ordinals)
             if current >= upper:
                 if (

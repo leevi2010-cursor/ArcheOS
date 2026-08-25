@@ -12054,19 +12054,33 @@ print("passed")
             batch_size=1,
         )
         next_runner = FakeRunner()
-        ExternalAgentSemanticHandoffService(
+        next_handoff = ExternalAgentSemanticHandoffService(
             next_service,
             JsonlAtomicInformationStore(next_root / "atomic.jsonl"),
             audit_root,
-        ).execute(
-            next_representation.representation_id,
-            CodexCliRepresentationAnalysisProvider(
-                provider_version="0.147.0",
-                timeout_seconds=300,
-                runner=next_runner,
+        )
+        next_provider = CodexCliRepresentationAnalysisProvider(
+            provider_version="0.147.0",
+            timeout_seconds=300,
+            runner=next_runner,
+        )
+        next_binding = replace(binding, reviewed_git_head=new_head)
+        next_handoff.prepare_results(
+            (
+                SemanticResultOnlyRequest(
+                    next_representation.representation_id,
+                    self.privacy_binding(),
+                    next_binding,
+                ),
             ),
+            (next_provider,),
+            concurrency=1,
+        )
+        next_handoff.execute(
+            next_representation.representation_id,
+            next_provider,
             privacy_binding=self.privacy_binding(),
-            authority_binding=replace(binding, reviewed_git_head=new_head),
+            authority_binding=next_binding,
         )
         self.assertEqual(len(next_runner.calls), 1)
         attempt_82 = next(
@@ -12077,6 +12091,15 @@ print("passed")
         self.assertEqual(
             attempt_82["global_authority_fingerprint"],
             continuation["continuation_fingerprint"],
+        )
+        commit_cursor_path = (
+            audit_root / "semantic_global_authority" / "commit-cursor.json"
+        )
+        commit_cursor = json.loads(commit_cursor_path.read_text("utf-8"))
+        self.assertEqual(commit_cursor["committed_global_ordinal"], 82)
+        self.assertEqual(
+            commit_cursor["attempt_receipt_fingerprint"],
+            attempt_82["attempt_receipt_fingerprint"],
         )
 
         second_root = root / "second-unknown"
@@ -12146,13 +12169,219 @@ print("passed")
             second_receipt["previous_global_authority_fingerprint"],
             continuation["continuation_fingerprint"],
         )
+        third_root = root / "third-unknown"
+        third_representation, third_service = self.build_service(
+            root=third_root,
+            source_id="src_" + "4" * 32,
+            batch_size=1,
+        )
+        third_handoff = ExternalAgentSemanticHandoffService(
+            third_service,
+            JsonlAtomicInformationStore(third_root / "atomic.jsonl"),
+            audit_root,
+        )
+        third_recovery = _SemanticRecoveryRun(
+            third_service,
+            audit_root,
+            third_representation.representation_id,
+            provider,
+            self.privacy_binding(),
+            global_authority=authority,
+            window_binding=second_binding,
+            complete_context=False,
+        )
+        third_recovery.ensure_run_receipt()
+        (third_attempt,) = authority.publish_attempts(
+            ((third_recovery, 1, second_binding, provider),)
+        )
+        third_recovery.publish_started(1)
+        self.assertEqual(third_attempt["global_ordinal"], 84)
+        third_digest = {
+            **digest,
+            "source_id": third_representation.source_id,
+            "representation_id": third_representation.representation_id,
+            "representation_manifest": third_representation.to_manifest_dict(),
+        }
+        third_manifest_path = root / "attempt-resolution-authority-3.json"
+        third_handoff.build_attempt_resolution_manifest(
+            provider,
+            candidate_file=third_manifest_path,
+            authority_ref=(
+                "https://github.com/leevi2010-cursor/ArcheOS/issues/999"
+                "#issuecomment-5407350000"
+            ),
+            observed_at="2026-08-25T14:00:00Z",
+            digest_binding=third_digest,
+        )
+
+        def commit_third(resolution_id: str, ordinal: int):
+            self.assertTrue(resolution_id.startswith("attempt_resolution_"))
+            self.assertEqual(ordinal, 84)
+            return "sha256:" + "5" * 64, third_digest
+
+        third_receipt = third_handoff.resolve_attempt(
+            provider,
+            authority_manifest_file=third_manifest_path,
+            reviewed_git_head=new_head,
+            digest_binding=third_digest,
+            commit_failed_closed_status=commit_third,
+        )
+        self.assertEqual(third_receipt["global_ordinal"], 84)
+        self.assertEqual(
+            json.loads(commit_cursor_path.read_text("utf-8"))[
+                "committed_global_ordinal"
+            ],
+            82,
+        )
+
+        final_root = root / "after-two-resolved-failures"
+        final_representation, final_service = self.build_service(
+            root=final_root,
+            source_id="src_" + "5" * 32,
+            batch_size=1,
+        )
+        final_handoff = ExternalAgentSemanticHandoffService(
+            final_service,
+            JsonlAtomicInformationStore(final_root / "atomic.jsonl"),
+            audit_root,
+        )
+        final_runner = FakeRunner()
+        final_provider = CodexCliRepresentationAnalysisProvider(
+            provider_version="0.147.0",
+            timeout_seconds=300,
+            runner=final_runner,
+        )
+        final_request = SemanticResultOnlyRequest(
+            final_representation.representation_id,
+            self.privacy_binding(),
+            second_binding,
+        )
+        final_handoff.prepare_results(
+            (final_request,), (final_provider,), concurrency=1
+        )
+        cursor_before_inspect = commit_cursor_path.read_bytes()
+        third_receipt_path = (
+            audit_root
+            / "semantic_global_authority"
+            / "attempt-resolution-0003.json"
+        )
+        third_receipt_bytes = third_receipt_path.read_bytes()
+        third_receipt_payload = json.loads(third_receipt_bytes)
+        damaged_receipt = json.loads(third_receipt_bytes)
+        damaged_receipt["semantic_attempt"]["attempt_nonce"] = "0" * 64
+        projected_receipt = dict(damaged_receipt)
+        projected_receipt.pop("resolution_receipt_fingerprint")
+        damaged_receipt["resolution_receipt_fingerprint"] = (
+            _canonical_fingerprint(projected_receipt)
+        )
+        third_receipt_path.write_text(
+            json.dumps(damaged_receipt), encoding="utf-8"
+        )
+        with self.assertRaises(SemanticHandoffError):
+            final_handoff.inspect_recovery_wave(
+                (final_request,), (final_provider,)
+            )
+        self.assertEqual(commit_cursor_path.read_bytes(), cursor_before_inspect)
+        third_receipt_path.write_bytes(third_receipt_bytes)
+
+        damaged_activation = json.loads(third_receipt_bytes)
+        damaged_activation["activation_attempt_inventory_fingerprint"] = (
+            "sha256:" + "0" * 64
+        )
+        projected_activation = dict(damaged_activation)
+        projected_activation.pop("resolution_receipt_fingerprint")
+        damaged_activation["resolution_receipt_fingerprint"] = (
+            _canonical_fingerprint(projected_activation)
+        )
+        third_receipt_path.write_text(
+            json.dumps(damaged_activation), encoding="utf-8"
+        )
+        with self.assertRaises(SemanticHandoffError):
+            final_handoff.inspect_recovery_wave(
+                (final_request,), (final_provider,)
+            )
+        self.assertEqual(commit_cursor_path.read_bytes(), cursor_before_inspect)
+        third_receipt_path.write_bytes(third_receipt_bytes)
+
+        third_started_path = (
+            audit_root
+            / str(third_receipt_payload["semantic_attempt"]["semantic_run_id"])
+            / "started"
+            / "batch_0001.json"
+        )
+        third_started_bytes = third_started_path.read_bytes()
+        damaged_started = json.loads(third_started_bytes)
+        damaged_started["state"] = "damaged"
+        projected_started = dict(damaged_started)
+        projected_started.pop("started_receipt_fingerprint")
+        damaged_started["started_receipt_fingerprint"] = (
+            _canonical_fingerprint(projected_started)
+        )
+        third_started_path.write_text(
+            json.dumps(damaged_started), encoding="utf-8"
+        )
+        with self.assertRaises(SemanticHandoffError):
+            final_handoff.inspect_recovery_wave(
+                (final_request,), (final_provider,)
+            )
+        self.assertEqual(commit_cursor_path.read_bytes(), cursor_before_inspect)
+        third_started_path.write_bytes(third_started_bytes)
+
+        third_result_path = (
+            audit_root
+            / str(third_receipt_payload["semantic_attempt"]["semantic_run_id"])
+            / "results"
+            / "batch_0001"
+        )
+        third_result_path.mkdir(parents=True)
+        with self.assertRaises(SemanticHandoffError):
+            final_handoff.inspect_recovery_wave(
+                (final_request,), (final_provider,)
+            )
+        self.assertEqual(commit_cursor_path.read_bytes(), cursor_before_inspect)
+        third_result_path.rmdir()
+        third_result_path.parent.rmdir()
+
+        third_receipt_path.unlink()
+        with self.assertRaises(SemanticHandoffError):
+            final_handoff.inspect_recovery_wave(
+                (final_request,), (final_provider,)
+            )
+        self.assertEqual(commit_cursor_path.read_bytes(), cursor_before_inspect)
+        third_receipt_path.write_bytes(third_receipt_bytes)
+        third_receipt_path.chmod(0o600)
+        self.assertEqual(
+            final_handoff.inspect_recovery_wave(
+                (final_request,), (final_provider,)
+            )[0]["global_ordinal_range"],
+            [85, 85],
+        )
+        self.assertEqual(commit_cursor_path.read_bytes(), cursor_before_inspect)
+        final_handoff.execute(
+            final_representation.representation_id,
+            final_provider,
+            privacy_binding=self.privacy_binding(),
+            authority_binding=second_binding,
+        )
+        final_cursor = json.loads(commit_cursor_path.read_text("utf-8"))
+        self.assertEqual(final_cursor["committed_global_ordinal"], 85)
+        attempt_85 = next(
+            json.loads(path.read_text("utf-8"))
+            for path in audit_root.glob("semantic_run_*/attempts/*.json")
+            if json.loads(path.read_text("utf-8")).get("global_ordinal") == 85
+        )
+        self.assertEqual(
+            final_cursor["attempt_receipt_fingerprint"],
+            attempt_85["attempt_receipt_fingerprint"],
+        )
+        self.assertEqual(len(final_runner.calls), 1)
         _base, effective, _continuations = (
             authority._current_effective_authority()
         )
         final_attempts, final_unknown = authority._global_attempts(effective)
         self.assertFalse(final_unknown)
-        self.assertEqual(final_attempts[-1]["global_ordinal"], 83)
-        self.assertEqual(80 + len(final_attempts) + 1, 84)
+        self.assertEqual(final_attempts[-1]["global_ordinal"], 85)
+        self.assertEqual(80 + len(final_attempts) + 1, 86)
         self.assertEqual(
             effective["global_authority_fingerprint"],
             continuation["continuation_fingerprint"],
@@ -13707,6 +13936,165 @@ print("passed")
                 phases=("already_ingested_pending_status",),
                 window=self.semantic_window_binding(),
                 provider=provider,
+            )
+
+    def test_commit_wave_crosses_exact_370_resolved_failure_gap(self) -> None:
+        authority = _SemanticGlobalAuthority(self.root / "exact-370-audits")
+        authority.root.mkdir(parents=True, mode=0o700)
+        provider = CodexCliRepresentationAnalysisProvider(
+            provider_version="0.147.0",
+            timeout_seconds=300,
+            runner=FakeRunner(),
+        )
+
+        class Recovery:
+            def __init__(self, semantic_run_id: str) -> None:
+                self.semantic_run_id = semantic_run_id
+
+        failed = Recovery("semantic_run_" + "1" * 32)
+        first = Recovery("semantic_run_" + "2" * 32)
+        second = Recovery("semantic_run_" + "3" * 32)
+        failed_attempt = {
+            "schema_version": "semantic-handoff-attempt-receipt/4.0",
+            "semantic_run_id": failed.semantic_run_id,
+            "global_ordinal": 371,
+            "batch_ordinal": 1,
+            "run_contract_fingerprint": "sha256:" + "1" * 64,
+            "batch_contract_fingerprint": "sha256:" + "2" * 64,
+            "input_fingerprint": "sha256:" + "3" * 64,
+            "attempt_id": "attempt_" + "4" * 32,
+            "attempt_nonce": "5" * 64,
+            "attempt_receipt_fingerprint": "sha256:" + "6" * 64,
+        }
+        attempts = [
+            failed_attempt,
+            {
+                "schema_version": "semantic-handoff-attempt-receipt/4.0",
+                "semantic_run_id": first.semantic_run_id,
+                "global_ordinal": 372,
+                "attempt_receipt_fingerprint": "sha256:" + "7" * 64,
+            },
+            {
+                "schema_version": "semantic-handoff-attempt-receipt/4.0",
+                "semantic_run_id": second.semantic_run_id,
+                "global_ordinal": 373,
+                "attempt_receipt_fingerprint": "sha256:" + "8" * 64,
+            },
+        ]
+        failed_run = authority.audit_root / failed.semantic_run_id
+        failed_run.mkdir(parents=True, mode=0o700)
+        (failed_run / "started").mkdir(mode=0o700)
+        run_receipt = {
+            "run_receipt_fingerprint": "sha256:" + "9" * 64,
+        }
+        run_receipt_path = failed_run / "run-receipt.json"
+        run_receipt_path.write_text(json.dumps(run_receipt), encoding="utf-8")
+        run_receipt_path.chmod(0o600)
+        started_without_fingerprint = {
+            "schema_version": "semantic-handoff-attempt-started/1.0",
+            "artifact_kind": "semantic_handoff_attempt_started",
+            "semantic_run_id": failed.semantic_run_id,
+            "batch_ordinal": 1,
+            "attempt_receipt_fingerprint": failed_attempt[
+                "attempt_receipt_fingerprint"
+            ],
+            "state": "started",
+        }
+        started = {
+            **started_without_fingerprint,
+            "started_receipt_fingerprint": _canonical_fingerprint(
+                started_without_fingerprint
+            ),
+        }
+        started_path = failed_run / "started" / "batch_0001.json"
+        started_path.write_text(json.dumps(started), encoding="utf-8")
+        started_path.chmod(0o600)
+        resolution = {
+            "global_ordinal": 371,
+            "semantic_attempt": {
+                "semantic_run_id": failed.semantic_run_id,
+                "run_receipt_fingerprint": run_receipt[
+                    "run_receipt_fingerprint"
+                ],
+                "run_contract_fingerprint": failed_attempt[
+                    "run_contract_fingerprint"
+                ],
+                "batch_ordinal": 1,
+                "batch_contract_fingerprint": failed_attempt[
+                    "batch_contract_fingerprint"
+                ],
+                "input_fingerprint": failed_attempt["input_fingerprint"],
+                "attempt_id": failed_attempt["attempt_id"],
+                "attempt_nonce": failed_attempt["attempt_nonce"],
+                "attempt_receipt_fingerprint": failed_attempt[
+                    "attempt_receipt_fingerprint"
+                ],
+                "started_receipt_fingerprint": started[
+                    "started_receipt_fingerprint"
+                ],
+                "result_present": False,
+            },
+            "digest": {
+                "failed_closed_status_fingerprint": "sha256:" + "a" * 64,
+            },
+        }
+        grant = {"baseline_total": 370}
+
+        @contextmanager
+        def unlocked():
+            yield
+
+        with (
+            patch.object(
+                authority, "_locked", side_effect=lambda **_kwargs: unlocked()
+            ),
+            patch.object(authority, "_load_grant", return_value=grant),
+            patch.object(
+                authority, "_global_attempts", return_value=(attempts, False)
+            ),
+            patch.object(
+                authority,
+                "_read_attempt_resolutions",
+                return_value=(resolution,),
+            ),
+        ):
+            cursor_path = authority._commit_cursor_path()
+            self.assertEqual(
+                authority.validate_commit_wave(
+                    (first, second),
+                    phases=(
+                        "package_pending_ingestion",
+                        "result_pending_package",
+                    ),
+                    window=self.semantic_window_binding(),
+                    provider=provider,
+                ),
+                ((372, 372), (373, 373)),
+            )
+            self.assertFalse(cursor_path.exists())
+            authority.commit_range(
+                first,
+                window=self.semantic_window_binding(),
+                provider=provider,
+                commit=True,
+            )
+            first_cursor = json.loads(cursor_path.read_text("utf-8"))
+            self.assertEqual(first_cursor["committed_global_ordinal"], 372)
+            self.assertEqual(
+                first_cursor["attempt_receipt_fingerprint"],
+                attempts[1]["attempt_receipt_fingerprint"],
+            )
+            authority.commit_range(
+                second,
+                window=self.semantic_window_binding(),
+                provider=provider,
+                commit=True,
+            )
+            self.assertEqual(
+                json.loads(cursor_path.read_text("utf-8"))[
+                    "committed_global_ordinal"
+                ],
+                373,
             )
 
 if __name__ == "__main__":
