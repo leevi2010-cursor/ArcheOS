@@ -1470,10 +1470,10 @@ class _SemanticRecoveryRun:
             _GLOBAL_RESERVED_ATTEMPT_SCHEMA,
         }:
             observed_window = _authority_window_from_payload(payload.get("window"))
+            global_authority = self.global_authority or _SemanticGlobalAuthority(
+                self.audit_root
+            )
             if self.window_binding is None:
-                global_authority = self.global_authority or _SemanticGlobalAuthority(
-                    self.audit_root
-                )
                 _base, effective, _continuations = (
                     global_authority._current_effective_authority()
                 )
@@ -1487,12 +1487,32 @@ class _SemanticRecoveryRun:
                     )
                 return payload
             if self.window_binding != observed_window:
-                raise SemanticHandoffError(
-                    "Semantic global authority attempt window binding 漂移。"
+                _base, effective, continuations = (
+                    global_authority._current_effective_authority()
                 )
-            global_authority = self.global_authority or _SemanticGlobalAuthority(
-                self.audit_root
-            )
+                if not global_authority._window_matches_reviewed_head_continuations(
+                    _authority_window_payload(observed_window),
+                    _authority_window_payload(self.window_binding),
+                    continuations,
+                ):
+                    raise SemanticHandoffError(
+                        "Semantic global authority attempt window binding 漂移。"
+                    )
+                global_authority._load_grant(
+                    self.window_binding,
+                    self.provider,
+                )
+                attempts, unknown = global_authority._global_attempts(effective)
+                matching = [
+                    attempt
+                    for attempt in attempts
+                    if _payloads_exactly_equal(payload, attempt)
+                ]
+                if unknown or len(matching) != 1:
+                    raise SemanticHandoffError(
+                        "Semantic global authority historical attempt 损坏。"
+                    )
+                return payload
             grant = global_authority._guard_grant
             if grant is None:
                 grant = self._validated_global_grant

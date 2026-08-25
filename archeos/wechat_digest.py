@@ -4673,19 +4673,39 @@ class WechatDigestService:
             plan_before = _canonical_json(plan)
             status_before = _canonical_json(status)
             self._load_active_capture_artifacts(run_id, plan, status)
+            processing_pre_state = (
+                status.get("state") == "processing"
+                and status.get("failure_category") is None
+            )
+            committed_failure_state = (
+                status.get("state") == "failed"
+                and status.get("failure_category")
+                == "SemanticHandoffError"
+            )
             if (
-                status.get("state") != "processing"
-                or status.get("failure_category") is not None
+                not (processing_pre_state or committed_failure_state)
                 or status.get("checkpoint_published") is not False
             ):
                 raise WechatDigestError(
                     "Semantic reviewed-head continuation active run 状态不匹配。"
                 )
-            self._verify_pre_provider_items(
-                plan,
-                status,
-                allow_run_receipt_only=True,
-            )
+            if processing_pre_state:
+                self._verify_pre_provider_items(
+                    plan,
+                    status,
+                    allow_run_receipt_only=True,
+                )
+            else:
+                committed_result_wave = self._inspect_committed_result_wave(
+                    run_id,
+                    plan,
+                    status,
+                    allow_reviewed_head_extension=True,
+                )
+                if committed_result_wave is None:
+                    raise WechatDigestError(
+                        "Semantic reviewed-head continuation committed-result wave 不完整。"
+                    )
             plan_fingerprint = _plan_fingerprint(plan)
             capture_receipt_fingerprint = plan.get(
                 "capture_receipt_fingerprint"
@@ -10495,6 +10515,8 @@ class WechatDigestService:
         run_id: str,
         plan: Mapping[str, object],
         status: Mapping[str, object],
+        *,
+        allow_reviewed_head_extension: bool = False,
     ) -> dict[str, dict[str, object]] | None:
         """Read the durable prepared prefix before normalizing a failed run."""
 
@@ -10645,7 +10667,10 @@ class WechatDigestService:
             )
         if not wave_items:
             return None
-        authority_binding = self._semantic_authority_binding(run_id)
+        authority_binding = self._semantic_authority_binding(
+            run_id,
+            allow_reviewed_head_extension=allow_reviewed_head_extension,
+        )
         try:
             inspections = self._semantic_port().inspect_recovery_wave(
                 tuple(

@@ -1427,6 +1427,27 @@ class InterruptedCommittedWaveSemanticHandoff(SyntheticSemanticHandoff):
             inspections[-1]["phase"] = "unknown-phase"
         elif self.inspection_drift == "ordinal":
             inspections[-1]["global_ordinal_range"] = [179, 179]
+        elif self.inspection_drift == "mixed":
+            inspections[-1] = {
+                "classification": "pre_provider",
+                "representation_id": requests[-1].representation_id,
+                "phase": None,
+                "atomic_information_ids": [],
+                "package_fingerprint": None,
+                "global_ordinal_range": None,
+            }
+        elif self.inspection_drift == "pre_provider":
+            inspections = [
+                {
+                    "classification": "pre_provider",
+                    "representation_id": request.representation_id,
+                    "phase": None,
+                    "atomic_information_ids": [],
+                    "package_fingerprint": None,
+                    "global_ordinal_range": None,
+                }
+                for request in requests
+            ]
         return tuple(inspections)
 
     def execute(
@@ -7202,6 +7223,222 @@ class WechatDigestTests(unittest.TestCase):
             len(information),
         )
 
+    def test_reviewed_head_install_preserves_pristine_suffix_then_resumes_two(
+        self,
+    ) -> None:
+        self.workspace = self.workspace.resolve()
+        self.workspace.chmod(0o700)
+        for directory in (
+            "01_inbox",
+            "02_processing",
+            "03_information",
+            "04_core",
+        ):
+            (self.workspace / directory).chmod(0o700)
+        capture_provider = SyntheticCaptureProvider(
+            [
+                message(index, conversation=f"install-wave-{index}")
+                for index in range(1, 5)
+            ]
+        )
+        runner = SuccessfulV34Runner()
+        semantic = RunnerBackedExistingSemanticHandoff(
+            workspace=self.workspace,
+            runner=runner,
+        )
+        service = WechatDigestService(
+            workspace=self.workspace,
+            capture_provider=capture_provider,
+            semantic_handoff_factory=lambda: semantic,
+            interpretation_provider=NoStructuralChangeProvider(),
+            semantic_batch_size=50,
+            semantic_parallelism=2,
+        )
+        capture = capture_provider.capture(ZERO_CURSOR)
+        plan, _status = service._persist_new_capture_plan(
+            capture,
+            all_history_upper_bound=capture.upper_bound,
+        )
+        run_id = str(plan["run_id"])
+        binding = service._semantic_authority_binding(run_id)
+        authority = _SemanticGlobalAuthority(semantic.service.audit_root)
+        _total, inventory_fingerprint, counts = authority._legacy_inventory(())
+        manifest = {
+            "schema_version": "semantic-handoff-inventory-authority/1.0",
+            "artifact_kind": "semantic_handoff_inventory_authority",
+            "authority_ref": "sha256:" + "5" * 64,
+            "reviewed_git_head": binding.reviewed_git_head,
+            "campaign": {
+                "created_at": binding.campaign_created_at,
+                "lower_cursor": list(binding.campaign_lower_cursor),
+                "frozen_global_upper_cursor": list(
+                    binding.frozen_global_upper_cursor
+                ),
+                "capture_provider_version": binding.capture_provider_version,
+                "semantic_batch_size": binding.semantic_batch_size,
+            },
+            "expected_raw_provider_labels": [],
+            "historical_provider_version_counts": counts,
+            "local_total": 0,
+            "legacy_inventory_fingerprint": inventory_fingerprint,
+            "baseline_total": 80,
+            "max_new": 20,
+            "absolute_cap": 100,
+        }
+        manifest["payload_fingerprint"] = _fingerprint(manifest)
+        authority_file = self.workspace / "synthetic-install-authority.json"
+        authority_file.write_text(json.dumps(manifest), encoding="utf-8")
+        authority_file.chmod(0o600)
+        semantic.install_global_authority(
+            inventory_authority_file=authority_file,
+            window_binding=binding,
+        )
+        original_persist = semantic.service._persist_audits
+        persist_calls = 0
+
+        def interrupt_after_first_package(*args, **kwargs):
+            nonlocal persist_calls
+            persist_calls += 1
+            if persist_calls == 1:
+                raise OSError("synthetic package durable interruption")
+            return original_persist(*args, **kwargs)
+
+        with patch.object(
+            semantic.service,
+            "_persist_audits",
+            side_effect=interrupt_after_first_package,
+        ), self.assertRaises(WechatDigestError):
+            service.run(max_terminal_items=2)
+
+        failed = service.run_store.status(run_id)
+        self.assertEqual(failed["state"], "failed")
+        self.assertEqual(failed["failure_category"], "SemanticHandoffError")
+        self.assertEqual(
+            [item["state"] for item in failed["items"].values()],
+            ["represented", "planned", "planned", "planned"],
+        )
+        inspections = service._inspect_committed_result_wave(
+            run_id,
+            plan,
+            failed,
+        )
+        assert inspections is not None
+        self.assertEqual(
+            [item["phase"] for item in inspections.values()],
+            ["package_pending_ingestion", "result_pending_package"],
+        )
+        representation_ids = [
+            str(item["representation_id"])
+            for item in inspections.values()
+        ]
+        attempt_summary = semantic.service.global_attempt_summary(
+            representation_ids[-1]
+        )
+        self.assertEqual(attempt_summary["global_attempt_total"], 82)
+        self.assertEqual(attempt_summary["global_unknown"], 0)
+        run_dir = service.run_store.runs_root / run_id
+        run_bytes_before = {
+            path.relative_to(run_dir).as_posix(): path.read_bytes()
+            for path in run_dir.rglob("*")
+            if path.is_file()
+        }
+        business_bytes_before = {
+            path.relative_to(self.workspace).as_posix(): path.read_bytes()
+            for root in (
+                "01_inbox",
+                "02_processing/representations",
+                "02_processing/information",
+                "03_information",
+                "04_core",
+            )
+            for path in (self.workspace / root).rglob("*")
+            if path.is_file()
+        }
+        semantic.reviewed_git_head = "7" * 40
+
+        continuation = service.install_semantic_reviewed_head_continuation(
+            authority_ref=(
+                "https://github.com/leevi2010-cursor/ArcheOS/issues/188"
+                "#issuecomment-5411902640"
+            )
+        )
+
+        self.assertEqual(continuation["previous_reviewed_git_head"], "6" * 40)
+        self.assertEqual(continuation["reviewed_git_head"], "7" * 40)
+        self.assertEqual(continuation["activation_total"], 82)
+        self.assertEqual(continuation["activation_unknown_count"], 0)
+        self.assertEqual(len(runner.calls), 2)
+        self.assertEqual(len(capture_provider.calls), 1)
+        self.assertEqual(service.run_store.status(run_id), failed)
+        self.assertEqual(service.run_store.plan(run_id), plan)
+        self.assertIsNone(service.run_store.checkpoint())
+        self.assertEqual(
+            semantic.service.global_attempt_summary(representation_ids[-1]),
+            attempt_summary,
+        )
+        self.assertEqual(
+            {
+                path.relative_to(run_dir).as_posix(): path.read_bytes()
+                for path in run_dir.rglob("*")
+                if path.is_file()
+            },
+            run_bytes_before,
+        )
+        self.assertEqual(
+            {
+                path.relative_to(self.workspace).as_posix(): path.read_bytes()
+                for root in (
+                    "01_inbox",
+                    "02_processing/representations",
+                    "02_processing/information",
+                    "03_information",
+                    "04_core",
+                )
+                for path in (self.workspace / root).rglob("*")
+                if path.is_file()
+            },
+            business_bytes_before,
+        )
+
+        resumed = service.run(max_terminal_items=2)
+
+        self.assertEqual(resumed.resume_provider_calls, 0)
+        self.assertEqual(resumed.segment_items_completed, 2)
+        self.assertFalse(resumed.checkpoint_published)
+        self.assertEqual(len(runner.calls), 2)
+        self.assertEqual(len(capture_provider.calls), 1)
+        self.assertEqual(
+            semantic.service.global_attempt_summary(representation_ids[-1]),
+            attempt_summary,
+        )
+        cursor_path = (
+            semantic.service.audit_root
+            / "semantic_global_authority"
+            / "commit-cursor.json"
+        )
+        cursor = json.loads(cursor_path.read_text(encoding="utf-8"))
+        self.assertEqual(cursor["committed_global_ordinal"], 82)
+        resumed_status = service.run_store.status(run_id)
+        self.assertEqual(
+            [item["state"] for item in resumed_status["items"].values()],
+            ["processed", "processed", "planned", "planned"],
+        )
+        pristine = tuple(resumed_status["items"].values())[2:]
+        self.assertTrue(
+            all(
+                item.get("representation_id") is None
+                and item.get("atomic_information_ids") == []
+                and item.get("governance_receipt") is None
+                for item in pristine
+            )
+        )
+        self.assertEqual(len(service.source_repository.list_sources()), 2)
+        self.assertEqual(
+            len(service.information_store.list_atomic_information()),
+            2,
+        )
+        self.assertIsNone(service.run_store.checkpoint())
+
     def test_real_package_result_wave_resumes_one_cursor_at_a_time(self) -> None:
         self.workspace = self.workspace.resolve()
         self.workspace.chmod(0o700)
@@ -7234,7 +7471,7 @@ class WechatDigestTests(unittest.TestCase):
         capture = capture_provider.capture(ZERO_CURSOR)
         plan, _status = service._persist_new_capture_plan(
             capture,
-            all_history_upper_bound=None,
+            all_history_upper_bound=capture.upper_bound,
         )
         run_id = str(plan["run_id"])
         binding = service._semantic_authority_binding(run_id)
@@ -7333,6 +7570,113 @@ class WechatDigestTests(unittest.TestCase):
                 "absolute_cap": 100,
             },
         )
+
+        run_dir = service.run_store.runs_root / run_id
+
+        def durable_business_bytes() -> dict[str, bytes]:
+            roots = (
+                "01_inbox",
+                "02_processing/representations",
+                "02_processing/information",
+                "03_information",
+                "04_core",
+            )
+            return {
+                path.relative_to(self.workspace).as_posix(): path.read_bytes()
+                for root in roots
+                for path in (self.workspace / root).rglob("*")
+                if path.is_file()
+            }
+
+        run_bytes_before_install = {
+            path.relative_to(run_dir).as_posix(): path.read_bytes()
+            for path in run_dir.rglob("*")
+            if path.is_file()
+        }
+        business_bytes_before_install = durable_business_bytes()
+        semantic_runs_before_install = {
+            path.relative_to(semantic.service.audit_root).as_posix(): (
+                path.read_bytes()
+            )
+            for path in semantic.service.audit_root.rglob("*")
+            if path.is_file()
+            and "semantic_global_authority" not in path.parts
+        }
+        semantic.reviewed_git_head = "7" * 40
+        with self.assertRaises(WechatDigestError):
+            service._inspect_committed_result_wave(run_id, plan, failed)
+        authority_ref = (
+            "https://github.com/leevi2010-cursor/ArcheOS/issues/188"
+            "#issuecomment-5411672370"
+        )
+
+        continuation = service.install_semantic_reviewed_head_continuation(
+            authority_ref=authority_ref
+        )
+
+        self.assertEqual(continuation["previous_reviewed_git_head"], "6" * 40)
+        self.assertEqual(continuation["reviewed_git_head"], "7" * 40)
+        self.assertEqual(continuation["activation_total"], 82)
+        self.assertEqual(continuation["activation_unknown_count"], 0)
+        self.assertEqual(continuation["next_global_ordinal"], 83)
+        self.assertEqual(continuation["authority_ref"], authority_ref)
+        self.assertEqual(
+            continuation["active_run"],
+            {
+                "run_id": run_id,
+                "plan_fingerprint": failed["plan_fingerprint"],
+                "capture_receipt_fingerprint": plan[
+                    "capture_receipt_fingerprint"
+                ],
+                "status_fingerprint": _sha256_bytes(
+                    _canonical_json(failed).encode("utf-8")
+                ),
+            },
+        )
+        self.assertEqual(
+            service.install_semantic_reviewed_head_continuation(
+                authority_ref=authority_ref
+            ),
+            continuation,
+        )
+        self.assertEqual(len(runner.calls), 2)
+        self.assertEqual(len(capture_provider.calls), 1)
+        self.assertEqual(service.run_store.checkpoint(), None)
+        self.assertEqual(
+            service.run_store.status(run_id),
+            failed,
+        )
+        self.assertEqual(
+            {
+                path.relative_to(run_dir).as_posix(): path.read_bytes()
+                for path in run_dir.rglob("*")
+                if path.is_file()
+            },
+            run_bytes_before_install,
+        )
+        self.assertEqual(durable_business_bytes(), business_bytes_before_install)
+        self.assertEqual(
+            {
+                path.relative_to(semantic.service.audit_root).as_posix(): (
+                    path.read_bytes()
+                )
+                for path in semantic.service.audit_root.rglob("*")
+                if path.is_file()
+                and "semantic_global_authority" not in path.parts
+            },
+            semantic_runs_before_install,
+        )
+        self.assertEqual(
+            len(
+                tuple(
+                    (
+                        semantic.service.audit_root
+                        / "semantic_global_authority"
+                    ).glob("reviewed-head-continuation-*.json")
+                )
+            ),
+            1,
+        )
         source_ids = [str(item["source_id"]) for item in plan["conversations"]]
         self.assertEqual(len(service.source_repository.list_sources()), 2)
         self.assertEqual(
@@ -7414,6 +7758,46 @@ class WechatDigestTests(unittest.TestCase):
                 for item in after_commit["items"].values()
             )
         )
+
+        leading_prefix_run_bytes = {
+            path.relative_to(run_dir).as_posix(): path.read_bytes()
+            for path in run_dir.rglob("*")
+            if path.is_file()
+        }
+        leading_prefix_business_bytes = durable_business_bytes()
+        cursor_bytes = cursor_path.read_bytes()
+        semantic.reviewed_git_head = "8" * 40
+        leading_prefix_continuation = (
+            service.install_semantic_reviewed_head_continuation(
+                authority_ref=(
+                    "https://github.com/leevi2010-cursor/ArcheOS/issues/188"
+                    "#issuecomment-5411672371"
+                )
+            )
+        )
+        self.assertEqual(
+            leading_prefix_continuation["previous_reviewed_git_head"],
+            "7" * 40,
+        )
+        self.assertEqual(
+            leading_prefix_continuation["reviewed_git_head"],
+            "8" * 40,
+        )
+        self.assertEqual(leading_prefix_continuation["activation_total"], 82)
+        self.assertEqual(leading_prefix_continuation["next_global_ordinal"], 83)
+        self.assertEqual(len(runner.calls), 2)
+        self.assertEqual(len(capture_provider.calls), 1)
+        self.assertEqual(cursor_path.read_bytes(), cursor_bytes)
+        self.assertEqual(service.run_store.status(run_id), after_commit)
+        self.assertEqual(
+            {
+                path.relative_to(run_dir).as_posix(): path.read_bytes()
+                for path in run_dir.rglob("*")
+                if path.is_file()
+            },
+            leading_prefix_run_bytes,
+        )
+        self.assertEqual(durable_business_bytes(), leading_prefix_business_bytes)
 
         resumed = service.run(max_terminal_items=2)
 
@@ -7547,6 +7931,95 @@ class WechatDigestTests(unittest.TestCase):
 
                 self.assertEqual(status_path.read_bytes(), before)
                 self.assertEqual(semantic.provider.calls, provider_calls)
+                self.assertIsNone(service.run_store.checkpoint())
+
+    def test_reviewed_head_continuation_rejects_invalid_failed_wave_before_write(
+        self,
+    ) -> None:
+        for case in (
+            "phase",
+            "ordinal",
+            "status",
+            "mixed",
+            "pre_provider",
+            "other_failure",
+        ):
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as temporary:
+                workspace = Path(temporary) / "workspace"
+                for directory in (
+                    "01_inbox",
+                    "02_processing",
+                    "03_information",
+                    "04_core",
+                ):
+                    (workspace / directory).mkdir(parents=True, exist_ok=True)
+                capture = SyntheticCaptureProvider(
+                    [
+                        message(1, conversation=f"install-{case}-a"),
+                        message(2, conversation=f"install-{case}-b"),
+                    ]
+                )
+                semantic = InterruptedCommittedWaveSemanticHandoff(workspace)
+                service = WechatDigestService(
+                    workspace=workspace,
+                    capture_provider=capture,
+                    semantic_handoff_factory=lambda: semantic,
+                    interpretation_provider=NoStructuralChangeProvider(),
+                )
+                with self.assertRaises(WechatDigestError):
+                    service.run(all_history=True, max_terminal_items=2)
+                run_id = service.run_store.active_run_id()
+                assert run_id is not None
+                plan = service.run_store.plan(run_id)
+                status_path = service.run_store.runs_root / run_id / "status.json"
+                if case == "status":
+                    status = json.loads(status_path.read_text(encoding="utf-8"))
+                    next(
+                        item
+                        for item in status["items"].values()
+                        if item["state"] == "planned"
+                    )["atomic_information_ids"] = [
+                        "atomic_info_" + "0" * 32
+                    ]
+                    status_path.write_text(json.dumps(status), encoding="utf-8")
+                elif case == "other_failure":
+                    status = json.loads(status_path.read_text(encoding="utf-8"))
+                    status["failure_category"] = "WechatDigestError"
+                    status_path.write_text(json.dumps(status), encoding="utf-8")
+                else:
+                    semantic.inspection_drift = case
+                semantic.reviewed_git_head = "7" * 40
+                semantic.campaign_binding = SimpleNamespace(
+                    created_at=plan["created_at"],
+                    lower_cursor=service._cursor_tuple(
+                        WechatCursor.from_dict(plan["after_cursor"])
+                    ),
+                    frozen_global_upper_cursor=service._cursor_tuple(
+                        WechatCursor.from_dict(plan["all_history_upper_bound"])
+                    ),
+                    capture_provider_version=plan["provider_version"],
+                    semantic_batch_size=plan["semantic_batch_size"],
+                    reviewed_git_head="6" * 40,
+                )
+                before = status_path.read_bytes()
+                provider_calls = semantic.provider.calls
+                capture_calls = len(capture.calls)
+
+                with self.assertRaises(WechatDigestError):
+                    service.install_semantic_reviewed_head_continuation(
+                        authority_ref=(
+                            "https://github.com/leevi2010-cursor/ArcheOS/"
+                            "issues/188#issuecomment-5411672370"
+                        )
+                    )
+
+                self.assertEqual(status_path.read_bytes(), before)
+                self.assertEqual(semantic.provider.calls, provider_calls)
+                self.assertEqual(len(capture.calls), capture_calls)
+                self.assertEqual(
+                    semantic.installed_reviewed_head_continuations,
+                    [],
+                )
                 self.assertIsNone(service.run_store.checkpoint())
 
     def test_prepare_requires_active_run_without_capture(self) -> None:

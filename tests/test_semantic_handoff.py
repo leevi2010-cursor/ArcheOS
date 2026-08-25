@@ -11355,6 +11355,137 @@ print("passed")
             )
         self.assertEqual(retry_runner.calls, [])
 
+    def test_recovery_reads_historical_attempt_through_reviewed_head_chain(
+        self,
+    ) -> None:
+        import archeos.semantic_handoff as handoff_module
+
+        root = self.root / "reviewed-head-historical-attempt"
+        representation, service = self.build_service(root=root)
+        audit_root = root / "audits"
+        handoff = ExternalAgentSemanticHandoffService(
+            service,
+            JsonlAtomicInformationStore(root / "atomic.jsonl"),
+            audit_root,
+        )
+        binding = self.semantic_window_binding()
+        execution_runner = FakeRunner()
+        execution_provider = CodexCliRepresentationAnalysisProvider(
+            provider_version="0.147.0",
+            timeout_seconds=300,
+            runner=execution_runner,
+        )
+        self.install_authority(handoff, execution_provider, binding)
+        handoff.execute(
+            representation.representation_id,
+            execution_provider,
+            privacy_binding=self.privacy_binding(),
+            authority_binding=binding,
+        )
+        self.assertEqual(len(execution_runner.calls), 1)
+        authority = _SemanticGlobalAuthority(audit_root)
+
+        def recovery(
+            window: SemanticWindowAuthorityBinding,
+            runner: FakeRunner,
+        ) -> _SemanticRecoveryRun:
+            return _SemanticRecoveryRun(
+                service,
+                audit_root,
+                representation.representation_id,
+                CodexCliRepresentationAnalysisProvider(
+                    provider_version="0.147.0",
+                    timeout_seconds=300,
+                    runner=runner,
+                ),
+                self.privacy_binding(),
+                global_authority=authority,
+                window_binding=window,
+                complete_context=True,
+            )
+
+        exact_runner = FakeRunner()
+        exact_loaded, exact_unknown = recovery(binding, exact_runner).inspect()
+        self.assertFalse(exact_unknown)
+        self.assertTrue(all(item is not None for item in exact_loaded))
+        self.assertEqual(exact_runner.calls, [])
+
+        reviewed_window = replace(binding, reviewed_git_head="f" * 40)
+        no_chain_runner = FakeRunner()
+        with self.assertRaises(SemanticHandoffError):
+            recovery(reviewed_window, no_chain_runner).inspect()
+        self.assertEqual(no_chain_runner.calls, [])
+
+        continuation = handoff.install_reviewed_head_continuation(
+            CodexCliRepresentationAnalysisProvider(
+                provider_version="0.147.0",
+                timeout_seconds=300,
+                runner=FakeRunner(),
+            ),
+            window_binding=binding,
+            reviewed_git_head="f" * 40,
+            authority_ref=(
+                "https://github.com/leevi2010-cursor/ArcheOS/issues/188"
+                "#issuecomment-5412023198"
+            ),
+            active_run_binding={
+                "run_id": binding.window_run_id,
+                "plan_fingerprint": binding.window_plan_fingerprint,
+                "capture_receipt_fingerprint": "sha256:" + "2" * 64,
+                "status_fingerprint": "sha256:" + "3" * 64,
+            },
+        )
+        bridge_runner = FakeRunner()
+        bridged_loaded, bridged_unknown = recovery(
+            reviewed_window, bridge_runner
+        ).inspect()
+        self.assertFalse(bridged_unknown)
+        self.assertEqual(bridged_loaded, exact_loaded)
+        self.assertEqual(bridge_runner.calls, [])
+
+        nonhead_runner = FakeRunner()
+        with self.assertRaises(SemanticHandoffError):
+            recovery(
+                replace(
+                    reviewed_window,
+                    window_upper_cursor=(2, "drift", "drift"),
+                ),
+                nonhead_runner,
+            ).inspect()
+        self.assertEqual(nonhead_runner.calls, [])
+
+        inventory_runner = FakeRunner()
+        with patch.object(
+            authority,
+            "_global_attempts",
+            return_value=([], False),
+        ), self.assertRaises(SemanticHandoffError):
+            recovery(reviewed_window, inventory_runner).inspect()
+        self.assertEqual(inventory_runner.calls, [])
+
+        continuation_path = (
+            audit_root
+            / "semantic_global_authority"
+            / "reviewed-head-continuation-0001.json"
+        )
+        damaged = json.loads(continuation_path.read_text(encoding="utf-8"))
+        damaged["previous_reviewed_git_head"] = "e" * 40
+        damaged_without_fingerprint = dict(damaged)
+        damaged_without_fingerprint.pop("continuation_fingerprint")
+        damaged["continuation_fingerprint"] = handoff_module._fingerprint(
+            damaged_without_fingerprint
+        )
+        continuation_path.write_text(json.dumps(damaged), encoding="utf-8")
+        continuation_path.chmod(0o600)
+        wrong_chain_runner = FakeRunner()
+        with self.assertRaises(SemanticHandoffError):
+            recovery(reviewed_window, wrong_chain_runner).inspect()
+        self.assertEqual(wrong_chain_runner.calls, [])
+        self.assertNotEqual(
+            damaged["continuation_fingerprint"],
+            continuation["continuation_fingerprint"],
+        )
+
     def test_reviewed_head_continuations_bridge_plan_receipts_before_attempts(
         self,
     ) -> None:
