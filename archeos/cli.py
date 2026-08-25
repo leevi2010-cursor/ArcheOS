@@ -705,6 +705,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="零 Provider 把已批准的 ordinal212 timeout 收敛为 failed_closed。",
     )
     wechat_digest.add_argument(
+        "--resolve-semantic-attempt",
+        action="store_true",
+        help="零 Provider 收敛唯一 tail Semantic attempt。",
+    )
+    wechat_digest.add_argument(
+        "--prepare-semantic-attempt-resolution",
+        action="store_true",
+        help="零 Provider 生成 tail Semantic attempt 的私有候选 manifest。",
+    )
+    wechat_digest.add_argument(
         "--seal-governance-timeout",
         action="store_true",
         help="零 Provider 封存 Governance timeout 并允许后续项目继续。",
@@ -738,6 +748,20 @@ def build_parser() -> argparse.ArgumentParser:
         "--semantic-timeout-212-authority-file",
         type=Path,
         help="Private 0600 Lead-approved ordinal-212 resolution authority manifest.",
+    )
+    wechat_digest.add_argument(
+        "--semantic-attempt-authority-file",
+        type=Path,
+        help="Private 0600 Lead-approved generic attempt resolution authority manifest.",
+    )
+    wechat_digest.add_argument(
+        "--semantic-attempt-candidate-file",
+        type=Path,
+        help="Private 0600 generic attempt resolution candidate output.",
+    )
+    wechat_digest.add_argument(
+        "--semantic-attempt-observed-at",
+        help="Lead-observed process cleanup timestamp for the candidate.",
     )
     wechat_digest.add_argument(
         "--batch-governance-authority-file",
@@ -1309,6 +1333,8 @@ def _wechat_product_command(args: argparse.Namespace) -> int:
             args.activate_batch_governance,
             args.resolve_semantic_unknown,
             args.resolve_semantic_timeout_212,
+            args.resolve_semantic_attempt,
+            args.prepare_semantic_attempt_resolution,
             args.seal_governance_timeout,
             args.resolve_governance_startup_failure,
             args.resolve_failed_closed_continuation,
@@ -1344,6 +1370,32 @@ def _wechat_product_command(args: argparse.Namespace) -> int:
     elif args.semantic_timeout_212_authority_file is not None:
         print("error: Semantic ordinal212 authority file 只能与恢复入口一起使用。")
         return 2
+    if args.resolve_semantic_attempt:
+        if args.semantic_attempt_authority_file is None:
+            print("error: 恢复 Semantic attempt 必须指定私有 authority file。")
+            return 2
+    elif args.semantic_attempt_authority_file is not None:
+        print("error: Semantic attempt authority file 只能与恢复入口一起使用。")
+        return 2
+    if args.prepare_semantic_attempt_resolution:
+        if (
+            args.semantic_attempt_candidate_file is None
+            or args.semantic_attempt_observed_at is None
+            or args.authority_ref is None
+        ):
+            print(
+                "error: 生成 Semantic attempt candidate 必须指定输出文件、"
+                "authority ref 与 observed-at。"
+            )
+            return 2
+    elif (
+        args.semantic_attempt_candidate_file is not None
+        or args.semantic_attempt_observed_at is not None
+    ):
+        print(
+            "error: Semantic attempt candidate 参数只能与生成入口一起使用。"
+        )
+        return 2
     if (
         args.install_semantic_maintenance_continuation
         or args.install_semantic_reviewed_head_continuation
@@ -1353,6 +1405,7 @@ def _wechat_product_command(args: argparse.Namespace) -> int:
         or args.resolve_governance_startup_failure
         or args.resolve_failed_closed_continuation
         or args.resolve_multi_governance_startup_failure
+        or args.prepare_semantic_attempt_resolution
     ):
         if args.authority_ref is None:
             print("error: 安装 continuation 必须指定 authority ref。")
@@ -1783,6 +1836,67 @@ def _wechat_product_command(args: argparse.Namespace) -> int:
                         "absolute_cap": 1000,
                         "remaining": 788,
                         "next_global_ordinal": continuation["next_global_ordinal"],
+                        "failed_closed": 1,
+                        "preserved_but_unabsorbed": 1,
+                        "resolution_receipt_fingerprint": resolution[
+                            "resolution_receipt_fingerprint"
+                        ],
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                )
+            )
+            return 0
+        if args.prepare_semantic_attempt_resolution:
+            candidate = service.build_semantic_attempt_resolution_manifest(
+                candidate_file=args.semantic_attempt_candidate_file,
+                authority_ref=args.authority_ref,
+                observed_at=args.semantic_attempt_observed_at,
+            )
+            continuation = candidate["continuation"]
+            print(
+                json.dumps(
+                    {
+                        "semantic_provider_calls": 0,
+                        "governance_provider_calls": 0,
+                        "candidate_file": str(
+                            args.semantic_attempt_candidate_file
+                        ),
+                        "global_attempt_total": candidate["activation_total"],
+                        "global_unknown": candidate[
+                            "activation_unknown_count"
+                        ],
+                        "next_global_ordinal": continuation[
+                            "next_global_ordinal"
+                        ],
+                        "payload_fingerprint": candidate[
+                            "payload_fingerprint"
+                        ],
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                )
+            )
+            return 0
+        if args.resolve_semantic_attempt:
+            resolution = service.resolve_semantic_attempt(
+                authority_manifest_file=args.semantic_attempt_authority_file,
+            )
+            continuation = resolution["continuation"]
+            total = int(resolution["global_ordinal"])
+            absolute_cap = int(continuation["absolute_cap"])
+            print(
+                json.dumps(
+                    {
+                        "semantic_provider_calls": 0,
+                        "governance_provider_calls": 0,
+                        "global_attempt_total": total,
+                        "global_unknown": 0,
+                        "absolute_cap": absolute_cap,
+                        "remaining": absolute_cap - total,
+                        "next_global_ordinal": continuation[
+                            "next_global_ordinal"
+                        ],
                         "failed_closed": 1,
                         "preserved_but_unabsorbed": 1,
                         "resolution_receipt_fingerprint": resolution[

@@ -199,6 +199,108 @@ class CliTest(unittest.TestCase):
     @patch("archeos.cli.WechatDigestService")
     @patch("archeos.cli.WechatCliCaptureProvider")
     @patch("archeos.cli.require_workspace")
+    def test_wechat_digest_builds_generic_attempt_candidate_zero_calls(
+        self,
+        require_workspace: Mock,
+        capture_provider: Mock,
+        digest_service: Mock,
+    ) -> None:
+        require_workspace.return_value = WorkspaceConfig(
+            Path("/workspace"), Path("/config")
+        )
+        digest_service.return_value.build_semantic_attempt_resolution_manifest.return_value = {
+            "activation_total": 371,
+            "activation_unknown_count": 1,
+            "continuation": {
+                "next_global_ordinal": 372,
+                "absolute_cap": 1000,
+            },
+            "payload_fingerprint": "sha256:" + "e" * 64,
+        }
+        candidate = Path("/private/attempt-candidate.json")
+        authority_ref = (
+            "https://github.com/leevi2010-cursor/ArcheOS/issues/184"
+            "#issuecomment-5407349371"
+        )
+        observed_at = "2026-08-25T12:00:00Z"
+        output = StringIO()
+        with redirect_stdout(output):
+            result = main(
+                [
+                    "wechat",
+                    "digest",
+                    "--prepare-semantic-attempt-resolution",
+                    "--semantic-attempt-candidate-file",
+                    str(candidate),
+                    "--authority-ref",
+                    authority_ref,
+                    "--semantic-attempt-observed-at",
+                    observed_at,
+                ]
+            )
+        self.assertEqual(result, 0)
+        payload = json.loads(output.getvalue())
+        self.assertEqual(payload["semantic_provider_calls"], 0)
+        self.assertEqual(payload["global_attempt_total"], 371)
+        self.assertEqual(payload["global_unknown"], 1)
+        self.assertEqual(payload["next_global_ordinal"], 372)
+        digest_service.return_value.build_semantic_attempt_resolution_manifest.assert_called_once_with(
+            candidate_file=candidate,
+            authority_ref=authority_ref,
+            observed_at=observed_at,
+        )
+        digest_service.return_value.run.assert_not_called()
+        capture_provider.assert_called_once()
+
+    @patch("archeos.cli.WechatDigestService")
+    @patch("archeos.cli.WechatCliCaptureProvider")
+    @patch("archeos.cli.require_workspace")
+    def test_wechat_digest_resolves_generic_attempt_with_zero_call_summary(
+        self,
+        require_workspace: Mock,
+        capture_provider: Mock,
+        digest_service: Mock,
+    ) -> None:
+        require_workspace.return_value = WorkspaceConfig(
+            Path("/workspace"), Path("/config")
+        )
+        digest_service.return_value.resolve_semantic_attempt.return_value = {
+            "global_ordinal": 371,
+            "continuation": {
+                "next_global_ordinal": 372,
+                "absolute_cap": 1000,
+            },
+            "resolution_receipt_fingerprint": "sha256:" + "f" * 64,
+        }
+        authority = Path("/private/attempt-authority.json")
+        output = StringIO()
+        with redirect_stdout(output):
+            result = main(
+                [
+                    "wechat",
+                    "digest",
+                    "--resolve-semantic-attempt",
+                    "--semantic-attempt-authority-file",
+                    str(authority),
+                ]
+            )
+        self.assertEqual(result, 0)
+        payload = json.loads(output.getvalue())
+        self.assertEqual(payload["semantic_provider_calls"], 0)
+        self.assertEqual(payload["governance_provider_calls"], 0)
+        self.assertEqual(payload["global_attempt_total"], 371)
+        self.assertEqual(payload["global_unknown"], 0)
+        self.assertEqual(payload["next_global_ordinal"], 372)
+        self.assertEqual(payload["remaining"], 629)
+        digest_service.return_value.resolve_semantic_attempt.assert_called_once_with(
+            authority_manifest_file=authority
+        )
+        digest_service.return_value.run.assert_not_called()
+        capture_provider.assert_called_once()
+
+    @patch("archeos.cli.WechatDigestService")
+    @patch("archeos.cli.WechatCliCaptureProvider")
+    @patch("archeos.cli.require_workspace")
     def test_wechat_digest_seals_governance_timeout_with_zero_call_summary(
         self,
         require_workspace: Mock,

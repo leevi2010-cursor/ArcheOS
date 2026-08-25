@@ -52,7 +52,7 @@ from archeos.representation_information import (
     _external_agent_request,
     _units_from_representation,
 )
-from archeos.semantic_handoff import _package_fingerprint
+from archeos.semantic_handoff import SemanticHandoffError, _package_fingerprint
 from archeos.source import LocalManagedSourceRepository
 from archeos.wechat_capture_helper import (
     _all_cursor_rows,
@@ -298,6 +298,8 @@ class _SyntheticSemanticHandoffBase:
         self.installed_reviewed_head_continuations = []
         self.unknown_resolution = None
         self.timeout_212_resolution = None
+        self.attempt_resolution = None
+        self.attempt_resolution_candidate = None
         self.before_unknown_commit = None
         self.campaign_binding = None
         self.authority_bindings = []
@@ -980,6 +982,105 @@ class SyntheticSemanticHandoff(_SyntheticSemanticHandoffBase):
             "failed_closed_status_fingerprint": failed_closed_status_fingerprint,
         }
         return self.timeout_212_resolution
+
+    def resolve_attempt(
+        self,
+        *,
+        authority_manifest_file,
+        digest_binding,
+        commit_failed_closed_status,
+    ):
+        manifest = json.loads(Path(authority_manifest_file).read_text("utf-8"))
+        assert manifest["digest"] == digest_binding
+        ordinal = manifest["activation_total"]
+        resolution_id = manifest["resolution_id"]
+        if self.before_unknown_commit is not None:
+            self.before_unknown_commit()
+        status_fingerprint, final_digest_binding = (
+            commit_failed_closed_status(resolution_id, ordinal)
+        )
+        assert final_digest_binding == digest_binding
+        expected = {
+            "global_ordinal": ordinal,
+            "resolution_id": resolution_id,
+            "preserved_but_unabsorbed": True,
+            "digest": {
+                **dict(digest_binding),
+                "failed_closed_status_fingerprint": status_fingerprint,
+            },
+            "continuation": {
+                "next_global_ordinal": ordinal + 1,
+                "absolute_cap": self.absolute_cap,
+            },
+            "resolution_receipt_fingerprint": "sha256:" + "d" * 64,
+        }
+        if self.attempt_resolution is not None:
+            assert self.attempt_resolution == expected
+        self.attempt_resolution = expected
+        self.global_attempt_total = ordinal
+        self.global_unknown = 0
+        return expected
+
+    def build_attempt_resolution_manifest(
+        self,
+        *,
+        candidate_file,
+        authority_ref,
+        observed_at,
+        digest_binding,
+    ):
+        ordinal = self.global_attempt_total
+        candidate = {
+            "authority_ref": authority_ref,
+            "activation_total": ordinal,
+            "activation_unknown_count": 1,
+            "digest": dict(digest_binding),
+            "resolution_id": "attempt_resolution_" + "c" * 32,
+            "failure_evidence": {"observed_at": observed_at},
+            "continuation": {
+                "next_global_ordinal": ordinal + 1,
+                "absolute_cap": self.absolute_cap,
+            },
+            "payload_fingerprint": "sha256:" + "e" * 64,
+        }
+        Path(candidate_file).write_text(
+            json.dumps(candidate, sort_keys=True), encoding="utf-8"
+        )
+        Path(candidate_file).chmod(0o600)
+        self.attempt_resolution_candidate = candidate
+        return candidate
+
+    def validate_attempt_resolution_digest(
+        self,
+        *,
+        digest_binding,
+        failed_closed_status_fingerprint,
+        resolution_id,
+    ):
+        if (
+            self.attempt_resolution is None
+            or self.attempt_resolution["resolution_id"] != resolution_id
+        ):
+            raise SemanticHandoffError(
+                "synthetic attempt resolution receipt drift"
+            )
+        terminal_digest = {
+            key: value
+            for key, value in self.attempt_resolution["digest"].items()
+            if key
+            not in {
+                "checkpoint_fingerprint",
+                "business_tree_fingerprint",
+            }
+        }
+        if terminal_digest != {
+            **dict(digest_binding),
+            "failed_closed_status_fingerprint": failed_closed_status_fingerprint,
+        }:
+            raise SemanticHandoffError(
+                "synthetic attempt resolution digest drift"
+            )
+        return self.attempt_resolution
 
     def _write_success_audits(
         self, package: Path, representation_id: str
@@ -7082,6 +7183,386 @@ class WechatDigestTests(unittest.TestCase):
             ),
             resolution,
         )
+        self.assertEqual(self.semantic.provider.calls, provider_calls)
+
+    def test_generic_attempt_resolution_preserves_other_items_and_business_state(
+        self,
+    ) -> None:
+        capture = SyntheticCaptureProvider(
+            [
+                message(index, conversation=f"conversation-{index:02d}")
+                for index in range(1, 124)
+            ]
+        )
+        service = self.service(capture)
+        self.semantic.global_attempt_total = 371
+        self.semantic.failures_remaining = 1
+        with self.assertRaises(WechatDigestError):
+            service.run(all_history=True)
+        run_id = service.run_store.active_run_id()
+        assert run_id is not None
+        plan = service.run_store.plan(run_id)
+        status = service.run_store.status(run_id)
+        status = {**status, "failure_category": "SemanticHandoffError"}
+        represented_ids = [
+            item_id
+            for item_id, value in status["items"].items()
+            if value.get("state") == "represented"
+        ]
+        self.assertEqual(len(represented_ids), 1)
+        target_id = represented_ids[0]
+        terminal_distribution = (
+            ["pending_human"] * 10
+            + ["processed"] * 8
+            + ["unsupported"] * 89
+            + ["planned"] * 15
+        )
+        updated_items = dict(status["items"])
+        for item_id, state in zip(
+            (key for key in updated_items if key != target_id),
+            terminal_distribution,
+            strict=True,
+        ):
+            updated_items[item_id] = {
+                **updated_items[item_id],
+                "state": state,
+            }
+        status = {**status, "items": updated_items}
+        service.run_store.update_status(run_id, status)
+        status_verifier = patch.object(service, "_verify_plan_and_status")
+        status_verifier.start()
+        self.addCleanup(status_verifier.stop)
+        represented = [
+            (item_id, item)
+            for item_id, item in status["items"].items()
+            if item.get("state") == "represented"
+        ]
+        self.assertEqual(len(represented), 1)
+        item_id, item = represented[0]
+        self.assertEqual(
+            Counter(
+                value.get("state")
+                for key, value in status["items"].items()
+                if key != item_id
+            ),
+            Counter(
+                {
+                    "pending_human": 10,
+                    "processed": 8,
+                    "unsupported": 89,
+                    "planned": 15,
+                }
+            ),
+        )
+        pre_status_fingerprint = _sha256_bytes(
+            _canonical_json(status).encode("utf-8")
+        )
+        binding = service._attempt_resolution_digest_binding(
+            run_id=run_id,
+            plan=plan,
+            item_id=item_id,
+            item=item,
+            pre_status_fingerprint=pre_status_fingerprint,
+        )
+        manifest_path = self.workspace / "private-attempt-authority.json"
+        extra_nonterminal_id = next(
+            key
+            for key, value in status["items"].items()
+            if key != item_id and value.get("state") == "planned"
+        )
+        damaged_items = dict(status["items"])
+        damaged_items[extra_nonterminal_id] = {
+            **damaged_items[extra_nonterminal_id],
+            "state": "represented",
+        }
+        service.run_store.update_status(
+            run_id, {**status, "items": damaged_items}
+        )
+        with self.assertRaisesRegex(WechatDigestError, "唯一绑定"):
+            service.build_semantic_attempt_resolution_manifest(
+                candidate_file=manifest_path,
+                authority_ref=(
+                    "https://github.com/leevi2010-cursor/ArcheOS/issues/184"
+                    "#issuecomment-5407691736"
+                ),
+                observed_at="2026-08-25T12:00:00Z",
+            )
+        service.run_store.update_status(run_id, status)
+        candidate = service.build_semantic_attempt_resolution_manifest(
+            candidate_file=manifest_path,
+            authority_ref=(
+                "https://github.com/leevi2010-cursor/ArcheOS/issues/184"
+                "#issuecomment-5407349371"
+            ),
+            observed_at="2026-08-25T12:00:00Z",
+        )
+        self.assertEqual(candidate["digest"], binding)
+        self.assertEqual(manifest_path.stat().st_mode & 0o777, 0o600)
+        self.assertEqual(self.semantic.provider.calls, 0)
+        plan_before = service.run_store.plan(run_id)
+        capture_before = service.run_store.capture_receipt(run_id)
+        checkpoint_before = service.run_store.checkpoint()
+        source_before = service.source_repository.get(item["source_id"])
+        representation_before = service.representation_repository.get(
+            item["representation_id"]
+        )
+        provider_calls = self.semantic.provider.calls
+
+        plan_path = service.run_store.runs_root / run_id / "plan.json"
+        plan_bytes = plan_path.read_bytes()
+        representation_manifest_path = (
+            self.workspace
+            / "02_processing"
+            / "representations"
+            / item["source_id"]
+            / item["representation_id"]
+            / "manifest.json"
+        )
+        representation_manifest = json.loads(
+            representation_manifest_path.read_text("utf-8")
+        )
+        artifact_path = (
+            representation_manifest_path.parent
+            / representation_manifest["artifacts"][0]["locator"]
+        )
+        artifact_bytes = artifact_path.read_bytes()
+        checkpoint_path = service.run_store.checkpoint_path
+
+        def drift_plan() -> None:
+            damaged = json.loads(plan_bytes)
+            damaged["created_at"] = "2026-08-25T13:00:00Z"
+            plan_path.write_text(json.dumps(damaged), encoding="utf-8")
+
+        def drift_representation() -> None:
+            artifact_path.write_bytes(artifact_bytes + b"drift")
+
+        def drift_checkpoint() -> None:
+            checkpoint_path.write_text(
+                json.dumps(
+                    {
+                        "schema_version": "wechat-digest-checkpoint/1.0",
+                        "cursor": plan["upper_bound"],
+                        "published_at": "2026-08-25T13:00:00Z",
+                        "run_id": run_id,
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+        for label, mutate, restore in (
+            ("plan", drift_plan, lambda: plan_path.write_bytes(plan_bytes)),
+            (
+                "representation",
+                drift_representation,
+                lambda: artifact_path.write_bytes(artifact_bytes),
+            ),
+            (
+                "checkpoint",
+                drift_checkpoint,
+                lambda: checkpoint_path.unlink(missing_ok=True),
+            ),
+        ):
+            with self.subTest(drift=label):
+                self.semantic.before_unknown_commit = mutate
+                try:
+                    with self.assertRaises(WechatDigestError):
+                        service.resolve_semantic_attempt(
+                            authority_manifest_file=manifest_path
+                        )
+                finally:
+                    restore()
+                    self.semantic.before_unknown_commit = None
+                self.assertEqual(service.run_store.status(run_id), status)
+                self.assertIsNone(self.semantic.attempt_resolution)
+                self.assertEqual(self.semantic.provider.calls, provider_calls)
+
+        receipt = service.resolve_semantic_attempt(
+            authority_manifest_file=manifest_path
+        )
+
+        self.assertEqual(self.semantic.provider.calls, provider_calls)
+        self.assertEqual(receipt["global_ordinal"], 371)
+        final_status = service.run_store.status(run_id)
+        final_item = final_status["items"][item_id]
+        self.assertEqual(final_status["state"], "processing")
+        self.assertIsNone(final_status["failure_category"])
+        self.assertEqual(final_item["state"], "failed_closed")
+        self.assertTrue(
+            final_item["semantic_failure"]["preserved_but_unabsorbed"]
+        )
+        self.assertEqual(
+            Counter(
+                value.get("state")
+                for key, value in final_status["items"].items()
+                if key != item_id
+            ),
+            Counter(
+                {
+                    "pending_human": 10,
+                    "processed": 8,
+                    "unsupported": 89,
+                    "planned": 15,
+                }
+            ),
+        )
+        self.assertEqual(service.run_store.plan(run_id), plan_before)
+        self.assertEqual(service.run_store.capture_receipt(run_id), capture_before)
+        self.assertEqual(service.run_store.checkpoint(), checkpoint_before)
+        self.assertEqual(
+            service.source_repository.get(item["source_id"]), source_before
+        )
+        self.assertEqual(
+            service.representation_repository.get(item["representation_id"]),
+            representation_before,
+        )
+        self.assertEqual(
+            service.resolve_semantic_attempt(
+                authority_manifest_file=manifest_path
+            ),
+            receipt,
+        )
+        self.assertEqual(self.semantic.provider.calls, provider_calls)
+
+    def test_generic_attempt_resolution_accepts_any_planned_tail_count(
+        self,
+    ) -> None:
+        capture = SyntheticCaptureProvider(
+            [
+                message(index, conversation=f"small-{index:02d}")
+                for index in range(1, 4)
+            ]
+        )
+        service = self.service(capture)
+        self.semantic.global_attempt_total = 500
+        self.semantic.failures_remaining = 1
+        with self.assertRaises(WechatDigestError):
+            service.run(all_history=True)
+        run_id = service.run_store.active_run_id()
+        assert run_id is not None
+        status = service.run_store.status(run_id)
+        status = {**status, "failure_category": "SemanticHandoffError"}
+        service.run_store.update_status(run_id, status)
+        represented = [
+            item_id
+            for item_id, value in status["items"].items()
+            if value.get("state") == "represented"
+        ]
+        self.assertEqual(len(represented), 1)
+        candidate_path = self.workspace / "small-attempt-authority.json"
+        service.build_semantic_attempt_resolution_manifest(
+            candidate_file=candidate_path,
+            authority_ref=(
+                "https://github.com/leevi2010-cursor/ArcheOS/issues/999"
+                "#issuecomment-5407349999"
+            ),
+            observed_at="2026-08-25T13:00:00Z",
+        )
+        receipt = service.resolve_semantic_attempt(
+            authority_manifest_file=candidate_path
+        )
+        final = service.run_store.status(run_id)
+        self.assertEqual(receipt["global_ordinal"], 500)
+        self.assertEqual(
+            [
+                value.get("state")
+                for key, value in final["items"].items()
+                if key != represented[0]
+            ],
+            ["planned", "planned"],
+        )
+        self.assertEqual(self.semantic.provider.calls, 0)
+        business_before = self.governance_business_state(service)
+        processed = service.run()
+        self.assertTrue(processed.checkpoint_published)
+        self.assertIsNotNone(service.run_store.checkpoint())
+        self.assertTrue(
+            any(
+                revision.origin_source_id
+                != final["items"][represented[0]]["source_id"]
+                for revision in service.information_store.list_atomic_information()
+            )
+        )
+        self.assertNotEqual(
+            self.governance_business_state(service), business_before
+        )
+        provider_calls = self.semantic.provider.calls
+        completed_status = service.run_store.status(run_id)
+        service._load_active_capture_artifacts(
+            run_id,
+            service.run_store.plan(run_id),
+            completed_status,
+        )
+        self.assertEqual(self.semantic.provider.calls, provider_calls)
+
+        target_id = represented[0]
+        target_item = completed_status["items"][target_id]
+        source_id = target_item["source_id"]
+        representation_id = target_item["representation_id"]
+        plan = service.run_store.plan(run_id)
+
+        damaged_status = json.loads(json.dumps(completed_status))
+        damaged_status["items"][target_id]["semantic_failure"][
+            "preserved_but_unabsorbed"
+        ] = False
+        service.run_store.update_status(run_id, damaged_status)
+        with self.assertRaises(WechatDigestError):
+            service._load_active_capture_artifacts(
+                run_id, plan, service.run_store.status(run_id)
+            )
+        service.run_store.update_status(run_id, completed_status)
+
+        original_source_get = service.source_repository.get
+        source = original_source_get(source_id)
+        with patch.object(
+            service.source_repository,
+            "get",
+            side_effect=lambda candidate: (
+                replace(source, content_hash="sha256:" + "0" * 64)
+                if candidate == source_id
+                else original_source_get(candidate)
+            ),
+        ), self.assertRaises(WechatDigestError):
+            service._load_active_capture_artifacts(run_id, plan, completed_status)
+
+        original_representation_get = service.representation_repository.get
+        representation = original_representation_get(representation_id)
+        with patch.object(
+            service.representation_repository,
+            "get",
+            side_effect=lambda candidate: (
+                replace(representation, source_id="src_" + "0" * 32)
+                if candidate == representation_id
+                else original_representation_get(candidate)
+            ),
+        ), self.assertRaises(WechatDigestError):
+            service._load_active_capture_artifacts(run_id, plan, completed_status)
+
+        original_read_artifact = service.representation_repository.read_artifact
+        with patch.object(
+            service.representation_repository,
+            "read_artifact",
+            side_effect=lambda candidate, artifact_id: (
+                original_read_artifact(candidate, artifact_id) + b"drift"
+                if candidate == representation_id
+                else original_read_artifact(candidate, artifact_id)
+            ),
+        ), self.assertRaises(WechatDigestError):
+            service._load_active_capture_artifacts(run_id, plan, completed_status)
+
+        assert self.semantic.attempt_resolution is not None
+        original_receipt = self.semantic.attempt_resolution
+        damaged_receipt = json.loads(json.dumps(original_receipt))
+        damaged_receipt["digest"]["source_fingerprint"] = (
+            "sha256:" + "0" * 64
+        )
+        self.semantic.attempt_resolution = damaged_receipt
+        try:
+            with self.assertRaises(WechatDigestError):
+                service._load_active_capture_artifacts(
+                    run_id, plan, completed_status
+                )
+        finally:
+            self.semantic.attempt_resolution = original_receipt
         self.assertEqual(self.semantic.provider.calls, provider_calls)
 
     def test_prepare_replays_existing_package_without_provider(self) -> None:
