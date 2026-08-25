@@ -4799,8 +4799,16 @@ class WechatDigestService:
                 and status.get("failure_category")
                 == "SemanticHandoffError"
             )
+            governance_startup_failure_state = (
+                status.get("state") == "failed"
+                and status.get("failure_category") == "RuntimeError"
+            )
             if (
-                not (processing_pre_state or committed_failure_state)
+                not (
+                    processing_pre_state
+                    or committed_failure_state
+                    or governance_startup_failure_state
+                )
                 or status.get("checkpoint_published") is not False
             ):
                 raise WechatDigestError(
@@ -4812,7 +4820,7 @@ class WechatDigestService:
                     status,
                     allow_run_receipt_only=True,
                 )
-            else:
+            elif committed_failure_state:
                 committed_result_wave = self._inspect_committed_result_wave(
                     run_id,
                     plan,
@@ -4822,6 +4830,22 @@ class WechatDigestService:
                 if committed_result_wave is None:
                     raise WechatDigestError(
                         "Semantic reviewed-head continuation committed-result wave 不完整。"
+                    )
+            else:
+                startup_evidence = (
+                    self._build_item_governance_startup_recovery_manifest_unlocked(
+                        authority_ref=authority_ref,
+                        for_reviewed_head_install=True,
+                    )
+                )
+                if startup_evidence.get("reviewed_git_head") != (
+                    self._semantic_authority_binding(
+                        run_id,
+                        allow_reviewed_head_extension=True,
+                    ).reviewed_git_head
+                ):
+                    raise WechatDigestError(
+                        "Semantic reviewed-head continuation Governance authority 漂移。"
                     )
             plan_fingerprint = _plan_fingerprint(plan)
             capture_receipt_fingerprint = plan.get(
@@ -5278,7 +5302,11 @@ class WechatDigestService:
         return _validated_governance_startup_recovery_manifest(candidate)
 
     def _build_item_governance_startup_recovery_manifest_unlocked(
-        self, *, authority_ref: str, allow_existing: bool = False
+        self,
+        *,
+        authority_ref: str,
+        allow_existing: bool = False,
+        for_reviewed_head_install: bool = False,
     ) -> dict[str, object]:
         run_id = self.run_store.active_run_id()
         if run_id is None:
@@ -5314,6 +5342,23 @@ class WechatDigestService:
         if len(candidates) != 1:
             raise WechatDigestError("Governance 单项启动恢复必须唯一绑定 started item。")
         item_id, item = candidates[0]
+        if for_reviewed_head_install and (
+            sum(
+                candidate.get("state") == "represented"
+                for candidate in items.values()
+                if isinstance(candidate, dict)
+            )
+            != 1
+            or any(
+                not isinstance(candidate, dict)
+                or candidate.get("state")
+                not in TERMINAL_ITEM_STATES | {"planned", "represented"}
+                for candidate in items.values()
+            )
+        ):
+            raise WechatDigestError(
+                "Semantic reviewed-head continuation Governance 当前 item 边界不匹配。"
+            )
         receipt = _validated_governance_receipt(item.get("governance_receipt"))
         metrics = _validated_governance_metrics(item.get("governance_metrics"))
         representation_id = item.get("representation_id")
@@ -5400,7 +5445,17 @@ class WechatDigestService:
         semantic_snapshot = self._semantic_port().governance_startup_recovery_snapshot(representation_id)
         window_binding = self._semantic_authority_binding(run_id, allow_reviewed_head_extension=True)
         reviewed_head = semantic_snapshot.get("reviewed_git_head")
-        if reviewed_head != self._semantic_port().reviewed_git_head or window_binding.reviewed_git_head != reviewed_head:
+        target_reviewed_head = self._semantic_port().reviewed_git_head
+        if (
+            window_binding.reviewed_git_head != reviewed_head
+            or for_reviewed_head_install
+            and (
+                re.fullmatch(r"[0-9a-f]{40}", target_reviewed_head) is None
+                or reviewed_head == target_reviewed_head
+            )
+            or not for_reviewed_head_install
+            and reviewed_head != target_reviewed_head
+        ):
             raise WechatDigestError("Governance 单项启动恢复 reviewed head 漂移。")
         recovery_binding = {
             "run_id": run_id,

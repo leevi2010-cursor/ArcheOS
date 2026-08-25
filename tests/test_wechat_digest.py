@@ -1001,6 +1001,9 @@ class SyntheticSemanticHandoff(_SyntheticSemanticHandoffBase):
     def governance_startup_recovery_snapshot(self, representation_id):
         if representation_id != self.latest_representation_id:
             raise RuntimeError("synthetic latest Representation mismatch")
+        reviewed_git_head = getattr(
+            self, "startup_reviewed_git_head", self.reviewed_git_head
+        )
         target_ordinal = getattr(
             self, "startup_target_ordinal", self.global_attempt_total
         )
@@ -1025,7 +1028,7 @@ class SyntheticSemanticHandoff(_SyntheticSemanticHandoffBase):
             "result_binding_fingerprint": "sha256:" + "4" * 64,
             "processing_audit_fingerprint": "sha256:" + "5" * 64,
             "global_authority_fingerprint": "sha256:" + "6" * 64,
-            "reviewed_git_head": self.reviewed_git_head,
+            "reviewed_git_head": reviewed_git_head,
             "execution_contract_fingerprint": "sha256:" + "7" * 64,
             "reviewed_head_sequence": len(self.installed_reviewed_head_continuations),
             "reviewed_head_chain_fingerprint": "sha256:" + "8" * 64,
@@ -4049,6 +4052,145 @@ class WechatDigestTests(unittest.TestCase):
         self.assertEqual(observed["atomic_information_ids"], atomic_ids)
         self.assertEqual(len(service.information_store.list_atomic_information()), 3)
         self.assertEqual(len(service.run_store.governance_startup_retries(run_id)), 1)
+
+    def test_reviewed_head_install_accepts_exact_item_startup_failure_zero_write(
+        self,
+    ) -> None:
+        service, provider, run_id, _item_id, atomic_ids = (
+            self.item_governance_startup_recovery_fixture()
+        )
+        self.semantic.global_attempt_total = 373
+        self.semantic.startup_target_ordinal = 372
+        self.semantic.startup_commit_cursor = 372
+        previous_head = self.semantic.reviewed_git_head
+        self.semantic.startup_reviewed_git_head = previous_head
+        self.semantic.reviewed_git_head = "d" * 40
+        run_dir = service.run_store.runs_root / run_id
+        run_before = {
+            path.relative_to(run_dir): path.read_bytes()
+            for path in run_dir.rglob("*")
+            if path.is_file()
+        }
+        business_before = self.governance_business_state(service)
+        capture_calls = list(service.capture_provider.calls)
+        semantic_calls = self.semantic.provider.calls
+        governance_attempts = provider.attempts
+        authority_ref = (
+            "https://github.com/leevi2010-cursor/ArcheOS/issues/196"
+            "#issuecomment-5416416138"
+        )
+
+        continuation = service.install_semantic_reviewed_head_continuation(
+            authority_ref=authority_ref
+        )
+
+        self.assertEqual(continuation["previous_reviewed_git_head"], previous_head)
+        self.assertEqual(continuation["reviewed_git_head"], "d" * 40)
+        self.assertEqual(continuation["activation_total"], 373)
+        self.assertEqual(continuation["activation_last_global_ordinal"], 373)
+        self.assertEqual(continuation["activation_unknown_count"], 0)
+        self.assertEqual(continuation["next_global_ordinal"], 374)
+        self.assertEqual(
+            {
+                path.relative_to(run_dir): path.read_bytes()
+                for path in run_dir.rglob("*")
+                if path.is_file()
+            },
+            run_before,
+        )
+        self.assertEqual(self.governance_business_state(service), business_before)
+        self.assertEqual(service.capture_provider.calls, capture_calls)
+        self.assertEqual(self.semantic.provider.calls, semantic_calls)
+        self.assertEqual(provider.attempts, governance_attempts)
+        self.assertEqual(
+            service.run_store.governance_startup_recoveries(run_id), ()
+        )
+        self.assertIsNone(service.run_store.checkpoint())
+        self.assertEqual(len(atomic_ids), 3)
+
+    def test_reviewed_head_install_rejects_item_startup_drift_before_write(
+        self,
+    ) -> None:
+        service, provider, run_id, item_id, _atomic_ids = (
+            self.item_governance_startup_recovery_fixture()
+        )
+        previous_head = self.semantic.reviewed_git_head
+        self.semantic.startup_reviewed_git_head = previous_head
+        self.semantic.reviewed_git_head = "d" * 40
+        status_path = service.run_store.runs_root / run_id / "status.json"
+        original = service.run_store.status(run_id)
+        authority_ref = (
+            "https://github.com/leevi2010-cursor/ArcheOS/issues/196"
+            "#issuecomment-5416416138"
+        )
+        semantic_calls = self.semantic.provider.calls
+        governance_attempts = provider.attempts
+
+        for case in (
+            "arbitrary_runtime",
+            "thread",
+            "turn",
+            "model_result",
+            "effect",
+            "candidate",
+            "ledger",
+            "cursor",
+            "head",
+        ):
+            with self.subTest(case=case):
+                status = json.loads(_canonical_json(original))
+                self.semantic.global_unknown = 0
+                self.semantic.startup_reviewed_git_head = previous_head
+                self.semantic.startup_commit_cursor = self.semantic.global_attempt_total
+                if case == "arbitrary_runtime":
+                    status["items"][item_id]["governance_metrics"][
+                        "failure_categories"
+                    ] = {"runtime": 1}
+                elif case == "thread":
+                    status["items"][item_id]["governance_metrics"][
+                        "thread_count"
+                    ] = 1
+                elif case == "turn":
+                    status["items"][item_id]["governance_metrics"][
+                        "turn_count"
+                    ] = 1
+                elif case == "model_result":
+                    status["items"][item_id]["governance_receipt"][
+                        "phase"
+                    ] = "interpreted"
+                elif case == "effect":
+                    status["items"][item_id]["context_object_ids"] = [
+                        "obj_" + "9" * 32
+                    ]
+                elif case == "candidate":
+                    duplicate = json.loads(
+                        _canonical_json(status["items"][item_id])
+                    )
+                    status["items"]["conversation:duplicate"] = duplicate
+                elif case == "ledger":
+                    self.semantic.global_unknown = 1
+                elif case == "cursor":
+                    self.semantic.startup_commit_cursor = (
+                        self.semantic.global_attempt_total - 1
+                    )
+                else:
+                    self.semantic.startup_reviewed_git_head = "e" * 40
+                service.run_store.update_status(run_id, status)
+                before = status_path.read_bytes()
+
+                with self.assertRaises(WechatDigestError):
+                    service.install_semantic_reviewed_head_continuation(
+                        authority_ref=authority_ref
+                    )
+
+                self.assertEqual(status_path.read_bytes(), before)
+                self.assertEqual(
+                    self.semantic.installed_reviewed_head_continuations, []
+                )
+                self.assertEqual(self.semantic.provider.calls, semantic_calls)
+                self.assertEqual(provider.attempts, governance_attempts)
+                self.assertIsNone(service.run_store.checkpoint())
+                service.run_store.update_status(run_id, original)
 
     def test_item_governance_startup_recovery_sdk_preflight_is_before_status_write(self) -> None:
         service, provider, run_id, _item_id, _atomic_ids = self.item_governance_startup_recovery_fixture()
