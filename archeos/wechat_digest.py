@@ -2610,8 +2610,11 @@ class WechatDigestResult:
     semantic_peak_concurrency: int = 0
     semantic_wall_ms: int = 0
     semantic_serial_estimate_ms: int = 0
+    commit_wall_ms: int = 0
+    checkpoint_wall_ms: int = 0
     governance_peak_concurrency: int = 0
     resume_provider_calls: int = 0
+    total_wall_ms: int = 0
 
 
 def _empty_governance_metrics() -> dict[str, object]:
@@ -9099,6 +9102,7 @@ class WechatDigestService:
         all_history: bool = False,
         max_terminal_items: int | None = None,
     ) -> WechatDigestResult:
+        run_started = time.monotonic()
         bootstrap_count = sum((since is not None, from_now, all_history))
         if bootstrap_count > 1:
             raise WechatDigestError(
@@ -9226,7 +9230,10 @@ class WechatDigestService:
                     segment_stop_reason="item_limit",
                     segment_receipt_fingerprint=str(receipt["receipt_fingerprint"]),
                 )
-            return aggregate
+            return replace(
+                aggregate,
+                total_wall_ms=round((time.monotonic() - run_started) * 1000),
+            )
 
     def _reject_cleanup_failed_active_run(self) -> None:
         run_id = self.run_store.active_run_id()
@@ -9255,16 +9262,23 @@ class WechatDigestService:
         ):
             raise WechatDigestError("微信运行不满足 checkpoint 发布条件。")
         upper = WechatCursor.from_dict(plan["upper_bound"], "plan.upper_bound")
-        self.run_store.publish_checkpoint(run_id, upper)
-        completed = dict(status)
-        completed["checkpoint_published"] = True
-        completed["state"] = "completed"
-        completed["failure_category"] = None
-        completed["updated_at"] = self.clock()
-        self.run_store.update_status(run_id, completed)
-        self.run_store.clear_active()
-        if self.run_store.checkpoint() != upper:
-            raise WechatDigestError("微信 checkpoint 完成读回失败。")
+        checkpoint_started = time.monotonic()
+        try:
+            self.run_store.publish_checkpoint(run_id, upper)
+            completed = dict(status)
+            completed["checkpoint_published"] = True
+            completed["state"] = "completed"
+            completed["failure_category"] = None
+            completed["updated_at"] = self.clock()
+            self.run_store.update_status(run_id, completed)
+            self.run_store.clear_active()
+            if self.run_store.checkpoint() != upper:
+                raise WechatDigestError("微信 checkpoint 完成读回失败。")
+        finally:
+            self._segment_performance["checkpoint_wall_ms"] = (
+                self._segment_performance.get("checkpoint_wall_ms", 0)
+                + round((time.monotonic() - checkpoint_started) * 1000)
+            )
         return self._result(run_id, completed, replayed=replayed)
 
     def prepare_next_semantic(
@@ -10209,20 +10223,25 @@ class WechatDigestService:
         capture_ms: int = 0,
     ) -> tuple[dict[str, object], dict[str, object]]:
         created_at = created_at or self.clock()
-        preliminary_plan, _ = _build_plan(
+        slice_started = time.monotonic()
+        preliminary_plan, preliminary_status = _build_plan(
             capture,
             clock=lambda: created_at,
             created_at=created_at,
             semantic_batch_size=self.semantic_batch_size,
             all_history_upper_bound=all_history_upper_bound,
         )
+        if self._segment_performance:
+            self._segment_performance["slice_build_ms"] += round(
+                (time.monotonic() - slice_started) * 1000
+            )
         run_id = str(preliminary_plan["run_id"])
+        publish_started = time.monotonic()
         self.run_store.publish_capture_pending(
             preliminary_plan,
             capture,
             capture_ms=capture_ms,
         )
-        publish_started = time.monotonic()
         receipt = self.run_store.publish_capture_artifacts(
             run_id,
             capture,
@@ -10233,15 +10252,15 @@ class WechatDigestService:
             self._segment_performance["snapshot_publish_ms"] = round(
                 (time.monotonic() - publish_started) * 1000
             )
-        plan, status = _build_plan(
-            capture,
-            clock=lambda: created_at,
-            run_id=run_id,
-            created_at=created_at,
-            semantic_batch_size=self.semantic_batch_size,
-            all_history_upper_bound=all_history_upper_bound,
-            capture_receipt_fingerprint=str(receipt["receipt_fingerprint"]),
-        )
+        plan = {
+            **preliminary_plan,
+            "schema_version": SNAPSHOT_RUN_PLAN_SCHEMA_VERSION,
+            "capture_receipt_fingerprint": str(receipt["receipt_fingerprint"]),
+        }
+        status = {
+            **preliminary_status,
+            "plan_fingerprint": _plan_fingerprint(plan),
+        }
         self.run_store.create(plan, status)
         return plan, status
 
@@ -10774,7 +10793,12 @@ class WechatDigestService:
         previous_fingerprint = _plan_fingerprint(previous_plan)
         existing_receipt = self.run_store.capture_receipt(run_id)
         if existing_receipt is None:
+            pending_started = time.monotonic()
             pending = self.run_store.pending_capture_for_run(run_id)
+            if pending is not None and self._segment_performance:
+                self._segment_performance["snapshot_readback_ms"] += round(
+                    (time.monotonic() - pending_started) * 1000
+                )
             if pending is None:
                 after = WechatCursor.from_dict(
                     previous_plan["after_cursor"], "plan.after_cursor"
@@ -10787,6 +10811,8 @@ class WechatDigestService:
                 if self._segment_performance:
                     self._segment_performance["capture_provider_calls"] += 1
                 capture_ms = round((time.monotonic() - started) * 1000)
+                if self._segment_performance:
+                    self._segment_performance["capture_ms"] += capture_ms
                 self._verify_capture_against_plan(capture, previous_plan)
                 self.run_store.publish_capture_pending(
                     previous_plan,
@@ -10804,10 +10830,15 @@ class WechatDigestService:
                 capture_ms=capture_ms,
             )
         else:
+            readback_started = time.monotonic()
             capture, existing_receipt = self.run_store.load_capture_artifacts(
                 run_id,
                 expected_plan_binding=previous_fingerprint,
             )
+            if self._segment_performance:
+                self._segment_performance["snapshot_readback_ms"] += round(
+                    (time.monotonic() - readback_started) * 1000
+                )
         self._verify_capture_against_plan(capture, previous_plan)
         self._committed_result_wave = committed_result_wave or {}
         if schema == SNAPSHOT_RUN_PLAN_SCHEMA_VERSION:
@@ -10887,12 +10918,17 @@ class WechatDigestService:
         self._segment_performance = {
             "upper_bound_probe_calls": 0,
             "capture_provider_calls": 0,
+            "capture_ms": 0,
             "snapshot_publish_ms": 0,
+            "snapshot_readback_ms": 0,
             "slice_build_ms": 0,
             "semantic_peak_concurrency": 0,
             "semantic_wall_ms": 0,
             "semantic_serial_estimate_ms": 0,
+            "commit_wall_ms": 0,
+            "governance_wall_ms": 0,
             "governance_peak_concurrency": 0,
+            "checkpoint_wall_ms": 0,
             "resume_provider_calls": 0,
             "completed_window_connector_replays": 0,
         }
@@ -10934,6 +10970,7 @@ class WechatDigestService:
                 )
                 self._segment_performance["capture_provider_calls"] += 1
                 capture_ms = round((time.monotonic() - capture_started) * 1000)
+                self._segment_performance["capture_ms"] += capture_ms
                 if next_capture.upper_bound <= upper:
                     raise WechatDigestError(
                         "冻结的微信全历史边界无法继续读回。"
@@ -10952,7 +10989,12 @@ class WechatDigestService:
         else:
             all_history_upper: WechatCursor | None = None
             capture_ms = 0
+            pending_started = time.monotonic()
             pending_capture = self.run_store.pending_capture()
+            if pending_capture is not None:
+                self._segment_performance["snapshot_readback_ms"] += round(
+                    (time.monotonic() - pending_started) * 1000
+                )
             if pending_capture is not None:
                 capture, pending = pending_capture
                 pending_upper = pending.get("all_history_upper_bound")
@@ -11003,6 +11045,7 @@ class WechatDigestService:
                     capture_ms = round(
                         (time.monotonic() - capture_started) * 1000
                     )
+                    self._segment_performance["capture_ms"] += capture_ms
                     if (
                         all_history_upper > ZERO_CURSOR
                         and capture.upper_bound <= ZERO_CURSOR
@@ -11018,6 +11061,7 @@ class WechatDigestService:
                     capture_ms = round(
                         (time.monotonic() - capture_started) * 1000
                     )
+                    self._segment_performance["capture_ms"] += capture_ms
             else:
                 if any((since is not None, from_now, all_history)):
                     raise WechatDigestError(
@@ -11029,6 +11073,7 @@ class WechatDigestService:
                 capture_ms = round(
                     (time.monotonic() - capture_started) * 1000
                 )
+                self._segment_performance["capture_ms"] += capture_ms
             if pending_capture is None:
                 plan, status = self._persist_new_capture_plan(
                     capture,
@@ -11124,7 +11169,7 @@ class WechatDigestService:
                 "capture.index.conversations",
             )
         }
-        self._segment_performance["slice_build_ms"] = round(
+        self._segment_performance["slice_build_ms"] += round(
             (time.monotonic() - slice_started) * 1000
         )
         completed_items = 0
@@ -11207,6 +11252,7 @@ class WechatDigestService:
                 item = self._item(items, item_id)
                 if self._terminal_item_valid(item):
                     continue
+                slice_started = time.monotonic()
                 payload = _conversation_source_payload(
                     capture,
                     str(conversation_plan["conversation_key"]),
@@ -11214,6 +11260,9 @@ class WechatDigestService:
                     message_indexes=conversation_indexes.get(
                         str(conversation_plan["conversation_key"])
                     ),
+                )
+                self._segment_performance["slice_build_ms"] += round(
+                    (time.monotonic() - slice_started) * 1000
                 )
                 if (
                     _sha256_bytes(payload) != conversation_plan["content_hash"]
@@ -11350,11 +11399,17 @@ class WechatDigestService:
                 replayed=replayed,
                 segment_items_completed=completed_items,
             )
-        self.run_store.publish_checkpoint(run_id, upper)
-        converged["checkpoint_published"] = True
-        converged["state"] = "completed"
-        converged["updated_at"] = self.clock()
-        self.run_store.update_status(run_id, converged)
+        checkpoint_started = time.monotonic()
+        try:
+            self.run_store.publish_checkpoint(run_id, upper)
+            converged["checkpoint_published"] = True
+            converged["state"] = "completed"
+            converged["updated_at"] = self.clock()
+            self.run_store.update_status(run_id, converged)
+        finally:
+            self._segment_performance["checkpoint_wall_ms"] += round(
+                (time.monotonic() - checkpoint_started) * 1000
+            )
         return self._result(
             run_id,
             converged,
@@ -11634,6 +11689,7 @@ class WechatDigestService:
             representation.representation_id
         ):
             return representation.representation_id
+        commit_started = time.monotonic()
         atomic_ids = self._semantic(run_id, representation.representation_id, privacy)
         self._update_item(
             run_id,
@@ -11641,9 +11697,13 @@ class WechatDigestService:
             item_id,
             atomic_information_ids=list(atomic_ids),
         )
+        self._segment_performance["commit_wall_ms"] = self._segment_performance.get(
+            "commit_wall_ms", 0
+        ) + round((time.monotonic() - commit_started) * 1000)
         pending, object_ids = self._govern_item(
             run_id, status, item_id, atomic_ids
         )
+        commit_started = time.monotonic()
         self._update_item(
             run_id,
             status,
@@ -11655,6 +11715,9 @@ class WechatDigestService:
             pending_human=pending,
             context_object_ids=list(object_ids),
         )
+        self._segment_performance["commit_wall_ms"] = self._segment_performance.get(
+            "commit_wall_ms", 0
+        ) + round((time.monotonic() - commit_started) * 1000)
         return None
 
     def _process_conversation(
@@ -11727,6 +11790,7 @@ class WechatDigestService:
             representation.representation_id
         ):
             return representation.representation_id
+        commit_started = time.monotonic()
         atomic_ids = self._semantic(
             run_id,
             representation.representation_id,
@@ -11739,9 +11803,13 @@ class WechatDigestService:
             item_id,
             atomic_information_ids=list(atomic_ids),
         )
+        self._segment_performance["commit_wall_ms"] = self._segment_performance.get(
+            "commit_wall_ms", 0
+        ) + round((time.monotonic() - commit_started) * 1000)
         pending, object_ids = self._govern_item(
             run_id, status, item_id, atomic_ids
         )
+        commit_started = time.monotonic()
         self._update_item(
             run_id,
             status,
@@ -11753,6 +11821,9 @@ class WechatDigestService:
             pending_human=pending,
             context_object_ids=list(object_ids),
         )
+        self._segment_performance["commit_wall_ms"] = self._segment_performance.get(
+            "commit_wall_ms", 0
+        ) + round((time.monotonic() - commit_started) * 1000)
         return None
 
     def _existing_semantic_package(self, representation_id: str) -> bool:
@@ -12098,10 +12169,19 @@ class WechatDigestService:
     ) -> tuple[bool, tuple[str, ...]]:
         if not atomic_ids:
             return False, ()
-        with self._governance_execution():
-            return self._govern_item_active(
-                run_id, status, item_id, atomic_ids
-            )
+        started = time.monotonic()
+        try:
+            with self._governance_execution():
+                return self._govern_item_active(
+                    run_id, status, item_id, atomic_ids
+                )
+        finally:
+            elapsed_ms = round((time.monotonic() - started) * 1000)
+            with self._governance_observation_lock:
+                self._segment_performance["governance_wall_ms"] = (
+                    self._segment_performance.get("governance_wall_ms", 0)
+                    + elapsed_ms
+                )
 
     def _govern_item_active(
         self,
@@ -12600,7 +12680,7 @@ class WechatDigestService:
                 result.completed_window_connector_replays for result in results
             ),
             snapshot_bytes=max(result.snapshot_bytes for result in results),
-            capture_ms=max(result.capture_ms for result in results),
+            capture_ms=sum(result.capture_ms for result in results),
             snapshot_publish_ms=sum(
                 result.snapshot_publish_ms for result in results
             ),
@@ -12618,12 +12698,17 @@ class WechatDigestService:
             semantic_serial_estimate_ms=sum(
                 result.semantic_serial_estimate_ms for result in results
             ),
+            commit_wall_ms=sum(result.commit_wall_ms for result in results),
+            checkpoint_wall_ms=sum(
+                result.checkpoint_wall_ms for result in results
+            ),
             governance_peak_concurrency=max(
                 result.governance_peak_concurrency for result in results
             ),
             resume_provider_calls=sum(
                 result.resume_provider_calls for result in results
             ),
+            total_wall_ms=sum(result.total_wall_ms for result in results),
         )
 
     def _result(
@@ -12660,16 +12745,13 @@ class WechatDigestService:
         ]
         readback_started = time.monotonic()
         capture, _capture_receipt = self.run_store.load_capture_artifacts(run_id)
-        summary_path = (
-            self.run_store.runs_root / run_id / "capture" / "summary.json"
-        )
-        summary = self.run_store._read_json(summary_path)
         snapshot_path = (
             self.run_store.runs_root / run_id / "capture" / "snapshot.json"
         )
         snapshot_bytes = snapshot_path.stat().st_size
-        snapshot_readback_ms = round(
-            (time.monotonic() - readback_started) * 1000
+        self._segment_performance["snapshot_readback_ms"] = (
+            self._segment_performance.get("snapshot_readback_ms", 0)
+            + round((time.monotonic() - readback_started) * 1000)
         )
         if _capture_fingerprint(capture) != _capture_receipt.get(
             "capture_fingerprint"
@@ -12707,7 +12789,9 @@ class WechatDigestService:
                 (int(item["turn_wall_ms_max"]) for item in metrics),
                 default=0,
             ),
-            governance_wall_ms=sum(int(item["governance_wall_ms"]) for item in metrics),
+            governance_wall_ms=self._segment_performance.get(
+                "governance_wall_ms", 0
+            ),
             governance_timeouts=sum(int(item["timeout_count"]) for item in metrics),
             governance_failures=sum(int(item["failure_count"]) for item in metrics),
             semantic_preserved_but_unabsorbed=sum(
@@ -12734,11 +12818,13 @@ class WechatDigestService:
                 "completed_window_connector_replays", 0
             ),
             snapshot_bytes=snapshot_bytes,
-            capture_ms=int(summary.get("capture_ms", 0)),
+            capture_ms=self._segment_performance.get("capture_ms", 0),
             snapshot_publish_ms=self._segment_performance.get(
                 "snapshot_publish_ms", 0
             ),
-            snapshot_readback_ms=snapshot_readback_ms,
+            snapshot_readback_ms=self._segment_performance.get(
+                "snapshot_readback_ms", 0
+            ),
             slice_build_ms=self._segment_performance.get("slice_build_ms", 0),
             semantic_parallelism=self.semantic_parallelism,
             semantic_peak_concurrency=self._segment_performance.get(
@@ -12750,10 +12836,15 @@ class WechatDigestService:
             semantic_serial_estimate_ms=self._segment_performance.get(
                 "semantic_serial_estimate_ms", 0
             ),
+            commit_wall_ms=self._segment_performance.get("commit_wall_ms", 0),
+            checkpoint_wall_ms=self._segment_performance.get(
+                "checkpoint_wall_ms", 0
+            ),
             governance_peak_concurrency=self._segment_performance.get(
                 "governance_peak_concurrency", 0
             ),
             resume_provider_calls=self._segment_performance.get(
                 "resume_provider_calls", 0
             ),
+            total_wall_ms=0,
         )

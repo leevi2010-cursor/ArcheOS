@@ -52,6 +52,23 @@ class CliTest(unittest.TestCase):
             context_objects=2,
             checkpoint_published=True,
             replayed=False,
+            capture_ms=3,
+            snapshot_publish_ms=4,
+            snapshot_readback_ms=5,
+            slice_build_ms=6,
+            semantic_wall_ms=12,
+            commit_wall_ms=7,
+            governance_app_server_starts=2,
+            governance_threads=3,
+            governance_turns=4,
+            governance_startup_wall_ms=101,
+            governance_turn_wall_ms_sum=202,
+            governance_turn_wall_ms_max=77,
+            governance_timeouts=1,
+            governance_failures=2,
+            governance_wall_ms=8,
+            checkpoint_wall_ms=2,
+            total_wall_ms=47,
         )
         output = StringIO()
         with redirect_stdout(output):
@@ -62,6 +79,31 @@ class CliTest(unittest.TestCase):
         self.assertIn("已保留但未形成长期信息：0", output.getvalue())
         self.assertIn("已形成长期信息但治理未完整确认：0", output.getvalue())
         self.assertIn("checkpoint：已推进", output.getvalue())
+        self.assertIn(
+            "历史累计治理记录（app-server / thread / turn）：2 / 3 / 4",
+            output.getvalue(),
+        )
+        self.assertIn(
+            "历史累计治理记录（耗时，ms）："
+            "startup=101, turn_sum=202, turn_max=77",
+            output.getvalue(),
+        )
+        self.assertIn("本次治理耗时（ms）：8", output.getvalue())
+        self.assertIn(
+            "历史累计治理记录（timeout / failure）：1 / 2",
+            output.getvalue(),
+        )
+        self.assertNotIn("total=", output.getvalue())
+        performance_line = next(
+            line for line in output.getvalue().splitlines()
+            if line.startswith("性能指标：")
+        )
+        performance = json.loads(performance_line.removeprefix("性能指标："))
+        self.assertEqual(performance["dominant_stage"], "semantic")
+        self.assertEqual(performance["commit_wall_ms"], 7)
+        self.assertEqual(performance["governance_wall_ms"], 8)
+        self.assertEqual(performance["checkpoint_wall_ms"], 2)
+        self.assertEqual(performance["total_wall_ms"], 47)
         digest_service.return_value.run.assert_called_once_with(
             since=None,
             from_now=True,
