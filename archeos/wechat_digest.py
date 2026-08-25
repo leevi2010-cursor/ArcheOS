@@ -15,8 +15,8 @@ import os
 import re
 import stat
 import subprocess
-import threading
 import tempfile
+import threading
 import time
 from collections import Counter
 from collections.abc import Callable, Iterator, Mapping, Sequence
@@ -46,6 +46,10 @@ from .representation import (
     RepresentationError,
     RepresentationService,
     WechatConversationV2RepresentationAdapter,
+)
+from .representation.identity import (
+    canonical_configuration_fingerprint,
+    representation_id,
 )
 from .representation.registry import production_adapter
 from .representation_information import (
@@ -267,6 +271,11 @@ class SemanticHandoffPort(Protocol):
         *,
         parallelism: int,
     ) -> dict[str, int]: ...
+
+    def inspect_recovery_wave(
+        self,
+        requests: Sequence[SemanticResultOnlyRequest],
+    ) -> tuple[dict[str, object], ...]: ...
 
     def validate_pre_attempt_inventory(
         self,
@@ -2224,6 +2233,15 @@ class ExistingSemanticHandoff:
             getattr(self.service, "last_result_only_metrics", {})
         )
         return elapsed
+
+    def inspect_recovery_wave(
+        self,
+        requests: Sequence[SemanticResultOnlyRequest],
+    ) -> tuple[dict[str, object], ...]:
+        providers = tuple(
+            self._new_provider(request.representation_id) for request in requests
+        )
+        return self.service.inspect_recovery_wave(requests, providers)
 
     def validate_pre_attempt_inventory(
         self,
@@ -4236,6 +4254,7 @@ class WechatDigestService:
         self.semantic_batch_size = semantic_batch_size
         self.semantic_parallelism = semantic_parallelism
         self._segment_performance: dict[str, int] = {}
+        self._committed_result_wave: dict[str, dict[str, object]] = {}
 
     @staticmethod
     def _cursor_tuple(cursor: WechatCursor) -> tuple[int, str, str]:
@@ -10471,6 +10490,226 @@ class WechatDigestService:
         )
         return bool(inventories) and "run_receipt_only" in inventories
 
+    def _inspect_committed_result_wave(
+        self,
+        run_id: str,
+        plan: Mapping[str, object],
+        status: Mapping[str, object],
+    ) -> dict[str, dict[str, object]] | None:
+        """Read the durable prepared prefix before normalizing a failed run."""
+
+        if (
+            status.get("state") != "failed"
+            or status.get("failure_category") != "SemanticHandoffError"
+            or status.get("checkpoint_published") is not False
+        ):
+            return None
+        items = status.get("items")
+        if not isinstance(items, dict):
+            raise WechatDigestError(
+                "微信 committed-result wave 状态 items 损坏。"
+            )
+        ordered: list[tuple[str, Mapping[str, object], bool]] = []
+        ordered.extend(
+            (
+                f"attachment:{item['attachment_key']}",
+                item,
+                False,
+            )
+            for item in _plan_sequence(plan.get("attachments"), "attachments")
+        )
+        ordered.extend(
+            (
+                f"conversation:{item['conversation_key']}",
+                item,
+                True,
+            )
+            for item in _plan_sequence(plan.get("conversations"), "conversations")
+        )
+        tail_started = False
+        pristine_started = False
+        wave_items: list[
+            tuple[str, str, SemanticPrivacyBinding]
+        ] = []
+        adapter = WechatConversationV2RepresentationAdapter()
+        configuration_fingerprint = canonical_configuration_fingerprint({})
+        for item_id, item_plan, is_conversation in ordered:
+            item = self._item(items, item_id)
+            if item.get("state") in TERMINAL_ITEM_STATES:
+                if tail_started:
+                    raise WechatDigestError(
+                        "微信 committed-result wave 非终态尾部不连续。"
+                    )
+                continue
+            tail_started = True
+            if not is_conversation or item.get("state") not in {
+                "planned",
+                "represented",
+            }:
+                return None
+            if (
+                item.get("atomic_information_ids") != []
+                or item.get("governance_receipt") is not None
+                or item.get("governance_metrics") is not None
+                or item.get("governance_migration") is not None
+                or item.get("semantic_failure") is not None
+                or item.get("governance_failure") is not None
+                or item.get("pending_human") is not False
+                or item.get("context_object_ids") != []
+                or item.get("privacy_route") is not None
+                or item.get("privacy_categories") != []
+            ):
+                raise WechatDigestError(
+                    "微信 committed-result wave 存在长期业务写入痕迹。"
+                )
+            source_id = str(item_plan["source_id"])
+            expected_representation_id = representation_id(
+                source_id=source_id,
+                source_content_hash=item_plan["content_hash"],
+                kind=adapter.kind,
+                adapter_name=adapter.name,
+                adapter_version=adapter.version,
+                configuration_fingerprint=configuration_fingerprint,
+            )
+            try:
+                source = self.source_repository.get(source_id)
+            except SourceNotFoundError:
+                source = None
+            try:
+                representation = self.representation_repository.get(
+                    expected_representation_id
+                )
+            except RepresentationError:
+                representation = None
+            trace_exists = self._semantic_trace_exists(
+                expected_representation_id
+            )
+            if source is None and representation is None and not trace_exists:
+                pristine_started = True
+                if item.get("state") != "planned" or item.get(
+                    "representation_id"
+                ) is not None:
+                    raise WechatDigestError(
+                        "微信 committed-result wave pristine tail 损坏。"
+                    )
+                continue
+            if source is not None and representation is not None and not trace_exists:
+                return None
+            if pristine_started:
+                raise WechatDigestError(
+                    "微信 committed-result wave durable prefix 不连续。"
+                )
+            if (
+                source is None
+                or source.content_hash != item_plan.get("content_hash")
+                or source.size_bytes != item_plan.get("size_bytes")
+                or not self.source_service.verify(source_id).verified
+                or representation is None
+                or representation.source_id != source_id
+                or representation.representation_id
+                != expected_representation_id
+                or representation.adapter_name != adapter.name
+                or representation.adapter_version != adapter.version
+                or representation.status != "complete"
+                or representation.completeness != 1.0
+                or representation.warnings
+                or not self.representation_service.verify(
+                    expected_representation_id
+                ).verified
+                or not trace_exists
+                or item.get("state") == "represented"
+                and item.get("representation_id")
+                != expected_representation_id
+                or item.get("state") == "planned"
+                and item.get("representation_id") is not None
+            ):
+                raise WechatDigestError(
+                    "微信 committed-result wave Source/Representation binding 损坏。"
+                )
+            privacy = self.privacy_gate.evaluate(
+                self._representation_texts(expected_representation_id),
+                semantic_completeness_known=True,
+            )
+            if privacy.route != "approved":
+                raise WechatDigestError(
+                    "微信 committed-result wave privacy binding 漂移。"
+                )
+            wave_items.append(
+                (
+                    item_id,
+                    expected_representation_id,
+                    self._semantic_privacy_binding(
+                        expected_representation_id, privacy
+                    ),
+                )
+            )
+        if not wave_items:
+            return None
+        authority_binding = self._semantic_authority_binding(run_id)
+        try:
+            inspections = self._semantic_port().inspect_recovery_wave(
+                tuple(
+                    SemanticResultOnlyRequest(
+                        representation_id=representation_id_value,
+                        privacy_binding=privacy_binding,
+                        authority_binding=authority_binding,
+                    )
+                    for _item_id, representation_id_value, privacy_binding in wave_items
+                )
+            )
+        except SemanticHandoffError as exc:
+            raise WechatDigestError(
+                "微信 committed-result wave 未通过只读 preflight。"
+            ) from exc
+        if len(inspections) != len(wave_items):
+            raise WechatDigestError(
+                "微信 committed-result wave inspect 数量不匹配。"
+            )
+        if all(
+            inspection.get("classification") == "pre_provider"
+            for inspection in inspections
+        ):
+            return None
+        if any(
+            inspection.get("classification") == "pre_provider"
+            for inspection in inspections
+        ):
+            raise WechatDigestError(
+                "微信 committed-result wave 不接受混合恢复分类。"
+            )
+        result: dict[str, dict[str, object]] = {}
+        previous_upper: int | None = None
+        for (item_id, representation_id_value, _privacy), inspection in zip(
+            wave_items, inspections, strict=True
+        ):
+            ordinal_range = inspection.get("global_ordinal_range")
+            if (
+                inspection.get("classification")
+                != "recoverable_committed_result_wave"
+                or inspection.get("representation_id")
+                != representation_id_value
+                or inspection.get("phase")
+                not in {
+                    "package_pending_ingestion",
+                    "result_pending_package",
+                    "already_ingested_pending_status",
+                }
+                or not isinstance(ordinal_range, list)
+                or len(ordinal_range) != 2
+                or any(
+                    isinstance(value, bool) or not isinstance(value, int)
+                    for value in ordinal_range
+                )
+                or previous_upper is not None
+                and ordinal_range[0] != previous_upper + 1
+            ):
+                raise WechatDigestError(
+                    "微信 committed-result wave inspect binding 损坏。"
+                )
+            previous_upper = int(ordinal_range[1])
+            result[item_id] = dict(inspection)
+        return result
+
     def _load_or_upgrade_active_capture(
         self,
         run_id: str,
@@ -10485,11 +10724,17 @@ class WechatDigestService:
             raise WechatDigestError(
                 "active legacy 微信运行必须先完成既有显式升级。"
             )
-        normalize_pre_provider_failure = (
-            self._value_error_was_pre_provider(plan, status)
+        committed_result_wave = self._inspect_committed_result_wave(
+            run_id,
+            plan,
+            status,
+        )
+        normalize_recoverable_failure = (
+            committed_result_wave is not None
+            or self._value_error_was_pre_provider(plan, status)
             or self._semantic_handoff_error_was_pre_provider(plan, status)
         )
-        if normalize_pre_provider_failure:
+        if normalize_recoverable_failure:
             self._verify_plan_and_status(
                 run_id,
                 None,
@@ -10539,17 +10784,18 @@ class WechatDigestService:
                 expected_plan_binding=previous_fingerprint,
             )
         self._verify_capture_against_plan(capture, previous_plan)
+        self._committed_result_wave = committed_result_wave or {}
         if schema == SNAPSHOT_RUN_PLAN_SCHEMA_VERSION:
             self._verify_plan_and_status(run_id, capture, plan, status)
             normalized_status = dict(status)
-            if normalize_pre_provider_failure:
+            if normalize_recoverable_failure:
                 normalized_status["state"] = "processing"
                 normalized_status["failure_category"] = None
                 normalized_status["updated_at"] = self.clock()
                 self.run_store.update_status(run_id, normalized_status)
                 if self.run_store.status(run_id) != normalized_status:
                     raise WechatDigestError(
-                        "微信 pre-provider failure 规范化读回失败。"
+                        "微信 recoverable failure 规范化读回失败。"
                     )
             self._verify_plan_and_status(
                 run_id,
@@ -10583,7 +10829,7 @@ class WechatDigestService:
             raise WechatDigestError("微信 capture upgrade 与 v3 plan 不一致。")
         target_status = dict(status)
         target_status["plan_fingerprint"] = _plan_fingerprint(target_plan)
-        if normalize_pre_provider_failure:
+        if normalize_recoverable_failure:
             target_status["state"] = "processing"
             target_status["failure_category"] = None
             target_status["updated_at"] = self.clock()
@@ -10612,6 +10858,7 @@ class WechatDigestService:
         all_history: bool,
         max_terminal_items: int | None = None,
     ) -> WechatDigestResult:
+        self._committed_result_wave = {}
         self._segment_performance = {
             "upper_bound_probe_calls": 0,
             "capture_provider_calls": 0,
@@ -10950,6 +11197,22 @@ class WechatDigestService:
                     raise WechatDigestError(
                         "微信 Conversation Source 重放不一致。"
                     )
+                if item_id in self._committed_result_wave:
+                    self._process_conversation(
+                        run_id,
+                        status,
+                        item_id,
+                        conversation_plan,
+                        payload,
+                        persist_prepared_state=(
+                            item.get("state") == "planned"
+                        ),
+                        recover_committed_result=True,
+                    )
+                    completed_items += 1
+                    if (segment_result := safe_stop_if_needed()) is not None:
+                        return segment_result
+                    continue
                 representation_id = self._process_conversation(
                     run_id,
                     status,
@@ -11379,6 +11642,7 @@ class WechatDigestService:
         *,
         prepare_only: bool = False,
         persist_prepared_state: bool = True,
+        recover_committed_result: bool = False,
     ) -> str | None:
         source_id = str(plan["source_id"])
         self._ensure_source_bytes(
@@ -11438,7 +11702,12 @@ class WechatDigestService:
             representation.representation_id
         ):
             return representation.representation_id
-        atomic_ids = self._semantic(run_id, representation.representation_id, privacy)
+        atomic_ids = self._semantic(
+            run_id,
+            representation.representation_id,
+            privacy,
+            recover_committed_result=recover_committed_result,
+        )
         self._update_item(
             run_id,
             status,
@@ -11480,7 +11749,12 @@ class WechatDigestService:
         return tuple(texts)
 
     def _semantic(
-        self, run_id: str, representation_id: str, privacy: PrivacyDecision
+        self,
+        run_id: str,
+        representation_id: str,
+        privacy: PrivacyDecision,
+        *,
+        recover_committed_result: bool = False,
     ) -> tuple[str, ...]:
         privacy_binding = self._semantic_privacy_binding(
             representation_id, privacy
@@ -11491,7 +11765,7 @@ class WechatDigestService:
             privacy_binding=privacy_binding,
             authority_binding=(
                 None
-                if package_exists
+                if package_exists and not recover_committed_result
                 else self._semantic_authority_binding(run_id)
             ),
         )
