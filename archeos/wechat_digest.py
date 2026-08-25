@@ -4550,10 +4550,13 @@ class WechatDigestService:
                 raise WechatDigestError(
                     "Semantic reviewed-head continuation 只能绑定 frozen campaign。"
                 )
+            after = WechatCursor.from_dict(
+                plan.get("after_cursor"), "plan.after_cursor"
+            )
             checkpoint = self.run_store.checkpoint()
-            if checkpoint is not None:
+            if checkpoint is not None and checkpoint != after:
                 raise WechatDigestError(
-                    "Semantic reviewed-head continuation 要求 checkpoint 未发布。"
+                    "Semantic reviewed-head continuation checkpoint binding 不一致。"
                 )
             status = self.run_store.status(run_id)
             plan_before = _canonical_json(plan)
@@ -4610,7 +4613,7 @@ class WechatDigestService:
                 or _canonical_json(self.run_store.plan(run_id)) != plan_before
                 or _canonical_json(self.run_store.status(run_id))
                 != status_before
-                or self.run_store.checkpoint() is not None
+                or self.run_store.checkpoint() != checkpoint
             ):
                 raise WechatDigestError(
                     "Semantic reviewed-head continuation 安装读回失败。"
