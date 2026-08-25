@@ -9444,6 +9444,7 @@ class WechatDigestService:
             or max_terminal_items < 1
         ):
             raise WechatDigestError("每个微信短执行段的完成项目数必须为正整数。")
+        _require_openai_codex_sdk()
         with self.run_store.lock():
             self._reject_cleanup_failed_active_run()
             session_factory = getattr(self.interpretation_provider, "session", None)
@@ -11367,8 +11368,6 @@ class WechatDigestService:
             governance_startup_recovery = self._installed_item_governance_startup_recovery(
                 active_run_id, status
             )
-            if governance_startup_recovery:
-                _require_openai_codex_sdk()
             capture, plan, status = self._load_or_upgrade_active_capture(
                 active_run_id,
                 plan,

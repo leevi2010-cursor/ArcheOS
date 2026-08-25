@@ -4213,6 +4213,45 @@ class WechatDigestTests(unittest.TestCase):
             _require_openai_codex_sdk()
             importer.assert_called_once_with("openai_codex")
 
+    def test_normal_digest_wrong_sdk_is_pristine_zero_write(self) -> None:
+        capture = SyntheticCaptureProvider([message(1)])
+        service = self.service(capture)
+        before = {
+            path.relative_to(self.workspace).as_posix(): path.read_bytes()
+            for path in self.workspace.rglob("*")
+            if path.is_file()
+        }
+        with patch(
+            "archeos.wechat_digest.importlib.metadata.version",
+            return_value="0.144.3",
+        ), self.assertRaises(RuntimeError):
+            service.run(all_history=True)
+        after = {
+            path.relative_to(self.workspace).as_posix(): path.read_bytes()
+            for path in self.workspace.rglob("*")
+            if path.is_file()
+        }
+        self.assertEqual(after, before)
+        self.assertEqual(capture.calls, [])
+        self.assertEqual(self.semantic.provider.calls, 0)
+        self.assertIsNone(service.run_store.active_run_id())
+        self.assertIsNone(service.run_store.checkpoint())
+
+    def test_normal_digest_correct_sdk_enters_fresh_run(self) -> None:
+        capture = SyntheticCaptureProvider([message(1)])
+        service = self.service(capture)
+        with patch(
+            "archeos.wechat_digest.importlib.metadata.version",
+            return_value="0.144.4",
+        ), patch(
+            "archeos.wechat_digest.importlib.import_module",
+            return_value=ModuleType("openai_codex"),
+        ):
+            result = service.run(all_history=True)
+        self.assertTrue(result.checkpoint_published)
+        self.assertTrue(capture.calls)
+        self.assertEqual(self.semantic.provider.calls, 1)
+
     def test_governance_startup_retry_failure_is_consumed_without_second_call(
         self,
     ) -> None:
