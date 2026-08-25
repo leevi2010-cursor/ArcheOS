@@ -8430,6 +8430,37 @@ class WechatDigestService:
         item: Mapping[str, object],
         pre_status_fingerprint: str,
     ) -> dict[str, object]:
+        terminal = self._attempt_resolution_terminal_binding(
+            run_id=run_id,
+            plan=plan,
+            item_id=item_id,
+            item=item,
+            pre_status_fingerprint=pre_status_fingerprint,
+        )
+        checkpoint = self.run_store.checkpoint()
+        with SQLiteWorldModelRepository(self.database) as repository:
+            business_tree_fingerprint = (
+                self._governance_business_tree_fingerprint(repository)
+            )
+        return {
+            **terminal,
+            "checkpoint_fingerprint": _sha256_bytes(
+                _canonical_json(
+                    checkpoint.to_dict() if checkpoint is not None else None
+                ).encode("utf-8")
+            ),
+            "business_tree_fingerprint": business_tree_fingerprint,
+        }
+
+    def _attempt_resolution_terminal_binding(
+        self,
+        *,
+        run_id: str,
+        plan: Mapping[str, object],
+        item_id: str,
+        item: Mapping[str, object],
+        pre_status_fingerprint: str,
+    ) -> dict[str, object]:
         base = self._unknown_resolution_digest_binding(
             run_id=run_id,
             plan=plan,
@@ -8453,27 +8484,16 @@ class WechatDigestService:
                 "Semantic attempt resolution status binding 漂移。"
             )
         capture_receipt = self.run_store.capture_receipt(run_id)
-        checkpoint = self.run_store.checkpoint()
         source = self.source_repository.get(str(base["source_id"]))
-        with SQLiteWorldModelRepository(self.database) as repository:
-            business_tree_fingerprint = (
-                self._governance_business_tree_fingerprint(repository)
-            )
         return {
             **base,
             "pre_status_fingerprint": pre_status_fingerprint,
             "capture_receipt_fingerprint": _sha256_bytes(
                 _canonical_json(capture_receipt).encode("utf-8")
             ),
-            "checkpoint_fingerprint": _sha256_bytes(
-                _canonical_json(
-                    checkpoint.to_dict() if checkpoint is not None else None
-                ).encode("utf-8")
-            ),
             "source_fingerprint": _sha256_bytes(
                 _canonical_json(asdict(source)).encode("utf-8")
             ),
-            "business_tree_fingerprint": business_tree_fingerprint,
         }
 
     def _commit_attempt_failed_closed_item(
@@ -9941,7 +9961,7 @@ class WechatDigestService:
                 "微信 failed_closed item 不得存在 Durable Atomic Information。"
             )
         binding = (
-            self._attempt_resolution_digest_binding(
+            self._attempt_resolution_terminal_binding(
                 run_id=run_id,
                 plan=plan,
                 item_id=item_id,

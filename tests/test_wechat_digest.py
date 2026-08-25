@@ -52,7 +52,7 @@ from archeos.representation_information import (
     _external_agent_request,
     _units_from_representation,
 )
-from archeos.semantic_handoff import _package_fingerprint
+from archeos.semantic_handoff import SemanticHandoffError, _package_fingerprint
 from archeos.source import LocalManagedSourceRepository
 from archeos.wechat_capture_helper import (
     _all_cursor_rows,
@@ -1057,12 +1057,29 @@ class SyntheticSemanticHandoff(_SyntheticSemanticHandoffBase):
         failed_closed_status_fingerprint,
         resolution_id,
     ):
-        assert self.attempt_resolution is not None
-        assert self.attempt_resolution["resolution_id"] == resolution_id
-        assert self.attempt_resolution["digest"] == {
+        if (
+            self.attempt_resolution is None
+            or self.attempt_resolution["resolution_id"] != resolution_id
+        ):
+            raise SemanticHandoffError(
+                "synthetic attempt resolution receipt drift"
+            )
+        terminal_digest = {
+            key: value
+            for key, value in self.attempt_resolution["digest"].items()
+            if key
+            not in {
+                "checkpoint_fingerprint",
+                "business_tree_fingerprint",
+            }
+        }
+        if terminal_digest != {
             **dict(digest_binding),
             "failed_closed_status_fingerprint": failed_closed_status_fingerprint,
-        }
+        }:
+            raise SemanticHandoffError(
+                "synthetic attempt resolution digest drift"
+            )
         return self.attempt_resolution
 
     def _write_success_audits(
@@ -7454,6 +7471,99 @@ class WechatDigestTests(unittest.TestCase):
             ["planned", "planned"],
         )
         self.assertEqual(self.semantic.provider.calls, 0)
+        business_before = self.governance_business_state(service)
+        processed = service.run()
+        self.assertTrue(processed.checkpoint_published)
+        self.assertIsNotNone(service.run_store.checkpoint())
+        self.assertTrue(
+            any(
+                revision.origin_source_id
+                != final["items"][represented[0]]["source_id"]
+                for revision in service.information_store.list_atomic_information()
+            )
+        )
+        self.assertNotEqual(
+            self.governance_business_state(service), business_before
+        )
+        provider_calls = self.semantic.provider.calls
+        completed_status = service.run_store.status(run_id)
+        service._load_active_capture_artifacts(
+            run_id,
+            service.run_store.plan(run_id),
+            completed_status,
+        )
+        self.assertEqual(self.semantic.provider.calls, provider_calls)
+
+        target_id = represented[0]
+        target_item = completed_status["items"][target_id]
+        source_id = target_item["source_id"]
+        representation_id = target_item["representation_id"]
+        plan = service.run_store.plan(run_id)
+
+        damaged_status = json.loads(json.dumps(completed_status))
+        damaged_status["items"][target_id]["semantic_failure"][
+            "preserved_but_unabsorbed"
+        ] = False
+        service.run_store.update_status(run_id, damaged_status)
+        with self.assertRaises(WechatDigestError):
+            service._load_active_capture_artifacts(
+                run_id, plan, service.run_store.status(run_id)
+            )
+        service.run_store.update_status(run_id, completed_status)
+
+        original_source_get = service.source_repository.get
+        source = original_source_get(source_id)
+        with patch.object(
+            service.source_repository,
+            "get",
+            side_effect=lambda candidate: (
+                replace(source, content_hash="sha256:" + "0" * 64)
+                if candidate == source_id
+                else original_source_get(candidate)
+            ),
+        ), self.assertRaises(WechatDigestError):
+            service._load_active_capture_artifacts(run_id, plan, completed_status)
+
+        original_representation_get = service.representation_repository.get
+        representation = original_representation_get(representation_id)
+        with patch.object(
+            service.representation_repository,
+            "get",
+            side_effect=lambda candidate: (
+                replace(representation, source_id="src_" + "0" * 32)
+                if candidate == representation_id
+                else original_representation_get(candidate)
+            ),
+        ), self.assertRaises(WechatDigestError):
+            service._load_active_capture_artifacts(run_id, plan, completed_status)
+
+        original_read_artifact = service.representation_repository.read_artifact
+        with patch.object(
+            service.representation_repository,
+            "read_artifact",
+            side_effect=lambda candidate, artifact_id: (
+                original_read_artifact(candidate, artifact_id) + b"drift"
+                if candidate == representation_id
+                else original_read_artifact(candidate, artifact_id)
+            ),
+        ), self.assertRaises(WechatDigestError):
+            service._load_active_capture_artifacts(run_id, plan, completed_status)
+
+        assert self.semantic.attempt_resolution is not None
+        original_receipt = self.semantic.attempt_resolution
+        damaged_receipt = json.loads(json.dumps(original_receipt))
+        damaged_receipt["digest"]["source_fingerprint"] = (
+            "sha256:" + "0" * 64
+        )
+        self.semantic.attempt_resolution = damaged_receipt
+        try:
+            with self.assertRaises(WechatDigestError):
+                service._load_active_capture_artifacts(
+                    run_id, plan, completed_status
+                )
+        finally:
+            self.semantic.attempt_resolution = original_receipt
+        self.assertEqual(self.semantic.provider.calls, provider_calls)
 
     def test_prepare_replays_existing_package_without_provider(self) -> None:
         self.create_object()

@@ -10566,9 +10566,29 @@ class _SemanticGlobalAuthority:
             )
         receipt = matches[0]
         digest = receipt.get("digest")
+        terminal_digest = (
+            {
+                key: value
+                for key, value in digest.items()
+                if key
+                not in {
+                    "checkpoint_fingerprint",
+                    "business_tree_fingerprint",
+                }
+            }
+            if isinstance(digest, dict)
+            else None
+        )
         if (
             not isinstance(digest, dict)
-            or digest
+            or set(digest)
+            != set(digest_binding)
+            | {
+                "checkpoint_fingerprint",
+                "business_tree_fingerprint",
+                "failed_closed_status_fingerprint",
+            }
+            or terminal_digest
             != {
                 **dict(digest_binding),
                 "failed_closed_status_fingerprint": (

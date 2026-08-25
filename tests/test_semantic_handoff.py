@@ -11889,7 +11889,15 @@ print("passed")
             receipt,
         )
         handoff.validate_attempt_resolution_digest(
-            digest_binding=digest,
+            digest_binding={
+                key: value
+                for key, value in digest.items()
+                if key
+                not in {
+                    "checkpoint_fingerprint",
+                    "business_tree_fingerprint",
+                }
+            },
             failed_closed_status_fingerprint="sha256:" + "9" * 64,
             resolution_id=receipt["resolution_id"],
         )
