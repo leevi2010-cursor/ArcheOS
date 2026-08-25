@@ -13486,5 +13486,97 @@ print("passed")
         self.assertEqual([len(runner.calls) for runner in runners], [1, 1, 1, 1])
         self.assertLessEqual(wall_ms, sum(elapsed.values()) * 0.45)
 
+    def test_commit_wave_accepts_only_complete_already_ingested_prefix(
+        self,
+    ) -> None:
+        authority = _SemanticGlobalAuthority(self.root / "covered-wave-audits")
+        provider = CodexCliRepresentationAnalysisProvider(
+            provider_version="0.147.0",
+            timeout_seconds=300,
+            runner=FakeRunner(),
+        )
+
+        class Recovery:
+            def __init__(self, semantic_run_id: str) -> None:
+                self.semantic_run_id = semantic_run_id
+
+        first = Recovery("semantic_run_" + "1" * 32)
+        second = Recovery("semantic_run_" + "2" * 32)
+        attempts = [
+            {
+                "schema_version": "semantic-handoff-attempt-receipt/4.0",
+                "semantic_run_id": first.semantic_run_id,
+                "global_ordinal": 81,
+            },
+            {
+                "schema_version": "semantic-handoff-attempt-receipt/4.0",
+                "semantic_run_id": second.semantic_run_id,
+                "global_ordinal": 82,
+            },
+        ]
+
+        @contextmanager
+        def unlocked():
+            yield
+
+        patches = (
+            patch.object(
+                authority,
+                "_locked",
+                side_effect=lambda **_kwargs: unlocked(),
+            ),
+            patch.object(authority, "_load_grant", return_value={}),
+            patch.object(
+                authority,
+                "_global_attempts",
+                return_value=(attempts, False),
+            ),
+            patch.object(
+                authority,
+                "_current_commit_cursor",
+                return_value={"committed_global_ordinal": 81},
+            ),
+        )
+        with patches[0], patches[1], patches[2], patches[3]:
+            self.assertEqual(
+                authority.validate_commit_wave(
+                    (first, second),
+                    phases=(
+                        "already_ingested_pending_status",
+                        "result_pending_package",
+                    ),
+                    window=self.semantic_window_binding(),
+                    provider=provider,
+                ),
+                ((81, 81), (82, 82)),
+            )
+            with self.assertRaises(SemanticHandoffError):
+                authority.validate_commit_wave(
+                    (first, second),
+                    phases=(
+                        "package_pending_ingestion",
+                        "result_pending_package",
+                    ),
+                    window=self.semantic_window_binding(),
+                    provider=provider,
+                )
+        attempts[:] = [
+            {
+                "schema_version": "semantic-handoff-attempt-receipt/4.0",
+                "semantic_run_id": first.semantic_run_id,
+                "global_ordinal": ordinal,
+            }
+            for ordinal in (81, 82)
+        ]
+        with patches[0], patches[1], patches[2], patches[3], self.assertRaises(
+            SemanticHandoffError
+        ):
+            authority.validate_commit_wave(
+                (first,),
+                phases=("already_ingested_pending_status",),
+                window=self.semantic_window_binding(),
+                provider=provider,
+            )
+
 if __name__ == "__main__":
     unittest.main()

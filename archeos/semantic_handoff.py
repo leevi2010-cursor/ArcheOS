@@ -12130,13 +12130,22 @@ class _SemanticGlobalAuthority:
         self,
         recoveries: Sequence[_SemanticRecoveryRun],
         *,
+        phases: Sequence[str],
         window: SemanticWindowAuthorityBinding,
         provider: CodexCliRepresentationAnalysisProvider,
     ) -> tuple[tuple[int, int], ...]:
         """Read one ordered committed-result wave without advancing its cursor."""
 
         if not recoveries:
+            if phases:
+                raise SemanticHandoffError(
+                    "Semantic committed-result wave phase 数量不匹配。"
+                )
             return ()
+        if len(recoveries) != len(phases):
+            raise SemanticHandoffError(
+                "Semantic committed-result wave phase 数量不匹配。"
+            )
         with self._locked():
             grant = self._load_grant(window, provider)
             attempts, unknown = self._global_attempts(grant)
@@ -12151,7 +12160,9 @@ class _SemanticGlobalAuthority:
             )
             ranges: list[tuple[int, int]] = []
             seen: set[str] = set()
-            for recovery in recoveries:
+            previous_upper: int | None = None
+            uncovered_started = False
+            for recovery, phase in zip(recoveries, phases, strict=True):
                 if recovery.semantic_run_id in seen:
                     raise SemanticHandoffError(
                         "Semantic committed-result wave identity 重复。"
@@ -12174,13 +12185,36 @@ class _SemanticGlobalAuthority:
                 lower, upper = min(ordinals), max(ordinals)
                 if (
                     ordinals != list(range(lower, upper + 1))
-                    or lower != current + 1
+                    or previous_upper is not None
+                    and lower != previous_upper + 1
                 ):
                     raise SemanticHandoffError(
                         "Semantic committed-result wave global ordinal 不连续。"
                     )
+                if lower <= current < upper:
+                    raise SemanticHandoffError(
+                        "Semantic committed-result wave cursor 落在 range 中间。"
+                    )
+                if upper <= current:
+                    if (
+                        uncovered_started
+                        or phase != "already_ingested_pending_status"
+                    ):
+                        raise SemanticHandoffError(
+                            "Semantic committed-result wave 已提交前缀状态不匹配。"
+                        )
+                else:
+                    if not uncovered_started and lower != current + 1:
+                        raise SemanticHandoffError(
+                            "Semantic committed-result wave suffix 起点不连续。"
+                        )
+                    uncovered_started = True
                 ranges.append((lower, upper))
-                current = upper
+                previous_upper = upper
+            if not uncovered_started and ranges[-1][1] != current:
+                raise SemanticHandoffError(
+                    "Semantic committed-result wave 已提交前缀未对齐 cursor。"
+                )
             return tuple(ranges)
 
     def commit_range(
@@ -14776,6 +14810,10 @@ class ExternalAgentSemanticHandoffService:
         if recoveries:
             ranges = authority.validate_commit_wave(
                 recoveries,
+                phases=tuple(
+                    str(inspection["phase"])
+                    for inspection in inspections
+                ),
                 window=requests[0].authority_binding,
                 provider=providers[0],
             )

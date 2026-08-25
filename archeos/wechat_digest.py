@@ -11204,7 +11204,9 @@ class WechatDigestService:
                         item_id,
                         conversation_plan,
                         payload,
-                        persist_prepared_state=False,
+                        persist_prepared_state=(
+                            item.get("state") == "planned"
+                        ),
                         recover_committed_result=True,
                     )
                     completed_items += 1

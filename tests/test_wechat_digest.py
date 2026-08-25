@@ -7343,16 +7343,42 @@ class WechatDigestTests(unittest.TestCase):
             2,
         )
 
-        first_resume = service.run(max_terminal_items=1)
+        original_update = service._update_item
+        interrupted_after_commit = False
 
-        self.assertEqual(first_resume.resume_provider_calls, 0)
+        def interrupt_before_semantic_status(*args, **changes):
+            nonlocal interrupted_after_commit
+            if (
+                not interrupted_after_commit
+                and "atomic_information_ids" in changes
+                and "state" not in changes
+            ):
+                interrupted_after_commit = True
+                raise SemanticHandoffError(
+                    "synthetic post-commit status interruption"
+                )
+            return original_update(*args, **changes)
+
+        with patch.object(
+            service,
+            "_update_item",
+            side_effect=interrupt_before_semantic_status,
+        ), self.assertRaises(WechatDigestError):
+            service.run(max_terminal_items=1)
+
+        self.assertTrue(interrupted_after_commit)
         self.assertEqual(len(runner.calls), 2)
         self.assertEqual(len(capture_provider.calls), 1)
+        after_commit = service.run_store.status(run_id)
+        self.assertEqual(after_commit["state"], "failed")
         self.assertEqual(
-            semantic.service.global_attempt_summary(representation_ids[1]),
-            attempt_summary,
+            after_commit["failure_category"],
+            "SemanticHandoffError",
         )
-        after_first = service.run_store.status(run_id)
+        self.assertEqual(
+            [item["state"] for item in after_commit["items"].values()],
+            ["represented", "planned"],
+        )
         cursor_path = (
             semantic.service.audit_root
             / "semantic_global_authority"
@@ -7361,10 +7387,15 @@ class WechatDigestTests(unittest.TestCase):
         self.assertTrue(cursor_path.exists())
         cursor = json.loads(cursor_path.read_text(encoding="utf-8"))
         self.assertEqual(cursor["committed_global_ordinal"], 81)
-        first_item_after = next(
-            dict(item)
-            for item in after_first["items"].values()
-            if item["state"] in TERMINAL_ITEM_STATES
+        after_commit_inspections = service._inspect_committed_result_wave(
+            run_id,
+            plan,
+            after_commit,
+        )
+        assert after_commit_inspections is not None
+        self.assertEqual(
+            [item["phase"] for item in after_commit_inspections.values()],
+            ["already_ingested_pending_status", "result_pending_package"],
         )
         self.assertEqual(
             {
@@ -7377,10 +7408,17 @@ class WechatDigestTests(unittest.TestCase):
         self.assertFalse(second_package.exists())
         first_atomic = service.information_store.list_atomic_information()
         self.assertEqual(len(first_atomic), 1)
+        self.assertTrue(
+            all(
+                item.get("governance_receipt") is None
+                for item in after_commit["items"].values()
+            )
+        )
 
-        second_resume = service.run(max_terminal_items=1)
+        resumed = service.run(max_terminal_items=2)
 
-        self.assertEqual(second_resume.resume_provider_calls, 0)
+        self.assertEqual(resumed.resume_provider_calls, 0)
+        self.assertEqual(resumed.segment_items_completed, 2)
         self.assertEqual(len(runner.calls), 2)
         self.assertEqual(len(capture_provider.calls), 1)
         self.assertEqual(
@@ -7390,12 +7428,21 @@ class WechatDigestTests(unittest.TestCase):
         cursor = json.loads(cursor_path.read_text(encoding="utf-8"))
         self.assertEqual(cursor["committed_global_ordinal"], 82)
         final = service.run_store.status(run_id)
-        final_first_item = next(
-            dict(item)
+        final_items_by_representation = {
+            item.get("representation_id"): item
             for item in final["items"].values()
-            if item.get("representation_id") == representation_ids[0]
+        }
+        self.assertEqual(
+            set(final_items_by_representation),
+            set(representation_ids),
         )
-        self.assertEqual(final_first_item, first_item_after)
+        self.assertTrue(
+            all(
+                item["state"] in TERMINAL_ITEM_STATES
+                and item.get("governance_receipt") is not None
+                for item in final_items_by_representation.values()
+            )
+        )
         self.assertTrue(second_package.is_dir())
         self.assertEqual(
             {
@@ -7421,6 +7468,35 @@ class WechatDigestTests(unittest.TestCase):
         )
         self.assertEqual(service.proposal_store.list_history(), ())
         self.assertEqual(service.journal.list_changes(), ())
+        self.assertEqual(service.run_store.checkpoint(), capture.upper_bound)
+        service._verify_plan_and_status(run_id, capture, plan, final)
+
+        reopened_store = WechatDigestRunStore(
+            self.workspace / "02_processing" / "wechat_digest"
+        )
+        reopened = WechatDigestService(
+            workspace=self.workspace,
+            capture_provider=capture_provider,
+            semantic_handoff_factory=lambda: semantic,
+            interpretation_provider=NoStructuralChangeProvider(),
+            semantic_batch_size=50,
+            semantic_parallelism=2,
+            run_store=reopened_store,
+        )
+        reopened_plan = reopened_store.plan(run_id)
+        reopened_status = reopened_store.status(run_id)
+        reopened_capture, _receipt = reopened_store.load_capture_artifacts(
+            run_id,
+            plan=reopened_plan,
+        )
+        reopened._verify_plan_and_status(
+            run_id,
+            reopened_capture,
+            reopened_plan,
+            reopened_status,
+        )
+        self.assertEqual(reopened_store.checkpoint(), capture.upper_bound)
+        self.assertEqual(len(capture_provider.calls), 1)
 
     def test_committed_wave_drift_fails_before_recovery_status_write(self) -> None:
         for case in ("phase", "ordinal", "status"):
