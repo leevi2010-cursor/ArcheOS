@@ -3532,6 +3532,17 @@ def _analysis_batches(
     )
 
 
+def _complete_context_analysis_batch(
+    units: Sequence[RepresentationAnalysisUnit],
+) -> RepresentationAnalysisBatch | None:
+    """Build the one canonical batch used for a complete-context execution."""
+
+    eligible = tuple(unit for unit in units if unit.analysis_eligible)
+    if not eligible:
+        return None
+    return _analysis_batch(eligible, {unit.unit_id: unit for unit in units})
+
+
 def _analysis_batches_for_anchor_unit_ids(
     units: Sequence[RepresentationAnalysisUnit],
     anchor_unit_id_batches: Sequence[Sequence[str]],

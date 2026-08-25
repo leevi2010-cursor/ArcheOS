@@ -46,6 +46,7 @@ from .representation_information import (
     RepresentationInformationService,
     _analysis_batches,
     _analysis_batches_for_anchor_unit_ids,
+    _complete_context_analysis_batch,
     _diagnostic_root_is_safe,
     _external_agent_prompt,
     _external_agent_request,
@@ -939,7 +940,12 @@ class _SemanticRecoveryRun:
         global_authority: _SemanticGlobalAuthority | None = None,
         window_binding: SemanticWindowAuthorityBinding | None = None,
         complete_context: bool = False,
+        legacy_complete_context_replay: bool = False,
     ) -> None:
+        if legacy_complete_context_replay and not complete_context:
+            raise SemanticHandoffError(
+                "Legacy complete-context candidate 仅允许只读重放。"
+            )
         if (
             not isinstance(privacy, SemanticPrivacyBinding)
             or privacy.route != "approved"
@@ -959,6 +965,7 @@ class _SemanticRecoveryRun:
         )
         self.provider = provider
         self.complete_context = complete_context
+        self.legacy_complete_context_replay = legacy_complete_context_replay
         self.privacy = privacy
         self.global_authority = global_authority
         self.window_binding = window_binding
@@ -981,11 +988,17 @@ class _SemanticRecoveryRun:
             self.units, representation_service.batch_size
         )
         eligible_units = tuple(unit for unit in self.units if unit.analysis_eligible)
-        self.batches = (
-            (RepresentationAnalysisBatch(anchor_units=eligible_units),)
-            if complete_context and eligible_units
-            else canonical_batches
-        )
+        if complete_context:
+            complete_batch = _complete_context_analysis_batch(self.units)
+            if legacy_complete_context_replay and complete_batch is not None:
+                complete_batch = RepresentationAnalysisBatch(
+                    anchor_units=eligible_units
+                )
+            self.batches = (() if complete_batch is None else (complete_batch,))
+        else:
+            self.batches = _analysis_batches(
+                self.units, representation_service.batch_size
+            )
         if not self.batches:
             raise SemanticHandoffError("Semantic recovery 没有可执行的 canonical batch。")
         self.batch_contracts = tuple(
@@ -1234,6 +1247,10 @@ class _SemanticRecoveryRun:
         )
 
     def ensure_run_receipt(self) -> None:
+        if self.legacy_complete_context_replay:
+            raise SemanticHandoffError(
+                "Legacy complete-context candidate 不得创建新执行。"
+            )
         _validate_shared_recovery_root(self.audit_root, create=True)
         if self.exists:
             self._converge_run_receipt()
@@ -1764,7 +1781,7 @@ class _SemanticRecoveryRun:
                 raise SemanticHandoffError("Semantic reserved inventory 损坏。")
 
     def inspect(
-        self,
+        self, *, reject_conflicting_execution_runs: bool = True
     ) -> tuple[
         tuple[
             tuple[RepresentationAnalysisResult, ExternalAgentExecutionRecord]
@@ -1777,7 +1794,8 @@ class _SemanticRecoveryRun:
             self.audit_root, create=False
         ):
             return tuple(None for _ in self.batches), 0
-        self._reject_conflicting_execution_runs()
+        if reject_conflicting_execution_runs:
+            self._reject_conflicting_execution_runs()
         if not self.exists:
             return tuple(None for _ in self.batches), 0
         self._validate_inventory()
@@ -11228,6 +11246,10 @@ class _RecoveryAwareProvider:
         authority_guard: object | None = None,
         global_grant: Mapping[str, object] | None = None,
     ) -> None:
+        if recovery.legacy_complete_context_replay:
+            raise SemanticHandoffError(
+                "Legacy complete-context candidate 不得启动 Provider。"
+            )
         self.provider = provider
         self.recovery = recovery
         self.global_authority = global_authority
@@ -12605,29 +12627,16 @@ def validate_completed_published_audits(
         ):
             raise SemanticHandoffError("已发布的信息包批次清单不可读。")
         batch_unit_ids.append(tuple(unit_ids))
-    representation = representation_service.representation_repository.get(
-        representation_id
+    candidates = _published_batch_contract_candidates(
+        representation_service,
+        representation_id,
+        batch_unit_ids,
+        protocol_version=protocol_version,
+        include_legacy_complete_context=True,
     )
-    try:
-        batches = _analysis_batches_for_anchor_unit_ids(
-            _units_from_representation(
-                representation,
-                representation_service.representation_repository,
-            ),
-            batch_unit_ids,
-        )
-    except RepresentationInformationError as exc:
-        raise SemanticHandoffError(
-            "已发布的信息包批次不再匹配 canonical Analysis Units。"
-        ) from exc
-    expected: dict[tuple[str, ...], str] = {}
-    for batch_unit_id, batch in zip(batch_unit_ids, batches, strict=True):
-        _, fingerprint = _external_agent_request(
-            batch, protocol_version=protocol_version
-        )
-        if batch_unit_id in expected:
-            raise SemanticHandoffError("已发布的信息包批次 identity 冲突。")
-        expected[batch_unit_id] = fingerprint
+    expected = dict(
+        _select_published_batch_contract_candidate(tuple(paths), candidates)
+    )
     _validate_versioned_published_audits(
         paths=tuple(paths),
         expected=expected,
@@ -12637,6 +12646,84 @@ def validate_completed_published_audits(
         completed_only=True,
     )
     return tuple(paths)
+
+
+def _published_batch_contract_candidates(
+    representation_service: RepresentationInformationService,
+    representation_id: str,
+    batch_unit_ids: Sequence[Sequence[str]],
+    *,
+    protocol_version: str,
+    include_legacy_complete_context: bool,
+) -> tuple[tuple[tuple[tuple[str, ...], str], ...], ...]:
+    representation = representation_service.representation_repository.get(
+        representation_id
+    )
+    units = _units_from_representation(
+        representation,
+        representation_service.representation_repository,
+    )
+    try:
+        batches = _analysis_batches_for_anchor_unit_ids(units, batch_unit_ids)
+    except RepresentationInformationError as exc:
+        raise SemanticHandoffError(
+            "已发布的信息包批次不再匹配 canonical Analysis Units。"
+        ) from exc
+
+    def contracts_for(
+        candidate_batches: Sequence[RepresentationAnalysisBatch],
+    ) -> tuple[tuple[tuple[str, ...], str], ...]:
+        contracts: list[tuple[tuple[str, ...], str]] = []
+        for unit_ids, batch in zip(batch_unit_ids, candidate_batches, strict=True):
+            anchor_unit_ids = tuple(unit.unit_id for unit in batch.anchor_units)
+            if tuple(unit_ids) != anchor_unit_ids:
+                raise SemanticHandoffError(
+                    "已发布的信息包批次不再匹配 canonical Analysis Units。"
+                )
+            _, fingerprint = _external_agent_request(
+                batch, protocol_version=protocol_version
+            )
+            contracts.append((anchor_unit_ids, fingerprint))
+        return tuple(contracts)
+
+    candidates = [contracts_for(batches)]
+    if (
+        include_legacy_complete_context
+        and len(batches) == 1
+        and batches[0].context_support_units
+    ):
+        legacy = RepresentationAnalysisBatch(anchor_units=batches[0].anchor_units)
+        candidates.append(contracts_for((legacy,)))
+    return tuple(candidates)
+
+
+def _select_published_batch_contract_candidate(
+    paths: tuple[Path, ...],
+    candidates: Sequence[tuple[tuple[tuple[str, ...], str], ...]],
+) -> tuple[tuple[tuple[str, ...], str], ...]:
+    observed: dict[tuple[str, ...], str] = {}
+    for path in paths:
+        audit = _private_json_exact(path)
+        anchor_unit_ids = audit.get("anchor_unit_ids")
+        input_fingerprint = audit.get("input_fingerprint")
+        if (
+            not isinstance(anchor_unit_ids, list)
+            or not anchor_unit_ids
+            or any(not isinstance(item, str) for item in anchor_unit_ids)
+            or not _sha256_fingerprint(input_fingerprint)
+        ):
+            raise SemanticHandoffError("已发布的信息包审计批次合同不可读。")
+        batch = tuple(anchor_unit_ids)
+        if batch in observed:
+            raise SemanticHandoffError("已发布的信息包审计批次合同不唯一。")
+        assert isinstance(input_fingerprint, str)
+        observed[batch] = input_fingerprint
+    matches = [candidate for candidate in candidates if dict(candidate) == observed]
+    if len(matches) != 1:
+        raise SemanticHandoffError(
+            "已发布的信息包没有唯一可重放的批次合同。"
+        )
+    return matches[0]
 
 
 class ExternalAgentSemanticHandoffService:
@@ -12671,7 +12758,7 @@ class ExternalAgentSemanticHandoffService:
         package = self.representation_service.output_root / representation_id
         if os.path.lexists(package):
             if privacy_binding is not None:
-                recovery = _SemanticRecoveryRun(
+                canonical_complete = _SemanticRecoveryRun(
                     self.representation_service,
                     self.audit_root,
                     representation_id,
@@ -12685,8 +12772,27 @@ class ExternalAgentSemanticHandoffService:
                     window_binding=None,
                     complete_context=True,
                 )
-                if not recovery.exists or not recovery.result_only_wave:
-                    recovery = _SemanticRecoveryRun(
+                recovery_candidates = [canonical_complete]
+                if canonical_complete.batches[0].context_support_units:
+                    recovery_candidates.append(
+                        _SemanticRecoveryRun(
+                            self.representation_service,
+                            self.audit_root,
+                            representation_id,
+                            provider,
+                            privacy_binding,
+                            global_authority=(
+                                _SemanticGlobalAuthority(self.audit_root)
+                                if authority_binding is not None
+                                else None
+                            ),
+                            window_binding=None,
+                            complete_context=True,
+                            legacy_complete_context_replay=True,
+                        )
+                    )
+                recovery_candidates.append(
+                    _SemanticRecoveryRun(
                         self.representation_service,
                         self.audit_root,
                         representation_id,
@@ -12699,13 +12805,45 @@ class ExternalAgentSemanticHandoffService:
                         ),
                         window_binding=None,
                     )
-                if recovery.exists:
+                )
+                unique_candidates = {
+                    candidate.semantic_run_id: candidate
+                    for candidate in recovery_candidates
+                }
+                existing_candidates = tuple(
+                    candidate
+                    for candidate in unique_candidates.values()
+                    if candidate.exists
+                )
+                matching_candidates: list[_SemanticRecoveryRun] = []
+                for candidate in existing_candidates:
+                    try:
+                        self._validate_recovery_package_candidate(
+                            representation_id,
+                            package,
+                            provider,
+                            candidate,
+                        )
+                    except SemanticHandoffError:
+                        continue
+                    matching_candidates.append(candidate)
+                if len(matching_candidates) > 1:
+                    raise SemanticHandoffError(
+                        "完整 Semantic recovery package 未能安全收敛；"
+                        "匹配多个合同且未执行 Provider。"
+                    )
+                if len(matching_candidates) == 1:
                     return self._resume_recovery_package(
                         representation_id,
                         package,
                         provider,
-                        recovery,
+                        matching_candidates[0],
                         authority_binding=authority_binding,
+                    )
+                if existing_candidates:
+                    raise SemanticHandoffError(
+                        "完整 Semantic recovery package 未能安全收敛；"
+                        "没有唯一合同且未执行 Provider。"
                     )
             try:
                 manifest = self._verify_replay_input(representation_id, package)
@@ -13541,6 +13679,11 @@ class ExternalAgentSemanticHandoffService:
         # Reserve complete Representation ranges in plan order. Global ordinals
         # therefore cannot interleave A/B while packages later commit A then B.
         authority.publish_attempts(tuple(reservations))
+        for request, recovery, wrapper, _missing in lanes:
+            recovery._validated_global_grant = authority._load_grant(
+                request.authority_binding,
+                wrapper.provider,
+            )
         failures: list[BaseException] = []
         active = 0
         peak = 0
@@ -13604,6 +13747,52 @@ class ExternalAgentSemanticHandoffService:
                 )
         return elapsed
 
+    def _validate_recovery_package_candidate(
+        self,
+        representation_id: str,
+        package: Path,
+        provider: CodexCliRepresentationAnalysisProvider,
+        recovery: _SemanticRecoveryRun,
+    ) -> None:
+        loaded, unknown = recovery.inspect(
+            reject_conflicting_execution_runs=False
+        )
+        if unknown or any(item is None for item in loaded):
+            raise SemanticHandoffError(
+                "Partial Semantic recovery 不得匹配完整 package。"
+            )
+        records = [item[1] for item in loaded if item is not None]
+        manifest = self._verify_replay_input(representation_id, package)
+        if manifest.get("provider") != _provider_manifest(provider):
+            raise SemanticHandoffError(
+                "当前 recovery 信息包 Provider execution profile 不匹配。"
+            )
+        expected_batches = tuple(
+            (
+                tuple(receipt["anchor_unit_ids"]),
+                str(receipt["input_fingerprint"]),
+            )
+            for contract in recovery.batch_contracts
+            for receipt in (contract["receipt"],)
+            if isinstance(receipt, dict)
+        )
+        self._validate_execution_records(records, expected_batches, provider)
+        package_fingerprint = _package_fingerprint(package)
+        audit_paths = self._matching_audit_paths(package_fingerprint)
+        if recovery.legacy_complete_context_replay and not audit_paths:
+            raise SemanticHandoffError(
+                "Legacy complete-context recovery 缺少 durable audit。"
+            )
+        if audit_paths:
+            self._validate_replay_audits(
+                audit_paths,
+                expected_batches,
+                manifest,
+                package_fingerprint,
+                protocol_version=EXTERNAL_AGENT_PROTOCOL_VERSION,
+                records=records,
+            )
+
     def _resume_recovery_package(
         self,
         representation_id: str,
@@ -13624,7 +13813,9 @@ class ExternalAgentSemanticHandoffService:
                     provider=provider,
                     commit=False,
                 )
-            loaded, unknown = recovery.inspect()
+            loaded, unknown = recovery.inspect(
+                reject_conflicting_execution_runs=False
+            )
             if unknown or any(item is None for item in loaded):
                 raise SemanticHandoffError(
                     "Partial Semantic recovery 不得作为完整 package authority。"
@@ -13654,6 +13845,7 @@ class ExternalAgentSemanticHandoffService:
                     manifest,
                     package_fingerprint,
                     protocol_version=EXTERNAL_AGENT_PROTOCOL_VERSION,
+                    records=records,
                 )
             else:
                 audit_paths = self._persist_audits(
@@ -13863,9 +14055,6 @@ class ExternalAgentSemanticHandoffService:
         manifest_batches = manifest.get("batches")
         if not isinstance(manifest_batches, list):
             raise SemanticHandoffError("已存在的信息包批次清单不可读。")
-        representation = self.representation_service.representation_repository.get(
-            representation_id
-        )
         batch_unit_ids: list[tuple[str, ...]] = []
         for package_batch in manifest_batches:
             if not isinstance(package_batch, dict):
@@ -13878,29 +14067,18 @@ class ExternalAgentSemanticHandoffService:
             ):
                 raise SemanticHandoffError("已存在的信息包批次清单不可读。")
             batch_unit_ids.append(tuple(unit_ids))
-        try:
-            batches = _analysis_batches_for_anchor_unit_ids(
-                _units_from_representation(
-                    representation, self.representation_service.representation_repository
-                ),
-                batch_unit_ids,
+        candidates = _published_batch_contract_candidates(
+            self.representation_service,
+            representation_id,
+            batch_unit_ids,
+            protocol_version=protocol_version,
+            include_legacy_complete_context=False,
+        )
+        if len(candidates) != 1:
+            raise SemanticHandoffError(
+                "当前 canonical Analysis Unit 批次不唯一。"
             )
-        except RepresentationInformationError as exc:
-            raise SemanticHandoffError("当前 canonical Analysis Unit 批次不再匹配信息包。") from exc
-        if len(batches) != len(manifest_batches):
-            raise SemanticHandoffError("当前 canonical Analysis Unit 批次不再匹配信息包。")
-        contracts: list[tuple[tuple[str, ...], str]] = []
-        for package_batch, batch in zip(manifest_batches, batches, strict=True):
-            if not isinstance(package_batch, dict):
-                raise SemanticHandoffError("已存在的信息包批次清单不可读。")
-            anchor_unit_ids = tuple(unit.unit_id for unit in batch.anchor_units)
-            if package_batch.get("unit_ids") != list(anchor_unit_ids):
-                raise SemanticHandoffError("当前 canonical Analysis Unit 批次不再匹配信息包。")
-            _, fingerprint = _external_agent_request(
-                batch, protocol_version=protocol_version
-            )
-            contracts.append((anchor_unit_ids, fingerprint))
-        return tuple(contracts)
+        return candidates[0]
 
     def _validate_execution_records(
         self,
@@ -13960,6 +14138,7 @@ class ExternalAgentSemanticHandoffService:
         package_fingerprint: str,
         *,
         protocol_version: str,
+        records: Sequence[ExternalAgentExecutionRecord] = (),
     ) -> None:
         _validate_versioned_published_audits(
             paths=paths,
@@ -13969,6 +14148,42 @@ class ExternalAgentSemanticHandoffService:
             package_fingerprint=package_fingerprint,
             completed_only=False,
         )
+        if records:
+            expected_records = {
+                record.processing_run_id: record for record in records
+            }
+            if len(expected_records) != len(records):
+                raise SemanticHandoffError(
+                    "当前信息包 Processing Run identity 不唯一。"
+                )
+            observed_records: set[str] = set()
+            for path in paths:
+                audit = _private_json_exact(path)
+                processing_run_id = audit.get("processing_run_id")
+                record = (
+                    expected_records.get(processing_run_id)
+                    if isinstance(processing_run_id, str)
+                    else None
+                )
+                if (
+                    record is None
+                    or processing_run_id in observed_records
+                    or audit.get("input_fingerprint")
+                    != record.input_fingerprint
+                    or tuple(audit.get("anchor_unit_ids", ()))
+                    != record.anchor_unit_ids
+                    or audit.get("result_fingerprint")
+                    != record.result_fingerprint
+                ):
+                    raise SemanticHandoffError(
+                        "当前信息包 audit 与 durable result binding 不匹配。"
+                    )
+                assert isinstance(processing_run_id, str)
+                observed_records.add(processing_run_id)
+            if observed_records != set(expected_records):
+                raise SemanticHandoffError(
+                    "当前信息包 audit 与 durable result 集合不完整。"
+                )
 
     def _readback_store(self, ingestion: IngestionResult) -> None:
         for atomic_information_id in ingestion.atomic_information_ids:
