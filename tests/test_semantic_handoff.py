@@ -8647,6 +8647,24 @@ class SemanticHandoffTest(unittest.TestCase):
             privacy_binding=self.privacy_binding(),
             authority_binding=binding,
         )
+        startup_snapshot = handoff.governance_startup_recovery_snapshot(
+            representation.representation_id
+        )
+        self.assertEqual(startup_snapshot["last_global_ordinal"], 81)
+        self.assertEqual(startup_snapshot["global_attempt_total"], 81)
+        self.assertEqual(startup_snapshot["global_unknown"], 0)
+        self.assertEqual(startup_snapshot["reviewed_git_head"], "6" * 40)
+        self.assertEqual(startup_snapshot["reviewed_head_sequence"], 0)
+        for field in (
+            "commit_cursor_fingerprint",
+            "latest_attempt_receipt_fingerprint",
+            "result_binding_fingerprint",
+            "processing_audit_fingerprint",
+            "global_authority_fingerprint",
+            "execution_contract_fingerprint",
+            "reviewed_head_chain_fingerprint",
+        ):
+            self.assertRegex(startup_snapshot[field], r"^sha256:[0-9a-f]{64}$")
         handoff.install_global_authority_extension(
             provider,
             window_binding=binding,

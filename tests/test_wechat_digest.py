@@ -88,6 +88,7 @@ from archeos.wechat_digest import (
     _conversation_source_payload,
     _governance_atomic_fingerprint,
     _plan_fingerprint,
+    _require_openai_codex_sdk,
     _sha256_bytes,
 )
 from archeos.world_model import SQLiteWorldModelRepository
@@ -995,6 +996,28 @@ class SyntheticSemanticHandoff(_SyntheticSemanticHandoffBase):
             "global_unknown": self.global_unknown,
             "next_global_ordinal": self.global_attempt_total + 1,
             "absolute_cap": self.absolute_cap,
+        }
+
+    def governance_startup_recovery_snapshot(self, representation_id):
+        if representation_id != self.latest_representation_id:
+            raise RuntimeError("synthetic latest Representation mismatch")
+        return {
+            "global_attempt_total": self.global_attempt_total,
+            "global_unknown": self.global_unknown,
+            "last_global_ordinal": self.global_attempt_total,
+            "next_global_ordinal": self.global_attempt_total + 1,
+            "absolute_cap": self.absolute_cap,
+            "commit_cursor_fingerprint": "sha256:" + "1" * 64,
+            "latest_attempt_receipt_fingerprint": "sha256:" + "2" * 64,
+            "semantic_run_id": "semantic_run_" + "3" * 32,
+            "batch_ordinal": 1,
+            "result_binding_fingerprint": "sha256:" + "4" * 64,
+            "processing_audit_fingerprint": "sha256:" + "5" * 64,
+            "global_authority_fingerprint": "sha256:" + "6" * 64,
+            "reviewed_git_head": self.reviewed_git_head,
+            "execution_contract_fingerprint": "sha256:" + "7" * 64,
+            "reviewed_head_sequence": len(self.installed_reviewed_head_continuations),
+            "reviewed_head_chain_fingerprint": "sha256:" + "8" * 64,
         }
 
     def resolve_unknown(
@@ -2350,6 +2373,55 @@ class WechatDigestTests(unittest.TestCase):
             ),
         )
         self.semantic.reviewed_git_head = "a" * 40
+        return service, provider, run_id, item_id, atomic_ids
+
+    def item_governance_startup_recovery_fixture(
+        self, *, fail_restart: bool = False, atomic_count: int = 3
+    ):
+        self.create_object()
+        self.semantic.provider.mode = "all_candidate"
+        self.semantic.global_attempt_total = 372
+        capture = SyntheticCaptureProvider([
+            message(index, conversation="issue-194-current")
+            for index in range(1, atomic_count + 1)
+        ])
+        provider = StartupFailOnceBatchProvider(fail_restart=fail_restart)
+        service = WechatDigestService(
+            workspace=self.workspace,
+            capture_provider=capture,
+            semantic_handoff_factory=lambda: self.semantic,
+            interpretation_provider=provider,
+        )
+        with self.assertRaises(WechatDigestError):
+            service.run(all_history=True)
+        run_id = service.run_store.active_run_id()
+        assert run_id is not None
+        plan = service.run_store.plan(run_id)
+        status = service.run_store.status(run_id)
+        item_id = next(iter(status["items"]))
+        item = status["items"][item_id]
+        atomic_ids = list(item["atomic_information_ids"])
+        self.assertEqual(len(atomic_ids), atomic_count)
+        self.assertEqual(status["state"], "failed")
+        self.assertEqual(status["failure_category"], "RuntimeError")
+        self.assertEqual(item["governance_receipt"]["phase"], "started")
+        self.assertEqual(item["governance_metrics"]["app_server_start_count"], 1)
+        self.assertEqual(item["governance_metrics"]["thread_count"], 0)
+        self.assertEqual(item["governance_metrics"]["turn_count"], 0)
+        self.semantic.latest_representation_id = item["representation_id"]
+        self.semantic.reviewed_git_head = "c" * 40
+        self.semantic.campaign_binding = SimpleNamespace(
+            created_at=plan["created_at"],
+            lower_cursor=(0, "", ""),
+            frozen_global_upper_cursor=(
+                plan["all_history_upper_bound"]["timestamp"],
+                plan["all_history_upper_bound"]["conversation_key"],
+                plan["all_history_upper_bound"]["message_key"],
+            ),
+            capture_provider_version=plan["provider_version"],
+            semantic_batch_size=plan["semantic_batch_size"],
+            reviewed_git_head=self.semantic.reviewed_git_head,
+        )
         return service, provider, run_id, item_id, atomic_ids
 
     def multi_governance_startup_recovery_fixture(
@@ -3929,6 +4001,99 @@ class WechatDigestTests(unittest.TestCase):
         retry = service.run_store.governance_startup_retry(run_id)
         assert retry is not None
         self.assertEqual(retry["retry_attempt"], 1)
+
+    def test_item_governance_startup_recovery_installs_zero_write_and_resumes_once(self) -> None:
+        service, provider, run_id, item_id, atomic_ids = self.item_governance_startup_recovery_fixture()
+        authority_ref = "https://github.com/leevi2010-cursor/ArcheOS/issues/194#issuecomment-5415298053"
+        manifest = service.build_governance_startup_recovery_manifest(authority_ref=authority_ref)
+        self.assertEqual(manifest["semantic_snapshot"]["last_global_ordinal"], 372)
+        self.assertEqual(manifest["recovery_binding"]["ordered_atomic_information_ids"], atomic_ids)
+        path = Path(self.temporary.name) / "issue-194-authority.json"
+        path.write_text(json.dumps(manifest), encoding="utf-8")
+        os.chmod(path, 0o600)
+        status_path = service.run_store.runs_root / run_id / "status.json"
+        status_before = status_path.read_bytes()
+        business_before = self.governance_business_state(service)
+        capture_calls = list(service.capture_provider.calls)
+        semantic_calls = self.semantic.provider.calls
+        attempts = provider.attempts
+        receipt = service.resolve_governance_startup_failure(
+            authority_ref=authority_ref, authority_manifest_file=path
+        )
+        self.assertEqual(status_path.read_bytes(), status_before)
+        self.assertEqual(self.governance_business_state(service), business_before)
+        self.assertEqual(service.capture_provider.calls, capture_calls)
+        self.assertEqual(self.semantic.provider.calls, semantic_calls)
+        self.assertEqual(provider.attempts, attempts)
+        self.assertEqual(service.resolve_governance_startup_failure(
+            authority_ref=authority_ref, authority_manifest_file=path
+        ), receipt)
+        result = service.run(max_terminal_items=1)
+        self.assertTrue(result.segment_safe_stopped or result.checkpoint_published)
+        self.assertEqual(provider.attempts, attempts + 1)
+        self.assertEqual(self.semantic.provider.calls, semantic_calls)
+        observed = service.run_store.status(run_id)["items"][item_id]
+        self.assertIn(observed["state"], {"processed", "pending_human"})
+        self.assertEqual(observed["atomic_information_ids"], atomic_ids)
+        self.assertEqual(len(service.information_store.list_atomic_information()), 3)
+        self.assertEqual(len(service.run_store.governance_startup_retries(run_id)), 1)
+
+    def test_item_governance_startup_recovery_sdk_preflight_is_before_status_write(self) -> None:
+        service, provider, run_id, _item_id, _atomic_ids = self.item_governance_startup_recovery_fixture()
+        authority_ref = "https://github.com/leevi2010-cursor/ArcheOS/issues/194#issuecomment-5415298053"
+        manifest = service.build_governance_startup_recovery_manifest(authority_ref=authority_ref)
+        path = Path(self.temporary.name) / "issue-194-sdk.json"
+        path.write_text(json.dumps(manifest), encoding="utf-8")
+        os.chmod(path, 0o600)
+        service.resolve_governance_startup_failure(authority_ref=authority_ref, authority_manifest_file=path)
+        status_path = service.run_store.runs_root / run_id / "status.json"
+        before = status_path.read_bytes()
+        business_before = self.governance_business_state(service)
+        with patch("archeos.wechat_digest.importlib.metadata.version", return_value="0.144.3"), self.assertRaises(RuntimeError):
+            service.run(max_terminal_items=1)
+        self.assertEqual(status_path.read_bytes(), before)
+        self.assertEqual(self.governance_business_state(service), business_before)
+        self.assertEqual(provider.attempts, 1)
+
+    def test_item_governance_startup_recovery_rejects_drift_before_receipt(self) -> None:
+        service, _provider, run_id, item_id, _atomic_ids = self.item_governance_startup_recovery_fixture(atomic_count=2)
+        authority_ref = "https://github.com/leevi2010-cursor/ArcheOS/issues/194#issuecomment-5415298053"
+        manifest = service.build_governance_startup_recovery_manifest(authority_ref=authority_ref)
+        self.assertEqual(manifest["recovery_binding"]["candidate_count"], 2)
+        path = Path(self.temporary.name) / "issue-194-drift.json"
+        path.write_text(json.dumps(manifest), encoding="utf-8")
+        os.chmod(path, 0o600)
+        status = service.run_store.status(run_id)
+        status["items"][item_id]["context_object_ids"] = ["obj_" + "9" * 32]
+        service.run_store.update_status(run_id, status)
+        with self.assertRaises(WechatDigestError):
+            service.resolve_governance_startup_failure(authority_ref=authority_ref, authority_manifest_file=path)
+        self.assertEqual(service.run_store.governance_startup_recoveries(run_id), ())
+
+    def test_item_governance_startup_retry_failure_is_consumed(self) -> None:
+        service, provider, run_id, _item_id, _atomic_ids = self.item_governance_startup_recovery_fixture(fail_restart=True)
+        authority_ref = "https://github.com/leevi2010-cursor/ArcheOS/issues/194#issuecomment-5415298053"
+        manifest = service.build_governance_startup_recovery_manifest(authority_ref=authority_ref)
+        path = Path(self.temporary.name) / "issue-194-consumed.json"
+        path.write_text(json.dumps(manifest), encoding="utf-8")
+        os.chmod(path, 0o600)
+        service.resolve_governance_startup_failure(authority_ref=authority_ref, authority_manifest_file=path)
+        with self.assertRaises(WechatDigestError):
+            service.run(max_terminal_items=1)
+        attempts = provider.attempts
+        self.assertEqual(len(service.run_store.governance_startup_retries(run_id)), 1)
+        with self.assertRaisesRegex(WechatDigestError, "机会已消费"):
+            service.run(max_terminal_items=1)
+        self.assertEqual(provider.attempts, attempts)
+
+    def test_openai_codex_sdk_preflight_checks_version_before_import(self) -> None:
+        with patch("archeos.wechat_digest.importlib.metadata.version", return_value="0.144.3"), patch("archeos.wechat_digest.importlib.import_module") as importer:
+            with self.assertRaises(RuntimeError):
+                _require_openai_codex_sdk()
+            importer.assert_not_called()
+        with patch("archeos.wechat_digest.importlib.metadata.version", return_value="0.144.4"), patch("archeos.wechat_digest.importlib.import_module") as importer:
+            _require_openai_codex_sdk()
+            importer.assert_called_once_with("openai_codex")
 
     def test_governance_startup_retry_failure_is_consumed_without_second_call(
         self,

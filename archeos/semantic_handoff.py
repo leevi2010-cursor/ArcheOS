@@ -14788,6 +14788,76 @@ class ExternalAgentSemanticHandoffService:
                 "absolute_cap": int(effective["absolute_cap"]),
             }
 
+    def governance_startup_recovery_snapshot(
+        self, representation_id: str
+    ) -> dict[str, object]:
+        """Bind one committed latest attempt to current reviewed authority."""
+
+        try:
+            require_representation_id(representation_id)
+        except ValueError as exc:
+            raise SemanticHandoffError(
+                "Semantic Governance recovery Representation identity 无效。"
+            ) from exc
+        authority = _SemanticGlobalAuthority(self.audit_root)
+        if not authority.exists:
+            raise SemanticHandoffError("Semantic global authority 未安装。")
+        with authority._locked(blocking=False):
+            base, effective, continuations = authority._current_effective_authority()
+            attempts, unknown = authority._global_attempts(effective)
+            if not attempts or unknown:
+                raise SemanticHandoffError("Semantic Governance recovery ledger 尚未收敛。")
+            latest = attempts[-1]
+            semantic_run_id = latest.get("semantic_run_id")
+            batch_ordinal = latest.get("batch_ordinal")
+            global_ordinal = latest.get("global_ordinal")
+            if (
+                not isinstance(semantic_run_id, str)
+                or isinstance(batch_ordinal, bool) or not isinstance(batch_ordinal, int)
+                or isinstance(global_ordinal, bool) or not isinstance(global_ordinal, int)
+            ):
+                raise SemanticHandoffError("Semantic Governance recovery latest attempt 损坏。")
+            run_receipt = _private_json_exact(self.audit_root / semantic_run_id / "run-receipt.json")
+            representation = run_receipt.get("representation")
+            result_root = self.audit_root / semantic_run_id / "results" / f"batch_{batch_ordinal:04d}"
+            result_receipt = _private_json_exact(result_root / "result-receipt.json")
+            committed_phase = _private_json_exact(result_root / "phase-committed.json")
+            processing_run_id = result_receipt.get("processing_run_id")
+            if not isinstance(processing_run_id, str):
+                raise SemanticHandoffError("Semantic Governance recovery result binding 损坏。")
+            audit = _private_json_exact(self.audit_root / processing_run_id / "processing-run-audit.json")
+            cursor = authority._current_commit_cursor(effective, attempts)
+            total = int(base["baseline_total"]) + len(attempts)
+            if (
+                not isinstance(representation, dict)
+                or representation.get("representation_id") != representation_id
+                or cursor.get("committed_global_ordinal") != global_ordinal
+                or total != global_ordinal
+                or result_receipt.get("attempt_receipt_fingerprint") != latest.get("attempt_receipt_fingerprint")
+                or audit.get("processing_run_id") != processing_run_id
+                or audit.get("handoff_status") != "completed"
+                or audit.get("durable_ingestion_status") != "completed"
+            ):
+                raise SemanticHandoffError("Semantic Governance recovery committed binding 不匹配。")
+            return {
+                "global_attempt_total": total,
+                "global_unknown": 0,
+                "last_global_ordinal": global_ordinal,
+                "next_global_ordinal": total + 1,
+                "absolute_cap": int(effective["absolute_cap"]),
+                "commit_cursor_fingerprint": cursor["commit_cursor_fingerprint"],
+                "latest_attempt_receipt_fingerprint": latest["attempt_receipt_fingerprint"],
+                "semantic_run_id": semantic_run_id,
+                "batch_ordinal": batch_ordinal,
+                "result_binding_fingerprint": _fingerprint({"receipt": result_receipt, "committed": committed_phase}),
+                "processing_audit_fingerprint": _fingerprint(audit),
+                "global_authority_fingerprint": effective["global_authority_fingerprint"],
+                "reviewed_git_head": effective["reviewed_git_head"],
+                "execution_contract_fingerprint": _fingerprint(effective["contract"]),
+                "reviewed_head_sequence": len(continuations),
+                "reviewed_head_chain_fingerprint": _fingerprint(continuations),
+            }
+
     def recovery_preflight(
         self,
         representation_id: str,
