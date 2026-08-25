@@ -44,7 +44,9 @@ from archeos.representation_information import (
     RepresentationInformationService,
     RepresentationResidueDraft,
     _analysis_batches,
+    _analysis_batches_for_anchor_unit_ids,
     _canonical_fingerprint,
+    _complete_context_analysis_batch,
     _contract_failure_diagnostics,
     _external_agent_request,
     _parse_external_agent_result,
@@ -60,6 +62,7 @@ from archeos.semantic_handoff import (
     SemanticResultOnlyRequest,
     SemanticWindowAuthorityBinding,
     _package_fingerprint,
+    _select_published_batch_contract_candidate,
     _SemanticGlobalAuthority,
     _SemanticRecoveryRun,
     validate_completed_published_audits,
@@ -2539,8 +2542,20 @@ class SemanticHandoffTest(unittest.TestCase):
         path.chmod(0o600)
         return path
 
-    def build_wechat_service(self):
-        root = self.root / "wechat"
+    def build_wechat_service(
+        self, *, non_anchor_context: bool = False, root: Path | None = None
+    ):
+        root = self.root / "wechat" if root is None else root
+        messages = [
+            "[2026-08-15 09:00] Sender_A: Synthetic message one.",
+            "[2026-08-15 09:01] Sender_B: Synthetic message two.",
+        ]
+        if non_anchor_context:
+            messages = [
+                messages[0],
+                "[2026-08-15 09:01] Sender_B: [图片]",
+                "[2026-08-15 09:02] Sender_A: Synthetic message three.",
+            ]
         source_path = root / "private.json"
         source_path.parent.mkdir(parents=True)
         source_path.write_text(
@@ -2549,16 +2564,13 @@ class SemanticHandoffTest(unittest.TestCase):
                     "chat": "Synthetic Chat",
                     "username": "wxid_synthetic",
                     "is_group": False,
-                    "count": 2,
+                    "count": len(messages),
                     "offset": 0,
                     "limit": 50,
                     "start_time": None,
                     "end_time": None,
                     "type": None,
-                    "messages": [
-                        "[2026-08-15 09:00] Sender_A: Synthetic message one.",
-                        "[2026-08-15 09:01] Sender_B: Synthetic message two.",
-                    ],
+                    "messages": messages,
                     "failures": None,
                 },
                 ensure_ascii=False,
@@ -12432,6 +12444,261 @@ print("passed")
                 resolution_id=unknown_166["resolution_id"],
             )
         unknown_path.write_bytes(unknown_bytes)
+
+    def test_complete_context_uses_canonical_non_anchor_support_on_first_run_and_replay(
+        self,
+    ) -> None:
+        representation, service = self.build_wechat_service(
+            non_anchor_context=True
+        )
+        units = _units_from_representation(
+            representation, service.representation_repository
+        )
+        batch = _complete_context_analysis_batch(units)
+        self.assertIsNotNone(batch)
+        assert batch is not None
+        self.assertEqual(len(batch.anchor_units), 2)
+        self.assertEqual(len(batch.context_support_units), 1)
+        self.assertFalse(batch.context_support_units[0].analysis_eligible)
+
+        provider = CodexCliRepresentationAnalysisProvider(
+            provider_version="0.147.0",
+            timeout_seconds=300,
+            runner=FakeRunner(),
+        )
+        recovery = _SemanticRecoveryRun(
+            service,
+            self.root / "complete-context-audits",
+            representation.representation_id,
+            provider,
+            self.privacy_binding(),
+            complete_context=True,
+        )
+        self.assertEqual(recovery.batches, (batch,))
+        request, first_fingerprint = _external_agent_request(recovery.batches[0])
+        self.assertEqual(
+            [item["unit_id"] for item in request["context_support_units"]],
+            [batch.context_support_units[0].unit_id],
+        )
+        replay_batch = _analysis_batches_for_anchor_unit_ids(
+            units,
+            (tuple(unit.unit_id for unit in batch.anchor_units),),
+        )[0]
+        self.assertEqual(
+            _external_agent_request(replay_batch)[1], first_fingerprint
+        )
+        self.assertNotEqual(
+            _external_agent_request(
+                RepresentationAnalysisBatch(anchor_units=batch.anchor_units)
+            )[1],
+            first_fingerprint,
+        )
+
+        prompts: list[str] = []
+
+        class CapturingRunner(FakeRunner):
+            def __call__(self, command, **kwargs):
+                process = super().__call__(command, **kwargs)
+
+                class CapturingProcess:
+                    pid = process.pid
+
+                    @property
+                    def returncode(self):
+                        return process.returncode
+
+                    def communicate(self, **communicate_kwargs):
+                        prompts.append(communicate_kwargs["input"])
+                        return process.communicate(**communicate_kwargs)
+
+                return CapturingProcess()
+
+        runner = CapturingRunner()
+        result_provider = CodexCliRepresentationAnalysisProvider(
+            provider_version="0.147.0",
+            timeout_seconds=300,
+            runner=runner,
+            diagnostic_root=self.root / "complete-context-diagnostics",
+        )
+        handoff = ExternalAgentSemanticHandoffService(
+            service,
+            JsonlAtomicInformationStore(self.root / "complete-context.jsonl"),
+            self.root / "complete-context-result-audits",
+        )
+        binding = self.semantic_window_binding(batch_size=service.batch_size)
+        self.install_authority(handoff, result_provider, binding)
+        handoff.prepare_results(
+            (
+                SemanticResultOnlyRequest(
+                    representation.representation_id,
+                    self.privacy_binding(),
+                    binding,
+                ),
+            ),
+            (result_provider,),
+            concurrency=1,
+        )
+        self.assertEqual(len(prompts), 1)
+        sent_request = json.loads(prompts[0].split("Request:\n", 1)[1])
+        self.assertEqual(
+            [item["unit_id"] for item in sent_request["context_support_units"]],
+            [batch.context_support_units[0].unit_id],
+        )
+
+    def test_legacy_complete_context_package_replays_exactly_without_provider_or_duplicate_write(
+        self,
+    ) -> None:
+        root = self.root / "legacy-complete-context"
+        representation, service = self.build_wechat_service(
+            non_anchor_context=True,
+            root=root,
+        )
+        audit_root = root / "audits"
+        store_path = root / "atomic.jsonl"
+        handoff = ExternalAgentSemanticHandoffService(
+            service,
+            JsonlAtomicInformationStore(store_path),
+            audit_root,
+        )
+        privacy = self.privacy_binding()
+        binding = self.semantic_window_binding(batch_size=service.batch_size)
+        legacy_runner = FakeRunner()
+        legacy_provider = CodexCliRepresentationAnalysisProvider(
+            provider_version="0.147.0",
+            timeout_seconds=300,
+            runner=legacy_runner,
+            diagnostic_root=root / "legacy-diagnostics",
+        )
+        self.install_authority(handoff, legacy_provider, binding)
+        request = SemanticResultOnlyRequest(
+            representation.representation_id,
+            privacy,
+            binding,
+        )
+
+        def anchors_only(units):
+            return RepresentationAnalysisBatch(
+                anchor_units=tuple(
+                    unit for unit in units if unit.analysis_eligible
+                )
+            )
+
+        with patch(
+            "archeos.semantic_handoff._complete_context_analysis_batch",
+            side_effect=anchors_only,
+        ):
+            handoff.prepare_results((request,), (legacy_provider,), concurrency=1)
+            published = handoff.execute(
+                representation.representation_id,
+                legacy_provider,
+                privacy_binding=privacy,
+                authority_binding=binding,
+            )
+        self.assertEqual(len(legacy_runner.calls), 1)
+        legacy_recovery = _SemanticRecoveryRun(
+            service,
+            audit_root,
+            representation.representation_id,
+            legacy_provider,
+            privacy,
+            complete_context=True,
+            legacy_complete_context_replay=True,
+        )
+        self.assertTrue(legacy_recovery.exists)
+        with self.assertRaisesRegex(SemanticHandoffError, "不得创建新执行"):
+            legacy_recovery.ensure_run_receipt()
+
+        package_before = self.tree_snapshot(published.package)
+        audits_before = self.tree_snapshot(audit_root)
+        store_before = store_path.read_bytes()
+        replay_runner = FakeRunner()
+        replay_provider = CodexCliRepresentationAnalysisProvider(
+            provider_version="0.147.0",
+            timeout_seconds=300,
+            runner=replay_runner,
+            diagnostic_root=root / "replay-diagnostics",
+        )
+        replayed = handoff.execute(
+            representation.representation_id,
+            replay_provider,
+            privacy_binding=privacy,
+        )
+        self.assertTrue(replayed.replayed_existing_package)
+        self.assertEqual(replayed.ingestion.created, 0)
+        self.assertEqual(replay_runner.calls, [])
+        self.assertEqual(self.tree_snapshot(published.package), package_before)
+        self.assertEqual(self.tree_snapshot(audit_root), audits_before)
+        self.assertEqual(store_path.read_bytes(), store_before)
+
+        manifest, _ = validate_representation_information_package(
+            published.package
+        )
+        self.assertEqual(
+            validate_completed_published_audits(
+                representation_service=service,
+                representation_id=representation.representation_id,
+                manifest=manifest,
+                audit_root=audit_root,
+                package_fingerprint=_package_fingerprint(published.package),
+            ),
+            published.audit_paths,
+        )
+
+        receipt_path = legacy_recovery.run_dir / "run-receipt.json"
+        receipt_bytes = receipt_path.read_bytes()
+        tampered_receipt = json.loads(receipt_bytes)
+        tampered_receipt["privacy"]["receipt_fingerprint"] = (
+            "sha256:" + "0" * 64
+        )
+        receipt_path.write_text(json.dumps(tampered_receipt), encoding="utf-8")
+        with self.assertRaises(SemanticHandoffError):
+            handoff.execute(
+                representation.representation_id,
+                replay_provider,
+                privacy_binding=privacy,
+            )
+        self.assertEqual(replay_runner.calls, [])
+        self.assertEqual(store_path.read_bytes(), store_before)
+        receipt_path.write_bytes(receipt_bytes)
+
+        with self.assertRaises(SemanticHandoffError):
+            handoff.execute(
+                representation.representation_id,
+                replay_provider,
+                privacy_binding=replace(
+                    privacy,
+                    receipt_fingerprint="sha256:" + "8" * 64,
+                ),
+            )
+        self.assertEqual(replay_runner.calls, [])
+        self.assertEqual(store_path.read_bytes(), store_before)
+
+    def test_published_contract_candidate_requires_one_exact_match(self) -> None:
+        path = self.root / "candidate-audit.json"
+        candidate = ((('unit_' + '1' * 64,), "sha256:" + "2" * 64),)
+        path.write_text(
+            json.dumps(
+                {
+                    "anchor_unit_ids": ["unit_" + "1" * 64],
+                    "input_fingerprint": "sha256:" + "2" * 64,
+                }
+            ),
+            encoding="utf-8",
+        )
+        path.chmod(0o600)
+        self.assertEqual(
+            _select_published_batch_contract_candidate((path,), (candidate,)),
+            candidate,
+        )
+        with self.assertRaisesRegex(SemanticHandoffError, "唯一"):
+            _select_published_batch_contract_candidate(
+                (path,), (candidate, candidate)
+            )
+        with self.assertRaisesRegex(SemanticHandoffError, "唯一"):
+            _select_published_batch_contract_candidate(
+                (path,),
+                (((('unit_' + '1' * 64,), "sha256:" + "3" * 64),),),
+            )
 
     def test_result_only_concurrency_overlaps_and_serial_replay_is_zero_call(
         self,
