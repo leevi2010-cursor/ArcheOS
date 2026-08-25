@@ -1940,19 +1940,20 @@ def _wechat_product_command(args: argparse.Namespace) -> int:
         f"已形成长期信息但治理未完整确认：{result.governance_preserved_but_incomplete}"
     )
     print(f"更新了 {result.context_objects} 个长期对象的 Context")
-    print(f"治理 app-server 启动：{result.governance_app_server_starts}")
     print(
-        f"治理 thread / turn：{result.governance_threads} / {result.governance_turns}"
+        "历史累计治理记录（app-server / thread / turn）："
+        f"{result.governance_app_server_starts} / "
+        f"{result.governance_threads} / {result.governance_turns}"
     )
     print(
-        "治理耗时（ms）："
+        "历史累计治理记录（耗时，ms）："
         f"startup={result.governance_startup_wall_ms}, "
         f"turn_sum={result.governance_turn_wall_ms_sum}, "
-        f"turn_max={result.governance_turn_wall_ms_max}, "
-        f"total={result.governance_wall_ms}"
+        f"turn_max={result.governance_turn_wall_ms_max}"
     )
+    print(f"本次治理耗时（ms）：{result.governance_wall_ms}")
     print(
-        "治理 timeout / failure："
+        "历史累计治理记录（timeout / failure）："
         f"{result.governance_timeouts} / {result.governance_failures}"
     )
     stage_timings = {
