@@ -5894,6 +5894,229 @@ class WechatDigestTests(unittest.TestCase):
             business_before,
         )
 
+    def _make_reviewed_head_multi_window_run(
+        self,
+    ) -> tuple[
+        WechatDigestService,
+        SyntheticCaptureProvider,
+        str,
+        str,
+        WechatCursor,
+    ]:
+        previous_message = message(1, conversation="previous_window")
+        current_messages = [
+            message(index, conversation=f"conversation_{index:02d}")
+            for index in range(2, 29)
+        ]
+        global_upper = current_messages[-1].cursor
+        capture_provider = SyntheticCaptureProvider(
+            [previous_message, *current_messages]
+        )
+        service = self.service(capture_provider)
+        run_store = service.run_store
+        created_at = "2026-08-25T00:00:00Z"
+
+        previous_capture = WechatCapture(
+            capture_provider.provider_version,
+            ZERO_CURSOR,
+            previous_message.cursor,
+            (previous_message,),
+        )
+        previous_legacy_plan, _ = _build_plan(
+            previous_capture,
+            clock=lambda: created_at,
+            all_history_upper_bound=global_upper,
+        )
+        run_store.publish_capture_pending(
+            previous_legacy_plan,
+            previous_capture,
+            capture_ms=1,
+        )
+        previous_receipt = run_store.publish_capture_artifacts(
+            str(previous_legacy_plan["run_id"]),
+            previous_capture,
+            plan_binding_fingerprint=_plan_fingerprint(previous_legacy_plan),
+            capture_ms=1,
+        )
+        previous_plan, previous_status = _build_plan(
+            previous_capture,
+            clock=lambda: created_at,
+            run_id=str(previous_legacy_plan["run_id"]),
+            created_at=created_at,
+            all_history_upper_bound=global_upper,
+            capture_receipt_fingerprint=str(
+                previous_receipt["receipt_fingerprint"]
+            ),
+        )
+        previous_status["state"] = "completed"
+        previous_status["checkpoint_published"] = True
+        for item in previous_status["items"].values():
+            item["state"] = "unsupported"
+        previous_run_id = str(previous_plan["run_id"])
+        run_store.create(previous_plan, previous_status)
+        run_store.clear_active()
+        run_store.publish_checkpoint(
+            previous_run_id,
+            previous_message.cursor,
+        )
+
+        current_capture = WechatCapture(
+            capture_provider.provider_version,
+            previous_message.cursor,
+            global_upper,
+            tuple(current_messages),
+        )
+        current_legacy_plan, _ = _build_plan(
+            current_capture,
+            clock=lambda: created_at,
+            all_history_upper_bound=global_upper,
+        )
+        run_store.publish_capture_pending(
+            current_legacy_plan,
+            current_capture,
+            capture_ms=1,
+        )
+        current_receipt = run_store.publish_capture_artifacts(
+            str(current_legacy_plan["run_id"]),
+            current_capture,
+            plan_binding_fingerprint=_plan_fingerprint(current_legacy_plan),
+            capture_ms=1,
+        )
+        current_plan, current_status = _build_plan(
+            current_capture,
+            clock=lambda: created_at,
+            run_id=str(current_legacy_plan["run_id"]),
+            created_at=created_at,
+            all_history_upper_bound=global_upper,
+            capture_receipt_fingerprint=str(
+                current_receipt["receipt_fingerprint"]
+            ),
+        )
+        current_run_id = str(current_plan["run_id"])
+        run_store.create(current_plan, current_status)
+        conversation_plan = current_plan["conversations"][0]
+        assert isinstance(conversation_plan, dict)
+        item_id = f"conversation:{conversation_plan['conversation_key']}"
+        payload = _conversation_source_payload(
+            current_capture,
+            str(conversation_plan["conversation_key"]),
+            {},
+        )
+        representation_id = service._process_conversation(
+            current_run_id,
+            current_status,
+            item_id,
+            conversation_plan,
+            payload,
+            prepare_only=True,
+        )
+        assert representation_id is not None
+        self.semantic.global_attempt_total = 361
+        self.semantic.reviewed_git_head = "a" * 40
+        self.semantic.campaign_binding = SimpleNamespace(
+            created_at=created_at,
+            lower_cursor=service._cursor_tuple(ZERO_CURSOR),
+            frozen_global_upper_cursor=service._cursor_tuple(global_upper),
+            capture_provider_version=current_plan["provider_version"],
+            semantic_batch_size=current_plan["semantic_batch_size"],
+            reviewed_git_head="9" * 40,
+        )
+        return (
+            service,
+            capture_provider,
+            current_run_id,
+            previous_run_id,
+            previous_message.cursor,
+        )
+
+    def test_reviewed_head_continuation_preserves_matching_previous_checkpoint(
+        self,
+    ) -> None:
+        (
+            service,
+            capture_provider,
+            run_id,
+            _previous_run_id,
+            expected_checkpoint,
+        ) = self._make_reviewed_head_multi_window_run()
+        checkpoint_bytes_before = service.run_store.checkpoint_path.read_bytes()
+        plan_before = service.run_store.plan(run_id)
+        status_before = service.run_store.status(run_id)
+
+        continuation = service.install_semantic_reviewed_head_continuation(
+            authority_ref=(
+                "https://github.com/leevi2010-cursor/ArcheOS/issues/178"
+                "#issuecomment-5403000000"
+            )
+        )
+
+        self.assertEqual(continuation["activation_total"], 361)
+        self.assertEqual(len(self.semantic.installed_reviewed_head_continuations), 1)
+        self.assertEqual(capture_provider.calls, [])
+        self.assertEqual(self.semantic.provider.calls, 0)
+        self.assertEqual(service.run_store.checkpoint(), expected_checkpoint)
+        self.assertEqual(
+            service.run_store.checkpoint_path.read_bytes(),
+            checkpoint_bytes_before,
+        )
+        self.assertEqual(service.run_store.plan(run_id), plan_before)
+        self.assertEqual(service.run_store.status(run_id), status_before)
+
+    def test_reviewed_head_continuation_rejects_checkpoint_mismatch_before_write(
+        self,
+    ) -> None:
+        (
+            service,
+            capture_provider,
+            run_id,
+            previous_run_id,
+            _expected_checkpoint,
+        ) = self._make_reviewed_head_multi_window_run()
+        service.run_store.publish_checkpoint(previous_run_id, ZERO_CURSOR)
+        digest_root = service.run_store.root
+        with service.run_store.lock():
+            pass
+        before = {
+            path.relative_to(digest_root): path.read_bytes()
+            for path in digest_root.rglob("*")
+            if path.is_file()
+        }
+        business_before = {
+            path.relative_to(self.workspace): path.read_bytes()
+            for root in ("03_information", "04_core")
+            for path in (self.workspace / root).rglob("*")
+            if path.is_file()
+        }
+
+        with self.assertRaisesRegex(WechatDigestError, "checkpoint binding"):
+            service.install_semantic_reviewed_head_continuation(
+                authority_ref=(
+                    "https://github.com/leevi2010-cursor/ArcheOS/issues/178"
+                    "#issuecomment-5403000000"
+                )
+            )
+
+        self.assertEqual(self.semantic.installed_reviewed_head_continuations, [])
+        self.assertEqual(capture_provider.calls, [])
+        self.assertEqual(self.semantic.provider.calls, 0)
+        self.assertEqual(
+            {
+                path.relative_to(digest_root): path.read_bytes()
+                for path in digest_root.rglob("*")
+                if path.is_file()
+            },
+            before,
+        )
+        self.assertEqual(
+            {
+                path.relative_to(self.workspace): path.read_bytes()
+                for root in ("03_information", "04_core")
+                for path in (self.workspace / root).rglob("*")
+                if path.is_file()
+            },
+            business_before,
+        )
+
     def test_capture_upgrade_keeps_all_planned_value_error_recovery(self) -> None:
         captured_message = message(1)
         capture_provider = SyntheticCaptureProvider([captured_message])
