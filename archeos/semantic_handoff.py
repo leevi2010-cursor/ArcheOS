@@ -192,6 +192,10 @@ _TIMEOUT_212_RESOLUTION_MANIFEST_SCHEMA = (
 _TIMEOUT_212_RESOLUTION_SCHEMA = (
     "semantic-handoff-timeout-212-resolution/1.0"
 )
+_ATTEMPT_RESOLUTION_MANIFEST_SCHEMA = (
+    "semantic-handoff-attempt-resolution-authority/1.0"
+)
+_ATTEMPT_RESOLUTION_SCHEMA = "semantic-handoff-attempt-resolution/1.0"
 _INVENTORY_AUTHORITY_SCHEMA = "semantic-handoff-inventory-authority/1.0"
 _GLOBAL_AUTHORITY_DIRECTORY = "semantic_global_authority"
 _GLOBAL_AUTHORITY_GRANT = "grant.json"
@@ -214,6 +218,9 @@ _MULTI_GOVERNANCE_STARTUP_RECOVERY_CONTINUATION_RECEIPT = (
 )
 _REVIEWED_HEAD_CONTINUATION_RECEIPT_PATTERN = re.compile(
     r"reviewed-head-continuation-(\d{4})\.json"
+)
+_ATTEMPT_RESOLUTION_RECEIPT_PATTERN = re.compile(
+    r"attempt-resolution-(\d{4})\.json"
 )
 _UNKNOWN_RESOLUTION_RECEIPT = "unknown-resolution-ordinal-0166.json"
 _TIMEOUT_212_RESOLUTION_RECEIPT = "unknown-resolution-ordinal-0212.json"
@@ -544,6 +551,7 @@ def _validate_global_authority_directory(path: Path) -> None:
     if any(
         name not in fixed_children
         and _REVIEWED_HEAD_CONTINUATION_RECEIPT_PATTERN.fullmatch(name) is None
+        and _ATTEMPT_RESOLUTION_RECEIPT_PATTERN.fullmatch(name) is None
         for name in children
     ):
         raise SemanticHandoffError("Semantic global authority inventory 损坏。")
@@ -593,7 +601,10 @@ def _validate_global_authority_directory(path: Path) -> None:
     if multi_startup_recovery_path is not None:
         _require_private_file(multi_startup_recovery_path)
     for name, continuation_path in children.items():
-        if _REVIEWED_HEAD_CONTINUATION_RECEIPT_PATTERN.fullmatch(name):
+        if (
+            _REVIEWED_HEAD_CONTINUATION_RECEIPT_PATTERN.fullmatch(name)
+            or _ATTEMPT_RESOLUTION_RECEIPT_PATTERN.fullmatch(name)
+        ):
             _require_private_file(continuation_path)
     commit_cursor_path = children.get(_GLOBAL_COMMIT_CURSOR)
     if commit_cursor_path is not None:
@@ -9577,9 +9588,13 @@ class _SemanticGlobalAuthority:
             grant=grant,
             previous=legacy,
         )
+        reviewed = self._fold_reviewed_head_continuations(
+            legacy, continuations
+        )
+        resolutions = self._read_attempt_resolutions(previous=reviewed)
         return (
             grant,
-            self._fold_reviewed_head_continuations(legacy, continuations),
+            self._fold_attempt_resolutions(reviewed, resolutions),
             continuations,
         )
 
@@ -9711,6 +9726,860 @@ class _SemanticGlobalAuthority:
                 ]
             )
         return effective
+
+    def _attempt_resolution_paths(self) -> tuple[Path, ...]:
+        if not os.path.lexists(self.root):
+            return ()
+        _validate_global_authority_directory(self.root)
+        paths = tuple(
+            sorted(
+                path
+                for path in self.root.iterdir()
+                if _ATTEMPT_RESOLUTION_RECEIPT_PATTERN.fullmatch(path.name)
+            )
+        )
+        sequences = [
+            int(
+                _ATTEMPT_RESOLUTION_RECEIPT_PATTERN.fullmatch(path.name).group(1)  # type: ignore[union-attr]
+            )
+            for path in paths
+        ]
+        if sequences != list(range(1, len(paths) + 1)):
+            raise SemanticHandoffError(
+                "Semantic attempt resolution 顺序损坏。"
+            )
+        return paths
+
+    @staticmethod
+    def _fold_attempt_resolutions(
+        previous: Mapping[str, object],
+        resolutions: Sequence[Mapping[str, object]],
+    ) -> dict[str, object]:
+        # Attempt resolutions are append-only ledger/Audit overlays.  They
+        # consume an exact failed attempt but never become Provider authority.
+        del resolutions
+        return dict(previous)
+
+    def _read_attempt_resolutions(
+        self,
+        *,
+        previous: Mapping[str, object],
+    ) -> tuple[dict[str, object], ...]:
+        resolutions: list[dict[str, object]] = []
+        del previous
+        for sequence, path in enumerate(
+            self._attempt_resolution_paths(), start=1
+        ):
+            receipt = _private_json_exact(path)
+            projected = dict(receipt)
+            fingerprint = projected.pop(
+                "resolution_receipt_fingerprint", None
+            )
+            attempt = receipt.get("semantic_attempt")
+            evidence = receipt.get("failure_evidence")
+            digest = receipt.get("digest")
+            continuation = receipt.get("continuation")
+            ordinal = receipt.get("global_ordinal")
+            if (
+                set(receipt)
+                != {
+                    "schema_version",
+                    "artifact_kind",
+                    "sequence",
+                    "authority_ref",
+                    "authority_manifest_fingerprint",
+                    "authority_manifest_raw_fingerprint",
+                    "previous_global_authority_fingerprint",
+                    "previous_reviewed_git_head",
+                    "previous_execution_contract",
+                    "resolution_id",
+                    "global_ordinal",
+                    "outcome",
+                    "semantic_attempt",
+                    "failure_evidence",
+                    "digest",
+                    "activation_total",
+                    "activation_unknown_count",
+                    "activation_last_global_ordinal",
+                    "activation_attempt_inventory_fingerprint",
+                    "preserved_but_unabsorbed",
+                    "continuation",
+                    "resolution_receipt_fingerprint",
+                }
+                or receipt.get("schema_version")
+                != _ATTEMPT_RESOLUTION_SCHEMA
+                or receipt.get("artifact_kind")
+                != "semantic_handoff_attempt_resolution"
+                or receipt.get("sequence") != sequence
+                or re.fullmatch(
+                    r"https://github\.com/leevi2010-cursor/ArcheOS/"
+                    r"issues/[1-9][0-9]*#issuecomment-[0-9]+",
+                    str(receipt.get("authority_ref")),
+                )
+                is None
+                or not _sha256_fingerprint(
+                    receipt.get("authority_manifest_fingerprint")
+                )
+                or not _sha256_fingerprint(
+                    receipt.get("authority_manifest_raw_fingerprint")
+                )
+                or not _sha256_fingerprint(
+                    receipt.get("previous_global_authority_fingerprint")
+                )
+                or re.fullmatch(
+                    r"[0-9a-f]{40}",
+                    str(receipt.get("previous_reviewed_git_head")),
+                )
+                is None
+                or not isinstance(
+                    receipt.get("previous_execution_contract"), dict
+                )
+                or isinstance(ordinal, bool)
+                or not isinstance(ordinal, int)
+                or ordinal < 1
+                or re.fullmatch(
+                    r"attempt_resolution_[0-9a-f]{32}",
+                    str(receipt.get("resolution_id")),
+                )
+                is None
+                or receipt.get("outcome") != "known_consumed_failure"
+                or not isinstance(attempt, dict)
+                or set(attempt)
+                != {
+                    "semantic_run_id",
+                    "run_receipt_fingerprint",
+                    "run_contract_fingerprint",
+                    "batch_ordinal",
+                    "batch_contract_fingerprint",
+                    "input_fingerprint",
+                    "attempt_id",
+                    "attempt_nonce",
+                    "attempt_receipt_fingerprint",
+                    "started_receipt_fingerprint",
+                    "result_present",
+                }
+                or attempt.get("result_present") is not False
+                or not _sha256_fingerprint(
+                    attempt.get("attempt_receipt_fingerprint")
+                )
+                or not _sha256_fingerprint(
+                    attempt.get("started_receipt_fingerprint")
+                )
+                or not isinstance(evidence, dict)
+                or evidence.get("failure_category") != "timeout"
+                or evidence.get("diagnostic_persistence_status") != "failed"
+                or evidence.get("process_cleanup_status") != "verified"
+                or evidence.get("evidence_mode")
+                != "lead_approved_process_exited_diagnostic_persistence_failed"
+                or not isinstance(evidence.get("observed_at"), str)
+                or not isinstance(digest, dict)
+                or receipt.get("activation_total") != ordinal
+                or receipt.get("activation_unknown_count") != 1
+                or receipt.get("activation_last_global_ordinal") != ordinal
+                or not _sha256_fingerprint(
+                    receipt.get("activation_attempt_inventory_fingerprint")
+                )
+                or receipt.get("preserved_but_unabsorbed") is not True
+                or not isinstance(continuation, dict)
+                or continuation
+                != {
+                    "previous_reviewed_git_head": receipt.get(
+                        "previous_reviewed_git_head"
+                    ),
+                    "previous_execution_contract": receipt.get(
+                        "previous_execution_contract"
+                    ),
+                    "reviewed_git_head": receipt.get(
+                        "previous_reviewed_git_head"
+                    ),
+                    "execution_contract": receipt.get(
+                        "previous_execution_contract"
+                    ),
+                    "next_global_ordinal": ordinal + 1,
+                    "absolute_cap": continuation.get("absolute_cap"),
+                }
+                or isinstance(continuation.get("absolute_cap"), bool)
+                or not isinstance(continuation.get("absolute_cap"), int)
+                or not _sha256_fingerprint(fingerprint)
+                or fingerprint != _fingerprint(projected)
+            ):
+                raise SemanticHandoffError(
+                    "Semantic attempt resolution receipt binding 损坏。"
+                )
+            resolutions.append(receipt)
+        return tuple(resolutions)
+
+    def _attempt_resolution_evidence(
+        self,
+        *,
+        attempts: Sequence[Mapping[str, object]],
+        resolutions: Sequence[Mapping[str, object]],
+        global_ordinal: int,
+    ) -> tuple[
+        dict[str, object],
+        dict[str, object],
+        dict[str, object],
+    ]:
+        matches = [
+            dict(attempt)
+            for attempt in attempts
+            if attempt.get("global_ordinal") == global_ordinal
+        ]
+        if len(matches) != 1 or attempts[-1].get("global_ordinal") != global_ordinal:
+            raise SemanticHandoffError(
+                "Semantic attempt resolution 必须绑定唯一 ledger tail。"
+            )
+        attempt = matches[0]
+        run_id = attempt.get("semantic_run_id")
+        batch_ordinal = attempt.get("batch_ordinal")
+        if (
+            not isinstance(run_id, str)
+            or isinstance(batch_ordinal, bool)
+            or not isinstance(batch_ordinal, int)
+        ):
+            raise SemanticHandoffError(
+                "Semantic attempt resolution attempt identity 损坏。"
+            )
+        run = self.audit_root / run_id
+        run_receipt = _private_json_exact(run / "run-receipt.json")
+        batches = run_receipt.get("batches")
+        if (
+            run_receipt.get("schema_version") != _RECOVERY_RUN_SCHEMA
+            or run_receipt.get("semantic_run_id") != run_id
+            or not isinstance(batches, list)
+            or not 1 <= batch_ordinal <= len(batches)
+        ):
+            raise SemanticHandoffError(
+                "Semantic attempt resolution run receipt 损坏。"
+            )
+        started_path = run / "started" / f"batch_{batch_ordinal:04d}.json"
+        started = _private_json_exact(started_path)
+        projected_started = dict(started)
+        started_fingerprint = projected_started.pop(
+            "started_receipt_fingerprint", None
+        )
+        if (
+            started.get("schema_version")
+            != _RECOVERY_ATTEMPT_STARTED_SCHEMA
+            or started.get("artifact_kind")
+            != "semantic_handoff_attempt_started"
+            or started.get("semantic_run_id") != run_id
+            or started.get("batch_ordinal") != batch_ordinal
+            or started.get("attempt_receipt_fingerprint")
+            != attempt.get("attempt_receipt_fingerprint")
+            or started.get("state") != "started"
+            or started_fingerprint != _fingerprint(projected_started)
+        ):
+            raise SemanticHandoffError(
+                "Semantic attempt resolution started receipt 损坏。"
+            )
+        result_path = run / "results" / f"batch_{batch_ordinal:04d}"
+        if os.path.lexists(result_path):
+            raise SemanticHandoffError(
+                "Semantic attempt resolution 已出现 result。"
+            )
+        for directory, suffix in (
+            (run / "attempts", ".json"),
+            (run / "started", ".json"),
+            (run / "results", ""),
+        ):
+            if not os.path.lexists(directory):
+                continue
+            for child in directory.iterdir():
+                match = re.fullmatch(r"batch_(\d{4})" + re.escape(suffix), child.name)
+                if match is not None and int(match.group(1)) > batch_ordinal:
+                    raise SemanticHandoffError(
+                        "Semantic attempt resolution 同 run 存在后续 batch。"
+                    )
+        resolved_ordinals = {
+            int(item["global_ordinal"])
+            for item in resolutions
+        } | {166, 212}
+        unresolved: list[int] = []
+        for item in attempts:
+            ordinal = int(item["global_ordinal"])
+            if ordinal in resolved_ordinals:
+                continue
+            item_run = self.audit_root / str(item["semantic_run_id"])
+            item_batch = int(item["batch_ordinal"])
+            if (
+                not os.path.lexists(
+                    item_run / "results" / f"batch_{item_batch:04d}"
+                )
+                and os.path.lexists(
+                    item_run / "started" / f"batch_{item_batch:04d}.json"
+                )
+            ):
+                unresolved.append(ordinal)
+        if unresolved not in ([], [global_ordinal]):
+            raise SemanticHandoffError(
+                "Semantic attempt resolution unknown 必须唯一。"
+            )
+        return attempt, run_receipt, started
+
+    def _validate_attempt_resolution_manifest(
+        self,
+        authority_manifest_file: Path,
+        *,
+        authority: Mapping[str, object],
+        attempts: Sequence[Mapping[str, object]],
+        attempt: Mapping[str, object],
+        run_receipt: Mapping[str, object],
+        started: Mapping[str, object],
+        digest_binding: Mapping[str, object],
+        reviewed_git_head: str,
+        provider: CodexCliRepresentationAnalysisProvider,
+    ) -> tuple[dict[str, object], str]:
+        del reviewed_git_head
+        raw = _private_bytes_read(authority_manifest_file)
+        try:
+            manifest = json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise SemanticHandoffError(
+                "Semantic attempt resolution authority manifest 不可读。"
+            ) from exc
+        if not isinstance(manifest, dict):
+            raise SemanticHandoffError(
+                "Semantic attempt resolution authority manifest 损坏。"
+            )
+        projected = dict(manifest)
+        fingerprint = projected.pop("payload_fingerprint", None)
+        ordinal = attempt.get("global_ordinal")
+        batch_ordinal = attempt.get("batch_ordinal")
+        attempt_window = attempt.get("window")
+        continuation = manifest.get("continuation")
+        evidence = manifest.get("failure_evidence")
+        if (
+            set(manifest)
+            != {
+                "schema_version",
+                "artifact_kind",
+                "authority_ref",
+                "current_global_authority_fingerprint",
+                "activation_total",
+                "activation_unknown_count",
+                "activation_last_global_ordinal",
+                "activation_attempt_inventory_fingerprint",
+                "absolute_cap",
+                "semantic_attempt",
+                "failure_evidence",
+                "digest",
+                "resolution_id",
+                "outcome",
+                "preserved_but_unabsorbed",
+                "continuation",
+                "payload_fingerprint",
+            }
+            or manifest.get("schema_version")
+            != _ATTEMPT_RESOLUTION_MANIFEST_SCHEMA
+            or manifest.get("artifact_kind")
+            != "semantic_handoff_attempt_resolution_authority"
+            or re.fullmatch(
+                r"https://github\.com/leevi2010-cursor/ArcheOS/"
+                r"issues/[1-9][0-9]*#issuecomment-[0-9]+",
+                str(manifest.get("authority_ref")),
+            )
+            is None
+            or manifest.get("current_global_authority_fingerprint")
+            != attempt.get("global_authority_fingerprint")
+            or manifest.get("activation_total") != ordinal
+            or manifest.get("activation_unknown_count") != 1
+            or manifest.get("activation_last_global_ordinal") != ordinal
+            or manifest.get("activation_attempt_inventory_fingerprint")
+            != _fingerprint(list(attempts))
+            or manifest.get("absolute_cap") != authority.get("absolute_cap")
+            or manifest.get("semantic_attempt")
+            != {
+                "semantic_run_id": attempt.get("semantic_run_id"),
+                "run_receipt_fingerprint": run_receipt.get(
+                    "run_receipt_fingerprint"
+                ),
+                "run_contract_fingerprint": attempt.get(
+                    "run_contract_fingerprint"
+                ),
+                "batch_ordinal": batch_ordinal,
+                "batch_contract_fingerprint": attempt.get(
+                    "batch_contract_fingerprint"
+                ),
+                "input_fingerprint": attempt.get("input_fingerprint"),
+                "attempt_id": attempt.get("attempt_id"),
+                "attempt_nonce": attempt.get("attempt_nonce"),
+                "attempt_receipt_fingerprint": attempt.get(
+                    "attempt_receipt_fingerprint"
+                ),
+                "started_receipt_fingerprint": started.get(
+                    "started_receipt_fingerprint"
+                ),
+                "result_present": False,
+            }
+            or not isinstance(evidence, dict)
+            or evidence.get("failure_category") != "timeout"
+            or evidence.get("diagnostic_persistence_status") != "failed"
+            or evidence.get("process_cleanup_status") != "verified"
+            or evidence.get("evidence_mode")
+            != "lead_approved_process_exited_diagnostic_persistence_failed"
+            or not isinstance(evidence.get("observed_at"), str)
+            or manifest.get("digest") != dict(digest_binding)
+            or re.fullmatch(
+                r"attempt_resolution_[0-9a-f]{32}",
+                str(manifest.get("resolution_id")),
+            )
+            is None
+            or manifest.get("outcome") != "known_consumed_failure"
+            or manifest.get("preserved_but_unabsorbed") is not True
+            or not isinstance(attempt_window, dict)
+            or authority.get("contract") != self._contract_payload(provider)
+            or continuation
+            != {
+                "previous_reviewed_git_head": attempt_window.get(
+                    "reviewed_git_head"
+                ),
+                "previous_execution_contract": authority.get("contract"),
+                "reviewed_git_head": attempt_window.get("reviewed_git_head"),
+                "execution_contract": authority.get("contract"),
+                "next_global_ordinal": int(ordinal) + 1,
+                "absolute_cap": authority.get("absolute_cap"),
+            }
+            or continuation.get("execution_contract")
+            != continuation.get("previous_execution_contract")
+            or not _sha256_fingerprint(fingerprint)
+            or fingerprint != _fingerprint(projected)
+        ):
+            raise SemanticHandoffError(
+                "Semantic attempt resolution authority manifest binding 损坏。"
+            )
+        return manifest, _bytes_fingerprint(raw)
+
+    def build_attempt_resolution_manifest(
+        self,
+        *,
+        candidate_file: Path,
+        authority_ref: str,
+        observed_at: str,
+        provider: CodexCliRepresentationAnalysisProvider,
+        digest_binding: Mapping[str, object],
+    ) -> dict[str, object]:
+        """Build and publish one deterministic private tail-attempt candidate."""
+
+        if (
+            re.fullmatch(
+                r"https://github\.com/leevi2010-cursor/ArcheOS/"
+                r"issues/[1-9][0-9]*#issuecomment-[0-9]+",
+                authority_ref,
+            )
+            is None
+            or not isinstance(observed_at, str)
+            or not observed_at.strip()
+        ):
+            raise SemanticHandoffError(
+                "Semantic attempt resolution candidate authority 无效。"
+            )
+        with self._locked(blocking=False):
+            _grant, authority, _continuations = (
+                self._current_effective_authority()
+            )
+            attempts, unknown = self._global_attempts(authority)
+            if not unknown or not attempts:
+                raise SemanticHandoffError(
+                    "Semantic attempt resolution candidate 不存在唯一 unknown。"
+                )
+            resolutions = self._read_attempt_resolutions(previous=authority)
+            ordinal = int(attempts[-1]["global_ordinal"])
+            attempt, run_receipt, started = self._attempt_resolution_evidence(
+                attempts=attempts,
+                resolutions=resolutions,
+                global_ordinal=ordinal,
+            )
+            attempt_window = attempt.get("window")
+            if (
+                attempt.get("global_authority_fingerprint")
+                != authority.get("global_authority_fingerprint")
+                or not isinstance(attempt_window, dict)
+                or attempt_window.get("reviewed_git_head")
+                != authority.get("reviewed_git_head")
+                or authority.get("contract") != self._contract_payload(provider)
+            ):
+                raise SemanticHandoffError(
+                    "Semantic attempt resolution candidate authority 漂移。"
+                )
+            identity = {
+                "authority_ref": authority_ref,
+                "global_ordinal": ordinal,
+                "attempt_receipt_fingerprint": attempt.get(
+                    "attempt_receipt_fingerprint"
+                ),
+                "started_receipt_fingerprint": started.get(
+                    "started_receipt_fingerprint"
+                ),
+                "observed_at": observed_at,
+                "digest": dict(digest_binding),
+            }
+            resolution_id = (
+                "attempt_resolution_"
+                + _fingerprint(identity).removeprefix("sha256:")[:32]
+            )
+            without_fingerprint: dict[str, object] = {
+                "schema_version": _ATTEMPT_RESOLUTION_MANIFEST_SCHEMA,
+                "artifact_kind": (
+                    "semantic_handoff_attempt_resolution_authority"
+                ),
+                "authority_ref": authority_ref,
+                "current_global_authority_fingerprint": attempt[
+                    "global_authority_fingerprint"
+                ],
+                "activation_total": ordinal,
+                "activation_unknown_count": 1,
+                "activation_last_global_ordinal": ordinal,
+                "activation_attempt_inventory_fingerprint": _fingerprint(
+                    attempts
+                ),
+                "absolute_cap": authority["absolute_cap"],
+                "semantic_attempt": {
+                    "semantic_run_id": attempt["semantic_run_id"],
+                    "run_receipt_fingerprint": run_receipt[
+                        "run_receipt_fingerprint"
+                    ],
+                    "run_contract_fingerprint": attempt[
+                        "run_contract_fingerprint"
+                    ],
+                    "batch_ordinal": attempt["batch_ordinal"],
+                    "batch_contract_fingerprint": attempt[
+                        "batch_contract_fingerprint"
+                    ],
+                    "input_fingerprint": attempt["input_fingerprint"],
+                    "attempt_id": attempt["attempt_id"],
+                    "attempt_nonce": attempt["attempt_nonce"],
+                    "attempt_receipt_fingerprint": attempt[
+                        "attempt_receipt_fingerprint"
+                    ],
+                    "started_receipt_fingerprint": started[
+                        "started_receipt_fingerprint"
+                    ],
+                    "result_present": False,
+                },
+                "failure_evidence": {
+                    "failure_category": "timeout",
+                    "diagnostic_persistence_status": "failed",
+                    "process_cleanup_status": "verified",
+                    "evidence_mode": (
+                        "lead_approved_process_exited_"
+                        "diagnostic_persistence_failed"
+                    ),
+                    "observed_at": observed_at,
+                },
+                "digest": dict(digest_binding),
+                "resolution_id": resolution_id,
+                "outcome": "known_consumed_failure",
+                "preserved_but_unabsorbed": True,
+                "continuation": {
+                    "previous_reviewed_git_head": authority[
+                        "reviewed_git_head"
+                    ],
+                    "previous_execution_contract": authority["contract"],
+                    "reviewed_git_head": authority["reviewed_git_head"],
+                    "execution_contract": authority["contract"],
+                    "next_global_ordinal": ordinal + 1,
+                    "absolute_cap": authority["absolute_cap"],
+                },
+            }
+            candidate = {
+                **without_fingerprint,
+                "payload_fingerprint": _fingerprint(without_fingerprint),
+            }
+            if os.path.lexists(candidate_file):
+                observed = _private_json_exact(candidate_file)
+                if not _payloads_exactly_equal(observed, candidate):
+                    raise SemanticHandoffError(
+                        "Semantic attempt resolution candidate 已存在且不一致。"
+                    )
+            else:
+                _publish_private_json_marker(candidate_file, candidate)
+            observed = _private_json_exact(candidate_file)
+            if not _payloads_exactly_equal(observed, candidate):
+                raise SemanticHandoffError(
+                    "Semantic attempt resolution candidate 读回失败。"
+                )
+            return candidate
+
+    def resolve_attempt(
+        self,
+        *,
+        authority_manifest_file: Path,
+        provider: CodexCliRepresentationAnalysisProvider,
+        reviewed_git_head: str,
+        digest_binding: Mapping[str, object],
+        commit_failed_closed_status: Callable[
+            [str, int], tuple[str, Mapping[str, object]]
+        ],
+    ) -> dict[str, object]:
+        """Resolve one exact unique tail started attempt without Provider."""
+
+        try:
+            manifest_probe = _private_json_exact(authority_manifest_file)
+        except SemanticHandoffError:
+            raise
+        ordinal_probe = manifest_probe.get("activation_total")
+        if isinstance(ordinal_probe, bool) or not isinstance(ordinal_probe, int):
+            raise SemanticHandoffError(
+                "Semantic attempt resolution authority ordinal 损坏。"
+            )
+
+        def validate_locked_state(
+            current_digest_binding: Mapping[str, object],
+        ) -> tuple[
+            dict[str, object],
+            tuple[dict[str, object], ...],
+            dict[str, object],
+            dict[str, object] | None,
+            list[dict[str, object]],
+            dict[str, object],
+            dict[str, object],
+            dict[str, object],
+            dict[str, object],
+            str,
+        ]:
+            grant, legacy = self._legacy_effective_authority()
+            reviewed = self._read_reviewed_head_continuations(
+                grant=grant, previous=legacy
+            )
+            reviewed_effective = self._fold_reviewed_head_continuations(
+                legacy, reviewed
+            )
+            resolutions = self._read_attempt_resolutions(
+                previous=reviewed_effective
+            )
+            existing_matches = [
+                item
+                for item in resolutions
+                if item.get("global_ordinal") == ordinal_probe
+            ]
+            if len(existing_matches) > 1 or (
+                existing_matches and existing_matches[0] is not resolutions[-1]
+            ):
+                raise SemanticHandoffError(
+                    "Semantic attempt resolution 已存在且不唯一。"
+                )
+            existing = existing_matches[0] if existing_matches else None
+            prior_resolutions = (
+                resolutions[:-1] if existing is not None else resolutions
+            )
+            previous = self._fold_attempt_resolutions(
+                reviewed_effective, prior_resolutions
+            )
+            current = self._fold_attempt_resolutions(
+                reviewed_effective, resolutions
+            )
+            attempts, unknown = self._global_attempts(current)
+            if (existing is None and not unknown) or (
+                existing is not None and unknown
+            ):
+                raise SemanticHandoffError(
+                    "Semantic attempt resolution unknown 状态不匹配。"
+                )
+            attempt, run_receipt, started = (
+                self._attempt_resolution_evidence(
+                    attempts=attempts,
+                    resolutions=prior_resolutions,
+                    global_ordinal=ordinal_probe,
+                )
+            )
+            manifest, raw_fingerprint = (
+                self._validate_attempt_resolution_manifest(
+                    authority_manifest_file,
+                    authority=previous,
+                    attempts=attempts,
+                    attempt=attempt,
+                    run_receipt=run_receipt,
+                    started=started,
+                    digest_binding=current_digest_binding,
+                    reviewed_git_head=reviewed_git_head,
+                    provider=provider,
+                )
+            )
+            return (
+                grant,
+                resolutions,
+                previous,
+                existing,
+                attempts,
+                attempt,
+                run_receipt,
+                started,
+                manifest,
+                raw_fingerprint,
+            )
+
+        preflight = validate_locked_state(digest_binding)
+        with self._locked():
+            locked = validate_locked_state(digest_binding)
+            if not _payloads_exactly_equal(preflight, locked):
+                raise SemanticHandoffError(
+                    "Semantic attempt resolution preflight 发生漂移。"
+                )
+            (
+                _grant,
+                resolutions,
+                previous,
+                existing,
+                attempts,
+                attempt,
+                _run_receipt,
+                _started,
+                manifest,
+                raw_fingerprint,
+            ) = locked
+            ordinal = int(attempt["global_ordinal"])
+            resolution_id = str(manifest["resolution_id"])
+            status_fingerprint, final_digest_binding = (
+                commit_failed_closed_status(resolution_id, ordinal)
+            )
+            if (
+                not _sha256_fingerprint(status_fingerprint)
+                or not isinstance(final_digest_binding, Mapping)
+            ):
+                raise SemanticHandoffError(
+                    "Semantic attempt resolution failed_closed status 读回失败。"
+                )
+            final = validate_locked_state(final_digest_binding)
+            if not _payloads_exactly_equal(locked, final):
+                raise SemanticHandoffError(
+                    "Semantic attempt resolution status 后 replay 发生漂移。"
+                )
+            if existing is not None:
+                digest = existing.get("digest")
+                if (
+                    existing.get("authority_manifest_fingerprint")
+                    != manifest.get("payload_fingerprint")
+                    or existing.get("authority_manifest_raw_fingerprint")
+                    != raw_fingerprint
+                    or existing.get("resolution_id") != resolution_id
+                    or not isinstance(digest, dict)
+                    or digest.get("failed_closed_status_fingerprint")
+                    != status_fingerprint
+                ):
+                    raise SemanticHandoffError(
+                        "Semantic attempt resolution 已存在且不匹配。"
+                    )
+                return dict(existing)
+            without_fingerprint: dict[str, object] = {
+                "schema_version": _ATTEMPT_RESOLUTION_SCHEMA,
+                "artifact_kind": "semantic_handoff_attempt_resolution",
+                "sequence": len(resolutions) + 1,
+                "authority_ref": manifest["authority_ref"],
+                "authority_manifest_fingerprint": manifest[
+                    "payload_fingerprint"
+                ],
+                "authority_manifest_raw_fingerprint": raw_fingerprint,
+                "previous_global_authority_fingerprint": manifest[
+                    "current_global_authority_fingerprint"
+                ],
+                "previous_reviewed_git_head": manifest["continuation"][
+                    "previous_reviewed_git_head"
+                ],
+                "previous_execution_contract": manifest["continuation"][
+                    "previous_execution_contract"
+                ],
+                "resolution_id": resolution_id,
+                "global_ordinal": ordinal,
+                "outcome": "known_consumed_failure",
+                "semantic_attempt": manifest["semantic_attempt"],
+                "failure_evidence": manifest["failure_evidence"],
+                "digest": {
+                    **dict(final_digest_binding),
+                    "failed_closed_status_fingerprint": status_fingerprint,
+                },
+                "activation_total": ordinal,
+                "activation_unknown_count": 1,
+                "activation_last_global_ordinal": ordinal,
+                "activation_attempt_inventory_fingerprint": _fingerprint(
+                    attempts
+                ),
+                "preserved_but_unabsorbed": True,
+                "continuation": manifest["continuation"],
+            }
+            receipt = {
+                **without_fingerprint,
+                "resolution_receipt_fingerprint": _fingerprint(
+                    without_fingerprint
+                ),
+            }
+            path = self.root / f"attempt-resolution-{len(resolutions) + 1:04d}.json"
+            _publish_private_json_marker(path, receipt)
+            _refsync_and_readback(
+                files=tuple(
+                    sorted(
+                        candidate
+                        for candidate in self.root.iterdir()
+                        if candidate.is_file()
+                    )
+                ),
+                directories=(self.root, self.audit_root),
+            )
+            observed = self._read_attempt_resolutions(
+                previous=self._fold_reviewed_head_continuations(
+                    self._legacy_effective_authority()[1],
+                    self._read_reviewed_head_continuations(
+                        grant=self._legacy_effective_authority()[0],
+                        previous=self._legacy_effective_authority()[1],
+                    ),
+                )
+            )
+            if not observed or not _payloads_exactly_equal(
+                observed[-1], receipt
+            ):
+                raise SemanticHandoffError(
+                    "Semantic attempt resolution 安装读回失败。"
+                )
+            _base, effective, _continuations = self._current_effective_authority()
+            final_attempts, unknown = self._global_attempts(effective)
+            if (
+                unknown
+                or len(final_attempts) != len(attempts)
+                or final_attempts[-1].get("global_ordinal") != ordinal
+            ):
+                raise SemanticHandoffError(
+                    "Semantic attempt resolution ledger 读回失败。"
+                )
+            return receipt
+
+    def validate_attempt_resolution_digest(
+        self,
+        *,
+        digest_binding: Mapping[str, object],
+        failed_closed_status_fingerprint: str,
+        resolution_id: str,
+    ) -> dict[str, object]:
+        grant, legacy = self._legacy_effective_authority()
+        reviewed = self._read_reviewed_head_continuations(
+            grant=grant, previous=legacy
+        )
+        previous = self._fold_reviewed_head_continuations(legacy, reviewed)
+        self._global_attempts(previous)
+        matches = [
+            item
+            for item in self._read_attempt_resolutions(previous=previous)
+            if item.get("resolution_id") == resolution_id
+        ]
+        if len(matches) != 1:
+            raise SemanticHandoffError(
+                "Semantic attempt resolution receipt 缺失。"
+            )
+        receipt = matches[0]
+        digest = receipt.get("digest")
+        if (
+            not isinstance(digest, dict)
+            or digest
+            != {
+                **dict(digest_binding),
+                "failed_closed_status_fingerprint": (
+                    failed_closed_status_fingerprint
+                ),
+            }
+        ):
+            raise SemanticHandoffError(
+                "Semantic attempt resolution digest binding 损坏。"
+            )
+        return receipt
 
     @staticmethod
     def _validate_effective_window(
@@ -9920,6 +10789,9 @@ class _SemanticGlobalAuthority:
                 reviewed_effective, (continuation,)
             )
             reviewed_head_authorities.append(reviewed_effective)
+        attempt_resolutions = self._read_attempt_resolutions(
+            previous=reviewed_effective
+        )
         known_authorities = (
             base_grant,
             previous_authority,
@@ -10364,6 +11236,12 @@ class _SemanticGlobalAuthority:
                         and payload.get("global_ordinal") == 212
                     ):
                         continue
+                    if any(
+                        item.get("global_ordinal")
+                        == payload.get("global_ordinal")
+                        for item in attempt_resolutions
+                    ):
+                        continue
                     started_path = (
                         run
                         / "started"
@@ -10594,6 +11472,55 @@ class _SemanticGlobalAuthority:
             ):
                 raise SemanticHandoffError(
                     "Semantic reviewed-head continuation activation 漂移。"
+                )
+        for resolution_receipt in attempt_resolutions:
+            activation_total = int(resolution_receipt["activation_total"])
+            activation_count = activation_total - int(
+                base_grant["baseline_total"]
+            )
+            activation = attempts[:activation_count]
+            resolved_attempt = activation[-1] if activation else None
+            attempt_window = (
+                resolved_attempt.get("window")
+                if isinstance(resolved_attempt, dict)
+                else None
+            )
+            authority_matches = tuple(
+                authority
+                for authority in known_authorities
+                if authority.get("global_authority_fingerprint")
+                == resolution_receipt.get(
+                    "previous_global_authority_fingerprint"
+                )
+            )
+            if (
+                activation_count < 0
+                or len(activation) != activation_count
+                or not activation
+                or activation[-1].get("global_ordinal")
+                != resolution_receipt.get("global_ordinal")
+                or activation[-1].get("global_authority_fingerprint")
+                != resolution_receipt.get(
+                    "previous_global_authority_fingerprint"
+                )
+                or not isinstance(attempt_window, dict)
+                or attempt_window.get("reviewed_git_head")
+                != resolution_receipt.get("previous_reviewed_git_head")
+                or not authority_matches
+                or any(
+                    authority.get("reviewed_git_head")
+                    != resolution_receipt.get("previous_reviewed_git_head")
+                    or authority.get("contract")
+                    != resolution_receipt.get("previous_execution_contract")
+                    for authority in authority_matches
+                )
+                or _fingerprint(activation)
+                != resolution_receipt.get(
+                    "activation_attempt_inventory_fingerprint"
+                )
+            ):
+                raise SemanticHandoffError(
+                    "Semantic attempt resolution activation 漂移。"
                 )
         previous_window: dict[str, object] | None = None
         for attempt in attempts:
@@ -13414,6 +14341,63 @@ class ExternalAgentSemanticHandoffService:
             reviewed_git_head=reviewed_git_head,
             digest_binding=digest_binding,
             commit_failed_closed_status=commit_failed_closed_status,
+        )
+
+    def resolve_attempt(
+        self,
+        provider: CodexCliRepresentationAnalysisProvider,
+        *,
+        authority_manifest_file: Path,
+        reviewed_git_head: str,
+        digest_binding: Mapping[str, object],
+        commit_failed_closed_status: Callable[
+            [str, int], tuple[str, Mapping[str, object]]
+        ],
+    ) -> dict[str, object]:
+        """Resolve one generic tail attempt without a Provider call."""
+
+        return _SemanticGlobalAuthority(self.audit_root).resolve_attempt(
+            authority_manifest_file=authority_manifest_file,
+            provider=provider,
+            reviewed_git_head=reviewed_git_head,
+            digest_binding=digest_binding,
+            commit_failed_closed_status=commit_failed_closed_status,
+        )
+
+    def build_attempt_resolution_manifest(
+        self,
+        provider: CodexCliRepresentationAnalysisProvider,
+        *,
+        candidate_file: Path,
+        authority_ref: str,
+        observed_at: str,
+        digest_binding: Mapping[str, object],
+    ) -> dict[str, object]:
+        """Build a private candidate without calling the Provider."""
+
+        return _SemanticGlobalAuthority(
+            self.audit_root
+        ).build_attempt_resolution_manifest(
+            candidate_file=candidate_file,
+            authority_ref=authority_ref,
+            observed_at=observed_at,
+            provider=provider,
+            digest_binding=digest_binding,
+        )
+
+    def validate_attempt_resolution_digest(
+        self,
+        *,
+        digest_binding: Mapping[str, object],
+        failed_closed_status_fingerprint: str,
+        resolution_id: str,
+    ) -> dict[str, object]:
+        return _SemanticGlobalAuthority(
+            self.audit_root
+        ).validate_attempt_resolution_digest(
+            digest_binding=digest_binding,
+            failed_closed_status_fingerprint=failed_closed_status_fingerprint,
+            resolution_id=resolution_id,
         )
 
     def validate_timeout_212_resolution_digest(

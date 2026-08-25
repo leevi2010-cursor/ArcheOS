@@ -11665,6 +11665,361 @@ print("passed")
             )
         self.assertEqual(runner.calls, [])
 
+    def test_generic_attempt_resolution_is_recoverable_and_continues_next_ordinal(
+        self,
+    ) -> None:
+        import archeos.semantic_handoff as handoff_module
+
+        root = self.root / "generic-attempt-resolution"
+        representation, representation_service = self.build_service(
+            root=root, blocks=2, batch_size=1
+        )
+        audit_root = root / "audits"
+        handoff = ExternalAgentSemanticHandoffService(
+            representation_service,
+            JsonlAtomicInformationStore(root / "atomic.jsonl"),
+            audit_root,
+        )
+        binding = self.semantic_window_binding(batch_size=1)
+        runner = FakeRunner()
+        provider = CodexCliRepresentationAnalysisProvider(
+            provider_version="0.147.0",
+            timeout_seconds=300,
+            runner=runner,
+        )
+        self.install_authority(handoff, provider, binding)
+        authority = _SemanticGlobalAuthority(audit_root)
+        recovery = _SemanticRecoveryRun(
+            representation_service,
+            audit_root,
+            representation.representation_id,
+            provider,
+            self.privacy_binding(),
+            global_authority=authority,
+            window_binding=binding,
+            complete_context=False,
+        )
+        recovery.ensure_run_receipt()
+        (attempt,) = authority.publish_attempts(
+            ((recovery, 1, binding, provider),)
+        )
+        recovery.publish_started(1)
+        _base, current, _continuations = authority._current_effective_authority()
+        attempts, unknown = authority._global_attempts(current)
+        self.assertTrue(unknown)
+        self.assertEqual(attempt["global_ordinal"], 81)
+        digest = {
+            "run_id": binding.window_run_id,
+            "plan_fingerprint": binding.window_plan_fingerprint,
+            "plan_receipt_fingerprint": (
+                binding.window_plan_receipt_fingerprint
+            ),
+            "item_id": "conversation:synthetic",
+            "source_id": representation.source_id,
+            "representation_id": representation.representation_id,
+            "representation_manifest": representation.to_manifest_dict(),
+            "representation_artifact_inventory_fingerprint": (
+                "sha256:" + "a" * 64
+            ),
+            "pre_status_fingerprint": "sha256:" + "b" * 64,
+            "capture_receipt_fingerprint": "sha256:" + "c" * 64,
+            "checkpoint_fingerprint": "sha256:" + "d" * 64,
+            "source_fingerprint": "sha256:" + "e" * 64,
+            "business_tree_fingerprint": "sha256:" + "f" * 64,
+        }
+        new_head = "f" * 40
+        manifest_path = root / "attempt-resolution-authority.json"
+        manifest = handoff.build_attempt_resolution_manifest(
+            provider,
+            candidate_file=manifest_path,
+            authority_ref=(
+                "https://github.com/leevi2010-cursor/ArcheOS/issues/184"
+                "#issuecomment-5407349371"
+            ),
+            observed_at="2026-08-25T12:00:00Z",
+            digest_binding=digest,
+        )
+        self.assertEqual(manifest["activation_total"], 81)
+        self.assertEqual(
+            manifest["continuation"]["reviewed_git_head"],
+            binding.reviewed_git_head,
+        )
+        self.assertEqual(runner.calls, [])
+        status_path = root / "failed-closed-status.json"
+
+        def commit(resolution_id: str, ordinal: int):
+            expected = {"resolution_id": resolution_id, "ordinal": ordinal}
+            if status_path.exists():
+                self.assertEqual(
+                    json.loads(status_path.read_text("utf-8")), expected
+                )
+            else:
+                status_path.write_text(json.dumps(expected), encoding="utf-8")
+                status_path.chmod(0o600)
+            return "sha256:" + "9" * 64, digest
+
+        manifest_bytes = manifest_path.read_bytes()
+        damaged_manifest = json.loads(manifest_bytes)
+        damaged_manifest["failure_evidence"]["process_cleanup_status"] = (
+            "unverified"
+        )
+        projected = dict(damaged_manifest)
+        projected.pop("payload_fingerprint")
+        damaged_manifest["payload_fingerprint"] = _canonical_fingerprint(
+            projected
+        )
+        manifest_path.write_text(json.dumps(damaged_manifest), encoding="utf-8")
+        with self.assertRaises(SemanticHandoffError):
+            handoff.resolve_attempt(
+                provider,
+                authority_manifest_file=manifest_path,
+                reviewed_git_head=new_head,
+                digest_binding=digest,
+                commit_failed_closed_status=commit,
+            )
+        self.assertFalse(status_path.exists())
+        manifest_path.write_bytes(manifest_bytes)
+
+        started_path = recovery.started_dir / "batch_0001.json"
+        started_bytes = started_path.read_bytes()
+        started_path.unlink()
+        with self.assertRaises(SemanticHandoffError):
+            handoff.resolve_attempt(
+                provider,
+                authority_manifest_file=manifest_path,
+                reviewed_git_head=new_head,
+                digest_binding=digest,
+                commit_failed_closed_status=commit,
+            )
+        self.assertFalse(status_path.exists())
+        started_path.write_bytes(started_bytes)
+        started_path.chmod(0o600)
+
+        result_path = recovery.results_dir / "batch_0001"
+        result_path.mkdir(parents=True, mode=0o700)
+        with self.assertRaises(SemanticHandoffError):
+            handoff.resolve_attempt(
+                provider,
+                authority_manifest_file=manifest_path,
+                reviewed_git_head=new_head,
+                digest_binding=digest,
+                commit_failed_closed_status=commit,
+            )
+        self.assertFalse(status_path.exists())
+        result_path.rmdir()
+        recovery.results_dir.rmdir()
+
+        attempt_path = recovery.attempts_dir / "batch_0001.json"
+        attempt_bytes = attempt_path.read_bytes()
+        damaged_attempt = json.loads(attempt_bytes)
+        damaged_attempt["attempt_nonce"] = "0" * 64
+        attempt_path.write_text(json.dumps(damaged_attempt), encoding="utf-8")
+        with self.assertRaises(SemanticHandoffError):
+            handoff.resolve_attempt(
+                provider,
+                authority_manifest_file=manifest_path,
+                reviewed_git_head=new_head,
+                digest_binding=digest,
+                commit_failed_closed_status=commit,
+            )
+        self.assertFalse(status_path.exists())
+        attempt_path.write_bytes(attempt_bytes)
+        attempt_path.chmod(0o600)
+
+        attempt_82_payload = recovery._global_attempt_payload(
+            2,
+            attempt_nonce="8" * 64,
+            global_ordinal=82,
+            grant=current,
+            window=binding,
+            reservation=True,
+        )
+        handoff_module._publish_private_json_marker(
+            recovery.attempts_dir / "batch_0002.json", attempt_82_payload
+        )
+        recovery.publish_started(2)
+        with self.assertRaises(SemanticHandoffError):
+            handoff.resolve_attempt(
+                provider,
+                authority_manifest_file=manifest_path,
+                reviewed_git_head=new_head,
+                digest_binding=digest,
+                commit_failed_closed_status=commit,
+            )
+        self.assertFalse(status_path.exists())
+        (recovery.started_dir / "batch_0002.json").unlink()
+        (recovery.attempts_dir / "batch_0002.json").unlink()
+
+        original_publish = handoff_module._publish_private_json_marker
+
+        def interrupt(path, payload):
+            if path.name == "attempt-resolution-0001.json":
+                raise OSError("synthetic receipt interruption")
+            return original_publish(path, payload)
+
+        with (
+            patch.object(handoff_module, "_publish_private_json_marker", interrupt),
+            self.assertRaisesRegex(OSError, "receipt interruption"),
+        ):
+            handoff.resolve_attempt(
+                provider,
+                authority_manifest_file=manifest_path,
+                reviewed_git_head=new_head,
+                digest_binding=digest,
+                commit_failed_closed_status=commit,
+            )
+        self.assertTrue(status_path.exists())
+        receipt = handoff.resolve_attempt(
+            provider,
+            authority_manifest_file=manifest_path,
+            reviewed_git_head=new_head,
+            digest_binding=digest,
+            commit_failed_closed_status=commit,
+        )
+        self.assertEqual(receipt["global_ordinal"], 81)
+        self.assertEqual(runner.calls, [])
+        self.assertEqual(
+            handoff.resolve_attempt(
+                provider,
+                authority_manifest_file=manifest_path,
+                reviewed_git_head=new_head,
+                digest_binding=digest,
+                commit_failed_closed_status=commit,
+            ),
+            receipt,
+        )
+        handoff.validate_attempt_resolution_digest(
+            digest_binding=digest,
+            failed_closed_status_fingerprint="sha256:" + "9" * 64,
+            resolution_id=receipt["resolution_id"],
+        )
+        continuation = handoff.install_reviewed_head_continuation(
+            provider,
+            window_binding=binding,
+            reviewed_git_head=new_head,
+            authority_ref=(
+                "https://github.com/leevi2010-cursor/ArcheOS/issues/184"
+                "#issuecomment-5407349371"
+            ),
+            active_run_binding={
+                "run_id": binding.window_run_id,
+                "plan_fingerprint": binding.window_plan_fingerprint,
+                "capture_receipt_fingerprint": "sha256:" + "7" * 64,
+                "status_fingerprint": "sha256:" + "8" * 64,
+            },
+        )
+        next_root = root / "next"
+        next_representation, next_service = self.build_service(
+            root=next_root,
+            source_id="src_" + "2" * 32,
+            batch_size=1,
+        )
+        next_runner = FakeRunner()
+        ExternalAgentSemanticHandoffService(
+            next_service,
+            JsonlAtomicInformationStore(next_root / "atomic.jsonl"),
+            audit_root,
+        ).execute(
+            next_representation.representation_id,
+            CodexCliRepresentationAnalysisProvider(
+                provider_version="0.147.0",
+                timeout_seconds=300,
+                runner=next_runner,
+            ),
+            privacy_binding=self.privacy_binding(),
+            authority_binding=replace(binding, reviewed_git_head=new_head),
+        )
+        self.assertEqual(len(next_runner.calls), 1)
+        attempt_82 = next(
+            json.loads(path.read_text("utf-8"))
+            for path in audit_root.glob("semantic_run_*/attempts/*.json")
+            if json.loads(path.read_text("utf-8")).get("global_ordinal") == 82
+        )
+        self.assertEqual(
+            attempt_82["global_authority_fingerprint"],
+            continuation["continuation_fingerprint"],
+        )
+
+        second_root = root / "second-unknown"
+        second_representation, second_service = self.build_service(
+            root=second_root,
+            source_id="src_" + "3" * 32,
+            batch_size=1,
+        )
+        second_handoff = ExternalAgentSemanticHandoffService(
+            second_service,
+            JsonlAtomicInformationStore(second_root / "atomic.jsonl"),
+            audit_root,
+        )
+        second_binding = replace(binding, reviewed_git_head=new_head)
+        second_recovery = _SemanticRecoveryRun(
+            second_service,
+            audit_root,
+            second_representation.representation_id,
+            provider,
+            self.privacy_binding(),
+            global_authority=authority,
+            window_binding=second_binding,
+            complete_context=False,
+        )
+        second_recovery.ensure_run_receipt()
+        (second_attempt,) = authority.publish_attempts(
+            ((second_recovery, 1, second_binding, provider),)
+        )
+        second_recovery.publish_started(1)
+        self.assertEqual(second_attempt["global_ordinal"], 83)
+        second_digest = {
+            **digest,
+            "source_id": second_representation.source_id,
+            "representation_id": second_representation.representation_id,
+            "representation_manifest": (
+                second_representation.to_manifest_dict()
+            ),
+        }
+        second_manifest_path = root / "attempt-resolution-authority-2.json"
+        second_handoff.build_attempt_resolution_manifest(
+            provider,
+            candidate_file=second_manifest_path,
+            authority_ref=(
+                "https://github.com/leevi2010-cursor/ArcheOS/issues/999"
+                "#issuecomment-5407349999"
+            ),
+            observed_at="2026-08-25T13:00:00Z",
+            digest_binding=second_digest,
+        )
+        second_status_path = root / "failed-closed-status-2.json"
+
+        def commit_second(resolution_id: str, ordinal: int):
+            expected = {"resolution_id": resolution_id, "ordinal": ordinal}
+            second_status_path.write_text(json.dumps(expected), encoding="utf-8")
+            second_status_path.chmod(0o600)
+            return "sha256:" + "6" * 64, second_digest
+
+        second_receipt = second_handoff.resolve_attempt(
+            provider,
+            authority_manifest_file=second_manifest_path,
+            reviewed_git_head=new_head,
+            digest_binding=second_digest,
+            commit_failed_closed_status=commit_second,
+        )
+        self.assertEqual(second_receipt["global_ordinal"], 83)
+        self.assertEqual(
+            second_receipt["previous_global_authority_fingerprint"],
+            continuation["continuation_fingerprint"],
+        )
+        _base, effective, _continuations = (
+            authority._current_effective_authority()
+        )
+        final_attempts, final_unknown = authority._global_attempts(effective)
+        self.assertFalse(final_unknown)
+        self.assertEqual(final_attempts[-1]["global_ordinal"], 83)
+        self.assertEqual(80 + len(final_attempts) + 1, 84)
+        self.assertEqual(
+            effective["global_authority_fingerprint"],
+            continuation["continuation_fingerprint"],
+        )
+        self.assertEqual(runner.calls, [])
+
     def test_issue_135_continuation_is_zero_call_and_starts_at_221(
         self,
     ) -> None:
