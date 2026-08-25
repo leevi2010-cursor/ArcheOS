@@ -1001,12 +1001,23 @@ class SyntheticSemanticHandoff(_SyntheticSemanticHandoffBase):
     def governance_startup_recovery_snapshot(self, representation_id):
         if representation_id != self.latest_representation_id:
             raise RuntimeError("synthetic latest Representation mismatch")
+        target_ordinal = getattr(
+            self, "startup_target_ordinal", self.global_attempt_total
+        )
+        commit_cursor = getattr(
+            self, "startup_commit_cursor", target_ordinal
+        )
         return {
             "global_attempt_total": self.global_attempt_total,
             "global_unknown": self.global_unknown,
             "last_global_ordinal": self.global_attempt_total,
             "next_global_ordinal": self.global_attempt_total + 1,
             "absolute_cap": self.absolute_cap,
+            "target_global_ordinal_range": [
+                target_ordinal,
+                target_ordinal,
+            ],
+            "commit_cursor_ordinal": commit_cursor,
             "commit_cursor_fingerprint": "sha256:" + "1" * 64,
             "latest_attempt_receipt_fingerprint": "sha256:" + "2" * 64,
             "semantic_run_id": "semantic_run_" + "3" * 32,
@@ -1018,6 +1029,7 @@ class SyntheticSemanticHandoff(_SyntheticSemanticHandoffBase):
             "execution_contract_fingerprint": "sha256:" + "7" * 64,
             "reviewed_head_sequence": len(self.installed_reviewed_head_continuations),
             "reviewed_head_chain_fingerprint": "sha256:" + "8" * 64,
+            "ledger_tail_attempt_receipt_fingerprint": "sha256:" + "9" * 64,
         }
 
     def resolve_unknown(
@@ -4055,6 +4067,31 @@ class WechatDigestTests(unittest.TestCase):
         self.assertEqual(self.governance_business_state(service), business_before)
         self.assertEqual(provider.attempts, 1)
 
+    def test_item_governance_startup_semantic_drift_is_before_status_write(self) -> None:
+        service, provider, run_id, _item_id, _atomic_ids = (
+            self.item_governance_startup_recovery_fixture()
+        )
+        authority_ref = "https://github.com/leevi2010-cursor/ArcheOS/issues/194#issuecomment-5415298053"
+        manifest = service.build_governance_startup_recovery_manifest(
+            authority_ref=authority_ref
+        )
+        path = Path(self.temporary.name) / "issue-194-semantic-drift.json"
+        path.write_text(json.dumps(manifest), encoding="utf-8")
+        os.chmod(path, 0o600)
+        service.resolve_governance_startup_failure(
+            authority_ref=authority_ref,
+            authority_manifest_file=path,
+        )
+        status_path = service.run_store.runs_root / run_id / "status.json"
+        before = status_path.read_bytes()
+        business_before = self.governance_business_state(service)
+        self.semantic.global_attempt_total += 1
+        with self.assertRaises(WechatDigestError):
+            service.run(max_terminal_items=1)
+        self.assertEqual(status_path.read_bytes(), before)
+        self.assertEqual(self.governance_business_state(service), business_before)
+        self.assertEqual(provider.attempts, 1)
+
     def test_item_governance_startup_recovery_rejects_drift_before_receipt(self) -> None:
         service, _provider, run_id, item_id, _atomic_ids = self.item_governance_startup_recovery_fixture(atomic_count=2)
         authority_ref = "https://github.com/leevi2010-cursor/ArcheOS/issues/194#issuecomment-5415298053"
@@ -4069,6 +4106,87 @@ class WechatDigestTests(unittest.TestCase):
         with self.assertRaises(WechatDigestError):
             service.resolve_governance_startup_failure(authority_ref=authority_ref, authority_manifest_file=path)
         self.assertEqual(service.run_store.governance_startup_recoveries(run_id), ())
+
+    def test_item_governance_startup_snapshot_preserves_uncommitted_ledger_tail(self) -> None:
+        service, _provider, run_id, _item_id, _atomic_ids = (
+            self.item_governance_startup_recovery_fixture()
+        )
+        self.semantic.global_attempt_total = 373
+        self.semantic.startup_target_ordinal = 372
+        self.semantic.startup_commit_cursor = 372
+        authority_ref = "https://github.com/leevi2010-cursor/ArcheOS/issues/194#issuecomment-5415298053"
+        before = service.run_store.status(run_id)
+        manifest = service.build_governance_startup_recovery_manifest(
+            authority_ref=authority_ref
+        )
+        semantic = manifest["semantic_snapshot"]
+        self.assertEqual(semantic["global_attempt_total"], 373)
+        self.assertEqual(semantic["last_global_ordinal"], 373)
+        self.assertEqual(semantic["next_global_ordinal"], 374)
+        self.assertEqual(semantic["target_global_ordinal_range"], [372, 372])
+        self.assertEqual(semantic["commit_cursor_ordinal"], 372)
+        self.assertEqual(service.run_store.status(run_id), before)
+
+    def test_item_governance_startup_allows_unrelated_v2_history(self) -> None:
+        service, _provider, run_id, _item_id, atomic_ids = (
+            self.item_governance_startup_recovery_fixture()
+        )
+        authority_ref = "https://github.com/leevi2010-cursor/ArcheOS/issues/194#issuecomment-5415298053"
+        manifest = service.build_governance_startup_recovery_manifest(
+            authority_ref=authority_ref
+        )
+        unrelated_binding = {
+            **manifest["recovery_binding"],
+            "item_id": "conversation:historical-item",
+        }
+        unrelated_without = {
+            "schema_version": "wechat-governance-startup-recovery/1.0",
+            "artifact_kind": "governance_startup_recovery",
+            "authority_ref": "https://github.com/leevi2010-cursor/ArcheOS/issues/193#issuecomment-1",
+            "authority_manifest_fingerprint": "sha256:" + "a" * 64,
+            "authority_manifest_raw_fingerprint": "sha256:" + "b" * 64,
+            "recovery_binding": unrelated_binding,
+            "atomic_effect_bindings": manifest["atomic_effect_bindings"],
+            "business_tree_fingerprint": manifest["business_tree_fingerprint"],
+            "semantic_continuation_fingerprint": "sha256:" + "c" * 64,
+            "provider_retry_permitted": True,
+            "max_retry_attempts": 1,
+            "retry_consumed": False,
+        }
+        unrelated = {
+            **unrelated_without,
+            "receipt_fingerprint": _sha256_bytes(
+                _canonical_json(unrelated_without).encode("utf-8")
+            ),
+        }
+        service.run_store.publish_item_scoped_governance_startup_receipt(
+            run_id, receipt=unrelated
+        )
+        retry_without = {
+            "schema_version": "wechat-governance-startup-retry/1.0",
+            "artifact_kind": "governance_startup_retry_consumption",
+            "recovery_receipt_fingerprint": unrelated["receipt_fingerprint"],
+            "run_id": run_id,
+            "item_id": "conversation:historical-item",
+            "atomic_information_fingerprint": _governance_atomic_fingerprint(
+                atomic_ids
+            ),
+            "retry_attempt": 1,
+            "consumed_at": "2026-08-26T00:00:00+00:00",
+        }
+        retry = {
+            **retry_without,
+            "receipt_fingerprint": _sha256_bytes(
+                _canonical_json(retry_without).encode("utf-8")
+            ),
+        }
+        service.run_store.publish_item_scoped_governance_startup_receipt(
+            run_id, receipt=retry
+        )
+        rebuilt = service.build_governance_startup_recovery_manifest(
+            authority_ref=authority_ref
+        )
+        self.assertEqual(rebuilt, manifest)
 
     def test_item_governance_startup_retry_failure_is_consumed(self) -> None:
         service, provider, run_id, _item_id, _atomic_ids = self.item_governance_startup_recovery_fixture(fail_restart=True)

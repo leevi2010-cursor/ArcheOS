@@ -14807,7 +14807,43 @@ class ExternalAgentSemanticHandoffService:
             attempts, unknown = authority._global_attempts(effective)
             if not attempts or unknown:
                 raise SemanticHandoffError("Semantic Governance recovery ledger 尚未收敛。")
-            latest = attempts[-1]
+            cursor = authority._current_commit_cursor(effective, attempts)
+            committed_ordinal = cursor.get("committed_global_ordinal")
+            if isinstance(committed_ordinal, bool) or not isinstance(
+                committed_ordinal, int
+            ):
+                raise SemanticHandoffError(
+                    "Semantic Governance recovery commit cursor 损坏。"
+                )
+            target_attempts: list[dict[str, object]] = []
+            for attempt in attempts:
+                semantic_run_id_value = attempt.get("semantic_run_id")
+                if not isinstance(semantic_run_id_value, str):
+                    raise SemanticHandoffError(
+                        "Semantic Governance recovery attempt identity 损坏。"
+                    )
+                receipt = _private_json_exact(
+                    self.audit_root / semantic_run_id_value / "run-receipt.json"
+                )
+                representation = receipt.get("representation")
+                if (
+                    isinstance(representation, dict)
+                    and representation.get("representation_id")
+                    == representation_id
+                ):
+                    target_attempts.append(attempt)
+            if not target_attempts:
+                raise SemanticHandoffError(
+                    "Semantic Governance recovery target attempt 缺失。"
+                )
+            target_ordinals = [
+                int(attempt["global_ordinal"]) for attempt in target_attempts
+            ]
+            if max(target_ordinals) != committed_ordinal:
+                raise SemanticHandoffError(
+                    "Semantic Governance recovery target 尚未提交。"
+                )
+            latest = target_attempts[-1]
             semantic_run_id = latest.get("semantic_run_id")
             batch_ordinal = latest.get("batch_ordinal")
             global_ordinal = latest.get("global_ordinal")
@@ -14826,13 +14862,11 @@ class ExternalAgentSemanticHandoffService:
             if not isinstance(processing_run_id, str):
                 raise SemanticHandoffError("Semantic Governance recovery result binding 损坏。")
             audit = _private_json_exact(self.audit_root / processing_run_id / "processing-run-audit.json")
-            cursor = authority._current_commit_cursor(effective, attempts)
             total = int(base["baseline_total"]) + len(attempts)
             if (
                 not isinstance(representation, dict)
                 or representation.get("representation_id") != representation_id
-                or cursor.get("committed_global_ordinal") != global_ordinal
-                or total != global_ordinal
+                or committed_ordinal != global_ordinal
                 or result_receipt.get("attempt_receipt_fingerprint") != latest.get("attempt_receipt_fingerprint")
                 or audit.get("processing_run_id") != processing_run_id
                 or audit.get("handoff_status") != "completed"
@@ -14842,9 +14876,14 @@ class ExternalAgentSemanticHandoffService:
             return {
                 "global_attempt_total": total,
                 "global_unknown": 0,
-                "last_global_ordinal": global_ordinal,
+                "last_global_ordinal": total,
                 "next_global_ordinal": total + 1,
                 "absolute_cap": int(effective["absolute_cap"]),
+                "target_global_ordinal_range": [
+                    min(target_ordinals),
+                    max(target_ordinals),
+                ],
+                "commit_cursor_ordinal": committed_ordinal,
                 "commit_cursor_fingerprint": cursor["commit_cursor_fingerprint"],
                 "latest_attempt_receipt_fingerprint": latest["attempt_receipt_fingerprint"],
                 "semantic_run_id": semantic_run_id,
@@ -14856,6 +14895,9 @@ class ExternalAgentSemanticHandoffService:
                 "execution_contract_fingerprint": _fingerprint(effective["contract"]),
                 "reviewed_head_sequence": len(continuations),
                 "reviewed_head_chain_fingerprint": _fingerprint(continuations),
+                "ledger_tail_attempt_receipt_fingerprint": attempts[-1][
+                    "attempt_receipt_fingerprint"
+                ],
             }
 
     def recovery_preflight(

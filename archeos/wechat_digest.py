@@ -3393,18 +3393,20 @@ def _validated_item_governance_startup_recovery_manifest(
     semantic_fields = {
         "global_attempt_total", "global_unknown", "last_global_ordinal",
         "next_global_ordinal", "absolute_cap", "commit_cursor_fingerprint",
+        "target_global_ordinal_range", "commit_cursor_ordinal",
         "latest_attempt_receipt_fingerprint", "semantic_run_id", "batch_ordinal",
         "result_binding_fingerprint", "processing_audit_fingerprint",
         "global_authority_fingerprint", "reviewed_git_head",
         "execution_contract_fingerprint", "reviewed_head_sequence",
         "reviewed_head_chain_fingerprint",
+        "ledger_tail_attempt_receipt_fingerprint",
     }
     ordered_ids = binding.get("ordered_atomic_information_ids") if isinstance(binding, dict) else None
     revisions = binding.get("ordered_atomic_revision_fingerprints") if isinstance(binding, dict) else None
     numeric_semantic = (
         "global_attempt_total", "global_unknown", "last_global_ordinal",
         "next_global_ordinal", "absolute_cap", "batch_ordinal",
-        "reviewed_head_sequence",
+        "reviewed_head_sequence", "commit_cursor_ordinal",
     )
     if (
         set(value) != {
@@ -3440,6 +3442,10 @@ def _validated_item_governance_startup_recovery_manifest(
         or semantic.get("global_unknown") != 0
         or semantic.get("last_global_ordinal") != semantic.get("global_attempt_total")
         or semantic.get("next_global_ordinal") != semantic.get("global_attempt_total") + 1
+        or not isinstance(semantic.get("target_global_ordinal_range"), list)
+        or len(semantic["target_global_ordinal_range"]) != 2
+        or any(isinstance(item, bool) or not isinstance(item, int) for item in semantic["target_global_ordinal_range"])
+        or semantic["target_global_ordinal_range"][1] != semantic.get("commit_cursor_ordinal")
         or any(not _sha256_value(semantic.get(field)) for field in semantic_fields if field.endswith("_fingerprint"))
         or not _sha256_value(fingerprint)
         or fingerprint != _sha256_bytes(_canonical_json(projected).encode("utf-8"))
@@ -5336,7 +5342,19 @@ class WechatDigestService:
             if isinstance(recovery.get("recovery_binding"), dict)
             and recovery["recovery_binding"].get("item_id") == item_id
         ]
-        if retries or len(matching_recoveries) > (1 if allow_existing else 0):
+        matching_fingerprints = {
+            str(recovery.get("receipt_fingerprint"))
+            for recovery in matching_recoveries
+        }
+        matching_retries = [
+            retry
+            for retry in retries
+            if retry.get("recovery_receipt_fingerprint")
+            in matching_fingerprints
+        ]
+        if matching_retries or len(matching_recoveries) > (
+            1 if allow_existing else 0
+        ):
             raise WechatDigestError("Governance 单项启动恢复许可已存在或已消费。")
         source = self.source_repository.get(source_id)
         representation = self.representation_repository.get(representation_id)
@@ -11075,11 +11093,34 @@ class WechatDigestService:
         if not isinstance(items, dict):
             raise WechatDigestError("微信运行状态 items 损坏。")
         recoveries, retries = self._governance_startup_history(run_id)
+        current_items = [
+            (item_id, item)
+            for item_id, item in items.items()
+            if isinstance(item_id, str)
+            and isinstance(item, dict)
+            and item.get("state") == "represented"
+            and isinstance(item.get("governance_receipt"), dict)
+            and item["governance_receipt"].get("phase") == "started"
+        ]
+        if len(current_items) != 1:
+            return False
+        current_item_id, current_item = current_items[0]
+        current_started = _validated_governance_receipt(
+            current_item.get("governance_receipt")
+        )
+        current_started_fingerprint = _sha256_bytes(
+            _canonical_json(current_started).encode("utf-8")
+        )
         generic = [
             recovery
             for recovery in recoveries
             if isinstance(recovery.get("recovery_binding"), dict)
             and "semantic_snapshot_fingerprint" in recovery["recovery_binding"]
+            and recovery["recovery_binding"].get("item_id") == current_item_id
+            and recovery["recovery_binding"].get(
+                "governance_started_receipt_fingerprint"
+            )
+            == current_started_fingerprint
         ]
         if not generic:
             return False
@@ -11106,6 +11147,28 @@ class WechatDigestService:
             != binding.get("governance_started_receipt_fingerprint")
         ):
             raise WechatDigestError("Governance 单项启动恢复 item binding 漂移。")
+        authority_ref = recovery.get("authority_ref")
+        if not isinstance(authority_ref, str):
+            raise WechatDigestError("Governance 单项启动恢复 authority ref 损坏。")
+        expected = self._build_item_governance_startup_recovery_manifest_unlocked(
+            authority_ref=authority_ref,
+            allow_existing=True,
+        )
+        semantic = expected.get("semantic_snapshot")
+        if (
+            recovery.get("authority_manifest_fingerprint")
+            != expected.get("manifest_fingerprint")
+            or recovery.get("recovery_binding")
+            != expected.get("recovery_binding")
+            or recovery.get("atomic_effect_bindings")
+            != expected.get("atomic_effect_bindings")
+            or recovery.get("business_tree_fingerprint")
+            != expected.get("business_tree_fingerprint")
+            or not isinstance(semantic, dict)
+            or recovery.get("semantic_continuation_fingerprint")
+            != semantic.get("global_authority_fingerprint")
+        ):
+            raise WechatDigestError("Governance 单项启动恢复完整现场漂移。")
         return True
 
     def _load_or_upgrade_active_capture(
