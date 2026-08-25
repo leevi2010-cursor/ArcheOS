@@ -1781,7 +1781,7 @@ class _SemanticRecoveryRun:
                 raise SemanticHandoffError("Semantic reserved inventory 损坏。")
 
     def inspect(
-        self,
+        self, *, reject_conflicting_execution_runs: bool = True
     ) -> tuple[
         tuple[
             tuple[RepresentationAnalysisResult, ExternalAgentExecutionRecord]
@@ -1794,7 +1794,8 @@ class _SemanticRecoveryRun:
             self.audit_root, create=False
         ):
             return tuple(None for _ in self.batches), 0
-        self._reject_conflicting_execution_runs()
+        if reject_conflicting_execution_runs:
+            self._reject_conflicting_execution_runs()
         if not self.exists:
             return tuple(None for _ in self.batches), 0
         self._validate_inventory()
@@ -12809,14 +12810,6 @@ class ExternalAgentSemanticHandoffService:
                     candidate.semantic_run_id: candidate
                     for candidate in recovery_candidates
                 }
-                observed_run_ids = self._current_recovery_run_ids(
-                    representation_id
-                )
-                if observed_run_ids - set(unique_candidates):
-                    raise SemanticHandoffError(
-                        "完整 Semantic recovery package 未能安全收敛；"
-                        "authority 漂移且未执行 Provider。"
-                    )
                 existing_candidates = tuple(
                     candidate
                     for candidate in unique_candidates.values()
@@ -13754,28 +13747,6 @@ class ExternalAgentSemanticHandoffService:
                 )
         return elapsed
 
-    def _current_recovery_run_ids(
-        self, representation_id: str
-    ) -> set[str]:
-        if not self.audit_root.is_dir():
-            return set()
-        observed: set[str] = set()
-        for run_dir in self.audit_root.glob("semantic_run_*"):
-            receipt_path = run_dir / "run-receipt.json"
-            if not os.path.lexists(receipt_path):
-                continue
-            receipt = _private_json_exact(receipt_path)
-            representation = receipt.get("representation")
-            if (
-                receipt.get("protocol_version")
-                == EXTERNAL_AGENT_PROTOCOL_VERSION
-                and isinstance(representation, dict)
-                and representation.get("representation_id")
-                == representation_id
-            ):
-                observed.add(run_dir.name)
-        return observed
-
     def _validate_recovery_package_candidate(
         self,
         representation_id: str,
@@ -13783,7 +13754,9 @@ class ExternalAgentSemanticHandoffService:
         provider: CodexCliRepresentationAnalysisProvider,
         recovery: _SemanticRecoveryRun,
     ) -> None:
-        loaded, unknown = recovery.inspect()
+        loaded, unknown = recovery.inspect(
+            reject_conflicting_execution_runs=False
+        )
         if unknown or any(item is None for item in loaded):
             raise SemanticHandoffError(
                 "Partial Semantic recovery 不得匹配完整 package。"
@@ -13840,7 +13813,9 @@ class ExternalAgentSemanticHandoffService:
                     provider=provider,
                     commit=False,
                 )
-            loaded, unknown = recovery.inspect()
+            loaded, unknown = recovery.inspect(
+                reject_conflicting_execution_runs=False
+            )
             if unknown or any(item is None for item in loaded):
                 raise SemanticHandoffError(
                     "Partial Semantic recovery 不得作为完整 package authority。"

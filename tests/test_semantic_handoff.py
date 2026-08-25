@@ -12607,6 +12607,23 @@ print("passed")
         self.assertTrue(legacy_recovery.exists)
         with self.assertRaisesRegex(SemanticHandoffError, "不得创建新执行"):
             legacy_recovery.ensure_run_receipt()
+        unrelated_recovery = _SemanticRecoveryRun(
+            service,
+            audit_root,
+            representation.representation_id,
+            legacy_provider,
+            replace(
+                privacy,
+                receipt_fingerprint="sha256:" + "7" * 64,
+            ),
+            complete_context=True,
+        )
+        unrelated_recovery.ensure_run_receipt()
+        self.assertTrue(unrelated_recovery.exists)
+        self.assertNotEqual(
+            unrelated_recovery.semantic_run_id,
+            legacy_recovery.semantic_run_id,
+        )
 
         package_before = self.tree_snapshot(published.package)
         audits_before = self.tree_snapshot(audit_root)
@@ -12643,6 +12660,28 @@ print("passed")
             ),
             published.audit_paths,
         )
+
+        canonical_recovery = _SemanticRecoveryRun(
+            service,
+            audit_root,
+            representation.representation_id,
+            replay_provider,
+            privacy,
+            complete_context=True,
+        )
+        canonical_recovery.run_dir.mkdir(mode=0o700)
+        with patch.object(
+            handoff,
+            "_validate_recovery_package_candidate",
+            return_value=None,
+        ), self.assertRaisesRegex(SemanticHandoffError, "匹配多个合同"):
+            handoff.execute(
+                representation.representation_id,
+                replay_provider,
+                privacy_binding=privacy,
+            )
+        self.assertEqual(replay_runner.calls, [])
+        self.assertEqual(store_path.read_bytes(), store_before)
 
         receipt_path = legacy_recovery.run_dir / "run-receipt.json"
         receipt_bytes = receipt_path.read_bytes()
