@@ -7027,7 +7027,15 @@ class WechatDigestTests(unittest.TestCase):
             )
             for number in range(1000)
         ]
-        capture = FailOnSecondFullCaptureProvider(messages)
+        class TimedFailOnSecondFullCaptureProvider(
+            FailOnSecondFullCaptureProvider
+        ):
+            def capture(self, *args, **kwargs):
+                if not kwargs.get("observe_only", False):
+                    time.sleep(0.01)
+                return super().capture(*args, **kwargs)
+
+        capture = TimedFailOnSecondFullCaptureProvider(messages)
         semantic = ObservedOutOfOrderSemanticHandoff(self.workspace)
 
         class BoundedBenchmarkAnalysisProvider(SyntheticAnalysisProvider):
@@ -7053,8 +7061,20 @@ class WechatDigestTests(unittest.TestCase):
         self.assertEqual(sum(not call[2] for call in capture.calls), 1)
         self.assertEqual(sum(item.capture_provider_calls for item in results), 1)
         self.assertEqual(sum(item.upper_bound_probe_calls for item in results), 1)
-        self.assertTrue(all(item.completed_window_connector_replays == 0 for item in results))
+        self.assertGreaterEqual(results[0].capture_ms, 5)
+        self.assertTrue(all(item.capture_ms == 0 for item in results[1:]))
+        self.assertTrue(
+            all(item.completed_window_connector_replays == 0 for item in results)
+        )
         self.assertTrue(all(item.segment_items_completed <= 3 for item in results))
+        self.assertTrue(all(item.total_wall_ms > 0 for item in results))
+        self.assertTrue(all(item.snapshot_readback_ms >= 0 for item in results))
+        self.assertTrue(all(item.slice_build_ms >= 0 for item in results))
+        self.assertTrue(all(item.commit_wall_ms >= 0 for item in results))
+        self.assertTrue(all(item.governance_wall_ms >= 0 for item in results))
+        self.assertTrue(all(item.checkpoint_wall_ms >= 0 for item in results))
+        self.assertTrue(any(item.governance_wall_ms > 0 for item in results))
+        self.assertEqual(results[-1].governance_wall_ms, 0)
         self.assertEqual(results[-1].new_messages, 1000)
         self.assertEqual(results[-1].new_attachments, 100)
         self.assertGreater(results[-1].snapshot_bytes, 0)

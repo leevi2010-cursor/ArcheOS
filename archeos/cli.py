@@ -1955,34 +1955,47 @@ def _wechat_product_command(args: argparse.Namespace) -> int:
         "治理 timeout / failure："
         f"{result.governance_timeouts} / {result.governance_failures}"
     )
+    stage_timings = {
+        "capture": result.capture_ms,
+        "snapshot_publish": result.snapshot_publish_ms,
+        "snapshot_readback": result.snapshot_readback_ms,
+        "slice_build": result.slice_build_ms,
+        "semantic": result.semantic_wall_ms,
+        "commit": result.commit_wall_ms,
+        "governance": result.governance_wall_ms,
+        "checkpoint": result.checkpoint_wall_ms,
+    }
+    dominant_stage = (
+        max(stage_timings, key=stage_timings.__getitem__)
+        if any(stage_timings.values())
+        else None
+    )
+    performance = {
+        "upper_bound_probe_calls": result.upper_bound_probe_calls,
+        "capture_provider_calls": result.capture_provider_calls,
+        "completed_window_connector_replays": (
+            result.completed_window_connector_replays
+        ),
+        "snapshot_bytes": result.snapshot_bytes,
+        "capture_ms": result.capture_ms,
+        "snapshot_publish_ms": result.snapshot_publish_ms,
+        "snapshot_readback_ms": result.snapshot_readback_ms,
+        "slice_build_ms": result.slice_build_ms,
+        "semantic_parallelism": result.semantic_parallelism,
+        "semantic_peak_concurrency": result.semantic_peak_concurrency,
+        "semantic_wall_ms": result.semantic_wall_ms,
+        "semantic_serial_estimate_ms": result.semantic_serial_estimate_ms,
+        "commit_wall_ms": result.commit_wall_ms,
+        "governance_wall_ms": result.governance_wall_ms,
+        "governance_peak_concurrency": result.governance_peak_concurrency,
+        "checkpoint_wall_ms": result.checkpoint_wall_ms,
+        "resume_provider_calls": result.resume_provider_calls,
+        "total_wall_ms": result.total_wall_ms,
+        "dominant_stage": dominant_stage,
+    }
     print(
         "性能指标："
-        + json.dumps(
-            {
-                "upper_bound_probe_calls": result.upper_bound_probe_calls,
-                "capture_provider_calls": result.capture_provider_calls,
-                "completed_window_connector_replays": (
-                    result.completed_window_connector_replays
-                ),
-                "snapshot_bytes": result.snapshot_bytes,
-                "capture_ms": result.capture_ms,
-                "snapshot_publish_ms": result.snapshot_publish_ms,
-                "snapshot_readback_ms": result.snapshot_readback_ms,
-                "slice_build_ms": result.slice_build_ms,
-                "semantic_parallelism": result.semantic_parallelism,
-                "semantic_peak_concurrency": result.semantic_peak_concurrency,
-                "semantic_wall_ms": result.semantic_wall_ms,
-                "semantic_serial_estimate_ms": (
-                    result.semantic_serial_estimate_ms
-                ),
-                "governance_peak_concurrency": (
-                    result.governance_peak_concurrency
-                ),
-                "resume_provider_calls": result.resume_provider_calls,
-            },
-            ensure_ascii=False,
-            sort_keys=True,
-        )
+        + json.dumps(performance, ensure_ascii=False, sort_keys=True)
     )
     print(f"checkpoint：{checkpoint}")
     if result.segment_safe_stopped:
