@@ -10936,12 +10936,31 @@ class WechatCaptureHelperTests(unittest.TestCase):
             )
         )
 
-    def test_contact_selection_drift_stops_before_message_body_query(self) -> None:
+    def test_contact_display_name_change_keeps_stable_identity_scope(self) -> None:
         request = self.request()
         request["contact_scope"] = {
             "conversation_key": self.cursors[1][1],
             "provider_conversation_id": self.username,
             "display_name": "Old Name",
+            "is_group": False,
+        }
+        with self.capture_runtime():
+            result = capture_with_wechat_cli(request)
+        self.assertTrue(result["messages"])
+        self.assertTrue(
+            all(
+                item["provider_conversation_id"] == self.username
+                and item["conversation_label"] == "Synthetic Conversation"
+                for item in result["messages"]
+            )
+        )
+
+    def test_contact_provider_identity_drift_stops_before_message_body_query(self) -> None:
+        request = self.request()
+        request["contact_scope"] = {
+            "conversation_key": self.cursors[1][1],
+            "provider_conversation_id": "wxid_other",
+            "display_name": "Synthetic Conversation",
             "is_group": False,
         }
         with self.capture_runtime(), patch.object(

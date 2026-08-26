@@ -113,9 +113,13 @@ Hypothesis 是 Atomic Information 的 canonical 语义形态，用于保存**尚
 
 同一相关批次仍由一个 Agent 在完整有界上下文中理解，不按消息或片段拆给多个 Agent。不同、完整且彼此独立的会话或 Representation 可以有限并行进行只读语义分析；并行只生成隔离、可恢复的结果。Information 保存、Identity 判断、Governance、Object / Relationship 更新、Proposal / Journal 与 checkpoint 始终按来源计划顺序串行执行。该执行边界不得降低 Evidence、冲突、不确定性或 Human Judgment 要求。
 
-微信日常消化默认以用户明确选择的一个联系人会话作为相关批次。联系人可读名称只用于选择，系统必须在正文读取前唯一绑定 provider 的稳定 conversation technical key；同名、无匹配、名称或 technical key 漂移时停止，不猜测身份。该 technical key 是 Processing provenance，不是 Person Object ID，也不能绕过 Identity Gate。
+微信日常消化默认以用户明确选择的一个联系人会话作为相关批次。联系人可读名称只用于发现与选择，系统必须在正文读取前唯一绑定 provider conversation identity 与稳定 conversation technical key；同名时由用户选择唯一 technical key，无匹配或技术身份漂移时停止，不猜测身份。绑定后的展示名称可以变化，系统保留名称历史并继续沿同一 technical key 恢复，不能因为改名换到另一会话。该 technical key 是 Processing provenance，不是 Person Object ID，也不能绕过 Identity Gate。
 
 选定联系人后，只允许捕获该会话的消息与附件。每个联系人拥有独立计划、冻结上界和 checkpoint；恢复只读该联系人的 durable capture，不推进 legacy 全局或其他联系人的 checkpoint。同一联系人语义并行度固定为 1；超出单次有界上下文时按消息顺序续接，并在联系人级归并 Object candidate、Event、当前状态、Evidence、冲突、未知与附件覆盖。不同联系人未来可以作为完整单位有限并行，但 Information、Identity、Governance 与 World Model 应用仍保持串行。
+
+联系人级连续理解按有序 Atomic Information 分段。每一段把上一段完整且已持久化的联系人 synthesis 与下一段新 Evidence 一并交给同一模型路线；完整结构化结果先持久化并读回，再推进 synthesis cursor。中断后先复用 durable result，Provider 调用为 0。最终 acceptance pack 只投影该 synthesis 中明确形成的 Object candidate、Event、Timeline 与 current state，不按日期、关键词、raw concern 或 semantic category 自行猜测 Event。
+
+normal contact write 与 legacy 全局任务重叠时，已处于明确终态的 message provenance 可以过滤；任何 nonterminal legacy item 的重叠都因无法证明长期效果尚未发生而在新 Source / Information / World 写入前停止。isolated acceptance 可以读取完整目标会话，因为其全部 Source、Information、World、run 与输出均位于主 Workspace 之外。
 
 隔离验收模式把 Source、Representation、Information、World Model、运行状态与业务验收 View 全部写入独立私有 Workspace；主 Workspace、active run 和任何既有 checkpoint 保持不变。隔离验收结果读回后停止，未经新的 Human Decision 不进入主 World Model。
 

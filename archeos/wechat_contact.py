@@ -12,8 +12,10 @@ import os
 import re
 import stat
 import tempfile
-from collections import Counter, defaultdict
+from collections import Counter
 from collections.abc import Callable, Mapping
+from contextlib import nullcontext
+from dataclasses import dataclass
 from pathlib import Path
 
 from .atomic_information import JsonlAtomicInformationStore
@@ -25,16 +27,17 @@ from .wechat_digest import (
     WechatDigestError,
     WechatDigestRunStore,
 )
-from .world_model import SQLiteWorldModelRepository
+from .wechat_contact_synthesis import (
+    ContactSynthesisProvider,
+    ContactSynthesisStore,
+)
 
 CONTACT_SELECTION_SCHEMA_VERSION = "wechat-contact-selection/1.0"
-CONTACT_ACCEPTANCE_SCHEMA_VERSION = "wechat-contact-acceptance-pack/1.0"
+CONTACT_ACCEPTANCE_SCHEMA_VERSION = "wechat-contact-acceptance-pack/2.0"
 
 
 def _canonical_json(value: object) -> str:
-    return json.dumps(
-        value, ensure_ascii=False, sort_keys=True, separators=(",", ":")
-    )
+    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
 
 def _fingerprint(value: object) -> str:
@@ -86,17 +89,16 @@ class WechatContactSelectionStore:
         self.root = Path(root)
 
     def bind(self, binding: WechatContactBinding) -> Path:
-        if re.fullmatch(
-            r"wechat_conversation_[0-9a-f]{32}", binding.conversation_key
-        ) is None:
+        if (
+            re.fullmatch(r"wechat_conversation_[0-9a-f]{32}", binding.conversation_key)
+            is None
+        ):
             raise WechatDigestError("联系人技术身份无效；未读取消息。")
         path = self.root / f"{binding.conversation_key}.json"
-        authority = binding.to_dict()
-        payload = {
-            "schema_version": CONTACT_SELECTION_SCHEMA_VERSION,
-            "selection": authority,
-            "selection_fingerprint": _fingerprint(authority),
-            "person_object_id": None,
+        stable_identity = {
+            "conversation_key": binding.conversation_key,
+            "provider_conversation_id": binding.provider_conversation_id,
+            "is_group": binding.is_group,
         }
         if self.root.exists():
             for existing_path in self.root.glob("wechat_conversation_*.json"):
@@ -106,24 +108,63 @@ class WechatContactSelectionStore:
                 selection = existing.get("selection")
                 if not isinstance(selection, dict):
                     raise WechatDigestError("联系人选择记录不可验证；未读取消息。")
+                existing_identity = selection.get("stable_identity")
+                if not isinstance(existing_identity, dict):
+                    raise WechatDigestError("联系人选择记录不可验证；未读取消息。")
                 if (
-                    selection.get("display_name") == binding.display_name
-                    or selection.get("provider_conversation_id")
+                    existing_identity.get("provider_conversation_id")
                     == binding.provider_conversation_id
                 ):
                     raise WechatDigestError(
-                        "联系人名称或技术身份与已保存选择不一致；请重新确认联系人。"
+                        "联系人技术身份与已保存选择不一致；请重新确认联系人。"
                     )
         if path.exists() or path.is_symlink():
-            if _read_private_json(path) != payload:
+            existing = _read_private_json(path)
+            selection = existing.get("selection")
+            if (
+                not isinstance(selection, dict)
+                or selection.get("stable_identity") != stable_identity
+                or existing.get("schema_version") != CONTACT_SELECTION_SCHEMA_VERSION
+                or existing.get("person_object_id") is not None
+            ):
                 raise WechatDigestError(
-                    "联系人名称或技术身份与已保存选择不一致；请重新确认联系人。"
+                    "联系人技术身份与已保存选择不一致；请重新确认联系人。"
                 )
+            history = selection.get("display_name_history")
+            if (
+                not isinstance(history, list)
+                or not history
+                or any(not isinstance(item, str) or not item for item in history)
+            ):
+                raise WechatDigestError("联系人展示名称历史不可验证；未读取消息。")
+            if binding.display_name not in history:
+                history = [*history, binding.display_name]
         else:
+            history = [binding.display_name]
+        selection = {
+            "stable_identity": stable_identity,
+            "current_display_name": binding.display_name,
+            "display_name_history": history,
+        }
+        payload = {
+            "schema_version": CONTACT_SELECTION_SCHEMA_VERSION,
+            "selection": selection,
+            "selection_fingerprint": _fingerprint(selection),
+            "person_object_id": None,
+        }
+        if not path.exists() or _read_private_json(path) != payload:
             _private_write(path, payload)
         if _read_private_json(path) != payload:
             raise WechatDigestError("联系人选择记录写入后无法一致读回。")
         return path
+
+
+@dataclass(frozen=True)
+class LegacyMessageOverlap:
+    """Legacy provenance that is either safe to filter or unsafe to replay."""
+
+    committed_message_keys: frozenset[str]
+    nonterminal_message_keys: frozenset[str]
 
 
 class OverlapFilteringWechatCaptureProvider:
@@ -132,11 +173,11 @@ class OverlapFilteringWechatCaptureProvider:
     def __init__(
         self,
         delegate: WechatCaptureProvider,
-        seen_message_keys: Callable[[], frozenset[str]],
+        overlap_authority: Callable[[], LegacyMessageOverlap],
     ) -> None:
         self.delegate = delegate
         self.provider_version = delegate.provider_version
-        self._seen_message_keys = seen_message_keys
+        self._overlap_authority = overlap_authority
 
     @property
     def last_capture_metrics(self) -> Mapping[str, int]:
@@ -147,22 +188,33 @@ class OverlapFilteringWechatCaptureProvider:
         capture = self.delegate.capture(after_cursor, **kwargs)
         if kwargs.get("observe_only"):
             return capture
-        seen = self._seen_message_keys()
+        authority = self._overlap_authority()
+        captured_keys = {message.message_key for message in capture.messages}
+        if captured_keys & authority.nonterminal_message_keys:
+            raise WechatDigestError(
+                "所选联系人范围与未完成的旧微信任务重叠；"
+                "无法证明不会重复长期效果，已在写入前停止。"
+            )
         return WechatCapture(
             capture.provider_version,
             capture.after_cursor,
             capture.upper_bound,
-            tuple(message for message in capture.messages if message.message_key not in seen),
+            tuple(
+                message
+                for message in capture.messages
+                if message.message_key not in authority.committed_message_keys
+            ),
         )
 
 
-def committed_legacy_message_keys(workspace: Path) -> frozenset[str]:
-    """Read plan/status metadata only; never open captured message bodies."""
+def legacy_message_overlap(workspace: Path) -> LegacyMessageOverlap:
+    """Classify legacy message provenance without opening captured bodies."""
 
     runs_root = Path(workspace) / "02_processing" / "wechat_digest" / "runs"
     if not runs_root.exists():
-        return frozenset()
-    seen: set[str] = set()
+        return LegacyMessageOverlap(frozenset(), frozenset())
+    committed: set[str] = set()
+    nonterminal: set[str] = set()
     for run_dir in sorted(runs_root.iterdir()):
         if not run_dir.is_dir() or run_dir.is_symlink():
             continue
@@ -193,30 +245,20 @@ def committed_legacy_message_keys(workspace: Path) -> frozenset[str]:
             ):
                 raise WechatDigestError("旧微信运行的消息来源记录不可验证。")
             if item.get("state") in TERMINAL_ITEM_STATES:
-                seen.update(message_keys)
-    return frozenset(seen)
+                committed.update(message_keys)
+            else:
+                nonterminal.update(message_keys)
+    overlap = committed & nonterminal
+    if overlap:
+        nonterminal.update(overlap)
+        committed.difference_update(overlap)
+    return LegacyMessageOverlap(frozenset(committed), frozenset(nonterminal))
 
 
-def _event_group(revision) -> tuple[str, str, str]:
-    evidence_time = next(
-        (item.start for item in revision.source_evidence if item.start), None
-    )
-    when = revision.claim.claimed_at if revision.claim and revision.claim.claimed_at else evidence_time
-    when = when or revision.created_at
-    day = when[:10] if len(when) >= 10 else "时间未知"
-    concern = (
-        min(revision.raw_concerns, key=str.casefold)
-        if revision.raw_concerns
-        else "联系人会话"
-    )
-    category = (
-        "业务变化"
-        if revision.semantic_type in {"action", "commitment", "decision"}
-        else "待确认事项"
-        if revision.semantic_type == "question"
-        else "业务信息"
-    )
-    return day, concern, category
+def committed_legacy_message_keys(workspace: Path) -> frozenset[str]:
+    """Compatibility projection of provably terminal legacy provenance."""
+
+    return legacy_message_overlap(workspace).committed_message_keys
 
 
 def build_contact_acceptance_pack(
@@ -225,32 +267,96 @@ def build_contact_acceptance_pack(
     run_store: WechatDigestRunStore,
     binding: WechatContactBinding,
     output_root: Path,
+    synthesis_provider_factory: Callable[[], ContactSynthesisProvider],
+    synthesis_segment_size: int = 100,
 ) -> tuple[Path, Path]:
-    """Build a private contact-level View from durable Information and evidence."""
+    """Build one contact View while excluding a concurrent contact digest."""
+
+    lock = getattr(run_store, "lock", None)
+    with lock() if callable(lock) else nullcontext():
+        return _build_contact_acceptance_pack_unlocked(
+            workspace=workspace,
+            run_store=run_store,
+            binding=binding,
+            output_root=output_root,
+            synthesis_provider_factory=synthesis_provider_factory,
+            synthesis_segment_size=synthesis_segment_size,
+        )
+
+
+def _build_contact_acceptance_pack_unlocked(
+    *,
+    workspace: Path,
+    run_store: WechatDigestRunStore,
+    binding: WechatContactBinding,
+    output_root: Path,
+    synthesis_provider_factory: Callable[[], ContactSynthesisProvider],
+    synthesis_segment_size: int,
+) -> tuple[Path, Path]:
+    """Project one durable contact-level synthesis into a private business View."""
 
     ordered_ids: list[str] = []
     attachment_counts: Counter[str] = Counter()
-    for run_dir in sorted(run_store.runs_root.glob("run_*")):
-        run_id = run_dir.name
+    ordered_runs: list[tuple[tuple[int, str, str], str]] = []
+    for run_dir in run_store.runs_root.glob("run_*"):
+        plan = run_store.plan(run_dir.name)
+        after = plan.get("after_cursor")
+        if not isinstance(after, dict):
+            raise WechatDigestError("联系人运行顺序不可验证。")
+        try:
+            key = (
+                int(after["timestamp"]),
+                str(after["conversation_key"]),
+                str(after["message_key"]),
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            raise WechatDigestError("联系人运行顺序不可验证。") from exc
+        ordered_runs.append((key, run_dir.name))
+    for _key, run_id in sorted(ordered_runs):
         plan = run_store.plan(run_id)
         status = run_store.status(run_id)
         items = status.get("items")
-        if not isinstance(items, dict):
+        run_completed = status.get("state") == "completed"
+        if status.get("state") not in {"processing", "completed"} or not isinstance(
+            items, dict
+        ):
             raise WechatDigestError("联系人运行状态不可验证。")
-        for item in items.values():
-            if not isinstance(item, dict):
-                raise WechatDigestError("联系人运行状态不可验证。")
-            values = item.get("atomic_information_ids", [])
-            if not isinstance(values, list) or any(not isinstance(value, str) for value in values):
-                raise WechatDigestError("联系人长期信息引用不可验证。")
-            for value in values:
-                if value not in ordered_ids:
-                    ordered_ids.append(value)
         attachments = plan.get("attachments")
-        if not isinstance(attachments, list):
-            raise WechatDigestError("联系人附件统计不可验证。")
+        conversations = plan.get("conversations")
+        if not isinstance(attachments, list) or not isinstance(conversations, list):
+            raise WechatDigestError("联系人运行计划项目顺序不可验证。")
+        ordered_item_ids: list[str] = []
         for attachment in attachments:
-            if not isinstance(attachment, dict) or not isinstance(attachment.get("status"), str):
+            if not isinstance(attachment, dict) or not isinstance(
+                attachment.get("attachment_key"), str
+            ):
+                raise WechatDigestError("联系人附件顺序不可验证。")
+            ordered_item_ids.append(f"attachment:{attachment['attachment_key']}")
+        for conversation in conversations:
+            if not isinstance(conversation, dict) or not isinstance(
+                conversation.get("conversation_key"), str
+            ):
+                raise WechatDigestError("联系人会话顺序不可验证。")
+            ordered_item_ids.append(f"conversation:{conversation['conversation_key']}")
+        if set(ordered_item_ids) != set(items):
+            raise WechatDigestError("联系人运行计划与状态项目不一致。")
+        if run_completed:
+            for item_id in ordered_item_ids:
+                item = items[item_id]
+                if not isinstance(item, dict):
+                    raise WechatDigestError("联系人运行状态不可验证。")
+                values = item.get("atomic_information_ids", [])
+                if not isinstance(values, list) or any(
+                    not isinstance(value, str) for value in values
+                ):
+                    raise WechatDigestError("联系人长期信息引用不可验证。")
+                for value in values:
+                    if value not in ordered_ids:
+                        ordered_ids.append(value)
+        for attachment in attachments:
+            if not isinstance(attachment, dict) or not isinstance(
+                attachment.get("status"), str
+            ):
                 raise WechatDigestError("联系人附件统计不可验证。")
             status_value = str(attachment["status"])
             attachment_key = attachment.get("attachment_key")
@@ -276,105 +382,105 @@ def build_contact_acceptance_pack(
     information = JsonlAtomicInformationStore(
         Path(workspace) / "03_information" / "atomic_information.jsonl"
     )
-    by_id = {item.atomic_information_id: item for item in information.list_atomic_information()}
+    by_id = {
+        item.atomic_information_id: item
+        for item in information.list_atomic_information()
+    }
     missing_ids = [value for value in ordered_ids if value not in by_id]
     if missing_ids:
         raise WechatDigestError("联系人业务验收所需的长期信息无法完整读回。")
-    revisions = tuple(by_id[value] for value in ordered_ids if value in by_id)
-    grouped: dict[tuple[str, str, str], list[object]] = defaultdict(list)
-    for revision in revisions:
-        grouped[_event_group(revision)].append(revision)
+    revisions = tuple(by_id[value] for value in ordered_ids)
+    synthesis = (
+        ContactSynthesisStore(
+            run_store.root / "synthesis", segment_size=synthesis_segment_size
+        )
+        .synthesize(
+            revisions,
+            binding=binding,
+            provider=synthesis_provider_factory(),
+        )
+        .result
+    )
 
-    events = []
-    for index, ((day, concern, category), values) in enumerate(sorted(grouped.items()), start=1):
-        evidence = [
+    def evidence_projection(atomic_ids: object) -> list[dict[str, object]]:
+        if not isinstance(atomic_ids, list):
+            raise WechatDigestError("联系人业务验收 Evidence 引用无效。")
+        return [
             {
-                "atomic_information_id": revision.atomic_information_id,
-                "source_id": item.source_id,
-                "locator": item.locator,
-                "excerpt": item.excerpt,
+                "atomic_information_id": atomic_id,
+                "source_id": evidence.source_id,
+                "locator": evidence.locator,
+                "speaker": evidence.speaker,
+                "start": evidence.start,
+                "end": evidence.end,
+                "excerpt": evidence.excerpt,
             }
-            for revision in values
-            for item in revision.source_evidence
+            for atomic_id in atomic_ids
+            for evidence in by_id[str(atomic_id)].source_evidence
         ]
-        participants = sorted(
-            {
-                label
-                for revision in values
-                for label in (
-                    *((revision.claim.claimant_label,) if revision.claim else ()),
-                    *revision.raw_concerns,
-                )
-                if label
-            },
-            key=str.casefold,
-        )
-        events.append(
-            {
-                "event_id": f"event-{index}",
-                "time": None if day == "时间未知" else day,
-                "participants": participants,
-                "location_or_channel": "微信会话",
-                "event": "；".join(dict.fromkeys(revision.statement for revision in values)),
-                "business_subject": concern,
-                "category": category,
-                "status_change": [
-                    revision.statement
-                    for revision in values
-                    if revision.semantic_type in {"action", "commitment", "decision"}
-                ],
-                "evidence": evidence,
-            }
-        )
 
-    object_candidates: list[dict[str, object]] = []
-    related_object_ids = {
-        object_id for revision in revisions for object_id in revision.related_object_ids
-    }
-    database = Path(workspace) / "04_core" / "archeos.sqlite3"
-    if database.exists():
-        repository = SQLiteWorldModelRepository(database)
-        repository.initialize()
-        try:
-            for value in repository.list_objects():
-                if value.object_id not in related_object_ids:
-                    continue
-                roles = [item.role for item in repository.list_roles(value.object_id, active_only=True)]
-                names = repository.list_names(value.object_id, active_only=True)
-                name = next(
-                    (item.name for item in names if item.is_primary),
-                    names[0].name if names else value.object_id,
-                )
-                object_candidates.append(
-                    {"name": name, "roles": roles, "object_id": value.object_id}
-                )
-        finally:
-            repository.close()
-    known_names = {str(item["name"]) for item in object_candidates}
-    for name in sorted({name for revision in revisions for name in revision.raw_concerns}, key=str.casefold):
-        if name not in known_names:
-            object_candidates.append({"name": name, "roles": [], "object_id": None})
-
-    conflicts_by_concern: dict[str, set[str]] = defaultdict(set)
-    for revision in revisions:
-        if revision.claim:
-            for concern in revision.raw_concerns:
-                conflicts_by_concern[concern].add(revision.claim.stance)
+    events = [
+        {
+            **item,
+            "evidence": evidence_projection(
+                item.get("evidence_atomic_information_ids")
+            ),
+        }
+        for item in synthesis["events"]
+        if isinstance(item, dict)
+    ]
+    object_candidates = [
+        {
+            **item,
+            "object_id": (related_ids[0] if len(related_ids) == 1 else None),
+            "evidence": evidence_projection(
+                item.get("evidence_atomic_information_ids")
+            ),
+        }
+        for item in synthesis["object_candidates"]
+        if isinstance(item, dict)
+        for related_ids in (
+            sorted(
+                {
+                    object_id
+                    for atomic_id in item.get("evidence_atomic_information_ids", [])
+                    for object_id in by_id[str(atomic_id)].related_object_ids
+                }
+            ),
+        )
+    ]
     conflicts = [
-        {"subject": concern, "reason": "同一事项存在相反声明立场"}
-        for concern, stances in sorted(conflicts_by_concern.items())
-        if "deny" in stances and "assert" in stances
+        {
+            **item,
+            "evidence": evidence_projection(
+                item.get("evidence_atomic_information_ids")
+            ),
+        }
+        for item in synthesis["conflicts"]
+        if isinstance(item, dict)
     ]
     unknowns = [
-        revision.statement
-        for revision in revisions
-        if revision.semantic_type == "question" or revision.confidence < 0.6
+        {
+            **item,
+            "evidence": evidence_projection(
+                item.get("evidence_atomic_information_ids")
+            ),
+        }
+        for item in synthesis["unknowns"]
+        if isinstance(item, dict)
     ]
     if any(
         attachment_counts[field]
         for field in ("missing", "unsupported", "failed", "privacy_blocked")
     ):
-        unknowns.append("部分附件尚未形成可验证内容。")
+        unknowns.append(
+            {
+                "subject": "附件覆盖",
+                "details": "部分附件尚未形成可验证内容。",
+                "evidence_atomic_information_ids": [],
+                "evidence": [],
+            }
+        )
 
     pack = {
         "schema_version": CONTACT_ACCEPTANCE_SCHEMA_VERSION,
@@ -385,23 +491,9 @@ def build_contact_acceptance_pack(
         },
         "object_candidates": object_candidates,
         "events": events,
-        "current_state": {
-            "completed": [
-                item.statement for item in revisions if item.semantic_type in {"action", "decision"}
-            ],
-            "in_progress": [
-                item.statement for item in revisions if item.semantic_type == "commitment"
-            ],
-            "todos": [
-                item.statement for item in revisions if item.semantic_type == "question"
-            ],
-            "commitments": [
-                item.statement for item in revisions if item.semantic_type == "commitment"
-            ],
-            "blockers": [item.statement for item in revisions if "阻" in item.statement],
-        },
+        "current_state": synthesis["current_state"],
         "conflicts": conflicts,
-        "unknowns": list(dict.fromkeys(unknowns)),
+        "unknowns": unknowns,
         "attachment_coverage": {
             "total": sum(attachment_counts.values()),
             "available": attachment_counts["available"],
@@ -412,6 +504,7 @@ def build_contact_acceptance_pack(
             "failed": attachment_counts["failed"],
         },
         "information_count": len(revisions),
+        "synthesis_fingerprint": _fingerprint(synthesis),
     }
     pack["pack_fingerprint"] = _fingerprint(pack)
     json_path = Path(output_root) / "contact-acceptance.json"
@@ -426,11 +519,38 @@ def build_contact_acceptance_pack(
         "",
         "## 发生过什么",
         "",
-        *(f"- {item['time'] or '时间未知'}｜{item['event']}" for item in events),
+        *(
+            f"- {item['time_start'] or '时间未知'}｜{item['what_happened']}"
+            for item in events
+        ),
         "",
-        "## 冲突与未知",
+        "## 当前状态",
         "",
-        *(f"- {item}" for item in (list(dict.fromkeys(unknowns)) or ["暂未发现"])),
+        *(
+            f"- {label}：{value}"
+            for field, label in (
+                ("completed", "已完成"),
+                ("in_progress", "进行中"),
+                ("todos", "待办"),
+                ("commitments", "承诺"),
+                ("blockers", "阻塞"),
+            )
+            for value in synthesis["current_state"][field]
+        ),
+        "",
+        "## 冲突",
+        "",
+        *(
+            f"- {item['subject']}：{item['details']}"
+            for item in (conflicts or [{"subject": "状态", "details": "暂未发现"}])
+        ),
+        "",
+        "## 未知",
+        "",
+        *(
+            f"- {item['subject']}：{item['details']}"
+            for item in (unknowns or [{"subject": "状态", "details": "暂未发现"}])
+        ),
     ]
     markdown_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     descriptor, temporary_name = tempfile.mkstemp(dir=markdown_path.parent)

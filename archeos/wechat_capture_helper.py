@@ -570,7 +570,6 @@ def _capture(request: dict[str, object]) -> dict[str, object]:
             if session[0] == contact_scope["provider_conversation_id"]
             and _digest("wechat_conversation", session[0])
             == contact_scope["conversation_key"]
-            and session[1] == contact_scope["display_name"]
             and session[2] is contact_scope["is_group"]
         )
         if len(matching) != 1:

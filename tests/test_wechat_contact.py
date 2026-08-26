@@ -13,11 +13,14 @@ from archeos.atomic_information import (
     JsonlAtomicInformationStore,
 )
 from archeos.wechat_contact import (
+    LegacyMessageOverlap,
     OverlapFilteringWechatCaptureProvider,
     WechatContactSelectionStore,
     build_contact_acceptance_pack,
     committed_legacy_message_keys,
+    legacy_message_overlap,
 )
+from archeos.wechat_contact_synthesis import ContactSynthesisStore
 from archeos.wechat_digest import (
     CapturedMessage,
     WechatCapture,
@@ -58,17 +61,45 @@ def _message(number: int) -> CapturedMessage:
 
 
 class ContactSelectionTests(unittest.TestCase):
-    def test_selection_receipt_is_private_and_drift_fails_closed(self) -> None:
+    def test_stable_identity_allows_rename_and_same_name_separate_bindings(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as directory:
             store = WechatContactSelectionStore(Path(directory))
             path = store.bind(_binding())
             self.assertEqual(path.stat().st_mode & 0o777, 0o600)
             self.assertIsNone(json.loads(path.read_text())["person_object_id"])
             self.assertEqual(store.bind(_binding()), path)
+            self.assertEqual(store.bind(_binding(name="已改名")), path)
+            renamed = json.loads(path.read_text())["selection"]
+            self.assertEqual(renamed["current_display_name"], "已改名")
+            self.assertEqual(renamed["display_name_history"], ["联系人甲", "已改名"])
+            second = store.bind(_binding("2", name="已改名"))
+            self.assertNotEqual(second, path)
+            self.assertTrue(second.exists())
+
+    def test_stable_key_or_provider_identity_drift_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = WechatContactSelectionStore(Path(directory))
+            store.bind(_binding())
             with self.assertRaisesRegex(WechatDigestError, "不一致"):
-                store.bind(_binding(name="已改名"))
+                store.bind(
+                    WechatContactBinding(
+                        _binding().conversation_key,
+                        "wxid_different",
+                        "联系人甲",
+                        False,
+                    )
+                )
             with self.assertRaisesRegex(WechatDigestError, "不一致"):
-                store.bind(_binding("2", name="联系人甲"))
+                store.bind(
+                    WechatContactBinding(
+                        _binding("2").conversation_key,
+                        _binding().provider_conversation_id,
+                        "另一联系人",
+                        False,
+                    )
+                )
 
     def test_overlap_filter_preserves_range_and_removes_only_seen_message(self) -> None:
         messages = (_message(1), _message(2))
@@ -89,12 +120,15 @@ class ContactSelectionTests(unittest.TestCase):
                 )
 
         filtered = OverlapFilteringWechatCaptureProvider(
-            Provider(), lambda: frozenset({messages[0].message_key})
+            Provider(),
+            lambda: LegacyMessageOverlap(
+                frozenset({messages[0].message_key}), frozenset()
+            ),
         ).capture(WechatCursor(0, "", ""))
         self.assertEqual(filtered.upper_bound, messages[-1].cursor)
         self.assertEqual(filtered.messages, (messages[1],))
 
-    def test_legacy_overlap_uses_only_terminal_plan_metadata(self) -> None:
+    def test_legacy_overlap_filters_terminal_and_blocks_nonterminal(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             workspace = Path(directory)
             runs = workspace / "02_processing" / "wechat_digest" / "runs"
@@ -129,15 +163,93 @@ class ContactSelectionTests(unittest.TestCase):
                 committed_legacy_message_keys(workspace),
                 frozenset({"message-1"}),
             )
+            authority = legacy_message_overlap(workspace)
+            self.assertEqual(
+                authority.nonterminal_message_keys, frozenset({"message-2"})
+            )
+            messages = (_message(1), _message(2))
+
+            class Provider:
+                provider_version = "synthetic/1"
+
+                def capture(self, after_cursor, **_kwargs):
+                    return WechatCapture(
+                        self.provider_version,
+                        after_cursor,
+                        messages[-1].cursor,
+                        messages,
+                    )
+
+            keyed = LegacyMessageOverlap(
+                frozenset({messages[0].message_key}),
+                frozenset({messages[1].message_key}),
+            )
+            with self.assertRaisesRegex(WechatDigestError, "未完成.*重叠"):
+                OverlapFilteringWechatCaptureProvider(
+                    Provider(), lambda: keyed
+                ).capture(WechatCursor(0, "", ""))
+
+    def test_nonterminal_effect_phases_all_fail_before_contact_writes(self) -> None:
+        for phase in ("source_saved", "information_committed", "world_applied"):
+            with self.subTest(phase=phase), tempfile.TemporaryDirectory() as directory:
+                workspace = Path(directory)
+                run = (
+                    workspace
+                    / "02_processing"
+                    / "wechat_digest"
+                    / "runs"
+                    / ("run_" + "1" * 32)
+                )
+                run.mkdir(parents=True)
+                key = _binding().conversation_key
+                (run / "plan.json").write_text(
+                    json.dumps(
+                        {
+                            "conversations": [
+                                {
+                                    "conversation_key": key,
+                                    "message_keys": ["overlap-message"],
+                                }
+                            ]
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                (run / "status.json").write_text(
+                    json.dumps(
+                        {
+                            "items": {
+                                f"conversation:{key}": {
+                                    "state": "represented",
+                                    "durable_effect_phase": phase,
+                                }
+                            }
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                authority = legacy_message_overlap(workspace)
+                self.assertEqual(
+                    authority.nonterminal_message_keys,
+                    frozenset({"overlap-message"}),
+                )
 
 
 class ContactAcceptancePackTests(unittest.TestCase):
-    def _revision(self, index: int, *, concern: str, statement: str):
+    def _revision(
+        self,
+        index: int,
+        *,
+        concern: str,
+        statement: str,
+        semantic_type: str = "action",
+    ):
         source_id = "src_" + f"{index:032x}"
         candidate_id = "candidate_" + f"{index:032x}"
-        atomic_id = "atomic_info_" + hashlib.sha256(
-            f"{source_id}\0{candidate_id}".encode()
-        ).hexdigest()[:32]
+        atomic_id = (
+            "atomic_info_"
+            + hashlib.sha256(f"{source_id}\0{candidate_id}".encode()).hexdigest()[:32]
+        )
         return AtomicInformationRevision(
             atomic_information_id=atomic_id,
             revision_number=1,
@@ -146,7 +258,7 @@ class ContactAcceptancePackTests(unittest.TestCase):
             origin_candidate_id=candidate_id,
             origin_fingerprint=f"{index:064x}",
             statement=statement,
-            semantic_type="action",
+            semantic_type=semantic_type,
             raw_concerns=(concern,),
             related_object_ids=(),
             source_evidence=(
@@ -166,7 +278,96 @@ class ContactAcceptancePackTests(unittest.TestCase):
             revision_reason="initial_ingestion",
         )
 
-    def test_pack_consolidates_same_business_subject_and_is_private(self) -> None:
+    class SynthesisProvider:
+        name = "synthetic-contact-synthesis"
+        provider_version = "synthetic/1"
+        model = "synthetic"
+        reasoning_effort = "medium"
+
+        def __init__(self) -> None:
+            self.provider_calls = 0
+
+        def synthesize(self, request, _schema):
+            self.provider_calls += 1
+            evidence = {
+                item["atomic_information_id"]: item
+                for item in request["new_atomic_information"]
+            }
+            previous = request["previous_synthesis"]
+            for event in previous["events"]:
+                for atomic_id in event["evidence_atomic_information_ids"]:
+                    evidence.setdefault(
+                        atomic_id,
+                        {
+                            "atomic_information_id": atomic_id,
+                            "statement": event["what_happened"],
+                        },
+                    )
+            quote_ids = [
+                atomic_id
+                for atomic_id, item in evidence.items()
+                if "报价" in item["statement"] or "询价" in item["statement"]
+            ]
+            visit_ids = [
+                atomic_id
+                for atomic_id, item in evidence.items()
+                if "拜访" in item["statement"]
+            ]
+            events = []
+            if quote_ids:
+                events.append(
+                    {
+                        "event_id": "event_quote",
+                        "business_subject": "项目甲报价",
+                        "time_start": "2026-08-26T10:00:00+08:00",
+                        "time_end": "2026-08-26T10:00:00+08:00",
+                        "participants": ["发送人"],
+                        "location_or_channel": "微信",
+                        "what_happened": "完成询价、答复与报价确认",
+                        "status": "已确认",
+                        "status_changes": ["从询价变为已确认"],
+                        "evidence_atomic_information_ids": quote_ids,
+                        "conflicts": [],
+                        "unknowns": [],
+                    }
+                )
+            if visit_ids:
+                events.append(
+                    {
+                        "event_id": "event_visit",
+                        "business_subject": "项目乙拜访",
+                        "time_start": "2026-08-26T10:00:00+08:00",
+                        "time_end": "2026-08-26T10:00:00+08:00",
+                        "participants": ["发送人"],
+                        "location_or_channel": "微信",
+                        "what_happened": "安排项目乙拜访",
+                        "status": "待执行",
+                        "status_changes": ["已安排"],
+                        "evidence_atomic_information_ids": visit_ids,
+                        "conflicts": [],
+                        "unknowns": [],
+                    }
+                )
+            ids = list(request["source_atomic_information_ids"])
+            return {
+                "schema_version": "wechat-contact-event-synthesis/1.0",
+                "request_fingerprint": request["request_fingerprint"],
+                "source_atomic_information_ids": ids,
+                "accounted_atomic_information_ids": ids,
+                "object_candidates": [],
+                "events": events,
+                "current_state": {
+                    "completed": ["报价已确认"] if quote_ids else [],
+                    "in_progress": ["拜访待执行"] if visit_ids else [],
+                    "todos": [],
+                    "commitments": [],
+                    "blockers": [],
+                },
+                "conflicts": [],
+                "unknowns": [],
+            }
+
+    def test_pack_projects_durable_synthesis_and_is_private(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             workspace = Path(directory)
             store = JsonlAtomicInformationStore(
@@ -184,35 +385,112 @@ class ContactAcceptancePackTests(unittest.TestCase):
             class RunStore:
                 def __init__(self):
                     self.runs_root = runs_root
+                    self.root = workspace / "contact-run-store"
 
                 def plan(self, _run_id):
-                    return {"attachments": []}
+                    return {
+                        "after_cursor": {
+                            "timestamp": 0,
+                            "conversation_key": "",
+                            "message_key": "",
+                        },
+                        "attachments": [],
+                        "conversations": [{"conversation_key": "test"}],
+                    }
 
                 def status(self, _run_id):
                     return {
+                        "state": "completed",
                         "items": {
                             "conversation:test": {
                                 "atomic_information_ids": [
                                     item.atomic_information_id for item in revisions
                                 ]
                             }
-                        }
+                        },
                     }
 
+            provider = self.SynthesisProvider()
             json_path, markdown_path = build_contact_acceptance_pack(
                 workspace=workspace,
                 run_store=RunStore(),  # type: ignore[arg-type]
                 binding=_binding(),
                 output_root=workspace / "acceptance",
+                synthesis_provider_factory=lambda: provider,
             )
             pack = json.loads(json_path.read_text())
             self.assertEqual(len(pack["events"]), 2)
             project_a = next(
-                item for item in pack["events"] if item["business_subject"] == "项目甲"
+                item
+                for item in pack["events"]
+                if item["business_subject"] == "项目甲报价"
             )
-            self.assertEqual(len(project_a["evidence"]), 2)
+            self.assertEqual(len(project_a["evidence_atomic_information_ids"]), 2)
+            self.assertEqual(provider.provider_calls, 1)
             self.assertEqual(os.stat(json_path).st_mode & 0o777, 0o600)
             self.assertEqual(os.stat(markdown_path).st_mode & 0o777, 0o600)
+
+    def test_ordered_continuation_merges_cross_segment_event_and_separates_same_day(
+        self,
+    ) -> None:
+        revisions = (
+            self._revision(
+                1,
+                concern="项目甲",
+                statement="询问项目甲报价",
+                semantic_type="question",
+            ),
+            self._revision(2, concern="项目甲", statement="答复项目甲报价"),
+            self._revision(3, concern="项目乙", statement="安排项目乙拜访"),
+            self._revision(4, concern="项目甲", statement="确认项目甲报价"),
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            provider = self.SynthesisProvider()
+            store = ContactSynthesisStore(Path(directory), segment_size=2)
+            first = store.synthesize(revisions, binding=_binding(), provider=provider)
+            self.assertEqual(first.provider_calls, 2)
+            self.assertEqual(len(first.result["events"]), 2)
+            quote = next(
+                item
+                for item in first.result["events"]
+                if item["event_id"] == "event_quote"
+            )
+            self.assertEqual(len(quote["evidence_atomic_information_ids"]), 3)
+            replay_provider = self.SynthesisProvider()
+            replay = store.synthesize(
+                revisions, binding=_binding(name="已改名"), provider=replay_provider
+            )
+            self.assertEqual(replay.provider_calls, 0)
+            self.assertEqual(replay.result, first.result)
+
+    def test_result_first_interruption_resumes_with_zero_provider_calls(self) -> None:
+        revisions = (
+            self._revision(1, concern="项目甲", statement="询问项目甲报价"),
+            self._revision(2, concern="项目甲", statement="确认项目甲报价"),
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            interrupted_provider = self.SynthesisProvider()
+
+            def interrupt() -> None:
+                raise RuntimeError("synthetic interruption")
+
+            interrupted = ContactSynthesisStore(
+                Path(directory), segment_size=2, after_result_write=interrupt
+            )
+            with self.assertRaisesRegex(RuntimeError, "synthetic interruption"):
+                interrupted.synthesize(
+                    revisions, binding=_binding(), provider=interrupted_provider
+                )
+            self.assertEqual(interrupted_provider.provider_calls, 1)
+            recovery_provider = self.SynthesisProvider()
+            recovered = ContactSynthesisStore(
+                Path(directory), segment_size=2
+            ).synthesize(
+                revisions, binding=_binding(name="新名称"), provider=recovery_provider
+            )
+            self.assertEqual(recovered.provider_calls, 0)
+            self.assertEqual(recovered.resumed_segments, 1)
+            self.assertEqual(len(recovered.result["events"]), 1)
 
 
 class ContactResolutionTests(unittest.TestCase):

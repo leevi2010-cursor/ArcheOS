@@ -59,8 +59,9 @@ from .wechat_contact import (
     OverlapFilteringWechatCaptureProvider,
     WechatContactSelectionStore,
     build_contact_acceptance_pack,
-    committed_legacy_message_keys,
+    legacy_message_overlap,
 )
+from .wechat_contact_synthesis import CodexCliContactSynthesisProvider
 from .wechat_digest import (
     ExistingSemanticHandoff,
     WechatCliCaptureProvider,
@@ -1541,7 +1542,7 @@ def _wechat_product_command(args: argparse.Namespace) -> int:
             if args.isolated_acceptance_dir is None:
                 capture = OverlapFilteringWechatCaptureProvider(
                     capture,
-                    lambda: committed_legacy_message_keys(workspace),
+                    lambda: legacy_message_overlap(workspace),
                 )
             run_store = WechatDigestRunStore(
                 service_workspace
@@ -2037,6 +2038,18 @@ def _wechat_product_command(args: argparse.Namespace) -> int:
                 run_store=run_store,
                 binding=contact_binding,
                 output_root=run_store.root / "acceptance",
+                synthesis_provider_factory=lambda: (
+                    CodexCliContactSynthesisProvider(
+                        codex_binary=args.codex_bin,
+                        provider_version=(
+                            args.provider_version
+                            or detect_codex_provider_version(args.codex_bin)
+                        ),
+                        model=args.model,
+                        reasoning_effort=args.reasoning_effort,
+                        timeout_seconds=args.timeout_seconds,
+                    )
+                ),
             )
     except (
         OSError,

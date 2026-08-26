@@ -99,7 +99,11 @@ contact metadata discovery（不读正文）
   → contact-level Event / Timeline / current-state View
 ```
 
-联系人 selection receipt、独立 plan/checkpoint、context continuation 与 acceptance pack 都是 Processing / Derived Artifact / View，不是 Contact、Conversation、Message Core，也不形成第二套 Source 或 Information truth。恢复绑定已保存 technical key；选择目录中的名称或 key 漂移会在正文、Provider 和长期写入前拒绝。normal contact run 的 stable message provenance 会与 legacy 全局窗口的已提交 message keys 对照，避免重叠消息产生第二次长期效果。
+联系人 selection receipt、独立 plan/checkpoint、context continuation 与 acceptance pack 都是 Processing / Derived Artifact / View，不是 Contact、Conversation、Message Core，也不形成第二套 Source 或 Information truth。恢复绑定已保存的 provider identity 与 technical key；展示名称作为可变历史留痕，同名联系人以不同 technical key 分别隔离。technical key 或 provider identity 漂移才在正文、Provider 和长期写入前拒绝。
+
+contact context continuation 以有序 Atomic Information prefix 为 cursor：每个有界 segment 的 request 绑定前一完整 synthesis、下一段 Evidence、稳定联系人身份和 Provider profile；结构化 Event synthesis 先写入私有 result，再写 receipt 与 cursor。恢复优先验证 result / receipt / cursor 并零 Provider 收敛。acceptance pack 只把该 durable synthesis 投影为 Event、Timeline、current state、Evidence、冲突和未知，不在 View 层重新分组消息。
+
+normal contact run 会把 legacy 全局 provenance 分成 terminal 与 nonterminal：terminal message keys 可安全过滤；任一捕获消息与 nonterminal legacy item 重叠时，在新 contact Source 写入前 fail closed。isolated acceptance 不使用该过滤，因为其完整运行边界不写 primary Workspace。
 
 隔离验收使用独立私有 Workspace 复用同一 Source → Representation → Information → World Model 链，只在该 Workspace 产生 Derived Artifact；主 Workspace 与所有 primary checkpoint 保持只读不变。
 

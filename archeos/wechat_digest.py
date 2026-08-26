@@ -847,7 +847,6 @@ class WechatCliCaptureProvider:
             message.conversation_key != self.contact_binding.conversation_key
             or message.provider_conversation_id
             != self.contact_binding.provider_conversation_id
-            or message.conversation_label != self.contact_binding.display_name
             or message.is_group is not self.contact_binding.is_group
             for message in capture.messages
         ):
