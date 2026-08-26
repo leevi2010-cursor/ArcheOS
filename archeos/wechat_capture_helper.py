@@ -269,6 +269,8 @@ def _bounded_window_cursor_rows(
 
     Each table contributes at most ``message_limit`` rows after the checkpoint,
     plus complete timestamp tie groups at the checkpoint and local boundary.
+    The returned metric counts every cursor row returned by those SQL queries,
+    including boundary rows read twice; aggregate ``MIN`` rows are excluded.
     The final full-cursor filter remains authoritative across databases.
     """
 
@@ -276,6 +278,7 @@ def _bounded_window_cursor_rows(
         tuple[str, str, str, int]
     ] = []
     materialized: dict[tuple[str, str, object, object], None] = {}
+    sql_cursor_rows = 0
     for database, tables in located_tables.items():
         try:
             with closing(sqlite3.connect(database)) as connection:
@@ -291,6 +294,7 @@ def _bounded_window_cursor_rows(
                         f"{end_filter} ORDER BY local_id ASC",
                         (after[0], *end_parameters),
                     ).fetchall()
+                    sql_cursor_rows += len(same_second)
                     eligible_same_second = []
                     for local_id, create_time in same_second:
                         row = (username, relative_key, local_id, create_time)
@@ -331,7 +335,7 @@ def _bounded_window_cursor_rows(
             raise RuntimeError("message cursor query failed") from None
 
     if not first_by_table:
-        return [], len(materialized)
+        return [], sql_cursor_rows
     first_timestamp = min(item[3] for item in first_by_table)
     cutoff = first_timestamp + window_days * 24 * 60 * 60
     for database, tables in located_tables.items():
@@ -347,6 +351,7 @@ def _bounded_window_cursor_rows(
                         "ORDER BY create_time ASC, local_id ASC LIMIT ?",
                         (after[0], upper_timestamp, message_limit),
                     ).fetchall()
+                    sql_cursor_rows += len(values)
                     if values:
                         boundary_timestamp = values[-1][1]
                         boundary_ties = connection.execute(
@@ -354,6 +359,7 @@ def _bounded_window_cursor_rows(
                             "WHERE create_time = ? ORDER BY local_id ASC",
                             (boundary_timestamp,),
                         ).fetchall()
+                        sql_cursor_rows += len(boundary_ties)
                         values.extend(boundary_ties)
                     for local_id, create_time in values:
                         row = (username, relative_key, local_id, create_time)
@@ -377,7 +383,7 @@ def _bounded_window_cursor_rows(
         except sqlite3.Error:
             raise RuntimeError("message cursor query failed") from None
     rows = list(materialized)
-    return rows, len(rows)
+    return rows, sql_cursor_rows
 
 
 def _upper_cursor_rows(
