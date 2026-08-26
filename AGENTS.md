@@ -25,8 +25,17 @@ Agents must keep these layers separate. Processing a recording or document is no
 ## Roles
 
 - **Product Owner（用户）:** 负责最终业务目标与产品取舍；批准 material Product Stage / Stage Gate / 产品边界变化；授权真实数据、外部调用与重大风险；接受或否决重要产品结果。
-- **Product / Technical Lead + Reviewer（ChatGPT 主线程）:** 负责产品定位、Product Roadmap、Development Roadmap、优先级与 backlog replenishment、技术路线、系统架构、canonical concepts、durable governance、implementation-ready Issue / Implementation Plan / Acceptance Criteria、实验 Gate 与风险接受标准。Lead 负责 Code Review、Architecture / Concept / Product-alignment Review，判断实现是否符合批准方案，提出修改要求，并决定 PR 是否可合并；在可用工具和权限允许时执行合并，或明确给出 Merge PASS。Lead 可在已批准 Product Stage 内重排技术工作，但不得因工程偏好静默改变 material 产品方向。
-- **Executor / Developer（Codex）:** 每次只实现一个已批准 GitHub Issue：建立 branch / worktree、实现、测试、提交 Draft PR，并根据 ChatGPT Lead Review 在同一 PR 修复。Codex 提供实施事实、测试结果、Roadmap Feedback 与 blocker，但不作 Code / Architecture / Concept Review 的最终判定、不作 Merge 决策、不重规划产品或技术路线，也不得自行修改 approved architecture / concept / Evidence contract 或扩大真实数据与 Provider 授权。
+- **Product / Technical Lead（ChatGPT 主线程）:** 负责产品定位、Product Roadmap、Development Roadmap、优先级与 backlog replenishment、技术路线、系统架构、canonical concepts、durable governance、implementation-ready Issue / Implementation Plan / Acceptance Criteria、实验 Gate 与风险接受标准。Lead 负责项目上下文、日常实现读回、Product Alignment 与 Merge 决策；可在已批准 Product Stage 内重排技术工作，但不得因工程偏好静默改变 material 产品方向，也不得把自己描述为其高风险设计的独立最终 Reviewer。
+- **Executor / Developer（Codex）:** 每次只实现一个已批准 GitHub Issue：建立 branch / worktree、实现、测试、提交 Draft PR，并根据已批准的 review 结果在同一 PR 做一个 bounded fix batch。Codex 提供实施事实、测试结果、Roadmap Feedback 与 blocker，但不作 Code / Architecture / Concept Review 的最终判定、不作 Merge 决策、不重规划产品或技术路线，也不得自行修改 approved architecture / concept / Evidence contract 或扩大真实数据与 Provider 授权。
+- **Independent Reviewer（短期任务）:** 仅在 authority ownership、schema compatibility、持久数据/迁移/恢复、付费 Provider、不可逆操作或生产发布等高风险边界发生 material 变化时启用。Reviewer 只接收 Issue、Acceptance Criteria、diff、测试结果、关键 contracts 与必要源码，返回一份合并后的问题清单；不得实现、合并或承接后续运行。
+
+## Delivery sizing, models, and stop gates
+
+- 一个 Issue / branch / PR 必须只证明一个可独立验收的业务 Gate。若同一提案同时跨越输入选择或 capture、语义效果、主存储写入或迁移恢复、真实数据验收或生产 activation，应按 Gate 拆分，不得因为共享上下文而捆成一个大 Issue。
+- MVP 默认先用隔离、只读或可逆方式证明业务结果；正式持久化、历史迁移、完整恢复与 activation 在业务验收后分阶段进入。会造成数据丢失、身份串线、重复付费调用或不可恢复状态的完整性缺口不属于可延期加固。
+- 每次委派必须显式声明 `model`、`reasoning_effort` 与 `stop_at`，不得继承主任务的高成本配置：Lead 默认 `gpt-5.6-terra / medium`；普通编码、文档和机械验证使用 `gpt-5.6-luna / low`；持久数据、复杂恢复与跨模块合同使用 `gpt-5.6-terra / medium`；必要的高风险独立复核使用短期 `gpt-5.6-sol / high`。
+- 测试、CI 或外部任务等待使用确定性进程或一次 bounded wait；无状态变化时不得持续调用高智能模型轮询。只在完成、失败、边界变化或需要决策时唤醒 Agent。
+- `Draft PR Ready` 是默认阶段终点。Merge、真实数据验收、主存储写入、Provider activation、checkpoint 推进和下一个 Issue 都是独立阶段，除非当前 work order 逐项明确授权，否则不得自动串联。
 
 ## Product-led planning authority
 
@@ -185,8 +194,9 @@ Before changing code or system documentation, the executor must:
 9. If a concrete repository conflict makes the plan unexecutable, stop the affected scope and report `LEAD_DECISION_REQUIRED`.
 10. Otherwise implement the smallest complete solution within the Issue boundary.
 11. Run required automated tests and smoke tests.
-12. Open or update one Draft PR with `Closes #<issue-number>`, then request ChatGPT Lead Code + Architecture + Concept Review.
+12. Open or update one Draft PR with `Closes #<issue-number>`, then request Lead readback and any risk-required Independent Review.
 13. Report changed areas, validation results, unresolved risks, and material Roadmap Feedback if real evidence changed an upstream assumption.
+14. Stop at the work order's declared `stop_at`; when absent, stop after Draft PR publication and readback.
 
 Ordinary engineering choices inside approved scope do not need product-owner approval. Architecture, lifecycle, canonical concepts, durable product rules, explicit non-goals, Product Stage or material product direction cannot be changed silently.
 
@@ -253,7 +263,7 @@ New canonical concepts: none
 
 Executor 开始实现时必须重新核对 Issue 正文已经使用 canonical terms。如果实现过程中发现必须新增未获批准的类型、Role、Relationship、状态机、长期记录、Store 或 API noun，必须停止相关实现并报告 `LEAD_DECISION_REQUIRED`，不得自行把实现便利升级成产品概念。
 
-ChatGPT Lead 的 PR Architecture / Concept Review 同样检查 **concept diff**：不仅看代码是否工作，也检查 PR 是否偷偷引入了 Issue 未声明的新概念或让已收敛的旧词重新变成平行模型。对于尚未开发的新能力，发现本应在设计阶段收敛的概念漂移应直接退回 Issue/Concept 设计，不用兼容层补救。
+Lead readback 或 risk-required Independent Review 同样检查 **concept diff**：不仅看代码是否工作，也检查 PR 是否偷偷引入了 Issue 未声明的新概念或让已收敛的旧词重新变成平行模型。对于尚未开发的新能力，发现本应在设计阶段收敛的概念漂移应直接退回 Issue/Concept 设计，不用兼容层补救。
 
 ## Product-rule governance
 
@@ -265,13 +275,15 @@ Do not duplicate those rules across Issues, adapters, prompts, or implementation
 
 ## Issue and PR discipline
 
-- One Issue = one implementation branch = one PR.
+- One independently verifiable business Gate = one Issue = one implementation branch = one PR.
 - Prefer `codex/issue-<number>-<topic>` branch names.
 - Do not mix unrelated cleanup, schema changes, docs changes, or UI work into the same PR.
 - A PR must demonstrate how it satisfies the Issue acceptance criteria and pre-defined tests.
 - Do not create issue-specific duplicate spec/plan documents unless the Issue explicitly requires one.
 - Product / architecture / capability PRs should preserve the Issue's Roadmap Alignment and report whether the expected product evidence was actually obtained.
-- Codex submits a Draft PR and only fixes it after ChatGPT Lead review; ChatGPT Lead owns the final Code / Architecture / Concept review judgment and Merge decision. Codex must not self-review as final authority or merge its own PR.
+- After each relevant edit, run targeted tests; at a stable checkpoint run affected-subsystem regressions; run the full suite once for the pre-PR or final candidate. Repeat the full suite only after a relevant code or dependency change, not after comments, status updates, documentation-only edits or unchanged readback.
+- Ordinary changes use deterministic tests plus Lead readback. A high-risk Independent Reviewer returns one consolidated issue list; the Developer fixes it as one bounded batch and the Lead performs one readback. If that readback discovers another material issue, report it and stop the current execution turn instead of starting another automatic review-fix loop.
+- Codex submits a Draft PR and must not self-review as final authority or merge its own PR. Lead owns Product Alignment and Merge decisions; required high-risk Code / Architecture / Concept judgment comes from the Independent Reviewer.
 
 ### Review concerns
 
@@ -283,7 +295,7 @@ Do not collapse all review into one question. Review should distinguish:
 
 Product Alignment does not require a second review platform. It can be a section of the existing Issue / PR / Architecture Review.
 
-For material product / architecture / capability PRs, the ChatGPT Lead reviewer should report at minimum:
+For material product / architecture / capability PRs, the Lead readback or required Independent Reviewer should report at minimum:
 
 ```text
 Product alignment: PASS | PARTIAL | FAIL
