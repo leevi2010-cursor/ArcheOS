@@ -1973,10 +1973,15 @@ def _wechat_product_command(args: argparse.Namespace) -> int:
     )
     performance = {
         "upper_bound_probe_calls": result.upper_bound_probe_calls,
+        "capture_attempts": result.capture_attempts,
+        "capture_successes": result.capture_successes,
+        "capture_reasons": list(result.capture_reasons),
         "capture_provider_calls": result.capture_provider_calls,
         "completed_window_connector_replays": (
             result.completed_window_connector_replays
         ),
+        "materialized_cursor_rows": result.materialized_cursor_rows,
+        "cursor_discovery_ms": result.cursor_discovery_ms,
         "snapshot_bytes": result.snapshot_bytes,
         "capture_ms": result.capture_ms,
         "snapshot_publish_ms": result.snapshot_publish_ms,

@@ -104,6 +104,10 @@ class CliTest(unittest.TestCase):
         self.assertEqual(performance["governance_wall_ms"], 8)
         self.assertEqual(performance["checkpoint_wall_ms"], 2)
         self.assertEqual(performance["total_wall_ms"], 47)
+        self.assertEqual(performance["capture_attempts"], 0)
+        self.assertEqual(performance["capture_successes"], 0)
+        self.assertEqual(performance["capture_reasons"], [])
+        self.assertEqual(performance["materialized_cursor_rows"], 0)
         digest_service.return_value.run.assert_called_once_with(
             since=None,
             from_now=True,

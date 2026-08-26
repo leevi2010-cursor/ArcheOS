@@ -62,6 +62,7 @@ from archeos.semantic_handoff import (
 from archeos.source import LocalManagedSourceRepository
 from archeos.wechat_capture_helper import (
     _all_cursor_rows,
+    _bounded_window_cursor_rows,
     _window_upper,
 )
 from archeos.wechat_capture_helper import (
@@ -7523,6 +7524,16 @@ class WechatDigestTests(unittest.TestCase):
             results.append(service.run(max_terminal_items=3))
 
         self.assertEqual(sum(not call[2] for call in capture.calls), 1)
+        self.assertEqual(sum(item.capture_attempts for item in results), 2)
+        self.assertEqual(sum(item.capture_successes for item in results), 2)
+        self.assertEqual(
+            tuple(
+                reason
+                for result in results
+                for reason in result.capture_reasons
+            ),
+            ("upper_bound_probe", "initial_history_window"),
+        )
         self.assertEqual(sum(item.capture_provider_calls for item in results), 1)
         self.assertEqual(sum(item.upper_bound_probe_calls for item in results), 1)
         self.assertGreaterEqual(results[0].capture_ms, 5)
@@ -7657,6 +7668,26 @@ class WechatDigestTests(unittest.TestCase):
         self.assertEqual(
             len({item.change_id for item in journal}), len(journal)
         )
+
+    def test_capture_failure_keeps_attempt_observable_without_success(self) -> None:
+        class FailingCaptureProvider(SyntheticCaptureProvider):
+            def capture(self, *args, **kwargs):
+                del args, kwargs
+                raise RuntimeError("synthetic capture failure")
+
+        service = self.service(FailingCaptureProvider([]))
+        with patch(
+            "archeos.wechat_digest._require_openai_codex_sdk"
+        ), self.assertRaisesRegex(WechatDigestError, "checkpoint 未推进"):
+            service.run(since="2023-01-01")
+        self.assertEqual(service._segment_performance["capture_attempts"], 1)
+        self.assertEqual(service._segment_performance["capture_successes"], 0)
+        self.assertEqual(
+            service._segment_performance["capture_provider_calls"], 0
+        )
+        self.assertEqual(service._capture_reasons, ["since_window"])
+        self.assertIsNone(service.run_store.checkpoint())
+        self.assertIsNone(service.run_store.active_run_id())
 
     def test_failed_two_lane_committed_wave_resumes_without_provider_calls(
         self,
@@ -10229,7 +10260,13 @@ class WechatDigestTests(unittest.TestCase):
                         status["state"] = "completed"
                         status["checkpoint_published"] = True
                         for item in status["items"].values():
-                            item["state"] = "unsupported"
+                            item["state"] = "processed"
+                            item["representation_id"] = (
+                                "rep_" + f"{index:032x}"
+                            )
+                            item["atomic_information_ids"] = [
+                                "info_" + f"{index:032x}"
+                            ]
                     run_store.create(plan, status)
                     if index < window_count:
                         run_store.clear_active()
@@ -10249,12 +10286,47 @@ class WechatDigestTests(unittest.TestCase):
                     side_effect=AssertionError(
                         "completed history must not deep-read snapshot"
                     ),
+                ), patch.object(
+                    service.source_repository,
+                    "get",
+                    side_effect=AssertionError(
+                        "completed history must not read Source"
+                    ),
+                ), patch.object(
+                    service.representation_repository,
+                    "get",
+                    side_effect=AssertionError(
+                        "completed history must not read Representation"
+                    ),
+                ), patch.object(
+                    service.information_store,
+                    "get_current",
+                    side_effect=AssertionError(
+                        "completed history must not read Atomic Information"
+                    ),
+                ), patch.object(
+                    service,
+                    "_verify_semantic_receipts",
+                    side_effect=AssertionError(
+                        "completed history must not read semantic package"
+                    ),
                 ):
                     binding = service._semantic_authority_binding(
                         str(plan["run_id"])
                     )
                 self.assertEqual(len(binding.completed_window_chain), window_count)
                 self.assertEqual(capture_provider.calls, [])
+                with patch.object(
+                    service,
+                    "_load_completed_window_lightweight",
+                    side_effect=AssertionError(
+                        "completed chain must be cached within one CLI run"
+                    ),
+                ):
+                    cached = service._semantic_authority_binding(
+                        str(plan["run_id"])
+                    )
+                self.assertEqual(cached, binding)
 
     def test_upgrade_rejects_tampered_legacy_binding_before_any_write(self) -> None:
         capture = SyntheticCaptureProvider([message(1)])
@@ -10393,6 +10465,10 @@ class WechatCaptureHelperTests(unittest.TestCase):
                     (5, 1, 300, "sender", "message-5", 0),
                 ],
             )
+            connection.execute(
+                f"CREATE INDEX [{self.table_name}_create_time] "
+                f"ON [{self.table_name}] (create_time, local_id)"
+            )
             connection.commit()
         self.app = SimpleNamespace(
             cache={self.database_key: str(self.database)},
@@ -10491,15 +10567,16 @@ class WechatCaptureHelperTests(unittest.TestCase):
         }
 
     @contextmanager
-    def capture_runtime(self):
+    def capture_runtime(self, sessions=None):
+        sessions = sessions or ((
+            self.username,
+            "Synthetic Conversation",
+            False,
+        ),)
         with patch.dict(sys.modules, self.modules), patch.object(
             wechat_capture_helper,
             "_sessions",
-            return_value=((
-                self.username,
-                "Synthetic Conversation",
-                False,
-            ),),
+            return_value=sessions,
         ):
             yield
 
@@ -10533,7 +10610,7 @@ class WechatCaptureHelperTests(unittest.TestCase):
             "message_key": cursor[2],
         }
 
-    def _legacy_capture(self, request):
+    def _legacy_capture(self, request, *, sessions=None):
         def unbounded_cursor_discovery(
             located_tables,
             *,
@@ -10545,10 +10622,32 @@ class WechatCaptureHelperTests(unittest.TestCase):
                 located_tables, start_timestamp=start_timestamp
             )
 
-        with self.capture_runtime(), patch.object(
+        def unbounded_window_discovery(
+            located_tables,
+            *,
+            after,
+            window_days,
+            message_limit,
+            end_cursor=None,
+        ):
+            del window_days, message_limit
+            rows = _all_cursor_rows(
+                located_tables,
+                start_timestamp=after[0],
+                end_timestamp=(
+                    None if end_cursor is None else end_cursor[0]
+                ),
+            )
+            return rows, len(rows)
+
+        with self.capture_runtime(sessions), patch.object(
             wechat_capture_helper,
             "_all_cursor_rows",
             side_effect=unbounded_cursor_discovery,
+        ), patch.object(
+            wechat_capture_helper,
+            "_bounded_window_cursor_rows",
+            side_effect=unbounded_window_discovery,
         ):
             return capture_with_wechat_cli(request)
 
@@ -10613,9 +10712,10 @@ class WechatCaptureHelperTests(unittest.TestCase):
         ) as discovery:
             optimized = capture_with_wechat_cli(request)
         self.assertEqual(discovery.call_args.kwargs["end_timestamp"], 200)
+        self.assertEqual(optimized["observed_upper"], legacy["observed_upper"])
+        self.assertEqual(optimized["messages"], legacy["messages"])
         self.assertEqual(
-            json.dumps(optimized, ensure_ascii=False, separators=(",", ":")),
-            json.dumps(legacy, ensure_ascii=False, separators=(",", ":")),
+            optimized["metrics"]["materialized_cursor_rows"], 4
         )
         returned = [
             (
@@ -10641,14 +10741,17 @@ class WechatCaptureHelperTests(unittest.TestCase):
         with self.capture_runtime(), patch.object(
             wechat_capture_helper,
             "_all_cursor_rows",
-            wraps=_all_cursor_rows,
+            side_effect=AssertionError("history window must not scan full tail"),
+        ) as full_tail, patch.object(
+            wechat_capture_helper,
+            "_bounded_window_cursor_rows",
+            wraps=_bounded_window_cursor_rows,
         ) as discovery:
             optimized = capture_with_wechat_cli(request)
-        self.assertEqual(discovery.call_args.kwargs["end_timestamp"], 200)
-        self.assertEqual(
-            json.dumps(optimized, ensure_ascii=False, separators=(",", ":")),
-            json.dumps(legacy, ensure_ascii=False, separators=(",", ":")),
-        )
+        full_tail.assert_not_called()
+        self.assertEqual(discovery.call_args.kwargs["end_cursor"], upper)
+        self.assertEqual(optimized["observed_upper"], legacy["observed_upper"])
+        self.assertEqual(optimized["messages"], legacy["messages"])
 
     def test_observe_only_uses_known_upper_without_returning_messages(self) -> None:
         upper = sorted(self.cursors.values())[3]
@@ -10769,8 +10872,12 @@ class WechatCaptureHelperTests(unittest.TestCase):
         ), patch.object(
             wechat_capture_helper,
             "_all_cursor_rows",
-            wraps=_all_cursor_rows,
-        ) as full_scan:
+            side_effect=AssertionError("new window must not scan full tail"),
+        ) as full_scan, patch.object(
+            wechat_capture_helper,
+            "_bounded_window_cursor_rows",
+            wraps=_bounded_window_cursor_rows,
+        ) as bounded_discovery:
             for _ in range(7):
                 started = time.monotonic_ns()
                 captured = capture_with_wechat_cli(
@@ -10812,7 +10919,8 @@ class WechatCaptureHelperTests(unittest.TestCase):
         median_readback = sorted(readback_samples)[3]
 
         self.assertEqual(total_rows, 1000)
-        self.assertEqual(full_scan.call_count, 7)
+        full_scan.assert_not_called()
+        self.assertEqual(bounded_discovery.call_count, 7)
         self.assertEqual(len(captured_samples), 7)
         self.assertTrue(
             all(len(item["messages"]) == 1000 for item in captured_samples)
@@ -10828,19 +10936,155 @@ class WechatCaptureHelperTests(unittest.TestCase):
         )
         self.assertLess(median_readback, median_full_capture)
 
-    def test_unbounded_window_discovery_is_unchanged(self) -> None:
+    def test_new_window_discovery_is_bounded_and_semantically_unchanged(self) -> None:
         request = self.request(message_limit=2)
         with self.capture_runtime(), patch.object(
             wechat_capture_helper,
             "_all_cursor_rows",
-            wraps=_all_cursor_rows,
+            side_effect=AssertionError("new window must not scan full tail"),
+        ) as full_tail, patch.object(
+            wechat_capture_helper,
+            "_bounded_window_cursor_rows",
+            wraps=_bounded_window_cursor_rows,
         ) as discovery:
             result = capture_with_wechat_cli(request)
-        self.assertIsNone(discovery.call_args.kwargs["end_timestamp"])
+        full_tail.assert_not_called()
+        discovery.assert_called_once()
         expected = _window_upper(
             list(self.cursors.values()), window_days=30, message_limit=2
         )
         self.assertEqual(result["observed_upper"], self.cursor_dict(expected))
+        self.assertLessEqual(
+            result["metrics"]["materialized_cursor_rows"], 5
+        )
+
+    def test_multi_database_ties_and_thirty_day_boundary_match_legacy(self) -> None:
+        second_database = self.root / "msg-second.db"
+        second_database_key = "msg/msg-second.db"
+        second_username = "wxid_synthetic_second"
+        second_table = "Msg_" + hashlib.md5(
+            second_username.encode()
+        ).hexdigest()
+        exact_thirty_day_boundary = 100 + 30 * 24 * 60 * 60
+        with closing(sqlite3.connect(second_database)) as connection:
+            connection.execute(
+                f"CREATE TABLE [{second_table}] ("
+                "local_id INTEGER PRIMARY KEY, local_type INTEGER, "
+                "create_time INTEGER, real_sender_id TEXT, "
+                "raw_content TEXT, compression INTEGER)"
+            )
+            connection.executemany(
+                f"INSERT INTO [{second_table}] VALUES (?, ?, ?, ?, ?, ?)",
+                [
+                    (1, 1, 200, "sender", "second-1", 0),
+                    (2, 1, 200, "sender", "second-2", 0),
+                    (3, 1, 200, "sender", "second-3", 0),
+                    (
+                        4,
+                        1,
+                        exact_thirty_day_boundary,
+                        "sender",
+                        "excluded-boundary",
+                        0,
+                    ),
+                ],
+            )
+            connection.execute(
+                f"CREATE INDEX [{second_table}_create_time] "
+                f"ON [{second_table}] (create_time, local_id)"
+            )
+            connection.commit()
+        self.app.cache[second_database_key] = str(second_database)
+        self.app.msg_db_keys = (self.database_key, second_database_key)
+        sessions = (
+            (self.username, "Synthetic Conversation", False),
+            (second_username, "Synthetic Conversation 2", False),
+        )
+        request = self.request(message_limit=4)
+        legacy = self._legacy_capture(request, sessions=sessions)
+        with self.capture_runtime(sessions), patch.object(
+            wechat_capture_helper,
+            "_all_cursor_rows",
+            side_effect=AssertionError("new window must not scan full tail"),
+        ):
+            bounded = capture_with_wechat_cli(request)
+        self.assertEqual(bounded["observed_upper"], legacy["observed_upper"])
+        self.assertEqual(bounded["messages"], legacy["messages"])
+        self.assertEqual(len(bounded["messages"]), 4)
+        self.assertTrue(
+            all(
+                item["timestamp"] < exact_thirty_day_boundary
+                for item in bounded["messages"]
+            )
+        )
+
+    def test_tail_1x_5x_10x_keeps_materialized_rows_bounded(self) -> None:
+        materialized_counts = []
+        legacy_counts = []
+        bounded_wall_ns = []
+        for tail_factor in (1, 5, 10):
+            database = self.root / f"tail-{tail_factor}.db"
+            username = f"wxid_tail_{tail_factor}"
+            table_name = "Msg_" + hashlib.md5(username.encode()).hexdigest()
+            with closing(sqlite3.connect(database)) as connection:
+                connection.execute(
+                    f"CREATE TABLE [{table_name}] ("
+                    "local_id INTEGER PRIMARY KEY, create_time INTEGER)"
+                )
+                first_window = [
+                    (index + 1, 100 + index) for index in range(100)
+                ]
+                future_tail = [
+                    (
+                        101 + index,
+                        100 + 31 * 24 * 60 * 60 + index,
+                    )
+                    for index in range(1000 * tail_factor)
+                ]
+                connection.executemany(
+                    f"INSERT INTO [{table_name}] VALUES (?, ?)",
+                    first_window + future_tail,
+                )
+                connection.execute(
+                    f"CREATE INDEX [{table_name}_create_time] "
+                    f"ON [{table_name}] (create_time, local_id)"
+                )
+                query_plan = connection.execute(
+                    f"EXPLAIN QUERY PLAN SELECT local_id, create_time "
+                    f"FROM [{table_name}] WHERE create_time > ? "
+                    "AND create_time < ? "
+                    "ORDER BY create_time ASC, local_id ASC LIMIT ?",
+                    (99, 100 + 30 * 24 * 60 * 60, 100),
+                ).fetchall()
+                connection.commit()
+            self.assertTrue(
+                any("INDEX" in str(row[-1]).upper() for row in query_plan)
+            )
+            located = {
+                str(database): ((
+                    f"msg/tail-{tail_factor}.db",
+                    username,
+                    "Synthetic Tail",
+                    False,
+                    table_name,
+                ),)
+            }
+            legacy = _all_cursor_rows(located, start_timestamp=99)
+            started = time.monotonic_ns()
+            bounded, materialized = _bounded_window_cursor_rows(
+                located,
+                after=(99, "", ""),
+                window_days=30,
+                message_limit=100,
+            )
+            bounded_wall_ns.append(time.monotonic_ns() - started)
+            legacy_counts.append(len(legacy))
+            materialized_counts.append(materialized)
+            self.assertEqual(len(bounded), 100)
+
+        self.assertEqual(legacy_counts, [1100, 5100, 10100])
+        self.assertEqual(materialized_counts, [100, 100, 100])
+        self.assertTrue(all(value >= 0 for value in bounded_wall_ns))
 
 
 class WechatCliCaptureProviderTests(unittest.TestCase):

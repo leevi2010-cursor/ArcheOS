@@ -14,6 +14,7 @@ import mimetypes
 import os
 import sqlite3
 import sys
+import time
 from contextlib import closing, redirect_stdout
 from datetime import datetime
 from io import StringIO
@@ -256,6 +257,129 @@ def _all_cursor_rows(
     return rows
 
 
+def _bounded_window_cursor_rows(
+    located_tables: dict[str, tuple[tuple[str, str, str, bool, str], ...]],
+    *,
+    after: tuple[int, str, str],
+    window_days: int,
+    message_limit: int,
+    end_cursor: tuple[int, str, str] | None = None,
+) -> tuple[list[tuple[str, str, object, object]], int]:
+    """Materialize only enough cursor rows to choose one exact window.
+
+    Each table contributes at most ``message_limit`` rows after the checkpoint,
+    plus complete timestamp tie groups at the checkpoint and local boundary.
+    The final full-cursor filter remains authoritative across databases.
+    """
+
+    first_by_table: list[
+        tuple[str, str, str, int]
+    ] = []
+    materialized: dict[tuple[str, str, object, object], None] = {}
+    for database, tables in located_tables.items():
+        try:
+            with closing(sqlite3.connect(database)) as connection:
+                for relative_key, username, _label, _group, table_name in tables:
+                    end_filter = ""
+                    end_parameters: tuple[int, ...] = ()
+                    if end_cursor is not None:
+                        end_filter = " AND create_time <= ?"
+                        end_parameters = (end_cursor[0],)
+                    same_second = connection.execute(
+                        f"SELECT local_id, create_time FROM [{table_name}] "
+                        "WHERE create_time = ?"
+                        f"{end_filter} ORDER BY local_id ASC",
+                        (after[0], *end_parameters),
+                    ).fetchall()
+                    eligible_same_second = []
+                    for local_id, create_time in same_second:
+                        row = (username, relative_key, local_id, create_time)
+                        cursor = (
+                            create_time,
+                            _digest("wechat_conversation", username),
+                            _digest(
+                                "wechat_message",
+                                username,
+                                relative_key,
+                                local_id,
+                                create_time,
+                            ),
+                        )
+                        if cursor > after and (
+                            end_cursor is None or cursor <= end_cursor
+                        ):
+                            eligible_same_second.append(row)
+                            materialized[row] = None
+                    if eligible_same_second:
+                        first_by_table.append(
+                            (database, table_name, username, after[0])
+                        )
+                        continue
+                    first = connection.execute(
+                        f"SELECT MIN(create_time) FROM [{table_name}] "
+                        "WHERE create_time > ?"
+                        f"{end_filter}",
+                        (after[0], *end_parameters),
+                    ).fetchone()
+                    timestamp = first[0] if first is not None else None
+                    if isinstance(timestamp, bool) or not isinstance(timestamp, int):
+                        continue
+                    first_by_table.append(
+                        (database, table_name, username, timestamp)
+                    )
+        except sqlite3.Error:
+            raise RuntimeError("message cursor query failed") from None
+
+    if not first_by_table:
+        return [], len(materialized)
+    first_timestamp = min(item[3] for item in first_by_table)
+    cutoff = first_timestamp + window_days * 24 * 60 * 60
+    for database, tables in located_tables.items():
+        try:
+            with closing(sqlite3.connect(database)) as connection:
+                for relative_key, username, _label, _group, table_name in tables:
+                    upper_timestamp = cutoff
+                    if end_cursor is not None:
+                        upper_timestamp = min(upper_timestamp, end_cursor[0] + 1)
+                    values = connection.execute(
+                        f"SELECT local_id, create_time FROM [{table_name}] "
+                        "WHERE create_time > ? AND create_time < ? "
+                        "ORDER BY create_time ASC, local_id ASC LIMIT ?",
+                        (after[0], upper_timestamp, message_limit),
+                    ).fetchall()
+                    if values:
+                        boundary_timestamp = values[-1][1]
+                        boundary_ties = connection.execute(
+                            f"SELECT local_id, create_time FROM [{table_name}] "
+                            "WHERE create_time = ? ORDER BY local_id ASC",
+                            (boundary_timestamp,),
+                        ).fetchall()
+                        values.extend(boundary_ties)
+                    for local_id, create_time in values:
+                        row = (username, relative_key, local_id, create_time)
+                        cursor = (
+                            create_time,
+                            _digest("wechat_conversation", username),
+                            _digest(
+                                "wechat_message",
+                                username,
+                                relative_key,
+                                local_id,
+                                create_time,
+                            ),
+                        )
+                        if (
+                            cursor > after
+                            and create_time < cutoff
+                            and (end_cursor is None or cursor <= end_cursor)
+                        ):
+                            materialized[row] = None
+        except sqlite3.Error:
+            raise RuntimeError("message cursor query failed") from None
+    rows = list(materialized)
+    return rows, len(rows)
+
+
 def _upper_cursor_rows(
     located_tables: dict[str, tuple[tuple[str, str, str, bool, str], ...]],
     *,
@@ -389,7 +513,12 @@ def _capture(request: dict[str, object]) -> dict[str, object]:
                 "schema_version": "wechat-cli-capture/1.0",
                 "observed_upper": _cursor_dict(observed_upper),
                 "messages": [],
+                "metrics": {
+                    "materialized_cursor_rows": 0,
+                    "cursor_discovery_ms": 0,
+                },
             }
+        discovery_started = time.monotonic()
         upper_cursor_rows = _upper_cursor_rows(
             located_tables,
             start_timestamp=after[0],
@@ -417,13 +546,31 @@ def _capture(request: dict[str, object]) -> dict[str, object]:
             "schema_version": "wechat-cli-capture/1.0",
             "observed_upper": _cursor_dict(observed_upper),
             "messages": [],
+            "metrics": {
+                "materialized_cursor_rows": len(upper_cursor_rows),
+                "cursor_discovery_ms": round(
+                    (time.monotonic() - discovery_started) * 1000
+                ),
+            },
         }
-    all_cursor_rows = _all_cursor_rows(
-        located_tables,
-        start_timestamp=after[0],
-        end_timestamp=(
-            None if cursor_query_upper is None else cursor_query_upper[0]
-        ),
+    discovery_started = time.monotonic()
+    if fixed_upper is not None:
+        all_cursor_rows = _all_cursor_rows(
+            located_tables,
+            start_timestamp=after[0],
+            end_timestamp=fixed_upper[0],
+        )
+        materialized_cursor_rows = len(all_cursor_rows)
+    else:
+        all_cursor_rows, materialized_cursor_rows = _bounded_window_cursor_rows(
+            located_tables,
+            after=after,
+            window_days=window_days,
+            message_limit=window_message_limit,
+            end_cursor=all_history_upper,
+        )
+    cursor_discovery_ms = round(
+        (time.monotonic() - discovery_started) * 1000
     )
     cursor_rows = [
         (
@@ -555,6 +702,10 @@ def _capture(request: dict[str, object]) -> dict[str, object]:
         "schema_version": "wechat-cli-capture/1.0",
         "observed_upper": _cursor_dict(observed_upper),
         "messages": ordered,
+        "metrics": {
+            "materialized_cursor_rows": materialized_cursor_rows,
+            "cursor_discovery_ms": cursor_discovery_ms,
+        },
     }
 
 
