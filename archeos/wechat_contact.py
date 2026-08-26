@@ -261,6 +261,68 @@ def committed_legacy_message_keys(workspace: Path) -> frozenset[str]:
     return legacy_message_overlap(workspace).committed_message_keys
 
 
+def _contact_semantic_provider_calls(
+    workspace: Path,
+    receipts: tuple[dict[str, object], ...],
+) -> int:
+    """Read only item-bound Semantic receipts; never inventory the Workspace."""
+
+    audit_root = Path(workspace) / "02_processing" / "semantic_handoff_runs"
+    seen_processing_runs: set[str] = set()
+    for receipt in receipts:
+        processing_run_id = receipt.get("processing_run_id")
+        relative_path = receipt.get("audit_relative_path")
+        if (
+            set(receipt)
+            != {
+                "source_id",
+                "representation_id",
+                "processing_run_id",
+                "audit_relative_path",
+                "audit_fingerprint",
+                "input_fingerprint",
+                "result_fingerprint",
+                "package_fingerprint",
+            }
+            or not isinstance(processing_run_id, str)
+            or not isinstance(relative_path, str)
+            or processing_run_id in seen_processing_runs
+        ):
+            raise WechatDigestError(
+                "联系人 Semantic receipt identity 无效或重复。"
+            )
+        expected_relative = str(
+            Path("02_processing")
+            / "semantic_handoff_runs"
+            / processing_run_id
+            / "processing-run-audit.json"
+        )
+        if relative_path != expected_relative:
+            raise WechatDigestError("联系人 Semantic receipt 路径绑定漂移。")
+        audit_path = Path(workspace) / relative_path
+        audit = _read_private_json(audit_path)
+        raw_fingerprint = "sha256:" + hashlib.sha256(
+            audit_path.read_bytes()
+        ).hexdigest()
+        if (
+            audit_path.parent.parent != audit_root
+            or audit.get("schema_version") != "processing-run-audit/1.0"
+            or audit.get("provider_route") != "codex-cli"
+            or audit.get("processing_run_id") != processing_run_id
+            or audit.get("input_fingerprint") != receipt.get("input_fingerprint")
+            or audit.get("result_fingerprint")
+            != receipt.get("result_fingerprint")
+            or audit.get("package_fingerprint")
+            != receipt.get("package_fingerprint")
+            or raw_fingerprint != receipt.get("audit_fingerprint")
+        ):
+            raise WechatDigestError(
+                "联系人 Semantic Processing Run receipt 绑定漂移。"
+            )
+        seen_processing_runs.add(processing_run_id)
+    return len(seen_processing_runs)
+
+
 def build_contact_acceptance_pack(
     *,
     workspace: Path,
@@ -268,9 +330,9 @@ def build_contact_acceptance_pack(
     binding: WechatContactBinding,
     output_root: Path,
     synthesis_provider_factory: Callable[[], ContactSynthesisProvider],
+    authority_ref: str,
+    absolute_cap: int,
     synthesis_segment_size: int = 100,
-    authority_ref: str = "synthetic-contact-authority",
-    absolute_cap: int = 50,
     resume_provider_calls: int = 0,
 ) -> tuple[Path, Path]:
     """Build one contact View while excluding a concurrent contact digest."""
@@ -307,6 +369,7 @@ def _build_contact_acceptance_pack_unlocked(
     ordered_ids: list[str] = []
     attachment_counts: Counter[str] = Counter()
     governance_provider_calls = 0
+    semantic_receipts: list[dict[str, object]] = []
     ordered_runs: list[tuple[tuple[int, str, str], str]] = []
     for run_dir in run_store.runs_root.glob("run_*"):
         plan = run_store.plan(run_dir.name)
@@ -336,18 +399,23 @@ def _build_contact_acceptance_pack_unlocked(
         if not isinstance(attachments, list) or not isinstance(conversations, list):
             raise WechatDigestError("联系人运行计划项目顺序不可验证。")
         ordered_item_ids: list[str] = []
+        planned_sources: dict[str, str] = {}
         for attachment in attachments:
             if not isinstance(attachment, dict) or not isinstance(
                 attachment.get("attachment_key"), str
-            ):
+            ) or not isinstance(attachment.get("source_id"), str):
                 raise WechatDigestError("联系人附件顺序不可验证。")
-            ordered_item_ids.append(f"attachment:{attachment['attachment_key']}")
+            item_id = f"attachment:{attachment['attachment_key']}"
+            ordered_item_ids.append(item_id)
+            planned_sources[item_id] = str(attachment["source_id"])
         for conversation in conversations:
             if not isinstance(conversation, dict) or not isinstance(
                 conversation.get("conversation_key"), str
-            ):
+            ) or not isinstance(conversation.get("source_id"), str):
                 raise WechatDigestError("联系人会话顺序不可验证。")
-            ordered_item_ids.append(f"conversation:{conversation['conversation_key']}")
+            item_id = f"conversation:{conversation['conversation_key']}"
+            ordered_item_ids.append(item_id)
+            planned_sources[item_id] = str(conversation["source_id"])
         if set(ordered_item_ids) != set(items):
             raise WechatDigestError("联系人运行计划与状态项目不一致。")
         if run_completed:
@@ -355,11 +423,39 @@ def _build_contact_acceptance_pack_unlocked(
                 item = items[item_id]
                 if not isinstance(item, dict):
                     raise WechatDigestError("联系人运行状态不可验证。")
+                source_id = item.get("source_id")
+                representation_id = item.get("representation_id")
+                item_receipts = item.get("semantic_provider_receipts", [])
                 values = item.get("atomic_information_ids", [])
                 if not isinstance(values, list) or any(
                     not isinstance(value, str) for value in values
-                ):
+                ) or source_id != planned_sources[item_id] or not isinstance(
+                    item_receipts, list
+                ) or any(not isinstance(receipt, dict) for receipt in item_receipts):
                     raise WechatDigestError("联系人长期信息引用不可验证。")
+                if representation_id is not None:
+                    if not isinstance(representation_id, str):
+                        raise WechatDigestError(
+                            "联系人 Representation 引用不可验证。"
+                        )
+                    if values and not item_receipts:
+                        raise WechatDigestError(
+                            "联系人长期信息缺少 item-bound Semantic receipt。"
+                        )
+                    for receipt in item_receipts:
+                        if (
+                            receipt.get("source_id") != source_id
+                            or receipt.get("representation_id")
+                            != representation_id
+                        ):
+                            raise WechatDigestError(
+                                "联系人 Semantic receipt 与 Source/Representation 不一致。"
+                            )
+                        semantic_receipts.append(dict(receipt))
+                elif values:
+                    raise WechatDigestError(
+                        "联系人长期信息缺少 Representation 引用。"
+                    )
                 for value in values:
                     if value not in ordered_ids:
                         ordered_ids.append(value)
@@ -414,18 +510,9 @@ def _build_contact_acceptance_pack_unlocked(
     if missing_ids:
         raise WechatDigestError("联系人业务验收所需的长期信息无法完整读回。")
     revisions = tuple(by_id[value] for value in ordered_ids)
-    semantic_provider_calls = 0
-    semantic_audit_root = Path(workspace) / "02_processing" / "semantic_handoff_runs"
-    for audit_path in sorted(
-        semantic_audit_root.glob("*/processing-run-audit.json")
-    ):
-        audit = _read_private_json(audit_path)
-        if (
-            audit.get("schema_version") != "processing-run-audit/1.0"
-            or audit.get("provider_route") != "codex-cli"
-        ):
-            raise WechatDigestError("联系人 Semantic 调用计数不可验证。")
-        semantic_provider_calls += 1
+    semantic_provider_calls = _contact_semantic_provider_calls(
+        workspace, tuple(semantic_receipts)
+    )
     synthesis_outcome = ContactSynthesisStore(
         run_store.root / "synthesis", segment_size=synthesis_segment_size
     ).synthesize(

@@ -6,6 +6,7 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import Mock
 
 from archeos.atomic_information import (
     AtomicInformationRevision,
@@ -13,6 +14,7 @@ from archeos.atomic_information import (
     JsonlAtomicInformationStore,
 )
 from archeos.wechat_contact import (
+    _contact_semantic_provider_calls,
     LegacyMessageOverlap,
     OverlapFilteringWechatCaptureProvider,
     WechatContactSelectionStore,
@@ -58,6 +60,13 @@ def _message(number: int) -> CapturedMessage:
         f"消息 {number}",
         (),
     )
+
+
+def _payload_fingerprint(value: object) -> str:
+    payload = json.dumps(
+        value, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode()
+    return "sha256:" + hashlib.sha256(payload).hexdigest()
 
 
 class ContactSelectionTests(unittest.TestCase):
@@ -236,6 +245,104 @@ class ContactSelectionTests(unittest.TestCase):
 
 
 class ContactAcceptancePackTests(unittest.TestCase):
+    AUTHORITY_REF = (
+        "https://github.com/leevi2010-cursor/ArcheOS/issues/999"
+        "#issuecomment-999"
+    )
+
+    @staticmethod
+    def _write_semantic_receipt(
+        workspace: Path,
+        *,
+        representation_id: str,
+        source_id: str,
+        suffix: str = "1",
+    ) -> dict[str, object]:
+        semantic_run_id = "semantic_run_" + suffix * 32
+        processing_run_id = "run_" + suffix * 32
+        contract_fingerprint = "sha256:" + suffix * 64
+        batch_fingerprint = "sha256:" + ("a" if suffix != "a" else "b") * 64
+        input_fingerprint = "sha256:" + "c" * 64
+        result_fingerprint = "sha256:" + "d" * 64
+        run_without_fingerprint = {
+            "schema_version": "semantic-handoff-recovery-run/3.4",
+            "artifact_kind": "semantic_handoff_recovery_run",
+            "semantic_run_id": semantic_run_id,
+            "source": {"source_id": source_id},
+            "representation": {"representation_id": representation_id},
+            "contract_fingerprint": contract_fingerprint,
+            "batches": [
+                {"batch_contract_fingerprint": batch_fingerprint}
+            ],
+        }
+        run_receipt = {
+            **run_without_fingerprint,
+            "run_receipt_fingerprint": _payload_fingerprint(
+                run_without_fingerprint
+            ),
+        }
+        run_root = (
+            workspace
+            / "02_processing"
+            / "semantic_handoff_runs"
+            / semantic_run_id
+        )
+        result_receipt = {
+            "semantic_run_id": semantic_run_id,
+            "run_contract_fingerprint": contract_fingerprint,
+            "batch_ordinal": 1,
+            "batch_contract_fingerprint": batch_fingerprint,
+            "processing_run_id": processing_run_id,
+            "execution_record": {
+                "processing_run_id": processing_run_id,
+                "input_fingerprint": input_fingerprint,
+                "result_fingerprint": result_fingerprint,
+            },
+        }
+        audit = {
+            "schema_version": "processing-run-audit/1.0",
+            "provider_route": "codex-cli",
+            "processing_run_id": processing_run_id,
+            "input_fingerprint": input_fingerprint,
+            "result_fingerprint": result_fingerprint,
+        }
+        for path, payload in (
+            (run_root / "run-receipt.json", run_receipt),
+            (
+                run_root / "results" / "batch_0001" / "result-receipt.json",
+                result_receipt,
+            ),
+            (
+                workspace
+                / "02_processing"
+                / "semantic_handoff_runs"
+                / processing_run_id
+                / "processing-run-audit.json",
+                audit,
+            ),
+        ):
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps(payload), encoding="utf-8")
+            os.chmod(path, 0o600)
+        audit_path = (
+            workspace
+            / "02_processing"
+            / "semantic_handoff_runs"
+            / processing_run_id
+            / "processing-run-audit.json"
+        )
+        return {
+            "source_id": source_id,
+            "representation_id": representation_id,
+            "processing_run_id": processing_run_id,
+            "audit_relative_path": str(audit_path.relative_to(workspace)),
+            "audit_fingerprint": "sha256:"
+            + hashlib.sha256(audit_path.read_bytes()).hexdigest(),
+            "input_fingerprint": input_fingerprint,
+            "result_fingerprint": result_fingerprint,
+            "package_fingerprint": None,
+        }
+
     def _revision(
         self,
         index: int,
@@ -379,24 +486,13 @@ class ContactAcceptancePackTests(unittest.TestCase):
                 self._revision(3, concern="项目乙", statement="已安排拜访"),
             )
             store.ingest_batch(revisions)
-            semantic_audit = (
-                workspace
-                / "02_processing"
-                / "semantic_handoff_runs"
-                / ("run_" + "1" * 32)
-                / "processing-run-audit.json"
+            source_id = "src_" + "1" * 64
+            representation_id = "repr_" + "1" * 64
+            semantic_receipt = self._write_semantic_receipt(
+                workspace,
+                representation_id=representation_id,
+                source_id=source_id,
             )
-            semantic_audit.parent.mkdir(parents=True)
-            semantic_audit.write_text(
-                json.dumps(
-                    {
-                        "schema_version": "processing-run-audit/1.0",
-                        "provider_route": "codex-cli",
-                    }
-                ),
-                encoding="utf-8",
-            )
-            os.chmod(semantic_audit, 0o600)
             runs_root = workspace / "runs"
             (runs_root / ("run_" + "1" * 32)).mkdir(parents=True)
 
@@ -413,7 +509,12 @@ class ContactAcceptancePackTests(unittest.TestCase):
                             "message_key": "",
                         },
                         "attachments": [],
-                        "conversations": [{"conversation_key": "test"}],
+                        "conversations": [
+                            {
+                                "conversation_key": "test",
+                                "source_id": source_id,
+                            }
+                        ],
                     }
 
                 def status(self, _run_id):
@@ -421,6 +522,11 @@ class ContactAcceptancePackTests(unittest.TestCase):
                         "state": "completed",
                         "items": {
                             "conversation:test": {
+                                "source_id": source_id,
+                                "representation_id": representation_id,
+                                "semantic_provider_receipts": [
+                                    semantic_receipt
+                                ],
                                 "atomic_information_ids": [
                                     item.atomic_information_id for item in revisions
                                 ],
@@ -436,6 +542,8 @@ class ContactAcceptancePackTests(unittest.TestCase):
                 binding=_binding(),
                 output_root=workspace / "acceptance",
                 synthesis_provider_factory=lambda: provider,
+                authority_ref=self.AUTHORITY_REF,
+                absolute_cap=50,
             )
             pack = json.loads(json_path.read_text())
             self.assertEqual(len(pack["events"]), 2)
@@ -460,6 +568,88 @@ class ContactAcceptancePackTests(unittest.TestCase):
             self.assertEqual(os.stat(json_path).st_mode & 0o777, 0o600)
             self.assertEqual(os.stat(markdown_path).st_mode & 0o777, 0o600)
 
+            audit_path = workspace / str(
+                semantic_receipt["audit_relative_path"]
+            )
+            audit = json.loads(audit_path.read_text(encoding="utf-8"))
+            audit["result_fingerprint"] = "sha256:" + "0" * 64
+            audit_path.write_text(json.dumps(audit), encoding="utf-8")
+            os.chmod(audit_path, 0o600)
+            provider_factory = Mock()
+            with self.assertRaisesRegex(WechatDigestError, "漂移"):
+                build_contact_acceptance_pack(
+                    workspace=workspace,
+                    run_store=RunStore(),  # type: ignore[arg-type]
+                    binding=_binding(),
+                    output_root=workspace / "acceptance-drift",
+                    synthesis_provider_factory=provider_factory,
+                    authority_ref=self.AUTHORITY_REF,
+                    absolute_cap=50,
+                )
+            provider_factory.assert_not_called()
+
+    def test_semantic_usage_reads_only_item_bound_receipts(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            current = self._write_semantic_receipt(
+                workspace,
+                representation_id="repr_" + "1" * 64,
+                source_id="src_" + "1" * 64,
+                suffix="1",
+            )
+            self._write_semantic_receipt(
+                workspace,
+                representation_id="repr_" + "2" * 64,
+                source_id="src_" + "2" * 64,
+                suffix="2",
+            )
+            legacy_audit = (
+                workspace
+                / "02_processing"
+                / "semantic_handoff_runs"
+                / ("run_" + "3" * 32)
+                / "processing-run-audit.json"
+            )
+            legacy_audit.parent.mkdir(parents=True)
+            legacy_audit.write_text("{}", encoding="utf-8")
+            os.chmod(legacy_audit, 0o600)
+            self.assertEqual(
+                _contact_semantic_provider_calls(workspace, (current,)), 1
+            )
+
+    def test_semantic_usage_missing_duplicate_and_drift_fail_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            current = self._write_semantic_receipt(
+                workspace,
+                representation_id="repr_" + "4" * 64,
+                source_id="src_" + "4" * 64,
+                suffix="4",
+            )
+            with self.assertRaisesRegex(WechatDigestError, "重复"):
+                _contact_semantic_provider_calls(
+                    workspace, (current, dict(current))
+                )
+
+            missing = dict(current)
+            missing["processing_run_id"] = "run_" + "5" * 32
+            missing["audit_relative_path"] = str(
+                Path("02_processing")
+                / "semantic_handoff_runs"
+                / missing["processing_run_id"]
+                / "processing-run-audit.json"
+            )
+            with self.assertRaises(WechatDigestError):
+                _contact_semantic_provider_calls(workspace, (missing,))
+
+            audit_path = workspace / str(current["audit_relative_path"])
+            audit = json.loads(audit_path.read_text(encoding="utf-8"))
+            audit["result_fingerprint"] = "sha256:" + "0" * 64
+            audit_path.write_text(json.dumps(audit), encoding="utf-8")
+            os.chmod(audit_path, 0o600)
+            with self.assertRaisesRegex(WechatDigestError, "漂移"):
+                _contact_semantic_provider_calls(workspace, (current,))
+
     def test_ordered_continuation_merges_cross_segment_event_and_separates_same_day(
         self,
     ) -> None:
@@ -477,7 +667,13 @@ class ContactAcceptancePackTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             provider = self.SynthesisProvider()
             store = ContactSynthesisStore(Path(directory), segment_size=2)
-            first = store.synthesize(revisions, binding=_binding(), provider=provider)
+            first = store.synthesize(
+                revisions,
+                binding=_binding(),
+                provider=provider,
+                authority_ref=self.AUTHORITY_REF,
+                absolute_cap=50,
+            )
             self.assertEqual(first.provider_calls, 2)
             self.assertEqual(len(first.result["events"]), 2)
             quote = next(
@@ -488,7 +684,11 @@ class ContactAcceptancePackTests(unittest.TestCase):
             self.assertEqual(len(quote["evidence_atomic_information_ids"]), 3)
             replay_provider = self.SynthesisProvider()
             replay = store.synthesize(
-                revisions, binding=_binding(name="已改名"), provider=replay_provider
+                revisions,
+                binding=_binding(name="已改名"),
+                provider=replay_provider,
+                authority_ref=self.AUTHORITY_REF,
+                absolute_cap=50,
             )
             self.assertEqual(replay.provider_calls, 0)
             self.assertEqual(replay.result, first.result)
@@ -509,14 +709,22 @@ class ContactAcceptancePackTests(unittest.TestCase):
             )
             with self.assertRaisesRegex(RuntimeError, "synthetic interruption"):
                 interrupted.synthesize(
-                    revisions, binding=_binding(), provider=interrupted_provider
+                    revisions,
+                    binding=_binding(),
+                    provider=interrupted_provider,
+                    authority_ref=self.AUTHORITY_REF,
+                    absolute_cap=50,
                 )
             self.assertEqual(interrupted_provider.provider_calls, 1)
             recovery_provider = self.SynthesisProvider()
             recovered = ContactSynthesisStore(
                 Path(directory), segment_size=2
             ).synthesize(
-                revisions, binding=_binding(name="新名称"), provider=recovery_provider
+                revisions,
+                binding=_binding(name="新名称"),
+                provider=recovery_provider,
+                authority_ref=self.AUTHORITY_REF,
+                absolute_cap=50,
             )
             self.assertEqual(recovered.provider_calls, 0)
             self.assertEqual(recovered.resumed_segments, 1)
@@ -539,7 +747,7 @@ class ContactAcceptancePackTests(unittest.TestCase):
                     revisions,
                     binding=_binding(),
                     provider=self.SynthesisProvider(),
-                    authority_ref="issue-202-test",
+                    authority_ref=self.AUTHORITY_REF,
                     absolute_cap=5,
                     semantic_provider_calls=1,
                     governance_provider_calls=1,
@@ -550,7 +758,7 @@ class ContactAcceptancePackTests(unittest.TestCase):
                 revisions,
                 binding=_binding(name="新名称"),
                 provider=provider,
-                authority_ref="issue-202-test",
+                authority_ref=self.AUTHORITY_REF,
                 absolute_cap=5,
                 semantic_provider_calls=1,
                 governance_provider_calls=1,
@@ -574,12 +782,18 @@ class ContactAcceptancePackTests(unittest.TestCase):
                     revisions,
                     binding=_binding(),
                     provider=provider,
+                    authority_ref=self.AUTHORITY_REF,
+                    absolute_cap=50,
                 )
             self.assertEqual(provider.provider_calls, 0)
             retry = self.SynthesisProvider()
             with self.assertRaisesRegex(WechatDigestError, "结果未知"):
                 ContactSynthesisStore(Path(directory)).synthesize(
-                    revisions, binding=_binding(), provider=retry
+                    revisions,
+                    binding=_binding(),
+                    provider=retry,
+                    authority_ref=self.AUTHORITY_REF,
+                    absolute_cap=50,
                 )
             self.assertEqual(retry.provider_calls, 0)
             self.assertFalse((Path(directory) / "cursor.json").exists())
@@ -596,13 +810,21 @@ class ContactAcceptancePackTests(unittest.TestCase):
             provider = FailingProvider()
             with self.assertRaisesRegex(RuntimeError, "no durable result"):
                 ContactSynthesisStore(Path(directory)).synthesize(
-                    revisions, binding=_binding(), provider=provider
+                    revisions,
+                    binding=_binding(),
+                    provider=provider,
+                    authority_ref=self.AUTHORITY_REF,
+                    absolute_cap=50,
                 )
             self.assertEqual(provider.provider_calls, 1)
             retry = self.SynthesisProvider()
             with self.assertRaisesRegex(WechatDigestError, "结果未知"):
                 ContactSynthesisStore(Path(directory)).synthesize(
-                    revisions, binding=_binding(), provider=retry
+                    revisions,
+                    binding=_binding(),
+                    provider=retry,
+                    authority_ref=self.AUTHORITY_REF,
+                    absolute_cap=50,
                 )
             self.assertEqual(retry.provider_calls, 0)
 
@@ -617,12 +839,20 @@ class ContactAcceptancePackTests(unittest.TestCase):
                 ContactSynthesisStore(
                     Path(directory), after_receipt_write=interrupt
                 ).synthesize(
-                    revisions, binding=_binding(), provider=provider
+                    revisions,
+                    binding=_binding(),
+                    provider=provider,
+                    authority_ref=self.AUTHORITY_REF,
+                    absolute_cap=50,
                 )
             self.assertEqual(provider.provider_calls, 1)
             retry = self.SynthesisProvider()
             outcome = ContactSynthesisStore(Path(directory)).synthesize(
-                revisions, binding=_binding(), provider=retry
+                revisions,
+                binding=_binding(),
+                provider=retry,
+                authority_ref=self.AUTHORITY_REF,
+                absolute_cap=50,
             )
             self.assertEqual(retry.provider_calls, 0)
             self.assertEqual(outcome.resumed_segments, 1)
@@ -637,7 +867,7 @@ class ContactAcceptancePackTests(unittest.TestCase):
                     revisions,
                     binding=_binding(),
                     provider=provider,
-                    authority_ref="issue-202-cap-test",
+                    authority_ref=self.AUTHORITY_REF,
                     absolute_cap=2,
                     semantic_provider_calls=1,
                     governance_provider_calls=1,

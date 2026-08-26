@@ -54,6 +54,22 @@ def _bytes_fingerprint(value: bytes) -> str:
     return "sha256:" + hashlib.sha256(value).hexdigest()
 
 
+def require_contact_provider_authority_ref(value: object) -> str:
+    """Require one durable Lead Decision comment, never an implementation Issue."""
+
+    if not (
+        isinstance(value, str)
+        and re.fullmatch(
+            r"https://github\.com/leevi2010-cursor/ArcheOS/issues/[0-9]+"
+            r"#issuecomment-[0-9]+",
+            value,
+        )
+        is not None
+    ):
+        raise WechatDigestError("联系人模型调用缺少明确授权来源。")
+    return value
+
+
 def _private_write(path: Path, value: object) -> None:
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     os.chmod(path.parent, 0o700)
@@ -643,6 +659,43 @@ class ContactSynthesisStore:
         self.after_result_write = after_result_write
         self.after_receipt_write = after_receipt_write
 
+    def read_provider_authority(
+        self, binding: WechatContactBinding
+    ) -> dict[str, object] | None:
+        """Read an existing contact authority without creating any artifact."""
+
+        if not (self.authority_path.exists() or self.authority_path.is_symlink()):
+            return None
+        authority = _read_private(self.authority_path)
+        without_fingerprint = {
+            key: item
+            for key, item in authority.items()
+            if key != "authority_fingerprint"
+        }
+        cap = authority.get("absolute_cap")
+        if (
+            set(authority)
+            != {
+                "schema_version",
+                "contact_identity",
+                "authority_ref",
+                "absolute_cap",
+                "authority_fingerprint",
+            }
+            or authority.get("schema_version") != CONTACT_PROVIDER_AUTHORITY_SCHEMA
+            or authority.get("contact_identity")
+            != _stable_contact_identity(binding)
+            or not isinstance(authority.get("authority_ref"), str)
+            or isinstance(cap, bool)
+            or not isinstance(cap, int)
+            or cap < 1
+            or authority.get("authority_fingerprint")
+            != _fingerprint(without_fingerprint)
+        ):
+            raise WechatDigestError("联系人模型调用 authority 损坏。")
+        require_contact_provider_authority_ref(authority["authority_ref"])
+        return authority
+
     def _provider_authority(
         self,
         *,
@@ -652,8 +705,7 @@ class ContactSynthesisStore:
         semantic_provider_calls: int,
         governance_provider_calls: int,
     ) -> dict[str, object]:
-        if not isinstance(authority_ref, str) or not authority_ref.strip():
-            raise WechatDigestError("联系人模型调用缺少明确授权来源。")
+        authority_ref = require_contact_provider_authority_ref(authority_ref)
         for label, value in (
             ("absolute cap", absolute_cap),
             ("semantic calls", semantic_provider_calls),
@@ -677,8 +729,9 @@ class ContactSynthesisStore:
             **authority_without_fingerprint,
             "authority_fingerprint": _fingerprint(authority_without_fingerprint),
         }
-        if self.authority_path.exists() or self.authority_path.is_symlink():
-            if _read_private(self.authority_path) != authority:
+        existing_authority = self.read_provider_authority(binding)
+        if existing_authority is not None:
+            if existing_authority != authority:
                 raise WechatDigestError("联系人模型调用 authority 或 absolute cap 漂移。")
         else:
             _private_write(self.authority_path, authority)
@@ -948,8 +1001,8 @@ class ContactSynthesisStore:
         *,
         binding: WechatContactBinding,
         provider: ContactSynthesisProvider,
-        authority_ref: str = "synthetic-contact-authority",
-        absolute_cap: int = 50,
+        authority_ref: str,
+        absolute_cap: int,
         semantic_provider_calls: int = 0,
         governance_provider_calls: int = 0,
         resume_provider_calls: int = 0,

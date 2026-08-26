@@ -61,7 +61,11 @@ from .wechat_contact import (
     build_contact_acceptance_pack,
     legacy_message_overlap,
 )
-from .wechat_contact_synthesis import CodexCliContactSynthesisProvider
+from .wechat_contact_synthesis import (
+    CodexCliContactSynthesisProvider,
+    ContactSynthesisStore,
+    require_contact_provider_authority_ref,
+)
 from .wechat_digest import (
     ExistingSemanticHandoff,
     WechatCliCaptureProvider,
@@ -814,7 +818,7 @@ def build_parser() -> argparse.ArgumentParser:
     wechat_digest.add_argument(
         "--provider-absolute-cap",
         type=int,
-        default=50,
+        default=None,
         help="联系人处理的 Semantic、Governance 与归并模型调用总上限。",
     )
     return parser
@@ -1456,7 +1460,7 @@ def _wechat_product_command(args: argparse.Namespace) -> int:
     elif args.authority_ref is not None and args.contact is None:
         print("error: authority ref 只能与 maintenance continuation 入口一起使用。")
         return 2
-    if (
+    if args.provider_absolute_cap is not None and (
         isinstance(args.provider_absolute_cap, bool)
         or not isinstance(args.provider_absolute_cap, int)
         or args.provider_absolute_cap < 1
@@ -1525,11 +1529,17 @@ def _wechat_product_command(args: argparse.Namespace) -> int:
             return 0
 
         contact_binding = None
+        contact_authority_ref = None
+        contact_absolute_cap = None
         service_workspace = workspace
         run_store = None
         capture = base_capture
         if args.contact is not None:
             contact_binding = base_capture.resolve_contact(args.contact)
+            if args.authority_ref is not None:
+                contact_authority_ref = require_contact_provider_authority_ref(
+                    args.authority_ref
+                )
             if args.isolated_acceptance_dir is not None:
                 candidate = args.isolated_acceptance_dir.expanduser()
                 if candidate.is_symlink():
@@ -1545,6 +1555,45 @@ def _wechat_product_command(args: argparse.Namespace) -> int:
                         "隔离验收目录必须位于主 Workspace 之外。"
                     )
                 service_workspace.chmod(0o700)
+            contact_root = (
+                service_workspace
+                / "02_processing"
+                / "wechat_digest"
+                / "contacts"
+                / contact_binding.conversation_key
+            )
+            existing_authority = ContactSynthesisStore(
+                contact_root / "synthesis"
+            ).read_provider_authority(contact_binding)
+            if existing_authority is None:
+                if args.authority_ref is None:
+                    raise WechatDigestError(
+                        "首次联系人处理必须提供真实批准链接；尚未读取消息或调用模型。"
+                    )
+                contact_authority_ref = require_contact_provider_authority_ref(
+                    args.authority_ref
+                )
+                contact_absolute_cap = (
+                    50
+                    if args.provider_absolute_cap is None
+                    else args.provider_absolute_cap
+                )
+            else:
+                stored_ref = str(existing_authority["authority_ref"])
+                stored_cap = int(existing_authority["absolute_cap"])
+                contact_authority_ref = args.authority_ref or stored_ref
+                contact_absolute_cap = (
+                    stored_cap
+                    if args.provider_absolute_cap is None
+                    else args.provider_absolute_cap
+                )
+                if (
+                    contact_authority_ref != stored_ref
+                    or contact_absolute_cap != stored_cap
+                ):
+                    raise WechatDigestError(
+                        "联系人模型调用批准来源或 absolute cap 与已有记录不一致。"
+                    )
             WechatContactSelectionStore(
                 service_workspace
                 / "02_processing"
@@ -1558,11 +1607,7 @@ def _wechat_product_command(args: argparse.Namespace) -> int:
                     lambda: legacy_message_overlap(workspace),
                 )
             run_store = WechatDigestRunStore(
-                service_workspace
-                / "02_processing"
-                / "wechat_digest"
-                / "contacts"
-                / contact_binding.conversation_key
+                contact_root
             )
 
         def semantic_handoff() -> ExistingSemanticHandoff:
@@ -2063,11 +2108,8 @@ def _wechat_product_command(args: argparse.Namespace) -> int:
                         timeout_seconds=args.timeout_seconds,
                     )
                 ),
-                authority_ref=(
-                    args.authority_ref
-                    or "https://github.com/leevi2010-cursor/ArcheOS/issues/202"
-                ),
-                absolute_cap=args.provider_absolute_cap,
+                authority_ref=str(contact_authority_ref),
+                absolute_cap=int(contact_absolute_cap),
                 resume_provider_calls=result.resume_provider_calls,
             )
     except (

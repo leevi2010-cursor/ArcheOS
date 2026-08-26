@@ -4544,6 +4544,9 @@ class WechatDigestService:
         self._segment_performance: dict[str, int] = {}
         self._capture_reasons: list[str] = []
         self._committed_result_wave: dict[str, dict[str, object]] = {}
+        self._semantic_provider_receipts: dict[
+            str, tuple[dict[str, object], ...]
+        ] = {}
         self._completed_window_chain_cache: tuple[
             tuple[object, ...], tuple[SemanticCompletedWindowBinding, ...]
         ] | None = None
@@ -12508,12 +12511,18 @@ class WechatDigestService:
         ):
             return representation.representation_id
         commit_started = time.monotonic()
-        atomic_ids = self._semantic(run_id, representation.representation_id, privacy)
+        atomic_ids = self._semantic(
+            run_id, representation.representation_id, privacy
+        )
+        semantic_provider_receipts = self._semantic_provider_receipts.get(
+            representation.representation_id, ()
+        )
         self._update_item(
             run_id,
             status,
             item_id,
             atomic_information_ids=list(atomic_ids),
+            semantic_provider_receipts=list(semantic_provider_receipts),
         )
         self._segment_performance["commit_wall_ms"] = self._segment_performance.get(
             "commit_wall_ms", 0
@@ -12615,11 +12624,15 @@ class WechatDigestService:
             privacy,
             recover_committed_result=recover_committed_result,
         )
+        semantic_provider_receipts = self._semantic_provider_receipts.get(
+            representation.representation_id, ()
+        )
         self._update_item(
             run_id,
             status,
             item_id,
             atomic_information_ids=list(atomic_ids),
+            semantic_provider_receipts=list(semantic_provider_receipts),
         )
         self._segment_performance["commit_wall_ms"] = self._segment_performance.get(
             "commit_wall_ms", 0
@@ -12686,6 +12699,49 @@ class WechatDigestService:
         atomic_ids = tuple(result.ingestion.atomic_information_ids)
         for atomic_id in atomic_ids:
             self.information_store.get_current(atomic_id)
+        representation = self.representation_repository.get(representation_id)
+        audit_root = self.workspace / "02_processing" / "semantic_handoff_runs"
+        receipt_bindings: list[dict[str, object]] = []
+        seen_processing_runs: set[str] = set()
+        for audit_path_value in getattr(result, "audit_paths", ()):
+            audit_path = Path(audit_path_value)
+            try:
+                relative_path = audit_path.relative_to(self.workspace)
+            except ValueError as exc:
+                raise WechatDigestError(
+                    "Semantic audit 不属于当前 Workspace。"
+                ) from exc
+            if (
+                audit_path.parent.parent != audit_root
+                or audit_path.name != "processing-run-audit.json"
+            ):
+                raise WechatDigestError("Semantic audit 路径绑定无效。")
+            audit, raw_fingerprint = _read_private_json_manifest(audit_path)
+            processing_run_id = audit.get("processing_run_id")
+            if (
+                not isinstance(processing_run_id, str)
+                or processing_run_id != audit_path.parent.name
+                or processing_run_id in seen_processing_runs
+                or audit.get("schema_version") != "processing-run-audit/1.0"
+                or audit.get("provider_route") != "codex-cli"
+            ):
+                raise WechatDigestError("Semantic audit identity 无效或重复。")
+            receipt_bindings.append(
+                {
+                    "source_id": representation.source_id,
+                    "representation_id": representation_id,
+                    "processing_run_id": processing_run_id,
+                    "audit_relative_path": str(relative_path),
+                    "audit_fingerprint": raw_fingerprint,
+                    "input_fingerprint": audit.get("input_fingerprint"),
+                    "result_fingerprint": audit.get("result_fingerprint"),
+                    "package_fingerprint": audit.get("package_fingerprint"),
+                }
+            )
+            seen_processing_runs.add(processing_run_id)
+        self._semantic_provider_receipts[representation_id] = tuple(
+            receipt_bindings
+        )
         return atomic_ids
 
     def _semantic_privacy_binding(
