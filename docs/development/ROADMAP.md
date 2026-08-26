@@ -627,6 +627,8 @@ Product Owner 真实人工验收
 
 当前尚未处理的输入保留为受控验证集：在对象—事件—时间线合同明确后，用于验证主流程与业务理解；不以清空队列或增加 Atomic Information 总量作为独立目标。
 
+微信 Stage 1 真实验收入口已从跨全部联系人的全局窗口调整为一个联系人会话：先唯一选择联系人，只捕获目标会话及附件，同一联系人保持单 Agent 有序理解，再形成联系人级 Object candidate、Event、Timeline、当前状态、Evidence、冲突与未知。Issue #172 的冻结 capture 与有界语义结果能力已经完成；Issue #202 负责把该能力收窄为联系人级日常入口和独立 checkpoint。legacy 全局 active run 只保留维护恢复，不再是新日常消化默认值。
+
 重复活动的结构化遵循现有概念边界：有明确目标与完成条件时可形成 bounded Project；持续经营活动可形成 Business Line；多次独立 Evidence 支持的可复用方法先形成 Pattern / Protocol candidate。不得仅因文字或事件重复就自动升级。
 
 并行 / 后置：
@@ -639,7 +641,7 @@ Product Owner 真实人工验收
 Human View / Frontend                    仅在对象—事件—时间线 read contract 获得真实验收后，启动最小业务 View；不先建设大而全前端
 #42 Protocol 驱动的决策增强实验          Product Stage 2；当前 blocked
 Protocol / Pattern Governance            Stage 2 后置规划，不启动
-#106 增量微信消化                         由 #172 冻结 capture + 有界语义并行性能门阻塞；门通过后仅恢复 Stage 1 受控验证集
+#106 增量微信消化                         以 #202 联系人级捕获与隔离验收作为当前 Stage 1 入口；不恢复全局历史扫描
 #122 整体审查与正式生产门                 Deferred；Stage 1 业务评估前不启动
 ```
 

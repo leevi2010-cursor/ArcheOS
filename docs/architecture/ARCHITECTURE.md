@@ -87,6 +87,22 @@ Conversation 也遵循相同原则：Conversation 是一种 Representation / Pro
 
 Conversation connector 对一个冻结窗口只执行一次 full capture。完整 capture、conversation index 与匿名 summary 作为私有 Processing Derived Artifact 持久化，并由 receipt-last 的运行计划绑定；分段恢复和历史验证只读 durable snapshot。不同完整 Conversation / Representation 可以进行 1–4 路（默认 2）result-only 语义分析，但同一会话的有序 Analysis Units 不跨 lane 拆分，并在一次有界模型调用中完整理解。详见 [ADR-006](../decisions/ADR-006-durable-capture-and-bounded-semantic-parallelism.md)。
 
+微信日常入口在 connector 边界进一步收窄为一个已唯一绑定的联系人会话：
+
+```text
+contact metadata discovery（不读正文）
+  → display name 唯一解析 + stable conversation technical key receipt
+  → target-only frozen capture + attachment binding
+  → Conversation Representation
+  → semantic parallelism = 1 / ordered contact context continuation
+  → serial Information + Identity + Governance + World Model apply
+  → contact-level Event / Timeline / current-state View
+```
+
+联系人 selection receipt、独立 plan/checkpoint、context continuation 与 acceptance pack 都是 Processing / Derived Artifact / View，不是 Contact、Conversation、Message Core，也不形成第二套 Source 或 Information truth。恢复绑定已保存 technical key；选择目录中的名称或 key 漂移会在正文、Provider 和长期写入前拒绝。normal contact run 的 stable message provenance 会与 legacy 全局窗口的已提交 message keys 对照，避免重叠消息产生第二次长期效果。
+
+隔离验收使用独立私有 Workspace 复用同一 Source → Representation → Information → World Model 链，只在该 Workspace 产生 Derived Artifact；主 Workspace 与所有 primary checkpoint 保持只读不变。
+
 ---
 
 ## 3. Information Layer

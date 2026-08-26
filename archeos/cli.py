@@ -55,10 +55,17 @@ from .timeline import (
     load_selection,
 )
 from .transcription import FileTranscriptionProvider, MlxWhisperTranscriptionProvider
+from .wechat_contact import (
+    OverlapFilteringWechatCaptureProvider,
+    WechatContactSelectionStore,
+    build_contact_acceptance_pack,
+    committed_legacy_message_keys,
+)
 from .wechat_digest import (
     ExistingSemanticHandoff,
     WechatCliCaptureProvider,
     WechatDigestError,
+    WechatDigestRunStore,
     WechatDigestService,
     detect_codex_provider_version,
 )
@@ -616,6 +623,20 @@ def build_parser() -> argparse.ArgumentParser:
     bootstrap.add_argument(
         "--all-history", action="store_true", help="首次处理全部可读历史。"
     )
+    wechat_digest.add_argument(
+        "--contact",
+        help="联系人备注、昵称或联系人列表给出的会话编号。",
+    )
+    wechat_digest.add_argument(
+        "--list-contacts",
+        action="store_true",
+        help="只读取联系人目录并列出可选择的联系人；不读取消息正文。",
+    )
+    wechat_digest.add_argument(
+        "--isolated-acceptance-dir",
+        type=Path,
+        help="把 Source、长期信息、对象和验收包全部写入独立私有目录。",
+    )
     wechat_digest.add_argument("--wechat-cli-bin", default="wechat-cli")
     wechat_digest.add_argument("--wechat-config", type=Path)
     wechat_digest.add_argument("--codex-bin", default="codex")
@@ -641,8 +662,10 @@ def build_parser() -> argparse.ArgumentParser:
     wechat_digest.add_argument(
         "--max-items-per-run",
         type=int,
-        default=DEFAULT_WECHAT_DIGEST_MAX_ITEMS,
-        help="每次最多完整处理的业务项数量；仅在项目终态边界停止。",
+        help=(
+            "可选的短执行段上限；联系人日常运行默认完成整个冻结窗口，"
+            "legacy 全局入口默认 3 项。"
+        ),
     )
     wechat_digest.add_argument(
         "--prepare-next-semantic",
@@ -1347,6 +1370,19 @@ def _wechat_product_command(args: argparse.Namespace) -> int:
     ):
         print("error: 恢复维护入口不能与首次起点或其他维护入口同时使用。")
         return 2
+    if args.list_contacts and (
+        maintenance_count
+        or any((args.since is not None, args.from_now, args.all_history))
+        or args.contact is not None
+        or args.isolated_acceptance_dir is not None
+    ):
+        print("error: 联系人列表不能与消化、恢复或验收参数同时使用。")
+        return 2
+    if maintenance_count and (
+        args.contact is not None or args.isolated_acceptance_dir is not None
+    ):
+        print("error: legacy 维护入口不能切换到联系人或隔离验收目录。")
+        return 2
     if args.install_semantic_authority:
         if args.inventory_authority_file is None:
             print(
@@ -1441,31 +1477,98 @@ def _wechat_product_command(args: argparse.Namespace) -> int:
     elif args.multi_governance_startup_authority_file is not None:
         print("error: 多项目 Governance authority file 只能与恢复入口一起使用。")
         return 2
+    if not args.list_contacts and maintenance_count == 0 and args.contact is None:
+        print("error: 请先用 --list-contacts 查找联系人，再用 --contact 选择一个联系人。")
+        return 2
     try:
         workspace = require_workspace(args.config).workspace
-        capture = WechatCliCaptureProvider(
+        base_capture = WechatCliCaptureProvider(
             wechat_cli_binary=args.wechat_cli_bin,
             config_path=args.wechat_config,
         )
+        if args.list_contacts:
+            contacts = base_capture.discover_contacts()
+            print(
+                json.dumps(
+                    {
+                        "contacts": [
+                            {
+                                "name": item.display_name,
+                                "selection": item.conversation_key,
+                                "conversation_type": (
+                                    "群聊" if item.is_group else "单聊"
+                                ),
+                            }
+                            for item in contacts
+                        ],
+                        "message_bodies_read": 0,
+                        "provider_calls": 0,
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                )
+            )
+            return 0
+
+        contact_binding = None
+        service_workspace = workspace
+        run_store = None
+        capture = base_capture
+        if args.contact is not None:
+            contact_binding = base_capture.resolve_contact(args.contact)
+            if args.isolated_acceptance_dir is not None:
+                candidate = args.isolated_acceptance_dir.expanduser()
+                if candidate.is_symlink():
+                    raise WechatDigestError("隔离验收目录不得使用符号链接。")
+                candidate.mkdir(parents=True, exist_ok=True, mode=0o700)
+                service_workspace = candidate.resolve()
+                primary_workspace = workspace.resolve()
+                if (
+                    service_workspace == primary_workspace
+                    or primary_workspace in service_workspace.parents
+                ):
+                    raise WechatDigestError(
+                        "隔离验收目录必须位于主 Workspace 之外。"
+                    )
+                service_workspace.chmod(0o700)
+            WechatContactSelectionStore(
+                service_workspace
+                / "02_processing"
+                / "wechat_digest"
+                / "contact-selections"
+            ).bind(contact_binding)
+            capture = base_capture.scoped(contact_binding)
+            if args.isolated_acceptance_dir is None:
+                capture = OverlapFilteringWechatCaptureProvider(
+                    capture,
+                    lambda: committed_legacy_message_keys(workspace),
+                )
+            run_store = WechatDigestRunStore(
+                service_workspace
+                / "02_processing"
+                / "wechat_digest"
+                / "contacts"
+                / contact_binding.conversation_key
+            )
 
         def semantic_handoff() -> ExistingSemanticHandoff:
             provider_version = args.provider_version or detect_codex_provider_version(
                 args.codex_bin
             )
             source_repository = LocalManagedSourceRepository(
-                workspace / DEFAULT_MANAGED_SOURCE_ROOT
+                service_workspace / DEFAULT_MANAGED_SOURCE_ROOT
             )
             representation_repository = LocalRepresentationRepository(
-                workspace / DEFAULT_REPRESENTATION_ROOT
+                service_workspace / DEFAULT_REPRESENTATION_ROOT
             )
             return ExistingSemanticHandoff(
                 source_repository=source_repository,
                 representation_repository=representation_repository,
-                information_root=workspace / DEFAULT_REPRESENTATION_INFORMATION_ROOT,
+                information_root=service_workspace / DEFAULT_REPRESENTATION_INFORMATION_ROOT,
                 information_store=JsonlAtomicInformationStore(
-                    workspace / DEFAULT_ATOMIC_INFORMATION_STORE
+                    service_workspace / DEFAULT_ATOMIC_INFORMATION_STORE
                 ),
-                audit_root=workspace / DEFAULT_SEMANTIC_HANDOFF_AUDIT_ROOT,
+                audit_root=service_workspace / DEFAULT_SEMANTIC_HANDOFF_AUDIT_ROOT,
                 codex_binary=args.codex_bin,
                 provider_version=provider_version,
                 model=args.model,
@@ -1475,12 +1578,13 @@ def _wechat_product_command(args: argparse.Namespace) -> int:
             )
 
         service = WechatDigestService(
-            workspace=workspace,
+            workspace=service_workspace,
             capture_provider=capture,
             semantic_handoff_factory=semantic_handoff,
             interpretation_provider=CodexAtomicInformationInterpretationProvider(),
             semantic_batch_size=args.batch_size,
-            semantic_parallelism=args.semantic_parallelism,
+            semantic_parallelism=(1 if contact_binding is not None else args.semantic_parallelism),
+            run_store=run_store,
         )
         if args.prepare_next_semantic:
             prepared = service.prepare_next_semantic(batch_size=args.batch_size)
@@ -1916,8 +2020,24 @@ def _wechat_product_command(args: argparse.Namespace) -> int:
             since=args.since,
             from_now=args.from_now,
             all_history=args.all_history,
-            max_terminal_items=args.max_items_per_run,
+            max_terminal_items=(
+                args.max_items_per_run
+                if args.max_items_per_run is not None
+                else (
+                    None
+                    if contact_binding is not None
+                    else DEFAULT_WECHAT_DIGEST_MAX_ITEMS
+                )
+            ),
         )
+        acceptance_paths = None
+        if contact_binding is not None and run_store is not None:
+            acceptance_paths = build_contact_acceptance_pack(
+                workspace=service_workspace,
+                run_store=run_store,
+                binding=contact_binding,
+                output_root=run_store.root / "acceptance",
+            )
     except (
         OSError,
         RuntimeError,
@@ -2004,6 +2124,10 @@ def _wechat_product_command(args: argparse.Namespace) -> int:
         + json.dumps(performance, ensure_ascii=False, sort_keys=True)
     )
     print(f"checkpoint：{checkpoint}")
+    if contact_binding is not None:
+        print(f"联系人：{contact_binding.display_name}")
+        assert acceptance_paths is not None
+        print(f"业务验收包：{acceptance_paths[1]}")
     if result.segment_safe_stopped:
         print(
             "本段已安全完成："
