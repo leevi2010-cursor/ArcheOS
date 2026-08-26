@@ -33,7 +33,7 @@ from .wechat_contact_synthesis import (
 )
 
 CONTACT_SELECTION_SCHEMA_VERSION = "wechat-contact-selection/1.0"
-CONTACT_ACCEPTANCE_SCHEMA_VERSION = "wechat-contact-acceptance-pack/2.0"
+CONTACT_ACCEPTANCE_SCHEMA_VERSION = "wechat-contact-acceptance-pack/3.0"
 
 
 def _canonical_json(value: object) -> str:
@@ -269,6 +269,9 @@ def build_contact_acceptance_pack(
     output_root: Path,
     synthesis_provider_factory: Callable[[], ContactSynthesisProvider],
     synthesis_segment_size: int = 100,
+    authority_ref: str = "synthetic-contact-authority",
+    absolute_cap: int = 50,
+    resume_provider_calls: int = 0,
 ) -> tuple[Path, Path]:
     """Build one contact View while excluding a concurrent contact digest."""
 
@@ -281,6 +284,9 @@ def build_contact_acceptance_pack(
             output_root=output_root,
             synthesis_provider_factory=synthesis_provider_factory,
             synthesis_segment_size=synthesis_segment_size,
+            authority_ref=authority_ref,
+            absolute_cap=absolute_cap,
+            resume_provider_calls=resume_provider_calls,
         )
 
 
@@ -292,11 +298,15 @@ def _build_contact_acceptance_pack_unlocked(
     output_root: Path,
     synthesis_provider_factory: Callable[[], ContactSynthesisProvider],
     synthesis_segment_size: int,
+    authority_ref: str,
+    absolute_cap: int,
+    resume_provider_calls: int,
 ) -> tuple[Path, Path]:
     """Project one durable contact-level synthesis into a private business View."""
 
     ordered_ids: list[str] = []
     attachment_counts: Counter[str] = Counter()
+    governance_provider_calls = 0
     ordered_runs: list[tuple[tuple[int, str, str], str]] = []
     for run_dir in run_store.runs_root.glob("run_*"):
         plan = run_store.plan(run_dir.name)
@@ -353,6 +363,20 @@ def _build_contact_acceptance_pack_unlocked(
                 for value in values:
                     if value not in ordered_ids:
                         ordered_ids.append(value)
+                governance_metrics = item.get("governance_metrics")
+                if governance_metrics is not None:
+                    if (
+                        not isinstance(governance_metrics, dict)
+                        or isinstance(governance_metrics.get("turn_count"), bool)
+                        or not isinstance(governance_metrics.get("turn_count"), int)
+                        or int(governance_metrics["turn_count"]) < 0
+                    ):
+                        raise WechatDigestError(
+                            "联系人 Governance 调用计数不可验证。"
+                        )
+                    governance_provider_calls += int(
+                        governance_metrics["turn_count"]
+                    )
         for attachment in attachments:
             if not isinstance(attachment, dict) or not isinstance(
                 attachment.get("status"), str
@@ -390,17 +414,31 @@ def _build_contact_acceptance_pack_unlocked(
     if missing_ids:
         raise WechatDigestError("联系人业务验收所需的长期信息无法完整读回。")
     revisions = tuple(by_id[value] for value in ordered_ids)
-    synthesis = (
-        ContactSynthesisStore(
-            run_store.root / "synthesis", segment_size=synthesis_segment_size
-        )
-        .synthesize(
-            revisions,
-            binding=binding,
-            provider=synthesis_provider_factory(),
-        )
-        .result
+    semantic_provider_calls = 0
+    semantic_audit_root = Path(workspace) / "02_processing" / "semantic_handoff_runs"
+    for audit_path in sorted(
+        semantic_audit_root.glob("*/processing-run-audit.json")
+    ):
+        audit = _read_private_json(audit_path)
+        if (
+            audit.get("schema_version") != "processing-run-audit/1.0"
+            or audit.get("provider_route") != "codex-cli"
+        ):
+            raise WechatDigestError("联系人 Semantic 调用计数不可验证。")
+        semantic_provider_calls += 1
+    synthesis_outcome = ContactSynthesisStore(
+        run_store.root / "synthesis", segment_size=synthesis_segment_size
+    ).synthesize(
+        revisions,
+        binding=binding,
+        provider=synthesis_provider_factory(),
+        authority_ref=authority_ref,
+        absolute_cap=absolute_cap,
+        semantic_provider_calls=semantic_provider_calls,
+        governance_provider_calls=governance_provider_calls,
+        resume_provider_calls=resume_provider_calls,
     )
+    synthesis = synthesis_outcome.result
 
     def evidence_projection(atomic_ids: object) -> list[dict[str, object]]:
         if not isinstance(atomic_ids, list):
@@ -505,6 +543,7 @@ def _build_contact_acceptance_pack_unlocked(
         },
         "information_count": len(revisions),
         "synthesis_fingerprint": _fingerprint(synthesis),
+        "provider_metrics": synthesis_outcome.provider_metrics,
     }
     pack["pack_fingerprint"] = _fingerprint(pack)
     json_path = Path(output_root) / "contact-acceptance.json"

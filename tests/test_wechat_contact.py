@@ -379,6 +379,24 @@ class ContactAcceptancePackTests(unittest.TestCase):
                 self._revision(3, concern="项目乙", statement="已安排拜访"),
             )
             store.ingest_batch(revisions)
+            semantic_audit = (
+                workspace
+                / "02_processing"
+                / "semantic_handoff_runs"
+                / ("run_" + "1" * 32)
+                / "processing-run-audit.json"
+            )
+            semantic_audit.parent.mkdir(parents=True)
+            semantic_audit.write_text(
+                json.dumps(
+                    {
+                        "schema_version": "processing-run-audit/1.0",
+                        "provider_route": "codex-cli",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            os.chmod(semantic_audit, 0o600)
             runs_root = workspace / "runs"
             (runs_root / ("run_" + "1" * 32)).mkdir(parents=True)
 
@@ -405,7 +423,8 @@ class ContactAcceptancePackTests(unittest.TestCase):
                             "conversation:test": {
                                 "atomic_information_ids": [
                                     item.atomic_information_id for item in revisions
-                                ]
+                                ],
+                                "governance_metrics": {"turn_count": 1},
                             }
                         },
                     }
@@ -427,6 +446,17 @@ class ContactAcceptancePackTests(unittest.TestCase):
             )
             self.assertEqual(len(project_a["evidence_atomic_information_ids"]), 2)
             self.assertEqual(provider.provider_calls, 1)
+            self.assertEqual(
+                pack["provider_metrics"]["semantic_provider_calls"], 1
+            )
+            self.assertEqual(
+                pack["provider_metrics"]["governance_provider_calls"], 1
+            )
+            self.assertEqual(
+                pack["provider_metrics"]["contact_synthesis_provider_calls"],
+                1,
+            )
+            self.assertEqual(pack["provider_metrics"]["total_provider_calls"], 3)
             self.assertEqual(os.stat(json_path).st_mode & 0o777, 0o600)
             self.assertEqual(os.stat(markdown_path).st_mode & 0o777, 0o600)
 
@@ -491,6 +521,137 @@ class ContactAcceptancePackTests(unittest.TestCase):
             self.assertEqual(recovered.provider_calls, 0)
             self.assertEqual(recovered.resumed_segments, 1)
             self.assertEqual(len(recovered.result["events"]), 1)
+
+    def test_reserved_attempt_can_start_once_and_reports_unified_budget(self) -> None:
+        revisions = (self._revision(1, concern="项目甲", statement="已询价"),)
+        with tempfile.TemporaryDirectory() as directory:
+            calls = 0
+
+            def interrupt() -> None:
+                nonlocal calls
+                calls += 1
+                raise RuntimeError("reserved interruption")
+
+            with self.assertRaisesRegex(RuntimeError, "reserved interruption"):
+                ContactSynthesisStore(
+                    Path(directory), after_reservation_write=interrupt
+                ).synthesize(
+                    revisions,
+                    binding=_binding(),
+                    provider=self.SynthesisProvider(),
+                    authority_ref="issue-202-test",
+                    absolute_cap=5,
+                    semantic_provider_calls=1,
+                    governance_provider_calls=1,
+                )
+            self.assertEqual(calls, 1)
+            provider = self.SynthesisProvider()
+            outcome = ContactSynthesisStore(Path(directory)).synthesize(
+                revisions,
+                binding=_binding(name="新名称"),
+                provider=provider,
+                authority_ref="issue-202-test",
+                absolute_cap=5,
+                semantic_provider_calls=1,
+                governance_provider_calls=1,
+            )
+            self.assertEqual(provider.provider_calls, 1)
+            self.assertEqual(outcome.provider_metrics["total_provider_calls"], 3)
+            self.assertEqual(outcome.provider_metrics["remaining_provider_calls"], 2)
+
+    def test_started_without_result_fails_closed_with_zero_retry(self) -> None:
+        revisions = (self._revision(1, concern="项目甲", statement="已询价"),)
+        with tempfile.TemporaryDirectory() as directory:
+            provider = self.SynthesisProvider()
+
+            def interrupt() -> None:
+                raise RuntimeError("started interruption")
+
+            with self.assertRaisesRegex(RuntimeError, "started interruption"):
+                ContactSynthesisStore(
+                    Path(directory), after_started_write=interrupt
+                ).synthesize(
+                    revisions,
+                    binding=_binding(),
+                    provider=provider,
+                )
+            self.assertEqual(provider.provider_calls, 0)
+            retry = self.SynthesisProvider()
+            with self.assertRaisesRegex(WechatDigestError, "结果未知"):
+                ContactSynthesisStore(Path(directory)).synthesize(
+                    revisions, binding=_binding(), provider=retry
+                )
+            self.assertEqual(retry.provider_calls, 0)
+            self.assertFalse((Path(directory) / "cursor.json").exists())
+
+    def test_post_start_pre_result_failure_is_unknown_and_not_retried(self) -> None:
+        revisions = (self._revision(1, concern="项目甲", statement="已询价"),)
+
+        class FailingProvider(self.SynthesisProvider):
+            def synthesize(self, request, schema):
+                self.provider_calls += 1
+                raise RuntimeError("provider returned no durable result")
+
+        with tempfile.TemporaryDirectory() as directory:
+            provider = FailingProvider()
+            with self.assertRaisesRegex(RuntimeError, "no durable result"):
+                ContactSynthesisStore(Path(directory)).synthesize(
+                    revisions, binding=_binding(), provider=provider
+                )
+            self.assertEqual(provider.provider_calls, 1)
+            retry = self.SynthesisProvider()
+            with self.assertRaisesRegex(WechatDigestError, "结果未知"):
+                ContactSynthesisStore(Path(directory)).synthesize(
+                    revisions, binding=_binding(), provider=retry
+                )
+            self.assertEqual(retry.provider_calls, 0)
+
+    def test_receipt_before_cursor_resumes_with_zero_provider_calls(self) -> None:
+        revisions = (self._revision(1, concern="项目甲", statement="已询价"),)
+        with tempfile.TemporaryDirectory() as directory:
+            def interrupt() -> None:
+                raise RuntimeError("receipt interruption")
+
+            provider = self.SynthesisProvider()
+            with self.assertRaisesRegex(RuntimeError, "receipt interruption"):
+                ContactSynthesisStore(
+                    Path(directory), after_receipt_write=interrupt
+                ).synthesize(
+                    revisions, binding=_binding(), provider=provider
+                )
+            self.assertEqual(provider.provider_calls, 1)
+            retry = self.SynthesisProvider()
+            outcome = ContactSynthesisStore(Path(directory)).synthesize(
+                revisions, binding=_binding(), provider=retry
+            )
+            self.assertEqual(retry.provider_calls, 0)
+            self.assertEqual(outcome.resumed_segments, 1)
+            self.assertTrue((Path(directory) / "cursor.json").exists())
+
+    def test_absolute_cap_exhaustion_preserves_result_and_cursor(self) -> None:
+        revisions = (self._revision(1, concern="项目甲", statement="已询价"),)
+        with tempfile.TemporaryDirectory() as directory:
+            provider = self.SynthesisProvider()
+            with self.assertRaisesRegex(WechatDigestError, "达到授权上限"):
+                ContactSynthesisStore(Path(directory)).synthesize(
+                    revisions,
+                    binding=_binding(),
+                    provider=provider,
+                    authority_ref="issue-202-cap-test",
+                    absolute_cap=2,
+                    semantic_provider_calls=1,
+                    governance_provider_calls=1,
+                )
+            self.assertEqual(provider.provider_calls, 0)
+            self.assertFalse((Path(directory) / "cursor.json").exists())
+            self.assertFalse(
+                (
+                    Path(directory)
+                    / "segments"
+                    / "segment_0001"
+                    / "result.json"
+                ).exists()
+            )
 
 
 class ContactResolutionTests(unittest.TestCase):

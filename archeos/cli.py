@@ -811,6 +811,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--authority-ref",
         help="Lead-approved GitHub Issue comment reference.",
     )
+    wechat_digest.add_argument(
+        "--provider-absolute-cap",
+        type=int,
+        default=50,
+        help="联系人处理的 Semantic、Governance 与归并模型调用总上限。",
+    )
     return parser
 
 
@@ -1447,8 +1453,15 @@ def _wechat_product_command(args: argparse.Namespace) -> int:
         if args.authority_ref is None:
             print("error: 安装 continuation 必须指定 authority ref。")
             return 2
-    elif args.authority_ref is not None:
+    elif args.authority_ref is not None and args.contact is None:
         print("error: authority ref 只能与 maintenance continuation 入口一起使用。")
+        return 2
+    if (
+        isinstance(args.provider_absolute_cap, bool)
+        or not isinstance(args.provider_absolute_cap, int)
+        or args.provider_absolute_cap < 1
+    ):
+        print("error: Provider absolute cap 必须为正整数。")
         return 2
     if args.activate_batch_governance:
         if args.batch_governance_authority_file is None:
@@ -2050,6 +2063,12 @@ def _wechat_product_command(args: argparse.Namespace) -> int:
                         timeout_seconds=args.timeout_seconds,
                     )
                 ),
+                authority_ref=(
+                    args.authority_ref
+                    or "https://github.com/leevi2010-cursor/ArcheOS/issues/202"
+                ),
+                absolute_cap=args.provider_absolute_cap,
+                resume_provider_calls=result.resume_provider_calls,
             )
     except (
         OSError,
@@ -2104,6 +2123,21 @@ def _wechat_product_command(args: argparse.Namespace) -> int:
         if any(stage_timings.values())
         else None
     )
+    contact_provider_metrics: dict[str, object] = {}
+    if acceptance_paths is not None and acceptance_paths[0].is_file():
+        try:
+            acceptance_payload = json.loads(
+                acceptance_paths[0].read_text(encoding="utf-8")
+            )
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            acceptance_payload = {}
+        observed = (
+            acceptance_payload.get("provider_metrics")
+            if isinstance(acceptance_payload, dict)
+            else None
+        )
+        if isinstance(observed, dict):
+            contact_provider_metrics = observed
     performance = {
         "upper_bound_probe_calls": result.upper_bound_probe_calls,
         "capture_attempts": result.capture_attempts,
@@ -2129,6 +2163,31 @@ def _wechat_product_command(args: argparse.Namespace) -> int:
         "governance_peak_concurrency": result.governance_peak_concurrency,
         "checkpoint_wall_ms": result.checkpoint_wall_ms,
         "resume_provider_calls": result.resume_provider_calls,
+        "provider_calls_by_category": {
+            "semantic": int(
+                contact_provider_metrics.get("semantic_provider_calls", 0)
+            ),
+            "governance": int(
+                contact_provider_metrics.get("governance_provider_calls", 0)
+            ),
+            "contact_synthesis": int(
+                contact_provider_metrics.get(
+                    "contact_synthesis_provider_calls", 0
+                )
+            ),
+        },
+        "provider_calls_total": int(
+            contact_provider_metrics.get("total_provider_calls", 0)
+        ),
+        "provider_absolute_cap": int(
+            contact_provider_metrics.get("absolute_cap", 0)
+        ),
+        "provider_remaining": int(
+            contact_provider_metrics.get("remaining_provider_calls", 0)
+        ),
+        "provider_unknown_attempts": int(
+            contact_provider_metrics.get("unknown_provider_attempts", 0)
+        ),
         "total_wall_ms": result.total_wall_ms,
         "dominant_stage": dominant_stage,
     }

@@ -35,6 +35,10 @@ CONTACT_SYNTHESIS_REQUEST_SCHEMA = "wechat-contact-synthesis-request/1.0"
 CONTACT_SYNTHESIS_RESULT_SCHEMA = "wechat-contact-event-synthesis/1.0"
 CONTACT_SYNTHESIS_RECEIPT_SCHEMA = "wechat-contact-synthesis-receipt/1.0"
 CONTACT_SYNTHESIS_CURSOR_SCHEMA = "wechat-contact-synthesis-cursor/1.0"
+CONTACT_PROVIDER_AUTHORITY_SCHEMA = "wechat-contact-provider-authority/1.0"
+CONTACT_PROVIDER_USAGE_SCHEMA = "wechat-contact-provider-usage/1.0"
+CONTACT_PROVIDER_RESERVATION_SCHEMA = "wechat-contact-provider-reservation/1.0"
+CONTACT_PROVIDER_STARTED_SCHEMA = "wechat-contact-provider-started/1.0"
 DEFAULT_CONTACT_SYNTHESIS_SEGMENT_SIZE = 100
 
 
@@ -606,6 +610,7 @@ class ContactSynthesisOutcome:
     result: dict[str, object]
     provider_calls: int
     resumed_segments: int
+    provider_metrics: dict[str, object]
 
 
 class ContactSynthesisStore:
@@ -616,7 +621,10 @@ class ContactSynthesisStore:
         root: Path,
         *,
         segment_size: int = DEFAULT_CONTACT_SYNTHESIS_SEGMENT_SIZE,
+        after_reservation_write: Callable[[], None] | None = None,
+        after_started_write: Callable[[], None] | None = None,
         after_result_write: Callable[[], None] | None = None,
+        after_receipt_write: Callable[[], None] | None = None,
     ) -> None:
         if (
             isinstance(segment_size, bool)
@@ -627,8 +635,211 @@ class ContactSynthesisStore:
         self.root = Path(root)
         self.segments_root = self.root / "segments"
         self.cursor_path = self.root / "cursor.json"
+        self.authority_path = self.root / "provider-authority.json"
+        self.usage_path = self.root / "provider-usage.json"
         self.segment_size = segment_size
+        self.after_reservation_write = after_reservation_write
+        self.after_started_write = after_started_write
         self.after_result_write = after_result_write
+        self.after_receipt_write = after_receipt_write
+
+    def _provider_authority(
+        self,
+        *,
+        binding: WechatContactBinding,
+        authority_ref: str,
+        absolute_cap: int,
+        semantic_provider_calls: int,
+        governance_provider_calls: int,
+    ) -> dict[str, object]:
+        if not isinstance(authority_ref, str) or not authority_ref.strip():
+            raise WechatDigestError("联系人模型调用缺少明确授权来源。")
+        for label, value in (
+            ("absolute cap", absolute_cap),
+            ("semantic calls", semantic_provider_calls),
+            ("governance calls", governance_provider_calls),
+        ):
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise WechatDigestError(f"联系人模型调用 {label} 无效。")
+        if absolute_cap < 1:
+            raise WechatDigestError("联系人模型调用 absolute cap 必须为正数。")
+        if semantic_provider_calls + governance_provider_calls > absolute_cap:
+            raise WechatDigestError(
+                "联系人历史模型调用已超过 absolute cap；禁止新增调用。"
+            )
+        authority_without_fingerprint = {
+            "schema_version": CONTACT_PROVIDER_AUTHORITY_SCHEMA,
+            "contact_identity": _stable_contact_identity(binding),
+            "authority_ref": authority_ref,
+            "absolute_cap": absolute_cap,
+        }
+        authority = {
+            **authority_without_fingerprint,
+            "authority_fingerprint": _fingerprint(authority_without_fingerprint),
+        }
+        if self.authority_path.exists() or self.authority_path.is_symlink():
+            if _read_private(self.authority_path) != authority:
+                raise WechatDigestError("联系人模型调用 authority 或 absolute cap 漂移。")
+        else:
+            _private_write(self.authority_path, authority)
+        usage_without_fingerprint = {
+            "schema_version": CONTACT_PROVIDER_USAGE_SCHEMA,
+            "authority_fingerprint": authority["authority_fingerprint"],
+            "semantic_provider_calls": semantic_provider_calls,
+            "governance_provider_calls": governance_provider_calls,
+        }
+        usage = {
+            **usage_without_fingerprint,
+            "usage_fingerprint": _fingerprint(usage_without_fingerprint),
+        }
+        if self.usage_path.exists() or self.usage_path.is_symlink():
+            existing = _read_private(self.usage_path)
+            old_semantic = existing.get("semantic_provider_calls")
+            old_governance = existing.get("governance_provider_calls")
+            if (
+                set(existing) != set(usage)
+                or existing.get("schema_version") != CONTACT_PROVIDER_USAGE_SCHEMA
+                or existing.get("authority_fingerprint")
+                != authority["authority_fingerprint"]
+                or isinstance(old_semantic, bool)
+                or not isinstance(old_semantic, int)
+                or isinstance(old_governance, bool)
+                or not isinstance(old_governance, int)
+                or old_semantic > semantic_provider_calls
+                or old_governance > governance_provider_calls
+                or existing.get("usage_fingerprint")
+                != _fingerprint(
+                    {
+                        key: item
+                        for key, item in existing.items()
+                        if key != "usage_fingerprint"
+                    }
+                )
+            ):
+                raise WechatDigestError("联系人历史模型调用计数不可验证。")
+            if existing != usage:
+                _private_write(self.usage_path, usage)
+        else:
+            _private_write(self.usage_path, usage)
+        if _read_private(self.authority_path) != authority or _read_private(
+            self.usage_path
+        ) != usage:
+            raise WechatDigestError("联系人模型调用 authority 写入后无法读回。")
+        return authority
+
+    def _attempt_paths(self, ordinal: int) -> tuple[Path, Path]:
+        root = self.root / "provider-attempts" / f"attempt_{ordinal:04d}"
+        return root / "reservation.json", root / "started.json"
+
+    def _attempt_inventory(self) -> tuple[int, int, int]:
+        attempts_root = self.root / "provider-attempts"
+        if not attempts_root.exists():
+            return 0, 0, 0
+        reserved = 0
+        started = 0
+        unknown = 0
+        for ordinal, directory in enumerate(
+            sorted(attempts_root.glob("attempt_*")), start=1
+        ):
+            if directory.name != f"attempt_{ordinal:04d}" or directory.is_symlink():
+                raise WechatDigestError("联系人模型调用 attempt 顺序损坏。")
+            reservation_path, started_path = self._attempt_paths(ordinal)
+            reservation = _read_private(reservation_path)
+            if (
+                set(reservation)
+                != {
+                    "schema_version",
+                    "attempt_ordinal",
+                    "category",
+                    "contact_identity",
+                    "segment_ordinal",
+                    "request_fingerprint",
+                    "provider",
+                    "authority_ref",
+                    "absolute_cap",
+                    "authority_fingerprint",
+                    "reservation_fingerprint",
+                }
+                or reservation.get("schema_version")
+                != CONTACT_PROVIDER_RESERVATION_SCHEMA
+                or reservation.get("attempt_ordinal") != ordinal
+                or reservation.get("category") != "contact_synthesis"
+                or reservation.get("reservation_fingerprint")
+                != _fingerprint(
+                    {
+                        key: item
+                        for key, item in reservation.items()
+                        if key != "reservation_fingerprint"
+                    }
+                )
+            ):
+                raise WechatDigestError("联系人模型调用 reservation 损坏。")
+            reserved += 1
+            if started_path.exists() or started_path.is_symlink():
+                marker = _read_private(started_path)
+                if (
+                    set(marker)
+                    != {
+                        "schema_version",
+                        "attempt_ordinal",
+                        "reservation_fingerprint",
+                    }
+                    or marker.get("schema_version")
+                    != CONTACT_PROVIDER_STARTED_SCHEMA
+                    or marker.get("attempt_ordinal") != ordinal
+                    or marker.get("reservation_fingerprint")
+                    != _bytes_fingerprint(reservation_path.read_bytes())
+                ):
+                    raise WechatDigestError("联系人模型调用 started marker 损坏。")
+                started += 1
+                segment_ordinal = reservation.get("segment_ordinal")
+                if isinstance(segment_ordinal, int) and not isinstance(
+                    segment_ordinal, bool
+                ):
+                    result_path = (
+                        self.segments_root
+                        / f"segment_{segment_ordinal:04d}"
+                        / "result.json"
+                    )
+                    if not (result_path.exists() or result_path.is_symlink()):
+                        unknown += 1
+                else:
+                    raise WechatDigestError("联系人模型调用 segment 绑定损坏。")
+        return reserved, started, unknown
+
+    def _attempt_binding(
+        self, *, segment_ordinal: int, request_fingerprint: str
+    ) -> dict[str, object]:
+        reserved, _started, _unknown = self._attempt_inventory()
+        matches: list[dict[str, object]] = []
+        for attempt_ordinal in range(1, reserved + 1):
+            reservation_path, started_path = self._attempt_paths(attempt_ordinal)
+            reservation = _read_private(reservation_path)
+            if (
+                reservation.get("segment_ordinal") == segment_ordinal
+                and reservation.get("request_fingerprint") == request_fingerprint
+            ):
+                if not (started_path.exists() or started_path.is_symlink()):
+                    raise WechatDigestError(
+                        "联系人连续理解结果缺少 Provider started 证明。"
+                    )
+                _read_private(started_path)
+                matches.append(
+                    {
+                        "attempt_ordinal": attempt_ordinal,
+                        "reservation_fingerprint": _bytes_fingerprint(
+                            reservation_path.read_bytes()
+                        ),
+                        "started_fingerprint": _bytes_fingerprint(
+                            started_path.read_bytes()
+                        ),
+                    }
+                )
+        if len(matches) != 1:
+            raise WechatDigestError(
+                "联系人连续理解结果无法唯一绑定 Provider attempt。"
+            )
+        return matches[0]
 
     def _load_cursor(
         self,
@@ -706,6 +917,7 @@ class ContactSynthesisStore:
                 "result_fingerprint",
                 "source_atomic_information_ids",
                 "provider",
+                "provider_attempt",
             }
             or receipt.get("schema_version") != CONTACT_SYNTHESIS_RECEIPT_SCHEMA
             or receipt.get("contact_identity") != _stable_contact_identity(binding)
@@ -714,8 +926,15 @@ class ContactSynthesisStore:
             or receipt.get("result_fingerprint") != cursor.get("result_fingerprint")
             or receipt.get("source_atomic_information_ids") != consumed
             or receipt.get("provider") != request.get("provider")
+            or not isinstance(receipt.get("provider_attempt"), dict)
         ):
             raise WechatDigestError("联系人连续理解 cursor receipt 绑定不一致。")
+        provider_attempt = self._attempt_binding(
+            segment_ordinal=ordinal,
+            request_fingerprint=str(request_fingerprint),
+        )
+        if receipt.get("provider_attempt") != provider_attempt:
+            raise WechatDigestError("联系人连续理解 cursor attempt 绑定不一致。")
         validated = _validate_result(
             result,
             request_fingerprint=str(request_fingerprint),
@@ -729,6 +948,11 @@ class ContactSynthesisStore:
         *,
         binding: WechatContactBinding,
         provider: ContactSynthesisProvider,
+        authority_ref: str = "synthetic-contact-authority",
+        absolute_cap: int = 50,
+        semantic_provider_calls: int = 0,
+        governance_provider_calls: int = 0,
+        resume_provider_calls: int = 0,
     ) -> ContactSynthesisOutcome:
         self.root.mkdir(parents=True, exist_ok=True, mode=0o700)
         os.chmod(self.root, 0o700)
@@ -740,7 +964,14 @@ class ContactSynthesisStore:
                 raise WechatDigestError("同一联系人已有连续理解任务正在运行。") from exc
             try:
                 return self._synthesize_locked(
-                    revisions, binding=binding, provider=provider
+                    revisions,
+                    binding=binding,
+                    provider=provider,
+                    authority_ref=authority_ref,
+                    absolute_cap=absolute_cap,
+                    semantic_provider_calls=semantic_provider_calls,
+                    governance_provider_calls=governance_provider_calls,
+                    resume_provider_calls=resume_provider_calls,
                 )
             finally:
                 fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
@@ -751,10 +982,22 @@ class ContactSynthesisStore:
         *,
         binding: WechatContactBinding,
         provider: ContactSynthesisProvider,
+        authority_ref: str,
+        absolute_cap: int,
+        semantic_provider_calls: int,
+        governance_provider_calls: int,
+        resume_provider_calls: int,
     ) -> ContactSynthesisOutcome:
         ordered_ids = [item.atomic_information_id for item in revisions]
         if len(ordered_ids) != len(set(ordered_ids)):
             raise WechatDigestError("联系人连续理解输入包含重复长期信息。")
+        authority = self._provider_authority(
+            binding=binding,
+            authority_ref=authority_ref,
+            absolute_cap=absolute_cap,
+            semantic_provider_calls=semantic_provider_calls,
+            governance_provider_calls=governance_provider_calls,
+        )
         ordinal, consumed, previous = self._load_cursor(binding, ordered_ids)
         provider_calls_before = provider.provider_calls
         resumed_segments = 0
@@ -811,6 +1054,84 @@ class ContactSynthesisStore:
                 )
                 resumed_segments += 1
             else:
+                reserved, _started, unknown = self._attempt_inventory()
+                if unknown:
+                    raise WechatDigestError(
+                        "联系人模型调用结果未知；禁止自动重试，需新的明确决定。"
+                    )
+                attempt_ordinal = reserved + 1
+                for candidate in range(1, reserved + 1):
+                    candidate_reservation, candidate_started = self._attempt_paths(
+                        candidate
+                    )
+                    existing_candidate = _read_private(candidate_reservation)
+                    if (
+                        existing_candidate.get("segment_ordinal") == next_ordinal
+                        and existing_candidate.get("request_fingerprint")
+                        == request_fingerprint
+                    ):
+                        if candidate_started.exists() or candidate_started.is_symlink():
+                            raise WechatDigestError(
+                                "联系人模型调用结果未知；禁止自动重试，需新的明确决定。"
+                            )
+                        attempt_ordinal = candidate
+                        break
+                reservation_path, started_path = self._attempt_paths(
+                    attempt_ordinal
+                )
+                reservation_without_fingerprint = {
+                    "schema_version": CONTACT_PROVIDER_RESERVATION_SCHEMA,
+                    "attempt_ordinal": attempt_ordinal,
+                    "category": "contact_synthesis",
+                    "contact_identity": _stable_contact_identity(binding),
+                    "segment_ordinal": next_ordinal,
+                    "request_fingerprint": request_fingerprint,
+                    "provider": provider_identity,
+                    "authority_ref": authority_ref,
+                    "absolute_cap": absolute_cap,
+                    "authority_fingerprint": authority["authority_fingerprint"],
+                }
+                reservation = {
+                    **reservation_without_fingerprint,
+                    "reservation_fingerprint": _fingerprint(
+                        reservation_without_fingerprint
+                    ),
+                }
+                reservation_exists = (
+                    reservation_path.exists() or reservation_path.is_symlink()
+                )
+                if reservation_exists:
+                    if _read_private(reservation_path) != reservation:
+                        raise WechatDigestError(
+                            "联系人模型调用 reservation 与当前 segment 不一致。"
+                        )
+                else:
+                    if (
+                        semantic_provider_calls
+                        + governance_provider_calls
+                        + reserved
+                        >= absolute_cap
+                    ):
+                        raise WechatDigestError(
+                            "联系人模型调用已达到授权上限；既有结果保持不变。"
+                        )
+                    _private_write(reservation_path, reservation)
+                    if self.after_reservation_write is not None:
+                        self.after_reservation_write()
+                if started_path.exists() or started_path.is_symlink():
+                    raise WechatDigestError(
+                        "联系人模型调用结果未知；禁止自动重试，需新的明确决定。"
+                    )
+                started = {
+                    "schema_version": CONTACT_PROVIDER_STARTED_SCHEMA,
+                    "attempt_ordinal": attempt_ordinal,
+                    "reservation_fingerprint": _bytes_fingerprint(
+                        reservation_path.read_bytes()
+                    ),
+                }
+                _private_write(started_path, started)
+                if self.after_started_write is not None:
+                    self.after_started_write()
                 result = _validate_result(
                     provider.synthesize(request, schema),
                     request_fingerprint=request_fingerprint,
@@ -820,6 +1141,10 @@ class ContactSynthesisStore:
                 if self.after_result_write is not None:
                     self.after_result_write()
             result_fingerprint = _bytes_fingerprint(result_path.read_bytes())
+            provider_attempt = self._attempt_binding(
+                segment_ordinal=next_ordinal,
+                request_fingerprint=request_fingerprint,
+            )
             receipt = {
                 "schema_version": CONTACT_SYNTHESIS_RECEIPT_SCHEMA,
                 "contact_identity": _stable_contact_identity(binding),
@@ -828,12 +1153,15 @@ class ContactSynthesisStore:
                 "result_fingerprint": result_fingerprint,
                 "source_atomic_information_ids": target_ids,
                 "provider": provider_identity,
+                "provider_attempt": provider_attempt,
             }
             if receipt_exists:
                 if _read_private(receipt_path) != receipt:
                     raise WechatDigestError("联系人连续理解 receipt 漂移。")
             else:
                 _private_write(receipt_path, receipt)
+                if self.after_receipt_write is not None:
+                    self.after_receipt_write()
             cursor = {
                 "schema_version": CONTACT_SYNTHESIS_CURSOR_SCHEMA,
                 "contact_identity": _stable_contact_identity(binding),
@@ -848,8 +1176,25 @@ class ContactSynthesisStore:
             ordinal = next_ordinal
             consumed = target_ids
             previous = result
+        reserved, started, unknown = self._attempt_inventory()
+        total_provider_calls = (
+            semantic_provider_calls + governance_provider_calls + started
+        )
         return ContactSynthesisOutcome(
             result=previous,
             provider_calls=provider.provider_calls - provider_calls_before,
             resumed_segments=resumed_segments,
+            provider_metrics={
+                "authority_ref": authority_ref,
+                "absolute_cap": absolute_cap,
+                "semantic_provider_calls": semantic_provider_calls,
+                "governance_provider_calls": governance_provider_calls,
+                "contact_synthesis_provider_calls": started,
+                "total_provider_calls": total_provider_calls,
+                "resume_provider_calls": resume_provider_calls,
+                "reserved_provider_attempts": reserved,
+                "started_provider_attempts": started,
+                "unknown_provider_attempts": unknown,
+                "remaining_provider_calls": absolute_cap - total_provider_calls,
+            },
         )
