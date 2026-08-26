@@ -193,10 +193,16 @@ _TIMEOUT_212_RESOLUTION_MANIFEST_SCHEMA = (
 _TIMEOUT_212_RESOLUTION_SCHEMA = (
     "semantic-handoff-timeout-212-resolution/1.0"
 )
-_ATTEMPT_RESOLUTION_MANIFEST_SCHEMA = (
+_LEGACY_ATTEMPT_RESOLUTION_MANIFEST_SCHEMA = (
     "semantic-handoff-attempt-resolution-authority/1.0"
 )
-_ATTEMPT_RESOLUTION_SCHEMA = "semantic-handoff-attempt-resolution/1.0"
+_ATTEMPT_RESOLUTION_MANIFEST_SCHEMA = (
+    "semantic-handoff-attempt-resolution-authority/2.0"
+)
+_LEGACY_ATTEMPT_RESOLUTION_SCHEMA = (
+    "semantic-handoff-attempt-resolution/1.0"
+)
+_ATTEMPT_RESOLUTION_SCHEMA = "semantic-handoff-attempt-resolution/2.0"
 _INVENTORY_AUTHORITY_SCHEMA = "semantic-handoff-inventory-authority/1.0"
 _GLOBAL_AUTHORITY_DIRECTORY = "semantic_global_authority"
 _GLOBAL_AUTHORITY_GRANT = "grant.json"
@@ -9781,6 +9787,102 @@ class _SemanticGlobalAuthority:
         del resolutions
         return dict(previous)
 
+    @staticmethod
+    def _valid_attempt_resolution_suffix(
+        value: object, *, target_ordinal: int, activation_total: int
+    ) -> bool:
+        if not isinstance(value, list):
+            return False
+        ordinals: list[int] = []
+        for item in value:
+            if not isinstance(item, dict):
+                return False
+            inventory = item.get("result_inventory")
+            if (
+                set(item)
+                != {
+                    "global_ordinal",
+                    "semantic_run_id",
+                    "batch_ordinal",
+                    "attempt_receipt_fingerprint",
+                    "result_raw_fingerprint",
+                    "result_receipt_fingerprint",
+                    "result_receipt_raw_fingerprint",
+                    "result_inventory",
+                    "result_inventory_fingerprint",
+                }
+                or isinstance(item.get("global_ordinal"), bool)
+                or not isinstance(item.get("global_ordinal"), int)
+                or not isinstance(item.get("semantic_run_id"), str)
+                or isinstance(item.get("batch_ordinal"), bool)
+                or not isinstance(item.get("batch_ordinal"), int)
+                or int(item["batch_ordinal"]) < 1
+                or any(
+                    not _sha256_fingerprint(item.get(field))
+                    for field in (
+                        "attempt_receipt_fingerprint",
+                        "result_raw_fingerprint",
+                        "result_receipt_fingerprint",
+                        "result_receipt_raw_fingerprint",
+                        "result_inventory_fingerprint",
+                    )
+                )
+                or not isinstance(inventory, list)
+                or not inventory
+                or any(
+                    not isinstance(entry, dict)
+                    or set(entry) != {"name", "raw_fingerprint"}
+                    or not isinstance(entry.get("name"), str)
+                    or not _sha256_fingerprint(
+                        entry.get("raw_fingerprint")
+                    )
+                    for entry in inventory
+                )
+                or item.get("result_inventory_fingerprint")
+                != _fingerprint(inventory)
+            ):
+                return False
+            ordinals.append(int(item["global_ordinal"]))
+        return ordinals == list(range(target_ordinal + 1, activation_total + 1))
+
+    @staticmethod
+    def _valid_attempt_resolution_commit_cursor(value: object) -> bool:
+        if not isinstance(value, dict) or set(value) != {
+            "present",
+            "payload",
+            "raw_fingerprint",
+        }:
+            return False
+        present = value.get("present")
+        payload = value.get("payload")
+        if not isinstance(present, bool) or not isinstance(payload, dict):
+            return False
+        projected = dict(payload)
+        fingerprint = projected.pop("commit_cursor_fingerprint", None)
+        ordinal = payload.get("committed_global_ordinal")
+        return bool(
+            set(payload)
+            == {
+                "schema_version",
+                "artifact_kind",
+                "committed_global_ordinal",
+                "attempt_receipt_fingerprint",
+                "commit_cursor_fingerprint",
+            }
+            and payload.get("schema_version")
+            == _GLOBAL_COMMIT_CURSOR_SCHEMA
+            and payload.get("artifact_kind")
+            == "semantic_handoff_global_commit_cursor"
+            and not isinstance(ordinal, bool)
+            and isinstance(ordinal, int)
+            and fingerprint == _fingerprint(projected)
+            and (
+                _sha256_fingerprint(value.get("raw_fingerprint"))
+                if present
+                else value.get("raw_fingerprint") is None
+            )
+        )
+
     def _read_attempt_resolutions(
         self,
         *,
@@ -9801,34 +9903,48 @@ class _SemanticGlobalAuthority:
             digest = receipt.get("digest")
             continuation = receipt.get("continuation")
             ordinal = receipt.get("global_ordinal")
+            schema = receipt.get("schema_version")
+            legacy = schema == _LEGACY_ATTEMPT_RESOLUTION_SCHEMA
+            activation_total = receipt.get("activation_total")
+            expected_fields = {
+                "schema_version",
+                "artifact_kind",
+                "sequence",
+                "authority_ref",
+                "authority_manifest_fingerprint",
+                "authority_manifest_raw_fingerprint",
+                "previous_global_authority_fingerprint",
+                "previous_reviewed_git_head",
+                "previous_execution_contract",
+                "resolution_id",
+                "global_ordinal",
+                "outcome",
+                "semantic_attempt",
+                "failure_evidence",
+                "digest",
+                "activation_total",
+                "activation_unknown_count",
+                "activation_last_global_ordinal",
+                "activation_attempt_inventory_fingerprint",
+                "preserved_but_unabsorbed",
+                "continuation",
+                "resolution_receipt_fingerprint",
+            }
+            if not legacy:
+                expected_fields.update(
+                    {
+                        "activation_next_global_ordinal",
+                        "committed_suffix",
+                        "commit_cursor",
+                    }
+                )
             if (
-                set(receipt)
-                != {
-                    "schema_version",
-                    "artifact_kind",
-                    "sequence",
-                    "authority_ref",
-                    "authority_manifest_fingerprint",
-                    "authority_manifest_raw_fingerprint",
-                    "previous_global_authority_fingerprint",
-                    "previous_reviewed_git_head",
-                    "previous_execution_contract",
-                    "resolution_id",
-                    "global_ordinal",
-                    "outcome",
-                    "semantic_attempt",
-                    "failure_evidence",
-                    "digest",
-                    "activation_total",
-                    "activation_unknown_count",
-                    "activation_last_global_ordinal",
-                    "activation_attempt_inventory_fingerprint",
-                    "preserved_but_unabsorbed",
-                    "continuation",
-                    "resolution_receipt_fingerprint",
+                set(receipt) != expected_fields
+                or schema
+                not in {
+                    _LEGACY_ATTEMPT_RESOLUTION_SCHEMA,
+                    _ATTEMPT_RESOLUTION_SCHEMA,
                 }
-                or receipt.get("schema_version")
-                != _ATTEMPT_RESOLUTION_SCHEMA
                 or receipt.get("artifact_kind")
                 != "semantic_handoff_attempt_resolution"
                 or receipt.get("sequence") != sequence
@@ -9894,9 +10010,32 @@ class _SemanticGlobalAuthority:
                 != "lead_approved_process_exited_diagnostic_persistence_failed"
                 or not isinstance(evidence.get("observed_at"), str)
                 or not isinstance(digest, dict)
-                or receipt.get("activation_total") != ordinal
+                or isinstance(activation_total, bool)
+                or not isinstance(activation_total, int)
+                or (
+                    legacy
+                    and activation_total != ordinal
+                    or not legacy
+                    and activation_total < int(ordinal)
+                )
                 or receipt.get("activation_unknown_count") != 1
-                or receipt.get("activation_last_global_ordinal") != ordinal
+                or receipt.get("activation_last_global_ordinal")
+                != activation_total
+                or (
+                    not legacy
+                    and (
+                        receipt.get("activation_next_global_ordinal")
+                        != activation_total + 1
+                        or not self._valid_attempt_resolution_suffix(
+                            receipt.get("committed_suffix"),
+                            target_ordinal=int(ordinal),
+                            activation_total=activation_total,
+                        )
+                        or not self._valid_attempt_resolution_commit_cursor(
+                            receipt.get("commit_cursor")
+                        )
+                    )
+                )
                 or not _sha256_fingerprint(
                     receipt.get("activation_attempt_inventory_fingerprint")
                 )
@@ -9916,7 +10055,7 @@ class _SemanticGlobalAuthority:
                     "execution_contract": receipt.get(
                         "previous_execution_contract"
                     ),
-                    "next_global_ordinal": ordinal + 1,
+                    "next_global_ordinal": activation_total + 1,
                     "absolute_cap": continuation.get("absolute_cap"),
                 }
                 or isinstance(continuation.get("absolute_cap"), bool)
@@ -9946,9 +10085,9 @@ class _SemanticGlobalAuthority:
             for attempt in attempts
             if attempt.get("global_ordinal") == global_ordinal
         ]
-        if len(matches) != 1 or attempts[-1].get("global_ordinal") != global_ordinal:
+        if len(matches) != 1:
             raise SemanticHandoffError(
-                "Semantic attempt resolution 必须绑定唯一 ledger tail。"
+                "Semantic attempt resolution 必须绑定唯一 ledger attempt。"
             )
         attempt = matches[0]
         run_id = attempt.get("semantic_run_id")
@@ -9999,19 +10138,6 @@ class _SemanticGlobalAuthority:
             raise SemanticHandoffError(
                 "Semantic attempt resolution 已出现 result。"
             )
-        for directory, suffix in (
-            (run / "attempts", ".json"),
-            (run / "started", ".json"),
-            (run / "results", ""),
-        ):
-            if not os.path.lexists(directory):
-                continue
-            for child in directory.iterdir():
-                match = re.fullmatch(r"batch_(\d{4})" + re.escape(suffix), child.name)
-                if match is not None and int(match.group(1)) > batch_ordinal:
-                    raise SemanticHandoffError(
-                        "Semantic attempt resolution 同 run 存在后续 batch。"
-                    )
         resolved_ordinals = {
             int(item["global_ordinal"])
             for item in resolutions
@@ -10032,11 +10158,103 @@ class _SemanticGlobalAuthority:
                 )
             ):
                 unresolved.append(ordinal)
-        if unresolved not in ([], [global_ordinal]):
+        if unresolved != [global_ordinal]:
             raise SemanticHandoffError(
                 "Semantic attempt resolution unknown 必须唯一。"
             )
         return attempt, run_receipt, started
+
+    def _attempt_resolution_result_binding(
+        self, attempt: Mapping[str, object]
+    ) -> dict[str, object]:
+        run_id = str(attempt["semantic_run_id"])
+        batch_ordinal = int(attempt["batch_ordinal"])
+        result = (
+            self.audit_root
+            / run_id
+            / "results"
+            / f"batch_{batch_ordinal:04d}"
+        )
+        if not os.path.lexists(result):
+            raise SemanticHandoffError(
+                "Semantic attempt resolution suffix result 缺失。"
+            )
+        receipt_path = result / "result-receipt.json"
+        receipt = _private_json_exact(receipt_path)
+        inventory = [
+            {
+                "name": child.name,
+                "raw_fingerprint": _bytes_fingerprint(
+                    _private_bytes_read(child)
+                ),
+            }
+            for child in sorted(result.iterdir(), key=lambda path: path.name)
+        ]
+        return {
+            "global_ordinal": int(attempt["global_ordinal"]),
+            "semantic_run_id": run_id,
+            "batch_ordinal": batch_ordinal,
+            "attempt_receipt_fingerprint": attempt[
+                "attempt_receipt_fingerprint"
+            ],
+            "result_raw_fingerprint": _bytes_fingerprint(
+                _private_bytes_read(result / "result.json")
+            ),
+            "result_receipt_fingerprint": receipt[
+                "result_receipt_fingerprint"
+            ],
+            "result_receipt_raw_fingerprint": _bytes_fingerprint(
+                _private_bytes_read(receipt_path)
+            ),
+            "result_inventory": inventory,
+            "result_inventory_fingerprint": _fingerprint(inventory),
+        }
+
+    def _attempt_resolution_state(
+        self,
+        *,
+        authority: Mapping[str, object],
+        attempts: Sequence[Mapping[str, object]],
+        resolutions: Sequence[Mapping[str, object]],
+    ) -> tuple[int, list[dict[str, object]], dict[str, object]]:
+        resolved_ordinals = {
+            int(item["global_ordinal"]) for item in resolutions
+        } | {166, 212}
+        unresolved: list[int] = []
+        for attempt in attempts:
+            ordinal = int(attempt["global_ordinal"])
+            if ordinal in resolved_ordinals:
+                continue
+            run = self.audit_root / str(attempt["semantic_run_id"])
+            batch_ordinal = int(attempt["batch_ordinal"])
+            result = run / "results" / f"batch_{batch_ordinal:04d}"
+            started = run / "started" / f"batch_{batch_ordinal:04d}.json"
+            if not os.path.lexists(result) and os.path.lexists(started):
+                unresolved.append(ordinal)
+        if len(unresolved) != 1:
+            raise SemanticHandoffError(
+                "Semantic attempt resolution candidate 不存在唯一 unknown。"
+            )
+        target_ordinal = unresolved[0]
+        suffix = [
+            self._attempt_resolution_result_binding(attempt)
+            for attempt in attempts
+            if int(attempt["global_ordinal"]) > target_ordinal
+        ]
+        cursor_path = self._commit_cursor_path()
+        cursor = self._current_commit_cursor(authority, attempts)
+        cursor_present = os.path.lexists(cursor_path)
+        cursor_raw_fingerprint = (
+            _bytes_fingerprint(_private_bytes_read(cursor_path))
+            if cursor_present
+            else None
+        )
+        commit_cursor = {
+            "present": cursor_present,
+            "payload": cursor,
+            "raw_fingerprint": cursor_raw_fingerprint,
+        }
+        return target_ordinal, suffix, commit_cursor
 
     def _validate_attempt_resolution_manifest(
         self,
@@ -10047,6 +10265,8 @@ class _SemanticGlobalAuthority:
         attempt: Mapping[str, object],
         run_receipt: Mapping[str, object],
         started: Mapping[str, object],
+        committed_suffix: Sequence[Mapping[str, object]],
+        commit_cursor: Mapping[str, object],
         digest_binding: Mapping[str, object],
         reviewed_git_head: str,
         provider: CodexCliRepresentationAnalysisProvider,
@@ -10080,7 +10300,11 @@ class _SemanticGlobalAuthority:
                 "activation_total",
                 "activation_unknown_count",
                 "activation_last_global_ordinal",
+                "activation_next_global_ordinal",
                 "activation_attempt_inventory_fingerprint",
+                "target_global_ordinal",
+                "committed_suffix",
+                "commit_cursor",
                 "absolute_cap",
                 "semantic_attempt",
                 "failure_evidence",
@@ -10103,11 +10327,23 @@ class _SemanticGlobalAuthority:
             is None
             or manifest.get("current_global_authority_fingerprint")
             != attempt.get("global_authority_fingerprint")
-            or manifest.get("activation_total") != ordinal
+            or not attempts
+            or manifest.get("activation_total")
+            != attempts[-1].get("global_ordinal")
             or manifest.get("activation_unknown_count") != 1
-            or manifest.get("activation_last_global_ordinal") != ordinal
+            or manifest.get("activation_last_global_ordinal")
+            != attempts[-1].get("global_ordinal")
+            or manifest.get("activation_next_global_ordinal")
+            != int(attempts[-1]["global_ordinal"]) + 1
             or manifest.get("activation_attempt_inventory_fingerprint")
             != _fingerprint(list(attempts))
+            or manifest.get("target_global_ordinal") != ordinal
+            or not _payloads_exactly_equal(
+                manifest.get("committed_suffix"), list(committed_suffix)
+            )
+            or not _payloads_exactly_equal(
+                manifest.get("commit_cursor"), commit_cursor
+            )
             or manifest.get("absolute_cap") != authority.get("absolute_cap")
             or manifest.get("semantic_attempt")
             != {
@@ -10158,7 +10394,8 @@ class _SemanticGlobalAuthority:
                 "previous_execution_contract": authority.get("contract"),
                 "reviewed_git_head": attempt_window.get("reviewed_git_head"),
                 "execution_contract": authority.get("contract"),
-                "next_global_ordinal": int(ordinal) + 1,
+                "next_global_ordinal": int(attempts[-1]["global_ordinal"])
+                + 1,
                 "absolute_cap": authority.get("absolute_cap"),
             }
             or continuation.get("execution_contract")
@@ -10180,7 +10417,7 @@ class _SemanticGlobalAuthority:
         provider: CodexCliRepresentationAnalysisProvider,
         digest_binding: Mapping[str, object],
     ) -> dict[str, object]:
-        """Build and publish one deterministic private tail-attempt candidate."""
+        """Build one private candidate for the unique authoritative unknown."""
 
         if (
             re.fullmatch(
@@ -10205,12 +10442,19 @@ class _SemanticGlobalAuthority:
                     "Semantic attempt resolution candidate 不存在唯一 unknown。"
                 )
             resolutions = self._read_attempt_resolutions(previous=authority)
-            ordinal = int(attempts[-1]["global_ordinal"])
+            ordinal, committed_suffix, commit_cursor = (
+                self._attempt_resolution_state(
+                    authority=authority,
+                    attempts=attempts,
+                    resolutions=resolutions,
+                )
+            )
             attempt, run_receipt, started = self._attempt_resolution_evidence(
                 attempts=attempts,
                 resolutions=resolutions,
                 global_ordinal=ordinal,
             )
+            activation_total = int(attempts[-1]["global_ordinal"])
             attempt_window = attempt.get("window")
             if (
                 attempt.get("global_authority_fingerprint")
@@ -10232,6 +10476,9 @@ class _SemanticGlobalAuthority:
                 "started_receipt_fingerprint": started.get(
                     "started_receipt_fingerprint"
                 ),
+                "activation_total": activation_total,
+                "committed_suffix": committed_suffix,
+                "commit_cursor": commit_cursor,
                 "observed_at": observed_at,
                 "digest": dict(digest_binding),
             }
@@ -10248,12 +10495,16 @@ class _SemanticGlobalAuthority:
                 "current_global_authority_fingerprint": attempt[
                     "global_authority_fingerprint"
                 ],
-                "activation_total": ordinal,
+                "activation_total": activation_total,
                 "activation_unknown_count": 1,
-                "activation_last_global_ordinal": ordinal,
+                "activation_last_global_ordinal": activation_total,
+                "activation_next_global_ordinal": activation_total + 1,
                 "activation_attempt_inventory_fingerprint": _fingerprint(
                     attempts
                 ),
+                "target_global_ordinal": ordinal,
+                "committed_suffix": committed_suffix,
+                "commit_cursor": commit_cursor,
                 "absolute_cap": authority["absolute_cap"],
                 "semantic_attempt": {
                     "semantic_run_id": attempt["semantic_run_id"],
@@ -10299,7 +10550,7 @@ class _SemanticGlobalAuthority:
                     "previous_execution_contract": authority["contract"],
                     "reviewed_git_head": authority["reviewed_git_head"],
                     "execution_contract": authority["contract"],
-                    "next_global_ordinal": ordinal + 1,
+                    "next_global_ordinal": activation_total + 1,
                     "absolute_cap": authority["absolute_cap"],
                 },
             }
@@ -10339,7 +10590,12 @@ class _SemanticGlobalAuthority:
             manifest_probe = _private_json_exact(authority_manifest_file)
         except SemanticHandoffError:
             raise
-        ordinal_probe = manifest_probe.get("activation_total")
+        ordinal_probe = (
+            manifest_probe.get("target_global_ordinal")
+            if manifest_probe.get("schema_version")
+            == _ATTEMPT_RESOLUTION_MANIFEST_SCHEMA
+            else manifest_probe.get("activation_total")
+        )
         if isinstance(ordinal_probe, bool) or not isinstance(ordinal_probe, int):
             raise SemanticHandoffError(
                 "Semantic attempt resolution authority ordinal 损坏。"
@@ -10397,6 +10653,17 @@ class _SemanticGlobalAuthority:
                 raise SemanticHandoffError(
                     "Semantic attempt resolution unknown 状态不匹配。"
                 )
+            target_ordinal, committed_suffix, commit_cursor = (
+                self._attempt_resolution_state(
+                    authority=previous,
+                    attempts=attempts,
+                    resolutions=prior_resolutions,
+                )
+            )
+            if target_ordinal != ordinal_probe:
+                raise SemanticHandoffError(
+                    "Semantic attempt resolution target ordinal 漂移。"
+                )
             attempt, run_receipt, started = (
                 self._attempt_resolution_evidence(
                     attempts=attempts,
@@ -10412,6 +10679,8 @@ class _SemanticGlobalAuthority:
                     attempt=attempt,
                     run_receipt=run_receipt,
                     started=started,
+                    committed_suffix=committed_suffix,
+                    commit_cursor=commit_cursor,
                     digest_binding=current_digest_binding,
                     reviewed_git_head=reviewed_git_head,
                     provider=provider,
@@ -10509,12 +10778,19 @@ class _SemanticGlobalAuthority:
                     **dict(final_digest_binding),
                     "failed_closed_status_fingerprint": status_fingerprint,
                 },
-                "activation_total": ordinal,
+                "activation_total": manifest["activation_total"],
                 "activation_unknown_count": 1,
-                "activation_last_global_ordinal": ordinal,
+                "activation_last_global_ordinal": manifest[
+                    "activation_last_global_ordinal"
+                ],
+                "activation_next_global_ordinal": manifest[
+                    "activation_next_global_ordinal"
+                ],
                 "activation_attempt_inventory_fingerprint": _fingerprint(
                     attempts
                 ),
+                "committed_suffix": manifest["committed_suffix"],
+                "commit_cursor": manifest["commit_cursor"],
                 "preserved_but_unabsorbed": True,
                 "continuation": manifest["continuation"],
             }
@@ -10556,7 +10832,16 @@ class _SemanticGlobalAuthority:
             if (
                 unknown
                 or len(final_attempts) != len(attempts)
-                or final_attempts[-1].get("global_ordinal") != ordinal
+                or len(
+                    [
+                        item
+                        for item in final_attempts
+                        if item.get("global_ordinal") == ordinal
+                    ]
+                )
+                != 1
+                or final_attempts[-1].get("global_ordinal")
+                != manifest.get("activation_last_global_ordinal")
             ):
                 raise SemanticHandoffError(
                     "Semantic attempt resolution ledger 读回失败。"
@@ -11520,7 +11805,15 @@ class _SemanticGlobalAuthority:
                 base_grant["baseline_total"]
             )
             activation = attempts[:activation_count]
-            resolved_attempt = activation[-1] if activation else None
+            target_ordinal = int(resolution_receipt["global_ordinal"])
+            resolved_matches = [
+                attempt
+                for attempt in activation
+                if attempt.get("global_ordinal") == target_ordinal
+            ]
+            resolved_attempt = (
+                resolved_matches[0] if len(resolved_matches) == 1 else None
+            )
             attempt_window = (
                 resolved_attempt.get("window")
                 if isinstance(resolved_attempt, dict)
@@ -11538,9 +11831,8 @@ class _SemanticGlobalAuthority:
                 activation_count < 0
                 or len(activation) != activation_count
                 or not activation
-                or activation[-1].get("global_ordinal")
-                != resolution_receipt.get("global_ordinal")
-                or activation[-1].get("global_authority_fingerprint")
+                or resolved_attempt is None
+                or resolved_attempt.get("global_authority_fingerprint")
                 != resolution_receipt.get(
                     "previous_global_authority_fingerprint"
                 )
