@@ -611,6 +611,12 @@ class WechatCliCaptureProvider:
         self._executable = self._resolve_executable(wechat_cli_binary)
         self._python = self._resolve_python(self._executable)
         self.provider_version = self._read_version()
+        self.capture_attempts = 0
+        self.capture_successes = 0
+        self.last_capture_metrics = {
+            "materialized_cursor_rows": 0,
+            "cursor_discovery_ms": 0,
+        }
         if self.provider_version != SUPPORTED_WECHAT_CLI_VERSION:
             raise WechatDigestError(
                 "微信只读连接器版本未经验证；未读取消息。"
@@ -681,6 +687,7 @@ class WechatCliCaptureProvider:
             "window_message_limit": self.window_message_limit,
         }
         helper = Path(__file__).with_name("wechat_capture_helper.py")
+        self.capture_attempts += 1
         try:
             result = self.runner(
                 [str(self._python), str(helper)],
@@ -708,16 +715,22 @@ class WechatCliCaptureProvider:
             raise WechatDigestError("微信全历史边界发生漂移；未推进 checkpoint。")
         if observe_only and capture.messages:
             raise WechatDigestError("微信只读边界观察返回了消息内容；未推进 checkpoint。")
+        self.capture_successes += 1
         return capture
 
     def _parse_capture(
         self, payload: object, after_cursor: WechatCursor
     ) -> WechatCapture:
-        if not isinstance(payload, dict) or set(payload) != {
+        required_fields = {
             "schema_version",
             "observed_upper",
             "messages",
-        }:
+        }
+        if (
+            not isinstance(payload, dict)
+            or not required_fields <= set(payload)
+            or set(payload) - required_fields not in (set(), {"metrics"})
+        ):
             raise ValueError("capture payload is invalid")
         if payload["schema_version"] != CAPTURE_SCHEMA_VERSION:
             raise ValueError("capture schema is unsupported")
@@ -736,6 +749,23 @@ class WechatCliCaptureProvider:
             raise ValueError("capture messages contain duplicate identities")
         if any(not after_cursor < message.cursor <= upper for message in messages):
             raise ValueError("capture message escaped its fixed range")
+        metrics = payload.get(
+            "metrics",
+            {"materialized_cursor_rows": 0, "cursor_discovery_ms": 0},
+        )
+        if (
+            not isinstance(metrics, dict)
+            or set(metrics)
+            != {"materialized_cursor_rows", "cursor_discovery_ms"}
+            or any(
+                isinstance(metrics[field], bool)
+                or not isinstance(metrics[field], int)
+                or metrics[field] < 0
+                for field in metrics
+            )
+        ):
+            raise ValueError("capture metrics are invalid")
+        self.last_capture_metrics = dict(metrics)
         return WechatCapture(
             self.provider_version, after_cursor, upper, messages
         )
@@ -2627,8 +2657,13 @@ class WechatDigestResult:
     segment_stop_reason: str | None = None
     segment_receipt_fingerprint: str | None = None
     upper_bound_probe_calls: int = 0
+    capture_attempts: int = 0
+    capture_successes: int = 0
+    capture_reasons: tuple[str, ...] = ()
     capture_provider_calls: int = 0
     completed_window_connector_replays: int = 0
+    materialized_cursor_rows: int = 0
+    cursor_discovery_ms: int = 0
     snapshot_bytes: int = 0
     capture_ms: int = 0
     snapshot_publish_ms: int = 0
@@ -4371,11 +4406,163 @@ class WechatDigestService:
         self.semantic_batch_size = semantic_batch_size
         self.semantic_parallelism = semantic_parallelism
         self._segment_performance: dict[str, int] = {}
+        self._capture_reasons: list[str] = []
         self._committed_result_wave: dict[str, dict[str, object]] = {}
+        self._completed_window_chain_cache: tuple[
+            tuple[object, ...], tuple[SemanticCompletedWindowBinding, ...]
+        ] | None = None
 
     @staticmethod
     def _cursor_tuple(cursor: WechatCursor) -> tuple[int, str, str]:
         return (cursor.timestamp, cursor.conversation_key, cursor.message_key)
+
+    def _observed_capture(
+        self,
+        after_cursor: WechatCursor,
+        *,
+        upper_bound: WechatCursor | None = None,
+        all_history_upper_bound: WechatCursor | None = None,
+        observe_only: bool = False,
+        upper_probe: bool = False,
+        completed_window_replay: bool = False,
+        reason: str,
+    ) -> tuple[WechatCapture, int]:
+        """Record the real connector boundary before and after each attempt."""
+
+        started = time.monotonic()
+        self._capture_reasons.append(reason)
+        if self._segment_performance:
+            self._segment_performance["capture_attempts"] += 1
+            if upper_probe:
+                self._segment_performance["upper_bound_probe_calls"] += 1
+            elif completed_window_replay:
+                self._segment_performance[
+                    "completed_window_connector_replays"
+                ] += 1
+        try:
+            capture = self.capture_provider.capture(
+                after_cursor,
+                upper_bound=upper_bound,
+                all_history_upper_bound=all_history_upper_bound,
+                observe_only=observe_only,
+            )
+        except Exception:
+            if self._segment_performance:
+                self._segment_performance["capture_ms"] += round(
+                    (time.monotonic() - started) * 1000
+                )
+            raise
+        elapsed_ms = round((time.monotonic() - started) * 1000)
+        if self._segment_performance:
+            self._segment_performance["capture_successes"] += 1
+            if not upper_probe:
+                self._segment_performance["capture_provider_calls"] += 1
+            self._segment_performance["capture_ms"] += elapsed_ms
+            metrics = getattr(
+                self.capture_provider, "last_capture_metrics", None
+            )
+            if isinstance(metrics, dict):
+                for field in (
+                    "materialized_cursor_rows",
+                    "cursor_discovery_ms",
+                ):
+                    value = metrics.get(field)
+                    if (
+                        not isinstance(value, bool)
+                        and isinstance(value, int)
+                        and value >= 0
+                    ):
+                        self._segment_performance[field] += value
+        return capture, elapsed_ms
+
+    def _load_completed_window_lightweight(
+        self, run_id: str
+    ) -> tuple[dict[str, object], dict[str, object], dict[str, object]]:
+        """Validate one completed window without reading business artifacts."""
+
+        plan = self.run_store.plan(run_id)
+        receipt = self.run_store.plan_receipt(run_id)
+        status = self.run_store.status(run_id)
+        plan_fingerprint = _plan_fingerprint(plan)
+        if (
+            _committed_receipt_fingerprint(receipt) != plan_fingerprint
+            or status.get("run_id") != run_id
+            or status.get("state") != "completed"
+            or status.get("failure_category") is not None
+            or status.get("checkpoint_published") is not True
+        ):
+            raise WechatDigestError(
+                "微信 Semantic completed window authority 损坏。"
+            )
+        expected_status_keys = {
+            "schema_version",
+            "run_id",
+            "state",
+            "failure_category",
+            "checkpoint_published",
+            "items",
+            "updated_at",
+        }
+        if plan.get("schema_version") != LEGACY_RUN_PLAN_SCHEMA_VERSION:
+            expected_status_keys.add("plan_fingerprint")
+            if status.get("plan_fingerprint") != plan_fingerprint:
+                raise WechatDigestError(
+                    "微信 Semantic completed window plan binding 损坏。"
+                )
+        elif status.get("plan_fingerprint") is not None:
+            raise WechatDigestError(
+                "微信 Semantic completed window legacy status 损坏。"
+            )
+        if (
+            set(status) != expected_status_keys
+            or status.get("schema_version") != RUN_STATUS_SCHEMA_VERSION
+        ):
+            raise WechatDigestError(
+                "微信 Semantic completed window status 形态损坏。"
+            )
+        items = status.get("items")
+        if not isinstance(items, dict):
+            raise WechatDigestError(
+                "微信 Semantic completed window items 损坏。"
+            )
+        expected_items = {
+            **{
+                f"conversation:{item['conversation_key']}": (
+                    "conversation",
+                    item["source_id"],
+                )
+                for item in _plan_sequence(
+                    plan.get("conversations"), "conversations"
+                )
+            },
+            **{
+                f"attachment:{item['attachment_key']}": (
+                    "attachment",
+                    item["source_id"],
+                )
+                for item in _plan_sequence(
+                    plan.get("attachments"), "attachments"
+                )
+            },
+        }
+        if set(items) != set(expected_items):
+            raise WechatDigestError(
+                "微信 Semantic completed window plan/status 不收敛。"
+            )
+        for item_id, (kind, source_id) in expected_items.items():
+            item = items.get(item_id)
+            if (
+                not isinstance(item, dict)
+                or item.get("kind") != kind
+                or item.get("source_id") != source_id
+                or item.get("state") not in TERMINAL_ITEM_STATES
+            ):
+                raise WechatDigestError(
+                    "微信 Semantic completed window item binding 损坏。"
+                )
+        if plan.get("schema_version") == SNAPSHOT_RUN_PLAN_SCHEMA_VERSION:
+            self.run_store.load_capture_summary_receipt(run_id, plan=plan)
+        return plan, receipt, status
 
     def _semantic_authority_binding(
         self,
@@ -4416,7 +4603,35 @@ class WechatDigestService:
                 raise WechatDigestError(
                     "微信运行计划与 frozen Semantic campaign 漂移。"
                 )
+        checkpoint_payload = None
+        checkpoint_fingerprint = None
+        checkpoint = self.run_store.checkpoint()
+        if checkpoint is not None:
+            checkpoint_payload = self.run_store._read_json(
+                self.run_store.checkpoint_path
+            )
+            checkpoint_fingerprint = _sha256_bytes(
+                _canonical_json(checkpoint_payload).encode("utf-8")
+            )
+        cache_key = (
+            campaign_created_at,
+            campaign_lower,
+            campaign_upper,
+            campaign_provider_version,
+            campaign_batch_size,
+            self._cursor_tuple(after),
+            checkpoint_fingerprint,
+        )
         completed_windows: list[SemanticCompletedWindowBinding] = []
+        if (
+            self._completed_window_chain_cache is not None
+            and self._completed_window_chain_cache[0] == cache_key
+        ):
+            completed_windows.extend(
+                self._completed_window_chain_cache[1]
+            )
+            if campaign is None and completed_windows:
+                campaign_lower = completed_windows[0].window_after_cursor
         candidates: list[
             tuple[
                 WechatCursor,
@@ -4427,7 +4642,7 @@ class WechatDigestService:
                 dict[str, object],
             ]
         ] = []
-        if self.run_store.runs_root.exists():
+        if not completed_windows and self.run_store.runs_root.exists():
             for path in sorted(self.run_store.runs_root.iterdir()):
                 if path.name == run_id:
                     continue
@@ -4467,21 +4682,16 @@ class WechatDigestService:
                 )
                 if candidate_upper > after:
                     continue
-                candidate_receipt = self.run_store.plan_receipt(path.name)
-                candidate_status = self.run_store.status(path.name)
-                self._verify_plan_and_status(
-                    path.name,
-                    None,
-                    candidate_plan,
+                (
+                    verified_plan,
+                    candidate_receipt,
                     candidate_status,
-                    lightweight_capture=True,
+                ) = self._load_completed_window_lightweight(
+                    path.name
                 )
-                if (
-                    candidate_status.get("state") != "completed"
-                    or candidate_status.get("checkpoint_published") is not True
-                ):
+                if verified_plan != candidate_plan:
                     raise WechatDigestError(
-                        "微信 Semantic completed window 未完成 checkpoint。"
+                        "微信 Semantic completed window plan 读回漂移。"
                     )
                 candidates.append(
                     (
@@ -4493,51 +4703,57 @@ class WechatDigestService:
                         candidate_status,
                     )
                 )
-        candidates.sort(key=lambda item: item[0])
-        if campaign is None and candidates:
-            campaign_lower = self._cursor_tuple(candidates[0][0])
-        chain_cursor = WechatCursor(*campaign_lower)
-        for (
-            candidate_after,
-            candidate_upper,
-            candidate_run_id,
-            candidate_plan,
-            candidate_receipt,
-            candidate_status,
-        ) in candidates:
-            if candidate_after != chain_cursor:
-                raise WechatDigestError(
-                    "微信 Semantic completed window chain 不连续。"
+        if not completed_windows:
+            candidates.sort(key=lambda item: item[0])
+            if campaign is None and candidates:
+                campaign_lower = self._cursor_tuple(candidates[0][0])
+            chain_cursor = WechatCursor(*campaign_lower)
+            for (
+                candidate_after,
+                candidate_upper,
+                candidate_run_id,
+                candidate_plan,
+                candidate_receipt,
+                candidate_status,
+            ) in candidates:
+                if candidate_after != chain_cursor:
+                    raise WechatDigestError(
+                        "微信 Semantic completed window chain 不连续。"
+                    )
+                completed_windows.append(
+                    SemanticCompletedWindowBinding(
+                        window_run_id=candidate_run_id,
+                        window_plan_fingerprint=_plan_fingerprint(candidate_plan),
+                        window_plan_receipt_fingerprint=_sha256_bytes(
+                            _canonical_json(candidate_receipt).encode("utf-8")
+                        ),
+                        window_status_fingerprint=_sha256_bytes(
+                            _canonical_json(candidate_status).encode("utf-8")
+                        ),
+                        window_after_cursor=self._cursor_tuple(candidate_after),
+                        window_upper_cursor=self._cursor_tuple(candidate_upper),
+                    )
                 )
-            completed_windows.append(
-                SemanticCompletedWindowBinding(
-                    window_run_id=candidate_run_id,
-                    window_plan_fingerprint=_plan_fingerprint(candidate_plan),
-                    window_plan_receipt_fingerprint=_sha256_bytes(
-                        _canonical_json(candidate_receipt).encode("utf-8")
-                    ),
-                    window_status_fingerprint=_sha256_bytes(
-                        _canonical_json(candidate_status).encode("utf-8")
-                    ),
-                    window_after_cursor=self._cursor_tuple(candidate_after),
-                    window_upper_cursor=self._cursor_tuple(candidate_upper),
-                )
+                chain_cursor = candidate_upper
+            self._completed_window_chain_cache = (
+                cache_key,
+                tuple(completed_windows),
             )
-            chain_cursor = candidate_upper
+        else:
+            chain_cursor = (
+                WechatCursor(*completed_windows[-1].window_upper_cursor)
+                if completed_windows
+                else WechatCursor(*campaign_lower)
+            )
         if chain_cursor != after:
             raise WechatDigestError(
                 "微信 Semantic completed window chain 不完整。"
             )
-        checkpoint_fingerprint = None
-        checkpoint = self.run_store.checkpoint()
         if checkpoint is not None:
             if checkpoint != after:
                 raise WechatDigestError(
                     "微信 checkpoint 与当前 Semantic window 不连续。"
                 )
-            checkpoint_payload = self.run_store._read_json(
-                self.run_store.checkpoint_path
-            )
             if (
                 completed_windows
                 and isinstance(checkpoint_payload, dict)
@@ -10144,24 +10360,18 @@ class WechatDigestService:
         require_receipt: bool = True,
         allow_legacy_status: bool = False,
         allow_pending_unknown_resolution: bool = False,
-        lightweight_capture: bool = False,
     ) -> None:
         run_id = plan.get("run_id")
         created_at = plan.get("created_at")
         if not isinstance(run_id, str) or run_id != active_run_id or not isinstance(created_at, str):
             raise WechatDigestError("微信运行计划损坏。")
         if plan.get("schema_version") == SNAPSHOT_RUN_PLAN_SCHEMA_VERSION:
-            if lightweight_capture:
-                self.run_store.load_capture_summary_receipt(
-                    active_run_id, plan=plan
-                )
-            else:
-                durable_capture, _ = self.run_store.load_capture_artifacts(
-                    active_run_id,
-                    plan=plan,
-                )
-                if capture is not None and durable_capture != capture:
-                    raise WechatDigestError("微信 durable capture 读回不一致。")
+            durable_capture, _ = self.run_store.load_capture_artifacts(
+                active_run_id,
+                plan=plan,
+            )
+            if capture is not None and durable_capture != capture:
+                raise WechatDigestError("微信 durable capture 读回不一致。")
         plan_is_legacy = plan.get("schema_version") == LEGACY_RUN_PLAN_SCHEMA_VERSION
         if plan.get("schema_version") not in {
             SNAPSHOT_RUN_PLAN_SCHEMA_VERSION,
@@ -11282,13 +11492,11 @@ class WechatDigestService:
                 upper = WechatCursor.from_dict(
                     previous_plan["upper_bound"], "plan.upper_bound"
                 )
-                started = time.monotonic()
-                capture = self.capture_provider.capture(after, upper_bound=upper)
-                if self._segment_performance:
-                    self._segment_performance["capture_provider_calls"] += 1
-                capture_ms = round((time.monotonic() - started) * 1000)
-                if self._segment_performance:
-                    self._segment_performance["capture_ms"] += capture_ms
+                capture, capture_ms = self._observed_capture(
+                    after,
+                    upper_bound=upper,
+                    reason="active_capture_recovery",
+                )
                 self._verify_capture_against_plan(capture, previous_plan)
                 self.run_store.publish_capture_pending(
                     previous_plan,
@@ -11391,9 +11599,14 @@ class WechatDigestService:
         max_terminal_items: int | None = None,
     ) -> WechatDigestResult:
         self._committed_result_wave = {}
+        self._capture_reasons = []
         self._segment_performance = {
             "upper_bound_probe_calls": 0,
+            "capture_attempts": 0,
+            "capture_successes": 0,
             "capture_provider_calls": 0,
+            "materialized_cursor_rows": 0,
+            "cursor_discovery_ms": 0,
             "capture_ms": 0,
             "snapshot_publish_ms": 0,
             "snapshot_readback_ms": 0,
@@ -11444,13 +11657,11 @@ class WechatDigestService:
                     raise WechatDigestError(
                         "微信全历史窗口 checkpoint 与完成状态不一致。"
                     )
-                capture_started = time.monotonic()
-                next_capture = self.capture_provider.capture(
-                    upper, all_history_upper_bound=all_history_upper
+                next_capture, capture_ms = self._observed_capture(
+                    upper,
+                    all_history_upper_bound=all_history_upper,
+                    reason="next_history_window",
                 )
-                self._segment_performance["capture_provider_calls"] += 1
-                capture_ms = round((time.monotonic() - capture_started) * 1000)
-                self._segment_performance["capture_ms"] += capture_ms
                 if next_capture.upper_bound <= upper:
                     raise WechatDigestError(
                         "冻结的微信全历史边界无法继续读回。"
@@ -11500,9 +11711,11 @@ class WechatDigestService:
                         "首次使用必须明确选择 --since、--from-now 或 --all-history。"
                     )
                 if from_now:
-                    self._segment_performance["upper_bound_probe_calls"] += 1
-                    observed = self.capture_provider.capture(
-                        ZERO_CURSOR, observe_only=True
+                    observed, _ = self._observed_capture(
+                        ZERO_CURSOR,
+                        observe_only=True,
+                        upper_probe=True,
+                        reason="upper_bound_probe",
                     )
                     capture = WechatCapture(
                         observed.provider_version,
@@ -11511,21 +11724,18 @@ class WechatDigestService:
                         (),
                     )
                 elif all_history:
-                    self._segment_performance["upper_bound_probe_calls"] += 1
-                    observed = self.capture_provider.capture(
-                        ZERO_CURSOR, observe_only=True
+                    observed, _ = self._observed_capture(
+                        ZERO_CURSOR,
+                        observe_only=True,
+                        upper_probe=True,
+                        reason="upper_bound_probe",
                     )
                     all_history_upper = observed.upper_bound
-                    capture_started = time.monotonic()
-                    capture = self.capture_provider.capture(
+                    capture, capture_ms = self._observed_capture(
                         ZERO_CURSOR,
                         all_history_upper_bound=all_history_upper,
+                        reason="initial_history_window",
                     )
-                    self._segment_performance["capture_provider_calls"] += 1
-                    capture_ms = round(
-                        (time.monotonic() - capture_started) * 1000
-                    )
-                    self._segment_performance["capture_ms"] += capture_ms
                     if (
                         all_history_upper > ZERO_CURSOR
                         and capture.upper_bound <= ZERO_CURSOR
@@ -11535,25 +11745,17 @@ class WechatDigestService:
                         )
                 else:
                     after = parse_since(str(since))
-                    capture_started = time.monotonic()
-                    capture = self.capture_provider.capture(after)
-                    self._segment_performance["capture_provider_calls"] += 1
-                    capture_ms = round(
-                        (time.monotonic() - capture_started) * 1000
+                    capture, capture_ms = self._observed_capture(
+                        after, reason="since_window"
                     )
-                    self._segment_performance["capture_ms"] += capture_ms
             else:
                 if any((since is not None, from_now, all_history)):
                     raise WechatDigestError(
                         "checkpoint 已存在；日常运行不要再指定首次起点。"
                     )
-                capture_started = time.monotonic()
-                capture = self.capture_provider.capture(checkpoint)
-                self._segment_performance["capture_provider_calls"] += 1
-                capture_ms = round(
-                    (time.monotonic() - capture_started) * 1000
+                capture, capture_ms = self._observed_capture(
+                    checkpoint, reason="checkpoint_window"
                 )
-                self._segment_performance["capture_ms"] += capture_ms
             if pending_capture is None:
                 plan, status = self._persist_new_capture_plan(
                     capture,
@@ -13153,11 +13355,24 @@ class WechatDigestService:
             upper_bound_probe_calls=sum(
                 result.upper_bound_probe_calls for result in results
             ),
+            capture_attempts=sum(result.capture_attempts for result in results),
+            capture_successes=sum(result.capture_successes for result in results),
+            capture_reasons=tuple(
+                reason
+                for result in results
+                for reason in result.capture_reasons
+            ),
             capture_provider_calls=sum(
                 result.capture_provider_calls for result in results
             ),
             completed_window_connector_replays=sum(
                 result.completed_window_connector_replays for result in results
+            ),
+            materialized_cursor_rows=sum(
+                result.materialized_cursor_rows for result in results
+            ),
+            cursor_discovery_ms=sum(
+                result.cursor_discovery_ms for result in results
             ),
             snapshot_bytes=max(result.snapshot_bytes for result in results),
             capture_ms=sum(result.capture_ms for result in results),
@@ -13291,11 +13506,24 @@ class WechatDigestService:
             upper_bound_probe_calls=self._segment_performance.get(
                 "upper_bound_probe_calls", 0
             ),
+            capture_attempts=self._segment_performance.get(
+                "capture_attempts", 0
+            ),
+            capture_successes=self._segment_performance.get(
+                "capture_successes", 0
+            ),
+            capture_reasons=tuple(self._capture_reasons),
             capture_provider_calls=self._segment_performance.get(
                 "capture_provider_calls", 0
             ),
             completed_window_connector_replays=self._segment_performance.get(
                 "completed_window_connector_replays", 0
+            ),
+            materialized_cursor_rows=self._segment_performance.get(
+                "materialized_cursor_rows", 0
+            ),
+            cursor_discovery_ms=self._segment_performance.get(
+                "cursor_discovery_ms", 0
             ),
             snapshot_bytes=snapshot_bytes,
             capture_ms=self._segment_performance.get("capture_ms", 0),
