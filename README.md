@@ -122,12 +122,23 @@ archeos conversation wechat represent <source_id>
 首次使用必须明确选择一个起点；成功后，日常运行只需执行增量命令：
 
 ```bash
-archeos wechat digest --since 2026-08-01
-# 或：archeos wechat digest --from-now
-# 或：archeos wechat digest --all-history
+# 先只读联系人目录，不读取聊天正文
+archeos wechat digest --list-contacts
 
-archeos wechat digest
+# 新日常运行必须选择一个联系人
+archeos wechat digest --contact "联系人名称" --since 2026-08-01
+# 或：archeos wechat digest --contact "联系人名称" --all-history
+# 后续增量：
+archeos wechat digest --contact "联系人名称"
+
+# 业务验收不写主 Workspace
+archeos wechat digest --contact "联系人名称" --since 2026-08-01 \
+  --isolated-acceptance-dir /private/path/contact-acceptance
 ```
+
+联系人名称不唯一时，使用联系人列表给出的会话编号分别选择；绑定后的联系人改名不会改变其独立进度。系统只捕获所选会话及附件，同一联系人不拆给多个并行 Agent；超长会话按顺序续接并持久化联系人级 Event synthesis，业务验收包只展示该结果。normal contact write 若与未完成的 legacy 任务重叠会在新长期写入前停止；隔离验收仍可读取完整目标会话，且不会写入主 World Model。
+
+联系人处理默认把 Semantic、Governance 与联系人级归并纳入同一个 50 次模型调用上限。首次可能调用模型的真实验收必须显式传入 `--authority-ref <Lead 批准评论链接>`；可用 `--provider-absolute-cap 50` 同时绑定绝对上限。已有同一联系人授权记录的恢复可以省略这两个参数并精确复用已保存值，但不允许更换批准来源或上限。业务验收包与性能摘要会分别报告三类调用、总调用、恢复调用和剩余额度。
 
 ArcheOS 会把待处理历史切成连续的有界窗口：每个窗口最长 30 日且最多 1000 条消息。高密度月份会自动拆成多个可续传子窗；每个窗口内的消息与附件全部达到明确终态后，才推进本地 checkpoint。任一窗口失败时保留此前成功 checkpoint，下次从失败窗口原样恢复。隐私受限、暂不支持或需要人工判断的内容会保留并在业务摘要中单独报告。
 

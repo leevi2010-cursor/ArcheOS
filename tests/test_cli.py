@@ -23,12 +23,262 @@ from archeos.pyannote_speakers import PyannoteSpeakerProvider
 from archeos.representation_information import (
     FileRepresentationAnalysisProvider,
 )
-from archeos.wechat_digest import WechatDigestResult, WechatSemanticPreparation
+from archeos.wechat_contact_synthesis import ContactSynthesisStore
+from archeos.wechat_digest import (
+    WechatContactBinding,
+    WechatDigestResult,
+    WechatSemanticPreparation,
+)
 from archeos.workspace import WorkspaceConfig
 from archeos.world_model import SQLiteWorldModelRepository
 
 
 class CliTest(unittest.TestCase):
+    CONTACT_AUTHORITY_REF = (
+        "https://github.com/leevi2010-cursor/ArcheOS/issues/999"
+        "#issuecomment-999"
+    )
+
+    @patch("archeos.cli.WechatDigestService")
+    @patch("archeos.cli.WechatCliCaptureProvider")
+    @patch("archeos.cli.require_workspace")
+    def test_first_contact_run_without_authority_stops_before_capture_or_run_artifact(
+        self,
+        require_workspace: Mock,
+        capture_provider: Mock,
+        digest_service: Mock,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            require_workspace.return_value = WorkspaceConfig(
+                workspace, workspace / "config"
+            )
+            binding = WechatContactBinding(
+                "wechat_conversation_" + "9" * 32,
+                "wxid_synthetic_9",
+                "Synthetic Contact 9",
+                False,
+            )
+            capture_provider.return_value.resolve_contact.return_value = binding
+            output = StringIO()
+            with redirect_stdout(output):
+                result = main(
+                    [
+                        "wechat",
+                        "digest",
+                        "--contact",
+                        binding.display_name,
+                        "--from-now",
+                    ]
+                )
+            self.assertEqual(result, 1)
+            self.assertIn("真实批准链接", output.getvalue())
+            capture_provider.return_value.scoped.assert_not_called()
+            capture_provider.return_value.capture.assert_not_called()
+            digest_service.assert_not_called()
+            contact_root = (
+                workspace
+                / "02_processing"
+                / "wechat_digest"
+                / "contacts"
+                / binding.conversation_key
+            )
+            self.assertFalse(contact_root.exists())
+
+            with redirect_stdout(output):
+                invalid = main(
+                    [
+                        "wechat",
+                        "digest",
+                        "--contact",
+                        binding.display_name,
+                        "--authority-ref",
+                        "https://github.com/leevi2010-cursor/ArcheOS/issues/202",
+                        "--from-now",
+                    ]
+                )
+            self.assertEqual(invalid, 1)
+            capture_provider.return_value.scoped.assert_not_called()
+            digest_service.assert_not_called()
+            self.assertFalse(contact_root.exists())
+
+    @patch("archeos.cli.build_contact_acceptance_pack")
+    @patch("archeos.cli.WechatDigestService")
+    @patch("archeos.cli.WechatCliCaptureProvider")
+    @patch("archeos.cli.require_workspace")
+    def test_contact_resume_reuses_exact_authority_and_rejects_drift(
+        self,
+        require_workspace: Mock,
+        capture_provider: Mock,
+        digest_service: Mock,
+        build_pack: Mock,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            require_workspace.return_value = WorkspaceConfig(
+                workspace, workspace / "config"
+            )
+            binding = WechatContactBinding(
+                "wechat_conversation_" + "8" * 32,
+                "wxid_synthetic_8",
+                "Synthetic Contact 8",
+                False,
+            )
+            capture_provider.return_value.resolve_contact.return_value = binding
+            capture_provider.return_value.scoped.return_value = (
+                capture_provider.return_value
+            )
+            contact_root = (
+                workspace
+                / "02_processing"
+                / "wechat_digest"
+                / "contacts"
+                / binding.conversation_key
+            )
+            provider = Mock()
+            provider.name = "synthetic"
+            provider.provider_version = "1"
+            provider.model = "synthetic"
+            provider.reasoning_effort = "medium"
+            provider.provider_calls = 0
+            ContactSynthesisStore(contact_root / "synthesis").synthesize(
+                (),
+                binding=binding,
+                provider=provider,
+                authority_ref=self.CONTACT_AUTHORITY_REF,
+                absolute_cap=7,
+            )
+            digest_service.return_value.run.return_value = WechatDigestResult(
+                run_id="run_" + "8" * 32,
+                new_messages=0,
+                new_attachments=0,
+                durable_information=0,
+                local_only=0,
+                unsupported=0,
+                pending_human=0,
+                context_objects=0,
+                checkpoint_published=True,
+                replayed=True,
+            )
+            build_pack.return_value = (
+                workspace / "result.json",
+                workspace / "result.md",
+            )
+            with redirect_stdout(StringIO()):
+                result = main(
+                    [
+                        "wechat",
+                        "digest",
+                        "--contact",
+                        binding.display_name,
+                    ]
+                )
+            self.assertEqual(result, 0)
+            self.assertEqual(
+                build_pack.call_args.kwargs["authority_ref"],
+                self.CONTACT_AUTHORITY_REF,
+            )
+            self.assertEqual(build_pack.call_args.kwargs["absolute_cap"], 7)
+
+            digest_service.reset_mock()
+            with redirect_stdout(StringIO()):
+                drift = main(
+                    [
+                        "wechat",
+                        "digest",
+                        "--contact",
+                        binding.display_name,
+                        "--authority-ref",
+                        (
+                            "https://github.com/leevi2010-cursor/ArcheOS/"
+                            "issues/998#issuecomment-998"
+                        ),
+                    ]
+                )
+            self.assertEqual(drift, 1)
+            digest_service.assert_not_called()
+
+    @patch("archeos.cli.WechatCliCaptureProvider")
+    @patch("archeos.cli.require_workspace")
+    def test_new_wechat_digest_requires_contact_before_connector(
+        self, require_workspace: Mock, capture_provider: Mock
+    ) -> None:
+        output = StringIO()
+        with redirect_stdout(output):
+            result = main(["wechat", "digest", "--since", "2026-08-01"])
+        self.assertEqual(result, 2)
+        self.assertIn("先用 --list-contacts", output.getvalue())
+        require_workspace.assert_not_called()
+        capture_provider.assert_not_called()
+
+    @patch("archeos.cli.WechatDigestService")
+    @patch("archeos.cli.WechatCliCaptureProvider")
+    @patch("archeos.cli.require_workspace")
+    def test_isolated_contact_acceptance_uses_only_private_workspace(
+        self,
+        require_workspace: Mock,
+        capture_provider: Mock,
+        digest_service: Mock,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            primary = root / "primary"
+            isolated = root / "isolated"
+            primary.mkdir()
+            require_workspace.return_value = WorkspaceConfig(
+                primary, root / "config"
+            )
+            binding = WechatContactBinding(
+                "wechat_conversation_" + "3" * 32,
+                "wxid_synthetic_3",
+                "Synthetic Contact 3",
+                False,
+            )
+            capture_provider.return_value.resolve_contact.return_value = binding
+            capture_provider.return_value.scoped.return_value = (
+                capture_provider.return_value
+            )
+            digest_service.return_value.run.return_value = WechatDigestResult(
+                run_id="run_" + "3" * 32,
+                new_messages=1,
+                new_attachments=0,
+                durable_information=1,
+                local_only=0,
+                unsupported=0,
+                pending_human=0,
+                context_objects=0,
+                checkpoint_published=True,
+                replayed=False,
+            )
+            before = tuple(primary.rglob("*"))
+            with patch(
+                "archeos.cli.build_contact_acceptance_pack",
+                return_value=(isolated / "result.json", isolated / "result.md"),
+            ), redirect_stdout(StringIO()):
+                result = main(
+                    [
+                        "wechat",
+                        "digest",
+                        "--contact",
+                        binding.display_name,
+                        "--authority-ref",
+                        self.CONTACT_AUTHORITY_REF,
+                        "--since",
+                        "2026-08-01",
+                        "--isolated-acceptance-dir",
+                        str(isolated),
+                    ]
+                )
+            self.assertEqual(result, 0)
+            self.assertEqual(tuple(primary.rglob("*")), before)
+            service_kwargs = digest_service.call_args.kwargs
+            self.assertEqual(service_kwargs["workspace"], isolated.resolve())
+            self.assertEqual(service_kwargs["semantic_parallelism"], 1)
+            self.assertIn(
+                binding.conversation_key,
+                str(service_kwargs["run_store"].root),
+            )
+
     @patch("archeos.cli.WechatDigestService")
     @patch("archeos.cli.WechatCliCaptureProvider")
     @patch("archeos.cli.require_workspace")
@@ -70,9 +320,35 @@ class CliTest(unittest.TestCase):
             checkpoint_wall_ms=2,
             total_wall_ms=47,
         )
+        capture_provider.return_value.resolve_contact.return_value = (
+            WechatContactBinding(
+                "wechat_conversation_" + "1" * 32,
+                "wxid_synthetic",
+                "Synthetic Contact",
+                False,
+            )
+        )
+        capture_provider.return_value.scoped.return_value = (
+            capture_provider.return_value
+        )
         output = StringIO()
-        with redirect_stdout(output):
-            result = main(["wechat", "digest", "--from-now"])
+        with patch(
+            "archeos.cli.WechatContactSelectionStore.bind"
+        ), patch(
+            "archeos.cli.build_contact_acceptance_pack",
+            return_value=(Path("/private/result.json"), Path("/private/result.md")),
+        ), redirect_stdout(output):
+            result = main(
+                [
+                    "wechat",
+                    "digest",
+                    "--contact",
+                    "Synthetic Contact",
+                    "--authority-ref",
+                    self.CONTACT_AUTHORITY_REF,
+                    "--from-now",
+                ]
+            )
         self.assertEqual(result, 0)
         self.assertIn("新增消息：3", output.getvalue())
         self.assertIn("待你判断：1", output.getvalue())
@@ -112,7 +388,7 @@ class CliTest(unittest.TestCase):
             since=None,
             from_now=True,
             all_history=False,
-            max_terminal_items=3,
+            max_terminal_items=None,
         )
         capture_provider.assert_called_once()
 
@@ -145,10 +421,35 @@ class CliTest(unittest.TestCase):
             segment_stop_reason="item_limit",
             segment_receipt_fingerprint="sha256:" + "c" * 64,
         )
+        _capture_provider.return_value.resolve_contact.return_value = (
+            WechatContactBinding(
+                "wechat_conversation_" + "2" * 32,
+                "wxid_synthetic_2",
+                "Synthetic Contact 2",
+                False,
+            )
+        )
+        _capture_provider.return_value.scoped.return_value = (
+            _capture_provider.return_value
+        )
         output = StringIO()
-        with redirect_stdout(output):
+        with patch(
+            "archeos.cli.WechatContactSelectionStore.bind"
+        ), patch(
+            "archeos.cli.build_contact_acceptance_pack",
+            return_value=(Path("/private/result.json"), Path("/private/result.md")),
+        ), redirect_stdout(output):
             result = main(
-                ["wechat", "digest", "--max-items-per-run", "1"]
+                [
+                    "wechat",
+                    "digest",
+                    "--contact",
+                    "Synthetic Contact 2",
+                    "--authority-ref",
+                    self.CONTACT_AUTHORITY_REF,
+                    "--max-items-per-run",
+                    "1",
+                ]
             )
         self.assertEqual(result, 0)
         self.assertIn("本段已安全完成：1 项；当前窗口剩余 3 项。", output.getvalue())

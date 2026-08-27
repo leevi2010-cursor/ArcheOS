@@ -186,6 +186,34 @@ def _sessions(
     )
 
 
+def _discover_contacts(request: dict[str, object]) -> dict[str, object]:
+    """Return session metadata only; message tables and attachment paths stay closed."""
+
+    from wechat_cli.core.contacts import get_contact_names
+    from wechat_cli.core.context import AppContext
+
+    if set(request) != {"operation", "config_path"}:
+        raise ValueError("contact discovery request is invalid")
+    config_path = request["config_path"]
+    if config_path is not None and not isinstance(config_path, str):
+        raise ValueError("config_path is invalid")
+    app = AppContext(config_path)
+    names = get_contact_names(app.cache, app.decrypted_dir)
+    contacts = [
+        {
+            "conversation_key": _digest("wechat_conversation", username),
+            "provider_conversation_id": username,
+            "display_name": display_name,
+            "is_group": is_group,
+        }
+        for username, display_name, is_group in _sessions(app, names)
+    ]
+    return {
+        "schema_version": "wechat-cli-contact-discovery/1.0",
+        "contacts": contacts,
+    }
+
+
 def _message_table_locations(
     app: object,
 ) -> dict[str, tuple[tuple[str, str], ...]]:
@@ -462,7 +490,7 @@ def _capture(request: dict[str, object]) -> dict[str, object]:
         decompress_content,
     )
 
-    if set(request) != {
+    legacy_fields = {
         "config_path",
         "after_cursor",
         "upper_bound",
@@ -470,6 +498,10 @@ def _capture(request: dict[str, object]) -> dict[str, object]:
         "observe_only",
         "window_days",
         "window_message_limit",
+    }
+    request_fields = set(request)
+    if request_fields != legacy_fields and request_fields != legacy_fields | {
+        "contact_scope"
     }:
         raise ValueError("capture request is invalid")
     config_path = request["config_path"]
@@ -509,6 +541,40 @@ def _capture(request: dict[str, object]) -> dict[str, object]:
     app = AppContext(config_path)
     names = get_contact_names(app.cache, app.decrypted_dir)
     sessions = _sessions(app, names)
+    contact_scope = request.get("contact_scope")
+    if contact_scope is not None:
+        expected_scope_fields = {
+            "conversation_key",
+            "provider_conversation_id",
+            "display_name",
+            "is_group",
+        }
+        if (
+            not isinstance(contact_scope, dict)
+            or set(contact_scope) != expected_scope_fields
+            or any(
+                not isinstance(contact_scope[field], str)
+                or not str(contact_scope[field]).strip()
+                for field in (
+                    "conversation_key",
+                    "provider_conversation_id",
+                    "display_name",
+                )
+            )
+            or not isinstance(contact_scope["is_group"], bool)
+        ):
+            raise ValueError("contact_scope is invalid")
+        matching = tuple(
+            session
+            for session in sessions
+            if session[0] == contact_scope["provider_conversation_id"]
+            and _digest("wechat_conversation", session[0])
+            == contact_scope["conversation_key"]
+            and session[2] is contact_scope["is_group"]
+        )
+        if len(matching) != 1:
+            raise RuntimeError("selected contact identity drifted")
+        sessions = matching
     table_locations = _message_table_locations(app)
     located_tables = _located_session_tables(sessions, table_locations)
     cursor_query_upper = fixed_upper or all_history_upper
@@ -721,7 +787,11 @@ def main() -> int:
         if not isinstance(request, dict):
             raise TypeError("capture request is invalid")
         with redirect_stdout(StringIO()):
-            result = _capture(request)
+            result = (
+                _discover_contacts(request)
+                if request.get("operation") == "discover_contacts"
+                else _capture(request)
+            )
     except Exception as exc:  # noqa: BLE001 - provider boundary must fail closed.
         print(f"capture_failed:{exc.__class__.__name__}", file=sys.stderr)
         return 1

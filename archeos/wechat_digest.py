@@ -144,6 +144,7 @@ CAPTURE_INDEX_SCHEMA_VERSION = "wechat-digest-capture-index/1.0"
 CAPTURE_SUMMARY_SCHEMA_VERSION = "wechat-digest-capture-summary/1.0"
 CAPTURE_RECEIPT_SCHEMA_VERSION = "wechat-digest-capture-receipt/1.0"
 CAPTURE_PENDING_SCHEMA_VERSION = "wechat-digest-capture-pending/1.0"
+CONTACT_DISCOVERY_SCHEMA_VERSION = "wechat-cli-contact-discovery/1.0"
 
 
 GOVERNANCE_METRIC_COUNTERS = (
@@ -243,6 +244,33 @@ class WechatCapture:
     after_cursor: WechatCursor
     upper_bound: WechatCursor
     messages: tuple[CapturedMessage, ...]
+
+
+@dataclass(frozen=True)
+class WechatContactBinding:
+    """Private Processing binding; it is not a Person Object identity."""
+
+    conversation_key: str
+    provider_conversation_id: str
+    display_name: str
+    is_group: bool
+
+    def __post_init__(self) -> None:
+        if (
+            re.fullmatch(
+                r"wechat_conversation_[0-9a-f]{32}", self.conversation_key
+            )
+            is None
+            or not isinstance(self.provider_conversation_id, str)
+            or not self.provider_conversation_id.strip()
+            or not isinstance(self.display_name, str)
+            or not self.display_name.strip()
+            or not isinstance(self.is_group, bool)
+        ):
+            raise ValueError("WeChat contact binding is invalid")
+
+    def to_dict(self) -> dict[str, object]:
+        return asdict(self)
 
 
 class WechatCaptureProvider(Protocol):
@@ -584,6 +612,7 @@ class WechatCliCaptureProvider:
         timeout_seconds: float = 300.0,
         window_days: int = DEFAULT_CAPTURE_WINDOW_DAYS,
         window_message_limit: int = DEFAULT_CAPTURE_WINDOW_MESSAGES,
+        contact_binding: WechatContactBinding | None = None,
         runner: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
     ) -> None:
         if not wechat_cli_binary.strip():
@@ -607,6 +636,7 @@ class WechatCliCaptureProvider:
         self.timeout_seconds = float(timeout_seconds)
         self.window_days = window_days
         self.window_message_limit = window_message_limit
+        self.contact_binding = contact_binding
         self.runner = runner
         self._executable = self._resolve_executable(wechat_cli_binary)
         self._python = self._resolve_python(self._executable)
@@ -663,6 +693,116 @@ class WechatCliCaptureProvider:
             raise WechatDigestError("无法验证微信只读连接器版本。")
         return match.group(1)
 
+    def _helper_request(self, request: Mapping[str, object]) -> object:
+        helper = Path(__file__).with_name("wechat_capture_helper.py")
+        try:
+            result = self.runner(
+                [str(self._python), str(helper)],
+                input=_canonical_json(request),
+                capture_output=True,
+                text=True,
+                timeout=self.timeout_seconds,
+                check=False,
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise WechatDigestError("微信只读连接器调用失败；未读取消息。") from exc
+        if result.returncode != 0:
+            raise WechatDigestError("微信只读连接器调用失败；未读取消息。")
+        try:
+            return json.loads(result.stdout)
+        except json.JSONDecodeError as exc:
+            raise WechatDigestError("微信只读连接器结果不完整；未读取消息。") from exc
+
+    def discover_contacts(self) -> tuple[WechatContactBinding, ...]:
+        payload = self._helper_request(
+            {
+                "operation": "discover_contacts",
+                "config_path": (
+                    None if self.config_path is None else str(self.config_path)
+                ),
+            }
+        )
+        if (
+            not isinstance(payload, dict)
+            or set(payload) != {"schema_version", "contacts"}
+            or payload.get("schema_version") != CONTACT_DISCOVERY_SCHEMA_VERSION
+            or not isinstance(payload.get("contacts"), list)
+        ):
+            raise WechatDigestError("联系人目录不可验证；未读取消息。")
+        contacts: list[WechatContactBinding] = []
+        for value in payload["contacts"]:
+            if (
+                not isinstance(value, dict)
+                or set(value)
+                != {
+                    "conversation_key",
+                    "provider_conversation_id",
+                    "display_name",
+                    "is_group",
+                }
+                or any(
+                    not isinstance(value[field], str) or not value[field].strip()
+                    for field in (
+                        "conversation_key",
+                        "provider_conversation_id",
+                        "display_name",
+                    )
+                )
+                or not isinstance(value["is_group"], bool)
+                or re.fullmatch(
+                    r"wechat_conversation_[0-9a-f]{32}",
+                    str(value["conversation_key"]),
+                )
+                is None
+            ):
+                raise WechatDigestError("联系人目录不可验证；未读取消息。")
+            contacts.append(
+                WechatContactBinding(
+                    conversation_key=str(value["conversation_key"]),
+                    provider_conversation_id=str(
+                        value["provider_conversation_id"]
+                    ),
+                    display_name=str(value["display_name"]),
+                    is_group=bool(value["is_group"]),
+                )
+            )
+        if len({item.conversation_key for item in contacts}) != len(contacts):
+            raise WechatDigestError("联系人目录存在重复身份；未读取消息。")
+        return tuple(contacts)
+
+    def resolve_contact(self, selection: str) -> WechatContactBinding:
+        if not isinstance(selection, str) or not selection.strip():
+            raise WechatDigestError("请先选择一个微信联系人。")
+        candidates = tuple(
+            item
+            for item in self.discover_contacts()
+            if item.display_name == selection or item.conversation_key == selection
+        )
+        if not candidates:
+            raise WechatDigestError(
+                f"没有找到名为“{selection}”的唯一微信联系人。"
+            )
+        if len(candidates) != 1:
+            details = "、".join(
+                f"{item.display_name}（{item.conversation_key[-8:]}）"
+                for item in candidates
+            )
+            raise WechatDigestError(
+                f"联系人“{selection}”有多个匹配：{details}。请使用候选编号重新选择。"
+            )
+        return candidates[0]
+
+    def scoped(self, binding: WechatContactBinding) -> WechatCliCaptureProvider:
+        return WechatCliCaptureProvider(
+            wechat_cli_binary=str(self._executable),
+            config_path=self.config_path,
+            timeout_seconds=self.timeout_seconds,
+            window_days=self.window_days,
+            window_message_limit=self.window_message_limit,
+            contact_binding=binding,
+            runner=self.runner,
+        )
+
     def capture(
         self,
         after_cursor: WechatCursor,
@@ -686,25 +826,13 @@ class WechatCliCaptureProvider:
             "window_days": self.window_days,
             "window_message_limit": self.window_message_limit,
         }
-        helper = Path(__file__).with_name("wechat_capture_helper.py")
+        if self.contact_binding is not None:
+            request["contact_scope"] = self.contact_binding.to_dict()
         self.capture_attempts += 1
         try:
-            result = self.runner(
-                [str(self._python), str(helper)],
-                input=_canonical_json(request),
-                capture_output=True,
-                text=True,
-                timeout=self.timeout_seconds,
-                check=False,
-            )
-        except (OSError, subprocess.SubprocessError) as exc:
-            raise WechatDigestError("微信只读捕获失败；未推进 checkpoint。") from exc
-        if result.returncode != 0:
-            raise WechatDigestError("微信只读捕获失败；未推进 checkpoint。")
-        try:
-            payload = json.loads(result.stdout)
+            payload = self._helper_request(request)
             capture = self._parse_capture(payload, after_cursor)
-        except (json.JSONDecodeError, TypeError, ValueError) as exc:
+        except (TypeError, ValueError) as exc:
             raise WechatDigestError("微信只读捕获结果不完整；未推进 checkpoint。") from exc
         if upper_bound is not None and capture.upper_bound != upper_bound:
             raise WechatDigestError("微信重放范围发生变化；未推进 checkpoint。")
@@ -715,6 +843,14 @@ class WechatCliCaptureProvider:
             raise WechatDigestError("微信全历史边界发生漂移；未推进 checkpoint。")
         if observe_only and capture.messages:
             raise WechatDigestError("微信只读边界观察返回了消息内容；未推进 checkpoint。")
+        if self.contact_binding is not None and any(
+            message.conversation_key != self.contact_binding.conversation_key
+            or message.provider_conversation_id
+            != self.contact_binding.provider_conversation_id
+            or message.is_group is not self.contact_binding.is_group
+            for message in capture.messages
+        ):
+            raise WechatDigestError("联系人身份发生变化；未读取或保存其他会话。")
         self.capture_successes += 1
         return capture
 
@@ -4408,6 +4544,9 @@ class WechatDigestService:
         self._segment_performance: dict[str, int] = {}
         self._capture_reasons: list[str] = []
         self._committed_result_wave: dict[str, dict[str, object]] = {}
+        self._semantic_provider_receipts: dict[
+            str, tuple[dict[str, object], ...]
+        ] = {}
         self._completed_window_chain_cache: tuple[
             tuple[object, ...], tuple[SemanticCompletedWindowBinding, ...]
         ] | None = None
@@ -12372,12 +12511,18 @@ class WechatDigestService:
         ):
             return representation.representation_id
         commit_started = time.monotonic()
-        atomic_ids = self._semantic(run_id, representation.representation_id, privacy)
+        atomic_ids = self._semantic(
+            run_id, representation.representation_id, privacy
+        )
+        semantic_provider_receipts = self._semantic_provider_receipts.get(
+            representation.representation_id, ()
+        )
         self._update_item(
             run_id,
             status,
             item_id,
             atomic_information_ids=list(atomic_ids),
+            semantic_provider_receipts=list(semantic_provider_receipts),
         )
         self._segment_performance["commit_wall_ms"] = self._segment_performance.get(
             "commit_wall_ms", 0
@@ -12479,11 +12624,15 @@ class WechatDigestService:
             privacy,
             recover_committed_result=recover_committed_result,
         )
+        semantic_provider_receipts = self._semantic_provider_receipts.get(
+            representation.representation_id, ()
+        )
         self._update_item(
             run_id,
             status,
             item_id,
             atomic_information_ids=list(atomic_ids),
+            semantic_provider_receipts=list(semantic_provider_receipts),
         )
         self._segment_performance["commit_wall_ms"] = self._segment_performance.get(
             "commit_wall_ms", 0
@@ -12550,6 +12699,49 @@ class WechatDigestService:
         atomic_ids = tuple(result.ingestion.atomic_information_ids)
         for atomic_id in atomic_ids:
             self.information_store.get_current(atomic_id)
+        representation = self.representation_repository.get(representation_id)
+        audit_root = self.workspace / "02_processing" / "semantic_handoff_runs"
+        receipt_bindings: list[dict[str, object]] = []
+        seen_processing_runs: set[str] = set()
+        for audit_path_value in getattr(result, "audit_paths", ()):
+            audit_path = Path(audit_path_value)
+            try:
+                relative_path = audit_path.relative_to(self.workspace)
+            except ValueError as exc:
+                raise WechatDigestError(
+                    "Semantic audit 不属于当前 Workspace。"
+                ) from exc
+            if (
+                audit_path.parent.parent != audit_root
+                or audit_path.name != "processing-run-audit.json"
+            ):
+                raise WechatDigestError("Semantic audit 路径绑定无效。")
+            audit, raw_fingerprint = _read_private_json_manifest(audit_path)
+            processing_run_id = audit.get("processing_run_id")
+            if (
+                not isinstance(processing_run_id, str)
+                or processing_run_id != audit_path.parent.name
+                or processing_run_id in seen_processing_runs
+                or audit.get("schema_version") != "processing-run-audit/1.0"
+                or audit.get("provider_route") != "codex-cli"
+            ):
+                raise WechatDigestError("Semantic audit identity 无效或重复。")
+            receipt_bindings.append(
+                {
+                    "source_id": representation.source_id,
+                    "representation_id": representation_id,
+                    "processing_run_id": processing_run_id,
+                    "audit_relative_path": str(relative_path),
+                    "audit_fingerprint": raw_fingerprint,
+                    "input_fingerprint": audit.get("input_fingerprint"),
+                    "result_fingerprint": audit.get("result_fingerprint"),
+                    "package_fingerprint": audit.get("package_fingerprint"),
+                }
+            )
+            seen_processing_runs.add(processing_run_id)
+        self._semantic_provider_receipts[representation_id] = tuple(
+            receipt_bindings
+        )
         return atomic_ids
 
     def _semantic_privacy_binding(

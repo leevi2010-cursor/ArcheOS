@@ -87,6 +87,26 @@ Conversation 也遵循相同原则：Conversation 是一种 Representation / Pro
 
 Conversation connector 对一个冻结窗口只执行一次 full capture。完整 capture、conversation index 与匿名 summary 作为私有 Processing Derived Artifact 持久化，并由 receipt-last 的运行计划绑定；分段恢复和历史验证只读 durable snapshot。不同完整 Conversation / Representation 可以进行 1–4 路（默认 2）result-only 语义分析，但同一会话的有序 Analysis Units 不跨 lane 拆分，并在一次有界模型调用中完整理解。详见 [ADR-006](../decisions/ADR-006-durable-capture-and-bounded-semantic-parallelism.md)。
 
+微信日常入口在 connector 边界进一步收窄为一个已唯一绑定的联系人会话：
+
+```text
+contact metadata discovery（不读正文）
+  → display name 唯一解析 + stable conversation technical key receipt
+  → target-only frozen capture + attachment binding
+  → Conversation Representation
+  → semantic parallelism = 1 / ordered contact context continuation
+  → serial Information + Identity + Governance + World Model apply
+  → contact-level Event / Timeline / current-state View
+```
+
+联系人 selection receipt、独立 plan/checkpoint、context continuation 与 acceptance pack 都是 Processing / Derived Artifact / View，不是 Contact、Conversation、Message Core，也不形成第二套 Source 或 Information truth。恢复绑定已保存的 provider identity 与 technical key；展示名称作为可变历史留痕，同名联系人以不同 technical key 分别隔离。technical key 或 provider identity 漂移才在正文、Provider 和长期写入前拒绝。
+
+contact context continuation 以有序 Atomic Information prefix 为 cursor：每个有界 segment 的 request 绑定前一完整 synthesis、下一段 Evidence、稳定联系人身份和 Provider profile；调用前先持久化 reservation 与 started marker，结构化 Event synthesis 再按 result、receipt、cursor 的顺序落盘。reserved 且未 started 可以安全启动一次；started 且没有可验证 result 时以 outcome unknown 零 Provider 拒绝；result 或 receipt 已持久化时零 Provider 收敛。联系人私有调用 authority 同时绑定真实批准来源、absolute cap，以及 Semantic、Governance、contact synthesis 的分类和总调用计数；首次可能调用 Provider 时不得使用实现 Issue 或默认字符串代替该批准。Semantic 用量只沿当前联系人 durable plan/item 精确绑定的 Source、Representation 与 Processing Run receipt 读回，不盘点 Workspace 内的其他 audit；绑定缺失、重复或漂移时在新 synthesis Provider 前拒绝。acceptance pack 只把 durable synthesis 投影为 Event、Timeline、current state、Evidence、冲突和未知，不在 View 层重新分组消息。
+
+normal contact run 会把 legacy 全局 provenance 分成 terminal 与 nonterminal：terminal message keys 可安全过滤；任一捕获消息与 nonterminal legacy item 重叠时，在新 contact Source 写入前 fail closed。isolated acceptance 不使用该过滤，因为其完整运行边界不写 primary Workspace。
+
+隔离验收使用独立私有 Workspace 复用同一 Source → Representation → Information → World Model 链，只在该 Workspace 产生 Derived Artifact；主 Workspace 与所有 primary checkpoint 保持只读不变。
+
 ---
 
 ## 3. Information Layer

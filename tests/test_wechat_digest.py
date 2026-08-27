@@ -10586,6 +10586,45 @@ class WechatDigestTests(unittest.TestCase):
             service.run(from_now=True)
         self.assertEqual(capture.calls, [])
 
+    def test_contact_scoped_isolated_run_keeps_primary_workspace_exact(self) -> None:
+        primary = Path(self.temporary.name) / "primary-workspace"
+        primary.mkdir()
+        sentinel = primary / "state.json"
+        sentinel.write_text('{"unchanged":true}\n', encoding="utf-8")
+        before = {
+            str(path.relative_to(primary)): path.read_bytes()
+            for path in primary.rglob("*")
+            if path.is_file()
+        }
+        contact_key = message(1).conversation_key
+        run_store = WechatDigestRunStore(
+            self.workspace
+            / "02_processing"
+            / "wechat_digest"
+            / "contacts"
+            / contact_key
+        )
+        service = self.service(
+            SyntheticCaptureProvider([message(1)]), run_store=run_store
+        )
+        result = service.run(all_history=True)
+        after = {
+            str(path.relative_to(primary)): path.read_bytes()
+            for path in primary.rglob("*")
+            if path.is_file()
+        }
+        self.assertTrue(result.checkpoint_published)
+        self.assertEqual(after, before)
+        self.assertTrue(run_store.checkpoint_path.exists())
+        self.assertFalse(
+            (
+                self.workspace
+                / "02_processing"
+                / "wechat_digest"
+                / "checkpoint.json"
+            ).exists()
+        )
+
 
 class WechatCaptureHelperTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -10847,6 +10886,90 @@ class WechatCaptureHelperTests(unittest.TestCase):
         self.assertEqual([row[3] for row in unbounded], [100, 200, 200, 200, 300])
         self.assertNotIn("create_time <= ?", statements[0][0])
         self.assertEqual(statements[0][1], (99,))
+
+    def test_contact_discovery_reads_session_metadata_without_message_tables(self) -> None:
+        with self.capture_runtime(), patch.object(
+            wechat_capture_helper,
+            "_message_table_locations",
+            side_effect=AssertionError("discovery must not open message tables"),
+        ):
+            result = wechat_capture_helper._discover_contacts(
+                {"operation": "discover_contacts", "config_path": None}
+            )
+        self.assertEqual(result["schema_version"], "wechat-cli-contact-discovery/1.0")
+        self.assertEqual(len(result["contacts"]), 1)
+        self.assertEqual(
+            result["contacts"][0]["conversation_key"], self.cursors[1][1]
+        )
+
+    def test_contact_scope_is_invariant_with_500_unrelated_sessions(self) -> None:
+        request = self.request()
+        request["contact_scope"] = {
+            "conversation_key": self.cursors[1][1],
+            "provider_conversation_id": self.username,
+            "display_name": "Synthetic Conversation",
+            "is_group": False,
+        }
+        with self.capture_runtime():
+            baseline = capture_with_wechat_cli(request)
+        unrelated = tuple(
+            (f"wxid_unrelated_{index}", f"Unrelated {index}", False)
+            for index in range(500)
+        )
+        with self.capture_runtime(
+            ((self.username, "Synthetic Conversation", False), *unrelated)
+        ), patch.object(
+            wechat_capture_helper,
+            "_all_message_rows",
+            wraps=wechat_capture_helper._all_message_rows,
+        ) as body_query:
+            expanded = capture_with_wechat_cli(request)
+        self.assertEqual(expanded["observed_upper"], baseline["observed_upper"])
+        self.assertEqual(expanded["messages"], baseline["messages"])
+        located = body_query.call_args.args[0]
+        self.assertTrue(located)
+        self.assertTrue(
+            all(
+                table[1] == self.username
+                for tables in located.values()
+                for table in tables
+            )
+        )
+
+    def test_contact_display_name_change_keeps_stable_identity_scope(self) -> None:
+        request = self.request()
+        request["contact_scope"] = {
+            "conversation_key": self.cursors[1][1],
+            "provider_conversation_id": self.username,
+            "display_name": "Old Name",
+            "is_group": False,
+        }
+        with self.capture_runtime():
+            result = capture_with_wechat_cli(request)
+        self.assertTrue(result["messages"])
+        self.assertTrue(
+            all(
+                item["provider_conversation_id"] == self.username
+                and item["conversation_label"] == "Synthetic Conversation"
+                for item in result["messages"]
+            )
+        )
+
+    def test_contact_provider_identity_drift_stops_before_message_body_query(self) -> None:
+        request = self.request()
+        request["contact_scope"] = {
+            "conversation_key": self.cursors[1][1],
+            "provider_conversation_id": "wxid_other",
+            "display_name": "Synthetic Conversation",
+            "is_group": False,
+        }
+        with self.capture_runtime(), patch.object(
+            wechat_capture_helper,
+            "_all_message_rows",
+            side_effect=AssertionError("body query must remain closed"),
+        ) as body_query, self.assertRaisesRegex(RuntimeError, "identity drifted"):
+            capture_with_wechat_cli(request)
+        body_query.assert_not_called()
 
     def test_fixed_upper_is_sql_bounded_and_byte_equivalent(self) -> None:
         same_second = sorted(
