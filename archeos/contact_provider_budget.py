@@ -159,6 +159,46 @@ class ContactProviderBudget:
     def before_call(self, category: str) -> ContactProviderAttempt:
         return self.reserve(category)
 
+    def reconcile_result(self, category: str, request_binding: dict[str, object]) -> None:
+        """Close only an exact started attempt after its native result was read back."""
+        with self.lock_path.open("a+") as handle:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            try:
+                current = _read(self.path)
+                attempts = self._validated(current)
+                matches = [
+                    item for item in attempts
+                    if item["category"] == category
+                    and item["request_binding"] == request_binding
+                ]
+                if len(matches) != 1:
+                    raise WechatDigestError("联系人统一 Provider result binding 不可验证。")
+                attempt = matches[0]
+                if attempt["state"] == "result":
+                    return
+                if attempt["state"] != "started":
+                    raise WechatDigestError("联系人统一 Provider result 缺少 started attempt。")
+                raw = {
+                    key: value
+                    for key, value in attempt.items()
+                    if key != "attempt_fingerprint"
+                }
+                raw["state"] = "result"
+                ordinal = int(attempt["ordinal"])
+                attempts[ordinal - 1] = {
+                    **raw,
+                    "attempt_fingerprint": _fingerprint(raw),
+                }
+                payload = {
+                    key: value
+                    for key, value in current.items()
+                    if key != "usage_fingerprint"
+                }
+                payload["attempts"] = attempts
+                _write(self.path, {**payload, "usage_fingerprint": _fingerprint(payload)})
+            finally:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
     def _transition(self, ordinal: int, expected: str, target: str) -> None:
         with self.lock_path.open("a+") as handle:
             fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
