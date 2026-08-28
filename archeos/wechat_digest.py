@@ -4468,18 +4468,18 @@ class _GovernanceProviderCallBoundary:
     def __init__(
         self,
         delegate: AtomicInformationInterpretationProvider,
-        before_call: Callable[[], None],
+        before_call: Callable[[dict[str, object]], None],
     ) -> None:
         self.delegate = delegate
         self.before_call = before_call
         self.name = delegate.name
 
     def interpret(self, atomic_information, current_world_state):
-        self.before_call()
+        self.before_call({"atomic_information_ids": [atomic_information.atomic_information_id]})
         return self.delegate.interpret(atomic_information, current_world_state)
 
     def interpret_batch(self, items):
-        self.before_call()
+        self.before_call({"atomic_information_ids": [item[0].atomic_information_id for item in items]})
         method = getattr(self.delegate, "interpret_batch", None)
         if not callable(method):
             if len(items) == 1:
@@ -13230,12 +13230,19 @@ class WechatDigestService:
             None if existing_receipt is None else dict(existing_receipt)
         )
 
-        def mark_provider_started() -> None:
+        def mark_provider_started(request: dict[str, object]) -> None:
             nonlocal provider_started, provider_completion
             if provider_started:
                 return
             if previous_provider_hook is not None:
-                completion = previous_provider_hook()
+                completion = previous_provider_hook(
+                    {
+                        "run_id": run_id,
+                        "item_id": item_id,
+                        "atomic_information_fingerprint": atomic_fingerprint,
+                        **request,
+                    }
+                )
                 if hasattr(completion, "mark_started"):
                     completion.mark_started()
                 if callable(completion):
@@ -13295,7 +13302,7 @@ class WechatDigestService:
             object_ids: tuple[str, ...],
             baseline_effect_snapshots: tuple[dict[str, object], ...],
         ) -> None:
-            nonlocal batch_persisted, latest_batch_receipt
+            nonlocal batch_persisted, latest_batch_receipt, provider_completion
             baseline_effect_fingerprints = (
                 self._governance_snapshot_fingerprints(
                     baseline_effect_snapshots
@@ -13337,6 +13344,9 @@ class WechatDigestService:
                 governance_receipt=latest_batch_receipt,
             )
             batch_persisted = True
+            if provider_completion is not None:
+                provider_completion()
+                provider_completion = None
 
         def persist_application_intent(index: int) -> None:
             nonlocal latest_batch_receipt
@@ -13440,8 +13450,6 @@ class WechatDigestService:
         self._after_governance_application = persist_application_progress
         try:
             outcome = self._govern(atomic_ids)
-            if provider_completion is not None:
-                provider_completion()
             return outcome
         except BaseException as exc:
             failure = exc
