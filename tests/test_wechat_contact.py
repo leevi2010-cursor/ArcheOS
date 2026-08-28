@@ -947,6 +947,26 @@ class ContactProviderBudgetTests(unittest.TestCase):
             with self.assertRaisesRegex(WechatDigestError, "结果未知"):
                 budget.before_call("governance")
 
+    def test_reserved_attempt_is_idempotent_but_binding_drift_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = self._root(directory)
+            budget = ContactProviderBudget(
+                root, binding=_binding(), authority_ref=self.AUTHORITY_REF, absolute_cap=2
+            )
+            first = budget.reserve("semantic", {"request_fingerprint": "sha256:a"})
+            resumed = budget.reserve("semantic", {"request_fingerprint": "sha256:a"})
+            self.assertEqual(first.ordinal, resumed.ordinal)
+            with self.assertRaisesRegex(WechatDigestError, "reservation"):
+                budget.reserve("semantic", {"request_fingerprint": "sha256:b"})
+            first.mark_started()
+            first.complete()
+            usage_path = root / "unified-provider-usage.json"
+            usage = json.loads(usage_path.read_text())
+            usage["absolute_cap"] = 99
+            usage_path.write_text(json.dumps(usage), encoding="utf-8")
+            with self.assertRaisesRegex(WechatDigestError, "漂移"):
+                budget.before_call("governance")
+
 
 class ContactResolutionTests(unittest.TestCase):
     def test_exact_name_or_technical_key_must_resolve_uniquely(self) -> None:
