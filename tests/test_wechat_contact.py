@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-import json
 import hashlib
+import json
 import os
 import tempfile
 import unittest
@@ -13,11 +13,12 @@ from archeos.atomic_information import (
     EvidenceRecord,
     JsonlAtomicInformationStore,
 )
+from archeos.contact_provider_budget import ContactProviderBudget
 from archeos.wechat_contact import (
-    _contact_semantic_provider_calls,
     LegacyMessageOverlap,
     OverlapFilteringWechatCaptureProvider,
     WechatContactSelectionStore,
+    _contact_semantic_provider_calls,
     build_contact_acceptance_pack,
     committed_legacy_message_keys,
     legacy_message_overlap,
@@ -699,13 +700,35 @@ class ContactAcceptancePackTests(unittest.TestCase):
             self._revision(2, concern="项目甲", statement="确认项目甲报价"),
         )
         with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            run = root / "runs" / "run_test"
+            run.mkdir(parents=True)
+            (root / "active.json").write_text('{"active_run_id":"run_test"}')
+            (run / "plan.json").write_text(
+                json.dumps(
+                    {
+                        "capture_fingerprint": "sha256:test-capture",
+                        "upper_bound": {"timestamp": 1, "message_id": "1"},
+                        "conversations": [
+                            {"conversation_key": _binding().conversation_key}
+                        ],
+                    }
+                )
+            )
+            (run / "run-plan-receipt.json").write_text('{"plan":"test"}')
+            budget = ContactProviderBudget(
+                root / "synthesis",
+                binding=_binding(),
+                authority_ref=self.AUTHORITY_REF,
+                absolute_cap=1,
+            )
             interrupted_provider = self.SynthesisProvider()
 
             def interrupt() -> None:
                 raise RuntimeError("synthetic interruption")
 
             interrupted = ContactSynthesisStore(
-                Path(directory), segment_size=2, after_result_write=interrupt
+                root / "synthesis", segment_size=2, after_result_write=interrupt
             )
             with self.assertRaisesRegex(RuntimeError, "synthetic interruption"):
                 interrupted.synthesize(
@@ -713,22 +736,38 @@ class ContactAcceptancePackTests(unittest.TestCase):
                     binding=_binding(),
                     provider=interrupted_provider,
                     authority_ref=self.AUTHORITY_REF,
-                    absolute_cap=50,
+                    absolute_cap=1,
+                    before_provider_call=lambda request: budget.reserve(
+                        "contact_synthesis", request
+                    ),
+                    reconcile_provider_result=lambda request: budget.reconcile_result(
+                        "contact_synthesis", request
+                    ),
                 )
             self.assertEqual(interrupted_provider.provider_calls, 1)
             recovery_provider = self.SynthesisProvider()
             recovered = ContactSynthesisStore(
-                Path(directory), segment_size=2
+                root / "synthesis", segment_size=2
             ).synthesize(
                 revisions,
                 binding=_binding(name="新名称"),
                 provider=recovery_provider,
                 authority_ref=self.AUTHORITY_REF,
-                absolute_cap=50,
+                absolute_cap=1,
+                before_provider_call=lambda request: budget.reserve(
+                    "contact_synthesis", request
+                ),
+                reconcile_provider_result=lambda request: budget.reconcile_result(
+                    "contact_synthesis", request
+                ),
             )
             self.assertEqual(recovered.provider_calls, 0)
             self.assertEqual(recovered.resumed_segments, 1)
             self.assertEqual(len(recovered.result["events"]), 1)
+            usage = json.loads(
+                (root / "synthesis" / "unified-provider-usage.json").read_text()
+            )
+            self.assertEqual([item["state"] for item in usage["attempts"]], ["result"])
 
     def test_reserved_attempt_can_start_once_and_reports_unified_budget(self) -> None:
         revisions = (self._revision(1, concern="项目甲", statement="已询价"),)
@@ -882,6 +921,121 @@ class ContactAcceptancePackTests(unittest.TestCase):
                     / "result.json"
                 ).exists()
             )
+
+class ContactProviderBudgetTests(unittest.TestCase):
+    AUTHORITY_REF = (
+        "https://github.com/leevi2010-cursor/ArcheOS/issues/206"
+        "#issuecomment-1"
+    )
+
+    def _root(self, directory: str) -> Path:
+        root = Path(directory) / "contact" / "synthesis"
+        run = root.parent / "runs" / "run_test"
+        run.mkdir(parents=True)
+        (root.parent / "active.json").write_text('{"active_run_id":"run_test"}')
+        plan = {
+            "contact_binding": {
+                "conversation_key": _binding().conversation_key,
+                "provider_conversation_id": _binding().provider_conversation_id,
+                "is_group": _binding().is_group,
+            },
+            "capture_fingerprint": "sha256:test-capture",
+            "upper_bound": {"timestamp": 1, "message_id": "1"},
+            "conversations": [{"conversation_key": _binding().conversation_key}],
+        }
+        (run / "plan.json").write_text(json.dumps(plan))
+        (run / "run-plan-receipt.json").write_text(json.dumps({"plan": "test"}))
+        return root
+
+    def test_shared_cap_is_durable_and_fails_closed_before_next_call(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = self._root(directory)
+            budget = ContactProviderBudget(
+                root,
+                binding=_binding(),
+                authority_ref=self.AUTHORITY_REF,
+                absolute_cap=3,
+            )
+            semantic_done = budget.before_call("semantic")
+            semantic_done.mark_started()
+            semantic_done()
+            governance_done = budget.before_call("governance")
+            governance_done.mark_started()
+            governance_done()
+            synthesis_done = budget.before_call("contact_synthesis")
+            synthesis_done.mark_started()
+            synthesis_done()
+            with self.assertRaisesRegex(WechatDigestError, "达到授权上限"):
+                budget.before_call("semantic")
+            authority = ContactSynthesisStore(root).read_provider_authority(
+                _binding()
+            )
+            self.assertIsNotNone(authority)
+            usage = json.loads((root / "unified-provider-usage.json").read_text())
+            self.assertEqual([item["state"] for item in usage["attempts"]], ["result", "result", "result"])
+            self.assertEqual([item["category"] for item in usage["attempts"]], ["semantic", "governance", "contact_synthesis"])
+            self.assertEqual(usage["absolute_cap"], 3)
+
+    def test_started_budget_attempt_is_unknown_and_never_retried(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            budget = ContactProviderBudget(
+                self._root(directory),
+                binding=_binding(),
+                authority_ref=self.AUTHORITY_REF,
+                absolute_cap=2,
+            )
+            attempt = budget.before_call("semantic")
+            attempt.mark_started()
+            with self.assertRaisesRegex(WechatDigestError, "结果未知"):
+                budget.before_call("governance")
+
+    def test_reserved_attempt_is_idempotent_but_binding_drift_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = self._root(directory)
+            budget = ContactProviderBudget(
+                root, binding=_binding(), authority_ref=self.AUTHORITY_REF, absolute_cap=2
+            )
+            first = budget.reserve("semantic", {"request_fingerprint": "sha256:a"})
+            resumed = budget.reserve("semantic", {"request_fingerprint": "sha256:a"})
+            self.assertEqual(first.ordinal, resumed.ordinal)
+            with self.assertRaisesRegex(WechatDigestError, "reservation"):
+                budget.reserve("semantic", {"request_fingerprint": "sha256:b"})
+            first.mark_started()
+            first.complete()
+            usage_path = root / "unified-provider-usage.json"
+            usage = json.loads(usage_path.read_text())
+            usage["absolute_cap"] = 99
+            usage_path.write_text(json.dumps(usage), encoding="utf-8")
+            with self.assertRaisesRegex(WechatDigestError, "漂移"):
+                budget.before_call("governance")
+
+    def test_existing_ledger_recovers_completed_run_after_active_is_cleared(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = self._root(directory)
+            budget = ContactProviderBudget(
+                root,
+                binding=_binding(),
+                authority_ref=self.AUTHORITY_REF,
+                absolute_cap=2,
+            )
+            request = {"segment_ordinal": 1, "request_fingerprint": "sha256:a", "contact_identity": {"conversation_key": _binding().conversation_key, "provider_conversation_id": _binding().provider_conversation_id, "is_group": False}}
+            attempt = budget.reserve("contact_synthesis", request)
+            attempt.mark_started()
+            attempt.complete()
+            contact_root = root.parent
+            run = contact_root / "runs" / "run_test"
+            (run / "status.json").write_text('{"state":"completed"}')
+            (contact_root / "active.json").write_text('{"active_run_id":null}')
+            recovered = ContactProviderBudget(
+                root,
+                binding=_binding(),
+                authority_ref=self.AUTHORITY_REF,
+                absolute_cap=2,
+            )
+            recovered.reconcile_result("contact_synthesis", request)
+            (contact_root / "active.json").write_text('{"active_run_id":"run_other"}')
+            with self.assertRaisesRegex(WechatDigestError, "scope"):
+                recovered.reconcile_result("contact_synthesis", request)
 
 
 class ContactResolutionTests(unittest.TestCase):

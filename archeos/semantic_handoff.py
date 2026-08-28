@@ -12420,6 +12420,8 @@ class _RecoveryAwareProvider:
         required_new_calls: int,
         authority_guard: object | None = None,
         global_grant: Mapping[str, object] | None = None,
+        before_provider_call: Callable[[], None] | None = None,
+        reconcile_provider_result: Callable[[dict[str, object]], None] | None = None,
     ) -> None:
         if recovery.legacy_complete_context_replay:
             raise SemanticHandoffError(
@@ -12432,6 +12434,8 @@ class _RecoveryAwareProvider:
         self.required_new_calls = required_new_calls
         self._authority_guard = authority_guard
         self._global_grant = global_grant
+        self.before_provider_call = before_provider_call
+        self.reconcile_provider_result = reconcile_provider_result
         self.name = provider.name
         self.provider_version = provider.provider_version
         self.model = provider.model
@@ -12575,13 +12579,47 @@ class _RecoveryAwareProvider:
             )
         recovered = loaded[self._ordinal - 1]
         if recovered is not None:
+            if self.reconcile_provider_result is not None:
+                receipt = self.recovery.batch_contracts[self._ordinal - 1]["receipt"]
+                self.reconcile_provider_result({
+                        "processing_run_id": self.recovery.semantic_run_id,
+                        "batch_ordinal": self._ordinal,
+                        "input_fingerprint": receipt["input_fingerprint"],
+                        "anchor_unit_ids": list(receipt["anchor_unit_ids"]),
+                    })
             result, record = recovered
             self.records.append(record)
             return result
         try:
+            request_binding = {
+                "processing_run_id": self.recovery.semantic_run_id,
+                "batch_ordinal": self._ordinal,
+                "input_fingerprint": self.recovery.batch_contracts[
+                    self._ordinal - 1
+                ]["receipt"]["input_fingerprint"],
+                "anchor_unit_ids": [unit.unit_id for unit in batch.anchor_units],
+            }
             if os.path.lexists(self.recovery._attempt_path(self._ordinal)):
+                completion = (
+                    None
+                    if self.before_provider_call is None
+                    else self.before_provider_call(request_binding)
+                )
+                if hasattr(completion, "mark_started"):
+                    completion.mark_started()
                 self.recovery.publish_started(self._ordinal)
-                return self._analyze_reserved(batch)
+                return self._analyze_reserved(batch, completion=completion)
+            if self.global_authority is None:
+                if self.before_provider_call is None:
+                    raise SemanticHandoffError(
+                        "Semantic authority 未绑定；不得启动新 Provider call。"
+                    )
+                completion = self.before_provider_call(request_binding)
+                self.recovery.publish_attempt(self._ordinal)
+                if hasattr(completion, "mark_started"):
+                    completion.mark_started()
+                self.recovery.publish_started(self._ordinal)
+                return self._analyze_reserved(batch, completion=completion)
             self._enter_authority_guard()
             assert (
                 self._global_grant is not None
@@ -12604,6 +12642,8 @@ class _RecoveryAwareProvider:
     def _analyze_reserved(
         self,
         batch: RepresentationAnalysisBatch,
+        *,
+        completion: object | None = None,
     ) -> RepresentationAnalysisResult:
         try:
             self.new_calls += 1
@@ -12632,6 +12672,8 @@ class _RecoveryAwareProvider:
             assert self._loaded_results is not None
             self._loaded_results[self._ordinal - 1] = (loaded_result, record)
             self.records.append(record)
+            if callable(completion):
+                completion()
             if self.new_calls == self.required_new_calls:
                 self._close_authority_guard()
             return loaded_result
@@ -13928,6 +13970,8 @@ class ExternalAgentSemanticHandoffService:
         privacy_binding: SemanticPrivacyBinding | None = None,
         new_call_authority: int | None = None,
         authority_binding: SemanticWindowAuthorityBinding | None = None,
+        before_provider_call: Callable[[], None] | None = None,
+        reconcile_provider_result: Callable[[dict[str, object]], None] | None = None,
     ) -> SemanticHandoffResult:
         record_offset = len(provider.execution_records)
         package = self.representation_service.output_root / representation_id
@@ -14076,9 +14120,13 @@ class ExternalAgentSemanticHandoffService:
                 provider,
                 privacy_binding,
                 global_authority=(
-                    global_authority if authority_binding is not None else None
+                    global_authority
+                    if authority_binding is not None and before_provider_call is None
+                    else None
                 ),
-                window_binding=authority_binding,
+                window_binding=(
+                    authority_binding if before_provider_call is None else None
+                ),
                 complete_context=True,
             )
             if not recovery.exists or not recovery.result_only_wave:
@@ -14089,26 +14137,40 @@ class ExternalAgentSemanticHandoffService:
                     provider,
                     privacy_binding,
                     global_authority=(
-                        global_authority if authority_binding is not None else None
+                        global_authority
+                        if authority_binding is not None
+                        and before_provider_call is None
+                        else None
                     ),
-                    window_binding=authority_binding,
+                    window_binding=(
+                        authority_binding if before_provider_call is None else None
+                    ),
                 )
             preflight = recovery.preflight()
             if preflight.conservatively_counted_attempts:
                 raise SemanticHandoffError(
                     "Semantic recovery 存在 outcome 不确定的 attempt；LEAD_DECISION_REQUIRED。"
                 )
-            if preflight.required_new_calls and authority_binding is None:
+            if (
+                preflight.required_new_calls
+                and authority_binding is None
+                and before_provider_call is None
+            ):
                 raise SemanticHandoffError(
                     "Semantic global authority 未绑定当前 window；不得启动新调用。"
                 )
-            if preflight.required_new_calls and not global_authority.exists:
+            if (
+                preflight.required_new_calls
+                and authority_binding is not None
+                and before_provider_call is None
+                and not global_authority.exists
+            ):
                 raise SemanticHandoffError(
                     "Semantic global authority 未安装；不得启动新 Provider call。"
                 )
             authority_guard = None
             global_grant = None
-            if preflight.required_new_calls:
+            if preflight.required_new_calls and before_provider_call is None:
                 authority_guard = global_authority.execution_guard(
                     window=authority_binding,
                     provider=provider,
@@ -14124,11 +14186,17 @@ class ExternalAgentSemanticHandoffService:
             analysis_provider = _RecoveryAwareProvider(
                 provider,
                 recovery,
-                global_authority if authority_binding is not None else None,
-                authority_binding,
+                (
+                    global_authority
+                    if authority_binding is not None and before_provider_call is None
+                    else None
+                ),
+                authority_binding if before_provider_call is None else None,
                 preflight.required_new_calls,
                 authority_guard=authority_guard,
                 global_grant=global_grant,
+                before_provider_call=before_provider_call,
+                reconcile_provider_result=reconcile_provider_result,
             )
 
         audit_paths: tuple[Path, ...] = ()

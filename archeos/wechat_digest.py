@@ -2361,6 +2361,8 @@ class ExistingSemanticHandoff:
         reasoning_effort: str = DEFAULT_SEMANTIC_REASONING_EFFORT,
         batch_size: int = DEFAULT_EXTERNAL_AGENT_BATCH_SIZE,
         reviewed_git_head: str | None = None,
+        before_provider_call: Callable[[], None] | None = None,
+        reconcile_provider_result: Callable[[dict[str, object]], None] | None = None,
     ) -> None:
         self.service = ExternalAgentSemanticHandoffService(
             RepresentationInformationService(
@@ -2380,6 +2382,8 @@ class ExistingSemanticHandoff:
             "timeout_seconds": timeout_seconds,
         }
         self._diagnostic_root = Path(audit_root) / "semantic-provider-diagnostics"
+        self._before_provider_call = before_provider_call
+        self._reconcile_provider_result = reconcile_provider_result
         self.provider = self._new_provider("serial")
         self.reviewed_git_head = reviewed_git_head or detect_clean_git_head()
 
@@ -2402,6 +2406,8 @@ class ExistingSemanticHandoff:
             self.provider,
             privacy_binding=privacy_binding,
             authority_binding=authority_binding,
+            before_provider_call=self._before_provider_call,
+            reconcile_provider_result=self._reconcile_provider_result,
         )
 
     def prepare_results(
@@ -2413,6 +2419,28 @@ class ExistingSemanticHandoff:
         providers = tuple(
             self._new_provider(request.representation_id) for request in requests
         )
+        if self._before_provider_call is not None:
+            elapsed: dict[str, int] = {}
+            for request, provider in zip(requests, providers, strict=True):
+                started = time.monotonic()
+                self.service.execute(
+                    request.representation_id,
+                    provider,
+                    privacy_binding=request.privacy_binding,
+                    before_provider_call=self._before_provider_call,
+                    reconcile_provider_result=self._reconcile_provider_result,
+                )
+                elapsed[request.representation_id] = max(
+                    0, round((time.monotonic() - started) * 1000)
+                )
+            self.last_prepare_metrics = {
+                "semantic_parallelism": 1,
+                "semantic_peak_concurrency": 1 if requests else 0,
+                "semantic_wall_ms": sum(elapsed.values()),
+                "semantic_serial_estimate_ms": sum(elapsed.values()),
+                "resume_provider_calls": 0,
+            }
+            return elapsed
         elapsed = self.service.prepare_results(
             requests,
             providers,
@@ -4444,18 +4472,18 @@ class _GovernanceProviderCallBoundary:
     def __init__(
         self,
         delegate: AtomicInformationInterpretationProvider,
-        before_call: Callable[[], None],
+        before_call: Callable[[dict[str, object]], None],
     ) -> None:
         self.delegate = delegate
         self.before_call = before_call
         self.name = delegate.name
 
     def interpret(self, atomic_information, current_world_state):
-        self.before_call()
+        self.before_call({"atomic_information_ids": [atomic_information.atomic_information_id]})
         return self.delegate.interpret(atomic_information, current_world_state)
 
     def interpret_batch(self, items):
-        self.before_call()
+        self.before_call({"atomic_information_ids": [item[0].atomic_information_id for item in items]})
         method = getattr(self.delegate, "interpret_batch", None)
         if not callable(method):
             if len(items) == 1:
@@ -4483,6 +4511,9 @@ class WechatDigestService:
         run_store: WechatDigestRunStore | None = None,
         semantic_batch_size: int = DEFAULT_EXTERNAL_AGENT_BATCH_SIZE,
         semantic_parallelism: int = 2,
+        before_governance_provider_call: Callable[[], None] | None = None,
+        reconcile_governance_provider_result: Callable[[dict[str, object]], None]
+        | None = None,
         clock: Callable[[], str] = _utc_now,
     ) -> None:
         self.workspace = Path(workspace)
@@ -4515,7 +4546,10 @@ class WechatDigestService:
             self.workspace / "02_processing" / "wechat_digest", clock=clock
         )
         self._semantic_handoff: SemanticHandoffPort | None = None
-        self._before_governance_provider_call: Callable[[], None] | None = None
+        self._before_governance_provider_call = before_governance_provider_call
+        self._reconcile_governance_provider_result = (
+            reconcile_governance_provider_result
+        )
         self._governance_resume_state: dict[str, object] | None = None
         self._governance_migration_state: dict[str, object] | None = None
         self._governance_execution_lock = threading.Lock()
@@ -4550,6 +4584,13 @@ class WechatDigestService:
         self._completed_window_chain_cache: tuple[
             tuple[object, ...], tuple[SemanticCompletedWindowBinding, ...]
         ] | None = None
+
+    def reconcile_governance_provider_result(
+        self, request: dict[str, object]
+    ) -> None:
+        """Close an exact unified attempt only after strict receipt readback."""
+        if self._reconcile_governance_provider_result is not None:
+            self._reconcile_governance_provider_result(request)
 
     @staticmethod
     def _cursor_tuple(cursor: WechatCursor) -> tuple[int, str, str]:
@@ -13168,6 +13209,17 @@ class WechatDigestService:
                     "微信 Governance migration batch binding 漂移。"
                 )
             self._verify_governance_receipt_effects(receipt)
+            if receipt["phase"] in {"interpreted", "applying", "applied", "completed"}:
+                self.reconcile_governance_provider_result(
+                    {
+                        "run_id": run_id,
+                        "item_id": item_id,
+                        "atomic_information_fingerprint": atomic_fingerprint,
+                        "atomic_information_ids": list(
+                            receipt["batch_atomic_information_ids"]
+                        ),
+                    }
+                )
             if receipt["phase"] == "completed":
                 return bool(receipt["pending_human"]), tuple(
                     str(object_id) for object_id in receipt["context_object_ids"]
@@ -13199,15 +13251,29 @@ class WechatDigestService:
                     ) from exc
 
         provider_started = False
+        provider_completion: Callable[[], None] | None = None
+        provider_request: dict[str, object] | None = None
         batch_persisted = resume_state is not None
         latest_batch_receipt = (
             None if existing_receipt is None else dict(existing_receipt)
         )
 
-        def mark_provider_started() -> None:
-            nonlocal provider_started
+        def mark_provider_started(request: dict[str, object]) -> None:
+            nonlocal provider_started, provider_completion, provider_request
             if provider_started:
                 return
+            if previous_provider_hook is not None:
+                provider_request = {
+                    "run_id": run_id,
+                    "item_id": item_id,
+                    "atomic_information_fingerprint": atomic_fingerprint,
+                    **request,
+                }
+                completion = previous_provider_hook(provider_request)
+                if hasattr(completion, "mark_started"):
+                    completion.mark_started()
+                if callable(completion):
+                    provider_completion = completion
             if startup_recovery is not None:
                 recovery_fingerprint = startup_recovery.get(
                     "receipt_fingerprint"
@@ -13263,7 +13329,7 @@ class WechatDigestService:
             object_ids: tuple[str, ...],
             baseline_effect_snapshots: tuple[dict[str, object], ...],
         ) -> None:
-            nonlocal batch_persisted, latest_batch_receipt
+            nonlocal batch_persisted, latest_batch_receipt, provider_completion
             baseline_effect_fingerprints = (
                 self._governance_snapshot_fingerprints(
                     baseline_effect_snapshots
@@ -13305,6 +13371,20 @@ class WechatDigestService:
                 governance_receipt=latest_batch_receipt,
             )
             batch_persisted = True
+            readback_item = self._item(
+                self.run_store.status(run_id)["items"], item_id
+            )
+            readback_receipt = _validated_governance_receipt(
+                readback_item.get("governance_receipt")
+            )
+            if readback_receipt != latest_batch_receipt:
+                raise WechatDigestError("微信 Governance interpretation receipt 写入后无法读回。")
+            self._verify_governance_receipt_effects(readback_receipt)
+            if provider_request is not None:
+                self.reconcile_governance_provider_result(provider_request)
+            elif provider_completion is not None:
+                provider_completion()
+            provider_completion = None
 
         def persist_application_intent(index: int) -> None:
             nonlocal latest_batch_receipt

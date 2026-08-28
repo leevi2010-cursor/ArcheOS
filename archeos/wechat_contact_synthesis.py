@@ -696,6 +696,22 @@ class ContactSynthesisStore:
         require_contact_provider_authority_ref(authority["authority_ref"])
         return authority
 
+    def ensure_provider_authority(
+        self,
+        *,
+        binding: WechatContactBinding,
+        authority_ref: str,
+        absolute_cap: int,
+    ) -> dict[str, object]:
+        """Persist the contact approval before any Provider route starts."""
+        return self._provider_authority(
+            binding=binding,
+            authority_ref=authority_ref,
+            absolute_cap=absolute_cap,
+            semantic_provider_calls=0,
+            governance_provider_calls=0,
+        )
+
     def _provider_authority(
         self,
         *,
@@ -898,6 +914,7 @@ class ContactSynthesisStore:
         self,
         binding: WechatContactBinding,
         ordered_ids: Sequence[str],
+        reconcile_provider_result: Callable[[dict[str, object]], None] | None = None,
     ) -> tuple[int, list[str], dict[str, object]]:
         if not self.cursor_path.exists() and not self.cursor_path.is_symlink():
             return 0, [], _empty_synthesis()
@@ -993,6 +1010,14 @@ class ContactSynthesisStore:
             request_fingerprint=str(request_fingerprint),
             ordered_ids=consumed,
         )
+        if reconcile_provider_result is not None:
+            reconcile_provider_result(
+                {
+                    "segment_ordinal": ordinal,
+                    "request_fingerprint": str(request_fingerprint),
+                    "contact_identity": _stable_contact_identity(binding),
+                }
+            )
         return ordinal, list(consumed), validated
 
     def synthesize(
@@ -1006,6 +1031,8 @@ class ContactSynthesisStore:
         semantic_provider_calls: int = 0,
         governance_provider_calls: int = 0,
         resume_provider_calls: int = 0,
+        before_provider_call: Callable[[], None] | None = None,
+        reconcile_provider_result: Callable[[dict[str, object]], None] | None = None,
     ) -> ContactSynthesisOutcome:
         self.root.mkdir(parents=True, exist_ok=True, mode=0o700)
         os.chmod(self.root, 0o700)
@@ -1025,6 +1052,8 @@ class ContactSynthesisStore:
                     semantic_provider_calls=semantic_provider_calls,
                     governance_provider_calls=governance_provider_calls,
                     resume_provider_calls=resume_provider_calls,
+                    before_provider_call=before_provider_call,
+                    reconcile_provider_result=reconcile_provider_result,
                 )
             finally:
                 fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
@@ -1040,6 +1069,8 @@ class ContactSynthesisStore:
         semantic_provider_calls: int,
         governance_provider_calls: int,
         resume_provider_calls: int,
+        before_provider_call: Callable[[], None] | None,
+        reconcile_provider_result: Callable[[dict[str, object]], None] | None,
     ) -> ContactSynthesisOutcome:
         ordered_ids = [item.atomic_information_id for item in revisions]
         if len(ordered_ids) != len(set(ordered_ids)):
@@ -1051,7 +1082,11 @@ class ContactSynthesisStore:
             semantic_provider_calls=semantic_provider_calls,
             governance_provider_calls=governance_provider_calls,
         )
-        ordinal, consumed, previous = self._load_cursor(binding, ordered_ids)
+        ordinal, consumed, previous = self._load_cursor(
+            binding,
+            ordered_ids,
+            reconcile_provider_result=reconcile_provider_result,
+        )
         provider_calls_before = provider.provider_calls
         resumed_segments = 0
         by_id = {item.atomic_information_id: item for item in revisions}
@@ -1095,6 +1130,11 @@ class ContactSynthesisStore:
                 request_fingerprint=request_fingerprint,
                 ordered_ids=target_ids,
             )
+            unified_binding = {
+                "segment_ordinal": next_ordinal,
+                "request_fingerprint": request_fingerprint,
+                "contact_identity": _stable_contact_identity(binding),
+            }
             result_exists = result_path.exists() or result_path.is_symlink()
             receipt_exists = receipt_path.exists() or receipt_path.is_symlink()
             if receipt_exists and not result_exists:
@@ -1153,11 +1193,17 @@ class ContactSynthesisStore:
                 reservation_exists = (
                     reservation_path.exists() or reservation_path.is_symlink()
                 )
+                completion = None
                 if reservation_exists:
                     if _read_private(reservation_path) != reservation:
                         raise WechatDigestError(
                             "联系人模型调用 reservation 与当前 segment 不一致。"
                         )
+                    completion = (
+                        None
+                        if before_provider_call is None
+                        else before_provider_call(unified_binding)
+                    )
                 else:
                     if (
                         semantic_provider_calls
@@ -1168,6 +1214,11 @@ class ContactSynthesisStore:
                         raise WechatDigestError(
                             "联系人模型调用已达到授权上限；既有结果保持不变。"
                         )
+                    completion = (
+                        None
+                        if before_provider_call is None
+                        else before_provider_call(unified_binding)
+                    )
                     _private_write(reservation_path, reservation)
                     if self.after_reservation_write is not None:
                         self.after_reservation_write()
@@ -1183,6 +1234,8 @@ class ContactSynthesisStore:
                     ),
                 }
                 _private_write(started_path, started)
+                if hasattr(completion, "mark_started"):
+                    completion.mark_started()
                 if self.after_started_write is not None:
                     self.after_started_write()
                 result = _validate_result(
@@ -1215,6 +1268,10 @@ class ContactSynthesisStore:
                 _private_write(receipt_path, receipt)
                 if self.after_receipt_write is not None:
                     self.after_receipt_write()
+            if _read_private(receipt_path) != receipt:
+                raise WechatDigestError("联系人连续理解 receipt 写入后无法读回。")
+            if reconcile_provider_result is not None:
+                reconcile_provider_result(unified_binding)
             cursor = {
                 "schema_version": CONTACT_SYNTHESIS_CURSOR_SCHEMA,
                 "contact_identity": _stable_contact_identity(binding),
