@@ -2428,6 +2428,7 @@ class ExistingSemanticHandoff:
                     provider,
                     privacy_binding=request.privacy_binding,
                     before_provider_call=self._before_provider_call,
+                    reconcile_provider_result=self._reconcile_provider_result,
                 )
                 elapsed[request.representation_id] = max(
                     0, round((time.monotonic() - started) * 1000)

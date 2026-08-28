@@ -1009,6 +1009,34 @@ class ContactProviderBudgetTests(unittest.TestCase):
             with self.assertRaisesRegex(WechatDigestError, "漂移"):
                 budget.before_call("governance")
 
+    def test_existing_ledger_recovers_completed_run_after_active_is_cleared(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = self._root(directory)
+            budget = ContactProviderBudget(
+                root,
+                binding=_binding(),
+                authority_ref=self.AUTHORITY_REF,
+                absolute_cap=2,
+            )
+            request = {"segment_ordinal": 1, "request_fingerprint": "sha256:a", "contact_identity": {"conversation_key": _binding().conversation_key, "provider_conversation_id": _binding().provider_conversation_id, "is_group": False}}
+            attempt = budget.reserve("contact_synthesis", request)
+            attempt.mark_started()
+            attempt.complete()
+            contact_root = root.parent
+            run = contact_root / "runs" / "run_test"
+            (run / "status.json").write_text('{"state":"completed"}')
+            (contact_root / "active.json").write_text('{"active_run_id":null}')
+            recovered = ContactProviderBudget(
+                root,
+                binding=_binding(),
+                authority_ref=self.AUTHORITY_REF,
+                absolute_cap=2,
+            )
+            recovered.reconcile_result("contact_synthesis", request)
+            (contact_root / "active.json").write_text('{"active_run_id":"run_other"}')
+            with self.assertRaisesRegex(WechatDigestError, "scope"):
+                recovered.reconcile_result("contact_synthesis", request)
+
 
 class ContactResolutionTests(unittest.TestCase):
     def test_exact_name_or_technical_key_must_resolve_uniquely(self) -> None:

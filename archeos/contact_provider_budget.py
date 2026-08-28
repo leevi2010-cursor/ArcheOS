@@ -93,9 +93,28 @@ class ContactProviderBudget:
         contact_root = self.root.parent
         try:
             active = json.loads((contact_root / "active.json").read_text(encoding="utf-8"))
-            run_id = active["active_run_id"]
-            if not isinstance(run_id, str) or not run_id:
+            active_run_id = active["active_run_id"]
+            if active_run_id is not None and (
+                not isinstance(active_run_id, str) or not active_run_id
+            ):
                 raise TypeError
+            existing_scope: dict[str, object] | None = None
+            if self.path.exists():
+                existing = _read(self.path)
+                candidate = existing.get("scope")
+                if not isinstance(candidate, dict):
+                    raise TypeError
+                existing_scope = candidate
+            if existing_scope is None:
+                if active_run_id is None:
+                    raise TypeError
+                run_id = active_run_id
+            else:
+                run_id = existing_scope.get("run_id")
+                if not isinstance(run_id, str) or not run_id:
+                    raise TypeError
+                if active_run_id not in {None, run_id}:
+                    raise ValueError
             run_root = contact_root / "runs" / run_id
             plan = json.loads((run_root / "plan.json").read_text(encoding="utf-8"))
             receipt = json.loads((run_root / "run-plan-receipt.json").read_text(encoding="utf-8"))
@@ -113,6 +132,13 @@ class ContactProviderBudget:
                 != self.contact_identity["conversation_key"]
             ):
                 raise ValueError
+            binding = plan.get("contact_binding")
+            if binding is not None and binding != self.contact_identity:
+                raise ValueError
+            if active_run_id is None and existing_scope is not None:
+                status = json.loads((run_root / "status.json").read_text(encoding="utf-8"))
+                if not isinstance(status, dict) or status.get("state") != "completed":
+                    raise ValueError
         except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
             raise WechatDigestError("联系人 Provider scope 无法绑定当前 frozen run。") from exc
         return {"contact_identity": self.contact_identity, "workspace_fingerprint": _fingerprint(str(contact_root.resolve())), "run_id": run_id, "plan_fingerprint": _fingerprint(plan), "plan_receipt_fingerprint": _fingerprint(receipt), "capture_fingerprint": capture, "frozen_upper_bound": upper, "authority_ref": self.authority_ref, "absolute_cap": self.absolute_cap}
