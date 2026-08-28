@@ -10685,6 +10685,36 @@ class WechatDigestTests(unittest.TestCase):
         usage = json.loads((root / "synthesis" / "unified-provider-usage.json").read_text())
         self.assertEqual([item["state"] for item in usage["attempts"]], ["result"])
 
+    def test_contact_real_handoff_failed_run_resumes_without_capture_or_provider(self) -> None:
+        self.workspace = self.workspace.resolve()
+        self.workspace.chmod(0o700)
+        for name in ("01_inbox", "02_processing", "03_information", "04_core"):
+            (self.workspace / name).chmod(0o700)
+        captured = message(2, conversation="durable-resume")
+        binding = WechatContactBinding(captured.conversation_key, captured.provider_conversation_id, captured.conversation_label, False)
+        root = self.workspace / "02_processing" / "wechat_digest" / "contacts" / binding.conversation_key
+        capture = FailOnSecondFullCaptureProvider([captured])
+        runner = SuccessfulV34Runner()
+        semantic = RunnerBackedExistingSemanticHandoff(workspace=self.workspace, runner=runner)
+        budget: ContactProviderBudget | None = None
+        def reserve():
+            nonlocal budget
+            if budget is None:
+                budget = ContactProviderBudget(root / "synthesis", binding=binding, authority_ref="https://github.com/leevi2010-cursor/ArcheOS/issues/206#issuecomment-1", absolute_cap=1)
+            return budget.before_call("semantic")
+        semantic._before_provider_call = reserve
+        service = FailAfterProviderOnceService(workspace=self.workspace, capture_provider=capture, semantic_handoff_factory=lambda: semantic, interpretation_provider=NoStructuralChangeProvider(), run_store=WechatDigestRunStore(root), semantic_parallelism=1)
+        with patch("archeos.wechat_digest._require_openai_codex_sdk"), self.assertRaises(WechatDigestError):
+            service.run(all_history=True)
+        calls = len(runner.calls)
+        with patch("archeos.wechat_digest._require_openai_codex_sdk"):
+            result = service.run()
+        self.assertTrue(result.checkpoint_published)
+        self.assertEqual(len(runner.calls), calls)
+        self.assertEqual(sum(not call[2] for call in capture.calls), 1)
+        information = service.information_store.list_atomic_information()
+        self.assertEqual(len({item.atomic_information_id for item in information}), len(information))
+
 
 class WechatCaptureHelperTests(unittest.TestCase):
     def setUp(self) -> None:
