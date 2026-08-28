@@ -1390,9 +1390,14 @@ def _wechat_product_command(args: argparse.Namespace) -> int:
     ):
         print("error: 联系人列表不能与消化、恢复或验收参数同时使用。")
         return 2
+    contact_seal = (
+        args.seal_governance_timeout
+        and args.contact is not None
+        and args.isolated_acceptance_dir is not None
+    )
     if maintenance_count and (
         args.contact is not None or args.isolated_acceptance_dir is not None
-    ):
+    ) and not contact_seal:
         print("error: legacy 维护入口不能切换到联系人或隔离验收目录。")
         return 2
     if args.install_semantic_authority:
