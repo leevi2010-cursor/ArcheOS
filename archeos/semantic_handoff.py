@@ -12421,6 +12421,7 @@ class _RecoveryAwareProvider:
         authority_guard: object | None = None,
         global_grant: Mapping[str, object] | None = None,
         before_provider_call: Callable[[], None] | None = None,
+        reconcile_provider_result: Callable[[dict[str, object]], None] | None = None,
     ) -> None:
         if recovery.legacy_complete_context_replay:
             raise SemanticHandoffError(
@@ -12434,6 +12435,7 @@ class _RecoveryAwareProvider:
         self._authority_guard = authority_guard
         self._global_grant = global_grant
         self.before_provider_call = before_provider_call
+        self.reconcile_provider_result = reconcile_provider_result
         self.name = provider.name
         self.provider_version = provider.provider_version
         self.model = provider.model
@@ -12577,20 +12579,14 @@ class _RecoveryAwareProvider:
             )
         recovered = loaded[self._ordinal - 1]
         if recovered is not None:
-            if self.before_provider_call is not None:
+            if self.reconcile_provider_result is not None:
                 receipt = self.recovery.batch_contracts[self._ordinal - 1]["receipt"]
-                completion = self.before_provider_call(
-                    {
+                self.reconcile_provider_result({
                         "processing_run_id": self.recovery.semantic_run_id,
                         "batch_ordinal": self._ordinal,
                         "input_fingerprint": receipt["input_fingerprint"],
                         "anchor_unit_ids": list(receipt["anchor_unit_ids"]),
-                    }
-                )
-                if hasattr(completion, "mark_started"):
-                    completion.mark_started()
-                if callable(completion):
-                    completion()
+                    })
             result, record = recovered
             self.records.append(record)
             return result
@@ -13975,6 +13971,7 @@ class ExternalAgentSemanticHandoffService:
         new_call_authority: int | None = None,
         authority_binding: SemanticWindowAuthorityBinding | None = None,
         before_provider_call: Callable[[], None] | None = None,
+        reconcile_provider_result: Callable[[dict[str, object]], None] | None = None,
     ) -> SemanticHandoffResult:
         record_offset = len(provider.execution_records)
         package = self.representation_service.output_root / representation_id
@@ -14199,6 +14196,7 @@ class ExternalAgentSemanticHandoffService:
                 authority_guard=authority_guard,
                 global_grant=global_grant,
                 before_provider_call=before_provider_call,
+                reconcile_provider_result=reconcile_provider_result,
             )
 
         audit_paths: tuple[Path, ...] = ()

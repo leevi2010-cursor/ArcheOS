@@ -2362,6 +2362,7 @@ class ExistingSemanticHandoff:
         batch_size: int = DEFAULT_EXTERNAL_AGENT_BATCH_SIZE,
         reviewed_git_head: str | None = None,
         before_provider_call: Callable[[], None] | None = None,
+        reconcile_provider_result: Callable[[dict[str, object]], None] | None = None,
     ) -> None:
         self.service = ExternalAgentSemanticHandoffService(
             RepresentationInformationService(
@@ -2382,6 +2383,7 @@ class ExistingSemanticHandoff:
         }
         self._diagnostic_root = Path(audit_root) / "semantic-provider-diagnostics"
         self._before_provider_call = before_provider_call
+        self._reconcile_provider_result = reconcile_provider_result
         self.provider = self._new_provider("serial")
         self.reviewed_git_head = reviewed_git_head or detect_clean_git_head()
 
@@ -2405,6 +2407,7 @@ class ExistingSemanticHandoff:
             privacy_binding=privacy_binding,
             authority_binding=authority_binding,
             before_provider_call=self._before_provider_call,
+            reconcile_provider_result=self._reconcile_provider_result,
         )
 
     def prepare_results(

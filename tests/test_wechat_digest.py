@@ -10667,6 +10667,7 @@ class WechatDigestTests(unittest.TestCase):
             return budget.reserve("semantic", request)
 
         semantic._before_provider_call = reserve_semantic
+        semantic._reconcile_provider_result = lambda request: budget.reconcile_result("semantic", request)
         service = WechatDigestService(
             workspace=self.workspace,
             capture_provider=SyntheticCaptureProvider([captured]),
@@ -10703,6 +10704,7 @@ class WechatDigestTests(unittest.TestCase):
                 budget = ContactProviderBudget(root / "synthesis", binding=binding, authority_ref="https://github.com/leevi2010-cursor/ArcheOS/issues/206#issuecomment-1", absolute_cap=1)
             return budget.reserve("semantic", request)
         semantic._before_provider_call = reserve
+        semantic._reconcile_provider_result = lambda request: budget.reconcile_result("semantic", request)
         service = FailAfterProviderOnceService(workspace=self.workspace, capture_provider=capture, semantic_handoff_factory=lambda: semantic, interpretation_provider=NoStructuralChangeProvider(), run_store=WechatDigestRunStore(root), semantic_parallelism=1)
         with patch("archeos.wechat_digest._require_openai_codex_sdk"), self.assertRaises(WechatDigestError):
             service.run(all_history=True)

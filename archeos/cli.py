@@ -1661,6 +1661,11 @@ def _wechat_product_command(args: argparse.Namespace) -> int:
                     if contact_binding is None
                     else lambda request: get_contact_provider_budget().reserve("semantic", request)
                 ),
+                reconcile_provider_result=(
+                    None
+                    if contact_binding is None
+                    else lambda request: get_contact_provider_budget().reconcile_result("semantic", request)
+                ),
             )
 
         service = WechatDigestService(
