@@ -749,6 +749,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="零 Provider 封存 Governance timeout 并允许后续项目继续。",
     )
     wechat_digest.add_argument(
+        "--seal-contact-governance-startup-transport-failure",
+        action="store_true",
+        help="零 Provider 封存联系人隔离验收的 Governance 启动 transport 失败。",
+    )
+    wechat_digest.add_argument(
         "--resolve-governance-startup-failure",
         action="store_true",
         help="零 Provider 恢复 Issue #150 唯一 Governance 启动失败。",
@@ -1371,6 +1376,7 @@ def _wechat_product_command(args: argparse.Namespace) -> int:
             args.resolve_semantic_attempt,
             args.prepare_semantic_attempt_resolution,
             args.seal_governance_timeout,
+            args.seal_contact_governance_startup_transport_failure,
             args.resolve_governance_startup_failure,
             args.resolve_failed_closed_continuation,
             args.resolve_multi_governance_startup_failure,
@@ -1391,10 +1397,17 @@ def _wechat_product_command(args: argparse.Namespace) -> int:
         print("error: 联系人列表不能与消化、恢复或验收参数同时使用。")
         return 2
     contact_seal = (
-        args.seal_governance_timeout
+        (args.seal_governance_timeout
+         or args.seal_contact_governance_startup_transport_failure)
         and args.contact is not None
         and args.isolated_acceptance_dir is not None
     )
+    if args.seal_contact_governance_startup_transport_failure and not contact_seal:
+        print(
+            "error: 联系人 Governance 启动 transport 封存必须同时指定 "
+            "--contact 与 --isolated-acceptance-dir。"
+        )
+        return 2
     if maintenance_count and (
         args.contact is not None or args.isolated_acceptance_dir is not None
     ) and not contact_seal:
@@ -1707,6 +1720,13 @@ def _wechat_product_command(args: argparse.Namespace) -> int:
                 if contact_binding is None
                 else lambda timeout_binding: get_contact_provider_budget().seal_governance_timeout(
                     timeout_binding=timeout_binding
+                )
+            ),
+            seal_contact_governance_startup_transport_failure=(
+                None
+                if contact_binding is None
+                else lambda startup_binding: get_contact_provider_budget().seal_governance_startup_transport_failure(
+                    startup_binding=startup_binding
                 )
             ),
         )
@@ -2138,6 +2158,10 @@ def _wechat_product_command(args: argparse.Namespace) -> int:
             return 0
         if args.seal_governance_timeout:
             resolution = service.seal_governance_timeout()
+            print(json.dumps(resolution, ensure_ascii=False, indent=2))
+            return 0
+        if args.seal_contact_governance_startup_transport_failure:
+            resolution = service.seal_contact_governance_startup_transport_failure()
             print(json.dumps(resolution, ensure_ascii=False, indent=2))
             return 0
         result = service.run(

@@ -740,6 +740,57 @@ class CliTest(unittest.TestCase):
             capture_provider.return_value.discover_contacts.assert_not_called()
             capture_provider.return_value.scoped.assert_called_once_with(binding)
 
+    @patch("archeos.cli.WechatContactSelectionStore")
+    @patch("archeos.cli.ContactSynthesisStore")
+    @patch("archeos.cli.WechatDigestService")
+    @patch("archeos.cli.WechatCliCaptureProvider")
+    @patch("archeos.cli.require_workspace")
+    def test_contact_isolated_startup_transport_seal_routes_without_capture_or_provider(
+        self, require_workspace: Mock, capture_provider: Mock, digest_service: Mock,
+        synthesis_store: Mock, selection_store: Mock,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            require_workspace.return_value = WorkspaceConfig(Path(temp_dir) / "workspace", Path(temp_dir) / "config")
+            binding = SimpleNamespace(conversation_key="contact-1")
+            capture_provider.return_value.resolve_contact.return_value = binding
+            capture_provider.return_value.scoped.return_value = Mock()
+            synthesis_store.return_value.read_provider_authority.return_value = {
+                "authority_ref": "https://github.com/example/repo/issues/1", "absolute_cap": 50,
+            }
+            digest_service.return_value.seal_contact_governance_startup_transport_failure.return_value = {
+                "semantic_provider_calls": 0, "governance_provider_calls": 0,
+            }
+            with redirect_stdout(StringIO()):
+                result = main(["wechat", "digest", "--contact", "contact-1",
+                    "--isolated-acceptance-dir", str(Path(temp_dir) / "isolated"),
+                    "--seal-contact-governance-startup-transport-failure"])
+            self.assertEqual(result, 0)
+            digest_service.return_value.seal_contact_governance_startup_transport_failure.assert_called_once_with()
+            digest_service.return_value.run.assert_not_called()
+            capture_provider.return_value.discover_contacts.assert_not_called()
+
+    @patch("archeos.cli.WechatDigestService")
+    @patch("archeos.cli.WechatCliCaptureProvider")
+    @patch("archeos.cli.require_workspace")
+    def test_startup_transport_seal_requires_contact_and_isolated_before_construction(
+        self,
+        require_workspace: Mock,
+        capture_provider: Mock,
+        digest_service: Mock,
+    ) -> None:
+        for arguments in (
+            ["wechat", "digest", "--seal-contact-governance-startup-transport-failure"],
+            [
+                "wechat", "digest", "--contact", "contact-1",
+                "--seal-contact-governance-startup-transport-failure",
+            ],
+        ):
+            with redirect_stdout(StringIO()):
+                self.assertEqual(main(arguments), 2)
+        require_workspace.assert_not_called()
+        capture_provider.assert_not_called()
+        digest_service.assert_not_called()
+
     @patch("archeos.cli.WechatDigestService")
     @patch("archeos.cli.WechatCliCaptureProvider")
     @patch("archeos.cli.require_workspace")
