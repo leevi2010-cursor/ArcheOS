@@ -35,6 +35,13 @@ def _write(path: Path, value: object) -> None:
             os.fsync(target.fileno())
         os.chmod(temporary, 0o600)
         os.replace(temporary, path)
+        directory = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+        if _read(path) != value:
+            raise WechatDigestError("联系人统一 Provider ledger 写入后无法读回。")
     finally:
         temporary.unlink(missing_ok=True)
 
