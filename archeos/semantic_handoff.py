@@ -12590,9 +12590,9 @@ class _RecoveryAwareProvider:
                         "Semantic authority 未绑定；不得启动新 Provider call。"
                     )
                 self.recovery.publish_attempt(self._ordinal)
-                self.before_provider_call()
+                completion = self.before_provider_call()
                 self.recovery.publish_started(self._ordinal)
-                return self._analyze_reserved(batch)
+                return self._analyze_reserved(batch, completion=completion)
             self._enter_authority_guard()
             assert (
                 self._global_grant is not None
@@ -12615,6 +12615,8 @@ class _RecoveryAwareProvider:
     def _analyze_reserved(
         self,
         batch: RepresentationAnalysisBatch,
+        *,
+        completion: object | None = None,
     ) -> RepresentationAnalysisResult:
         try:
             self.new_calls += 1
@@ -12643,6 +12645,8 @@ class _RecoveryAwareProvider:
             assert self._loaded_results is not None
             self._loaded_results[self._ordinal - 1] = (loaded_result, record)
             self.records.append(record)
+            if callable(completion):
+                completion()
             if self.new_calls == self.required_new_calls:
                 self._close_authority_guard()
             return loaded_result

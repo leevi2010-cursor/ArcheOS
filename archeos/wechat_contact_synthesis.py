@@ -1172,6 +1172,7 @@ class ContactSynthesisStore:
                 reservation_exists = (
                     reservation_path.exists() or reservation_path.is_symlink()
                 )
+                completion = None
                 if reservation_exists:
                     if _read_private(reservation_path) != reservation:
                         raise WechatDigestError(
@@ -1187,8 +1188,11 @@ class ContactSynthesisStore:
                         raise WechatDigestError(
                             "联系人模型调用已达到授权上限；既有结果保持不变。"
                         )
-                    if before_provider_call is not None:
-                        before_provider_call()
+                    completion = (
+                        None
+                        if before_provider_call is None
+                        else before_provider_call()
+                    )
                     _private_write(reservation_path, reservation)
                     if self.after_reservation_write is not None:
                         self.after_reservation_write()
@@ -1212,6 +1216,8 @@ class ContactSynthesisStore:
                     ordered_ids=target_ids,
                 )
                 _private_write(result_path, result)
+                if callable(completion):
+                    completion()
                 if self.after_result_write is not None:
                     self.after_result_write()
             result_fingerprint = _bytes_fingerprint(result_path.read_bytes())

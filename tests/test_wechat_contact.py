@@ -899,8 +899,10 @@ class ContactProviderBudgetTests(unittest.TestCase):
                 authority_ref=self.AUTHORITY_REF,
                 absolute_cap=2,
             )
-            budget.before_call("semantic")
-            budget.before_call("governance")
+            semantic_done = budget.before_call("semantic")
+            semantic_done()
+            governance_done = budget.before_call("governance")
+            governance_done()
             with self.assertRaisesRegex(WechatDigestError, "达到授权上限"):
                 budget.before_call("semantic")
             authority = ContactSynthesisStore(root).read_provider_authority(
@@ -908,7 +910,13 @@ class ContactProviderBudgetTests(unittest.TestCase):
             )
             self.assertIsNotNone(authority)
             usage = json.loads((root / "unified-provider-usage.json").read_text())
-            self.assertEqual(usage["entries"], ["semantic", "governance"])
+            self.assertEqual(
+                usage["attempts"],
+                [
+                    {"ordinal": 1, "category": "semantic", "state": "result"},
+                    {"ordinal": 2, "category": "governance", "state": "result"},
+                ],
+            )
             self.assertEqual(usage["absolute_cap"], 2)
 
 

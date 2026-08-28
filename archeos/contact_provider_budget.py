@@ -67,6 +67,11 @@ class ContactProviderBudget:
         absolute_cap: int,
     ) -> None:
         self.root = Path(root)
+        self.contact_identity = {
+            "conversation_key": binding.conversation_key,
+            "provider_conversation_id": binding.provider_conversation_id,
+            "is_group": binding.is_group,
+        }
         self.authority_ref = require_contact_provider_authority_ref(authority_ref)
         if (
             isinstance(absolute_cap, bool)
@@ -83,7 +88,7 @@ class ContactProviderBudget:
             absolute_cap=absolute_cap,
         )
 
-    def before_call(self, category: str) -> None:
+    def before_call(self, category: str):
         if category not in {"semantic", "governance", "contact_synthesis"}:
             raise WechatDigestError("联系人 Provider 调用类别无效。")
         self.root.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -93,7 +98,7 @@ class ContactProviderBudget:
             try:
                 if self.path.exists() or self.path.is_symlink():
                     current = _read(self.path)
-                    entries = current.get("entries")
+                    attempts = current.get("attempts")
                     payload = {
                         key: value
                         for key, value in current.items()
@@ -103,19 +108,27 @@ class ContactProviderBudget:
                         current.get("schema_version") != _SCHEMA
                         or current.get("authority_ref") != self.authority_ref
                         or current.get("absolute_cap") != self.absolute_cap
-                        or not isinstance(entries, list)
+                        or current.get("contact_identity") != self.contact_identity
+                        or not isinstance(attempts, list)
                         or any(
-                            item
+                            not isinstance(item, dict)
+                            or item.get("category")
                             not in {"semantic", "governance", "contact_synthesis"}
-                            for item in entries
+                            or item.get("ordinal") != index
+                            or item.get("state") not in {"started", "result"}
+                            for index, item in enumerate(attempts, start=1)
                         )
                         or current.get("usage_fingerprint")
                         != _fingerprint(payload)
                     ):
                         raise WechatDigestError("联系人统一 Provider 用量记录漂移。")
                 else:
-                    entries = []
-                if len(entries) >= self.absolute_cap:
+                    attempts = []
+                if any(item["state"] == "started" for item in attempts):
+                    raise WechatDigestError(
+                        "联系人模型调用结果未知；禁止自动重试，需新的明确决定。"
+                    )
+                if len(attempts) >= self.absolute_cap:
                     raise WechatDigestError(
                         "联系人模型调用已达到授权上限；既有结果保持不变。"
                     )
@@ -123,11 +136,42 @@ class ContactProviderBudget:
                     "schema_version": _SCHEMA,
                     "authority_ref": self.authority_ref,
                     "absolute_cap": self.absolute_cap,
-                    "entries": [*entries, category],
+                    "contact_identity": self.contact_identity,
+                    "attempts": [
+                        *attempts,
+                        {
+                            "ordinal": len(attempts) + 1,
+                            "category": category,
+                            "state": "started",
+                        },
+                    ],
                 }
                 _write(
                     self.path,
                     {**payload, "usage_fingerprint": _fingerprint(payload)},
                 )
+                return lambda: self.complete(len(attempts) + 1)
+            finally:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+    def complete(self, ordinal: int) -> None:
+        with self.lock_path.open("a+") as handle:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            try:
+                current = _read(self.path)
+                attempts = current.get("attempts")
+                if not isinstance(attempts, list) or ordinal < 1 or ordinal > len(attempts):
+                    raise WechatDigestError("联系人统一 Provider attempt 不可验证。")
+                attempt = attempts[ordinal - 1]
+                if not isinstance(attempt, dict) or attempt.get("ordinal") != ordinal:
+                    raise WechatDigestError("联系人统一 Provider attempt 不可验证。")
+                if attempt.get("state") == "result":
+                    return
+                if attempt.get("state") != "started":
+                    raise WechatDigestError("联系人统一 Provider attempt 状态不可验证。")
+                attempts[ordinal - 1] = {**attempt, "state": "result"}
+                payload = {key: value for key, value in current.items() if key != "usage_fingerprint"}
+                payload["attempts"] = attempts
+                _write(self.path, {**payload, "usage_fingerprint": _fingerprint(payload)})
             finally:
                 fcntl.flock(handle.fileno(), fcntl.LOCK_UN)

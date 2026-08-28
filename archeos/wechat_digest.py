@@ -13224,17 +13224,20 @@ class WechatDigestService:
                     ) from exc
 
         provider_started = False
+        provider_completion: Callable[[], None] | None = None
         batch_persisted = resume_state is not None
         latest_batch_receipt = (
             None if existing_receipt is None else dict(existing_receipt)
         )
 
         def mark_provider_started() -> None:
-            nonlocal provider_started
+            nonlocal provider_started, provider_completion
             if provider_started:
                 return
             if previous_provider_hook is not None:
-                previous_provider_hook()
+                completion = previous_provider_hook()
+                if callable(completion):
+                    provider_completion = completion
             if startup_recovery is not None:
                 recovery_fingerprint = startup_recovery.get(
                     "receipt_fingerprint"
@@ -13435,6 +13438,8 @@ class WechatDigestService:
         self._after_governance_application = persist_application_progress
         try:
             outcome = self._govern(atomic_ids)
+            if provider_completion is not None:
+                provider_completion()
             return outcome
         except BaseException as exc:
             failure = exc
