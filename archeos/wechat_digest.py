@@ -4522,6 +4522,9 @@ class WechatDigestService:
         | None = None,
         seal_contact_governance_timeout: Callable[[dict[str, object]], dict[str, int]]
         | None = None,
+        seal_contact_governance_startup_transport_failure: Callable[
+            [dict[str, object]], dict[str, int]
+        ] | None = None,
         clock: Callable[[], str] = _utc_now,
     ) -> None:
         self.workspace = Path(workspace)
@@ -4559,6 +4562,9 @@ class WechatDigestService:
             reconcile_governance_provider_result
         )
         self._seal_contact_governance_timeout = seal_contact_governance_timeout
+        self._seal_contact_governance_startup_transport_failure = (
+            seal_contact_governance_startup_transport_failure
+        )
         self._governance_resume_state: dict[str, object] | None = None
         self._governance_migration_state: dict[str, object] | None = None
         self._governance_execution_lock = threading.Lock()
@@ -9906,6 +9912,87 @@ class WechatDigestService:
                 "provider_retry_permitted": False,
             }
 
+    def seal_contact_governance_startup_transport_failure(self) -> dict[str, object]:
+        """Fail-close one contact-only, pre-turn Governance transport failure."""
+
+        if self._seal_contact_governance_startup_transport_failure is None:
+            raise WechatDigestError("联系人 Governance 启动封存未绑定 contact Provider ledger。")
+        with self.run_store.lock():
+            run_id = self.run_store.active_run_id()
+            if run_id is None:
+                raise WechatDigestError("不存在可封存 Governance 启动失败的 active run。")
+            plan = self.run_store.plan(run_id)
+            after = WechatCursor.from_dict(plan.get("after_cursor"), "plan.after_cursor")
+            if self.run_store.checkpoint() not in {None, after}:
+                raise WechatDigestError("Governance 启动封存的 checkpoint binding 不一致。")
+            status = self.run_store.status(run_id)
+            self._load_active_capture_artifacts(run_id, plan, status)
+            if status.get("checkpoint_published") is not False:
+                raise WechatDigestError("Governance 启动封存不得发生在 checkpoint 推进后。")
+            items = status.get("items")
+            if not isinstance(items, dict):
+                raise WechatDigestError("微信运行状态 items 损坏。")
+            candidates: list[tuple[str, dict[str, object]]] = []
+            for item_id, item in items.items():
+                if not isinstance(item_id, str) or not isinstance(item, dict):
+                    raise WechatDigestError("微信运行状态 items 损坏。")
+                receipt_value = item.get("governance_receipt")
+                if receipt_value is not None and _validated_governance_receipt(
+                    receipt_value
+                ).get("phase") == "started":
+                    candidates.append((item_id, item))
+            if len(candidates) != 1:
+                raise WechatDigestError("Governance 启动封存必须唯一绑定一个 started item。")
+            item_id, item = candidates[0]
+            already_sealed = item.get("state") == "failed_closed"
+            receipt = _validated_governance_receipt(item.get("governance_receipt"))
+            metrics = _validated_governance_metrics(item.get("governance_metrics"))
+            atomic_ids = self._verify_semantic_receipts(
+                str(item.get("representation_id")), item, recover_missing_item_receipt=True
+            )
+            if (
+                (not already_sealed and item.get("state") != "represented")
+                or (
+                    not already_sealed
+                    and (status.get("state") != "failed" or status.get("failure_category") != "RuntimeError")
+                )
+                or (
+                    already_sealed
+                    and (status.get("state") != "processing" or status.get("failure_category") is not None)
+                )
+                or item.get("semantic_failure") is not None
+                or item.get("privacy_route") not in {None, "approved"}
+                or item.get("privacy_categories") not in (None, [])
+                or item.get("pending_human") is not False
+                or item.get("context_object_ids") != []
+                or receipt.get("phase") != "started"
+                or receipt.get("atomic_information_fingerprint") != _governance_atomic_fingerprint(atomic_ids)
+                or metrics.get("app_server_start_count") != 1
+                or metrics.get("thread_count") != 0
+                or metrics.get("turn_count") != 0
+                or metrics.get("timeout_count") != 0
+                or metrics.get("failure_count") != 1
+                or metrics.get("failure_categories") != {"transport": 1}
+            ):
+                raise WechatDigestError("联系人 Governance 启动 transport evidence 不完整。")
+            provider_summary = self._seal_contact_governance_startup_transport_failure({
+                "run_id": run_id, "item_id": item_id,
+                "atomic_information_fingerprint": str(receipt["atomic_information_fingerprint"]),
+                "governance_receipt_fingerprint": _sha256_bytes(_canonical_json(receipt).encode("utf-8")),
+                "governance_metrics_fingerprint": _sha256_bytes(_canonical_json(metrics).encode("utf-8")),
+            })
+            failure = {"failure_category": "startup_transport", "preserved_but_partially_governed": True, "provider_retry_permitted": False}
+            if already_sealed:
+                if item.get("governance_failure") != failure:
+                    raise WechatDigestError("联系人 Governance 启动封存记录不一致。")
+            else:
+                updated_items = dict(items)
+                updated_items[item_id] = {**item, "state": "failed_closed", "privacy_route": "approved", "privacy_categories": [], "atomic_information_ids": list(atomic_ids), "governance_failure": failure}
+                self.run_store.update_status(run_id, {**status, "items": updated_items, "state": "processing", "failure_category": None, "updated_at": self.clock()})
+            final_item = self._item(self.run_store.status(run_id)["items"], item_id)
+            self._verify_governance_failed_closed_item(final_item, failure_category="startup_transport")
+            return {**provider_summary, "semantic_provider_calls": 0, "governance_provider_calls": 0, "governance_preserved_but_incomplete": 1, "provider_retry_permitted": False}
+
     def run(
         self,
         *,
@@ -10729,7 +10816,19 @@ class WechatDigestService:
                 "微信 failed_closed item failure variant 损坏。"
             )
         if governance_failure is not None:
-            self._verify_governance_failed_closed_item(item)
+            category = (
+                governance_failure.get("failure_category")
+                if isinstance(governance_failure, dict)
+                else None
+            )
+            self._verify_governance_failed_closed_item(
+                item,
+                failure_category=(
+                    "startup_transport"
+                    if category == "startup_transport"
+                    else "turn_timeout"
+                ),
+            )
             return
         failure = semantic_failure
         global_ordinal = (
@@ -10859,7 +10958,7 @@ class WechatDigestService:
             ) from exc
 
     def _verify_governance_failed_closed_item(
-        self, item: Mapping[str, object]
+        self, item: Mapping[str, object], *, failure_category: str = "turn_timeout"
     ) -> None:
         failure = item.get("governance_failure")
         receipt = _validated_governance_receipt(
@@ -10877,7 +10976,7 @@ class WechatDigestService:
                 "preserved_but_partially_governed",
                 "provider_retry_permitted",
             }
-            or failure.get("failure_category") != "turn_timeout"
+            or failure.get("failure_category") != failure_category
             or failure.get("preserved_but_partially_governed") is not True
             or failure.get("provider_retry_permitted") is not False
             or item.get("semantic_failure") is not None
@@ -10891,8 +10990,22 @@ class WechatDigestService:
             or receipt.get("phase") != "started"
             or receipt.get("atomic_information_fingerprint")
             != _governance_atomic_fingerprint(atomic_ids)
-            or int(metrics["timeout_count"]) < 1
-            or int(dict(metrics["failure_categories"]).get("timeout", 0)) < 1
+            or (
+                failure_category == "turn_timeout"
+                and (int(metrics["timeout_count"]) < 1
+                     or int(dict(metrics["failure_categories"]).get("timeout", 0)) < 1)
+            )
+            or (
+                failure_category == "startup_transport"
+                and not (
+                    metrics.get("app_server_start_count") == 1
+                    and metrics.get("thread_count") == 0
+                    and metrics.get("turn_count") == 0
+                    and metrics.get("timeout_count") == 0
+                    and metrics.get("failure_count") == 1
+                    and metrics.get("failure_categories") == {"transport": 1}
+                )
+            )
             or item.get("pending_human") is not False
             or item.get("context_object_ids") != []
         ):

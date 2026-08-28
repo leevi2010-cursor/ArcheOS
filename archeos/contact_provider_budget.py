@@ -280,9 +280,13 @@ class ContactProviderBudget:
                 not isinstance(attempt, dict)
                 or attempt.get("ordinal") != ordinal
                 or attempt.get("category") not in _CATEGORIES
-                or state not in {"reserved", "started", "result", "unknown", "timeout_no_result"}
+                or state not in {"reserved", "started", "result", "unknown", "timeout_no_result", "startup_no_result"}
                 or not isinstance(attempt.get("request_binding"), dict)
                 or (state == "timeout_no_result") != isinstance(timeout_binding, dict)
+                or (
+                    state == "startup_no_result"
+                    and not isinstance(attempt.get("startup_binding"), dict)
+                )
                 or attempt.get("attempt_fingerprint") != _fingerprint(raw)
             ):
                 raise WechatDigestError("联系人统一 Provider attempt 不可验证。")
@@ -442,6 +446,55 @@ class ContactProviderBudget:
                     "remaining": self.absolute_cap - total,
                     "next_contact_ordinal": total + 1,
                 }
+            finally:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+    def seal_governance_startup_transport_failure(
+        self, *, startup_binding: dict[str, object]
+    ) -> dict[str, int]:
+        """Close the exact contact startup transport attempt without a retry."""
+
+        required = {
+            "run_id", "item_id", "atomic_information_fingerprint",
+            "governance_receipt_fingerprint", "governance_metrics_fingerprint",
+        }
+        if (
+            set(startup_binding) != required
+            or any(not isinstance(value, str) or not value for value in startup_binding.values())
+        ):
+            raise WechatDigestError("联系人 Governance 启动 transport binding 不可验证。")
+        with self.lock_path.open("a+") as handle:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            try:
+                current = _read(self.path)
+                attempts = self._validated(current)
+                matches = [
+                    item for item in attempts
+                    if item["category"] == "governance"
+                    and all(item["request_binding"].get(key) == startup_binding[key]
+                            for key in ("run_id", "item_id", "atomic_information_fingerprint"))
+                ]
+                if len(matches) != 1:
+                    raise WechatDigestError("联系人 Governance 启动未能唯一绑定 started attempt。")
+                attempt = matches[0]
+                if attempt["state"] == "startup_no_result":
+                    if attempt.get("startup_binding") != startup_binding:
+                        raise WechatDigestError("联系人 Governance 启动 binding 漂移。")
+                elif attempt["state"] == "started":
+                    ordinal = int(attempt["ordinal"])
+                    raw = {key: value for key, value in attempt.items() if key != "attempt_fingerprint"}
+                    raw["state"] = "startup_no_result"
+                    raw["startup_binding"] = startup_binding
+                    attempts[ordinal - 1] = {**raw, "attempt_fingerprint": _fingerprint(raw)}
+                    payload = {key: value for key, value in current.items() if key != "usage_fingerprint"}
+                    payload["attempts"] = attempts
+                    _write(self.path, {**payload, "usage_fingerprint": _fingerprint(payload)})
+                else:
+                    raise WechatDigestError("联系人 Governance 启动缺少 started attempt。")
+                total = len(attempts)
+                return {"contact_attempt_total": total, "absolute_cap": self.absolute_cap,
+                        "remaining": self.absolute_cap - total,
+                        "next_contact_ordinal": total + 1}
             finally:
                 fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 

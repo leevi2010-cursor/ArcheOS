@@ -3827,6 +3827,58 @@ class WechatDigestTests(unittest.TestCase):
         next_attempt = budget.reserve("semantic", {"request": "next-item"})
         self.assertEqual(next_attempt.ordinal, 22)
 
+    @patch("archeos.wechat_digest._require_openai_codex_sdk")
+    def test_contact_startup_transport_seal_preserves_atomic_information_and_budget(
+        self,
+        _sdk: object,
+    ) -> None:
+        service, capture, provider, run_id, item_id = self.governance_timeout_fixture(
+            include_next=False
+        )
+        status = service.run_store.status(run_id)
+        item = status["items"][item_id]
+        metrics = dict(item["governance_metrics"])
+        metrics.update({"app_server_start_count": 1, "thread_count": 0,
+                        "turn_count": 0, "timeout_count": 0, "failure_count": 1,
+                        "failure_categories": {"transport": 1}})
+        item["governance_metrics"] = metrics
+        status["state"] = "failed"
+        status["failure_category"] = "RuntimeError"
+        service.run_store.update_status(run_id, status)
+        contact_store, binding = self.contact_timeout_store_with_contact_plan(service, run_id)
+        budget = ContactProviderBudget(
+            contact_store.root / "synthesis", binding=binding,
+            authority_ref="https://github.com/leevi2010-cursor/ArcheOS/issues/216#issuecomment-1",
+            absolute_cap=50,
+        )
+        for ordinal in range(1, 43):
+            attempt = budget.reserve("semantic", {"request": f"semantic-{ordinal}"})
+            attempt.mark_started()
+            attempt.complete()
+        receipt = item["governance_receipt"]
+        started = budget.reserve("governance", {"run_id": run_id, "item_id": item_id,
+            "atomic_information_fingerprint": receipt["atomic_information_fingerprint"]})
+        started.mark_started()
+        contact_service = WechatDigestService(
+            workspace=self.workspace, capture_provider=capture,
+            semantic_handoff_factory=lambda: self.semantic, interpretation_provider=provider,
+            run_store=contact_store,
+            seal_contact_governance_startup_transport_failure=lambda binding: budget.seal_governance_startup_transport_failure(startup_binding=binding),
+        )
+        semantic_calls, provider_calls, capture_calls = self.semantic.provider.calls, provider.calls, len(capture.calls)
+        resolution = contact_service.seal_contact_governance_startup_transport_failure()
+        self.assertEqual(resolution["contact_attempt_total"], 43)
+        self.assertEqual(resolution["next_contact_ordinal"], 44)
+        self.assertEqual(self.semantic.provider.calls, semantic_calls)
+        self.assertEqual(provider.calls, provider_calls)
+        self.assertEqual(len(capture.calls), capture_calls)
+        self.assertEqual(contact_store.status(run_id)["items"][item_id]["state"], "failed_closed")
+        self.assertEqual(json.loads((budget.root / "unified-provider-usage.json").read_text())["attempts"][-1]["state"], "startup_no_result")
+        self.assertEqual(
+            contact_service.seal_contact_governance_startup_transport_failure(), resolution
+        )
+        self.assertEqual(budget.reserve("semantic", {"request": "next-item"}).ordinal, 44)
+
     def test_contact_plan_without_seal_callback_still_requires_frozen_campaign(
         self,
     ) -> None:
