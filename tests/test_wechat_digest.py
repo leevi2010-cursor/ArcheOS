@@ -3690,6 +3690,87 @@ class WechatDigestTests(unittest.TestCase):
         self.assertEqual(final_item, sealed_item)
         self.assertIsNone(service.run_store.active_run_id())
 
+    def test_governance_timeout_seal_uses_contact_ledger_without_global_authority(
+        self,
+    ) -> None:
+        service, capture, provider, run_id, item_id = (
+            self.governance_timeout_fixture(include_next=False)
+        )
+        status = service.run_store.status(run_id)
+        captured = message(1, conversation="failed")
+        binding = WechatContactBinding(
+            captured.conversation_key,
+            captured.provider_conversation_id,
+            captured.conversation_label,
+            captured.is_group,
+        )
+        contact_root = (
+            self.workspace
+            / "02_processing"
+            / "wechat_digest"
+            / "contacts"
+            / binding.conversation_key
+        )
+        contact_run = contact_root / "runs" / run_id
+        shutil.copytree(service.run_store.runs_root / run_id, contact_run)
+        contact_store = WechatDigestRunStore(contact_root)
+        contact_store.active_path.write_text(json.dumps({"active_run_id": run_id}))
+        budget = ContactProviderBudget(
+            contact_root / "synthesis",
+            binding=binding,
+            authority_ref=(
+                "https://github.com/leevi2010-cursor/ArcheOS/issues/210"
+                "#issuecomment-1"
+            ),
+            absolute_cap=50,
+        )
+        for ordinal in range(1, 21):
+            done = budget.reserve("semantic", {"request": f"semantic-{ordinal}"})
+            done.mark_started()
+            done.complete()
+        item = status["items"][item_id]
+        receipt = item["governance_receipt"]
+        started = budget.reserve(
+            "governance",
+            {
+                "run_id": run_id,
+                "item_id": item_id,
+                "atomic_information_fingerprint": receipt[
+                    "atomic_information_fingerprint"
+                ],
+            },
+        )
+        started.mark_started()
+        contact_service = WechatDigestService(
+            workspace=self.workspace,
+            capture_provider=capture,
+            semantic_handoff_factory=lambda: self.semantic,
+            interpretation_provider=provider,
+            run_store=contact_store,
+            seal_contact_governance_timeout=lambda timeout_binding: budget.seal_governance_timeout(
+                timeout_binding=timeout_binding
+            ),
+        )
+        self.semantic.global_attempt_summary = lambda _representation_id: (_ for _ in ()).throw(
+            AssertionError("contact seal must not read global authority")
+        )
+        semantic_calls = self.semantic.provider.calls
+        governance_calls = provider.calls
+        capture_calls = len(capture.calls)
+
+        resolution = contact_service.seal_governance_timeout()
+
+        self.assertEqual(resolution["contact_attempt_total"], 21)
+        self.assertEqual(resolution["next_contact_ordinal"], 22)
+        self.assertEqual(resolution["governance_provider_calls"], 0)
+        self.assertEqual(self.semantic.provider.calls, semantic_calls)
+        self.assertEqual(provider.calls, governance_calls)
+        self.assertEqual(len(capture.calls), capture_calls)
+        usage = json.loads((budget.root / "unified-provider-usage.json").read_text())
+        self.assertEqual(usage["attempts"][-1]["state"], "timeout_no_result")
+        next_attempt = budget.reserve("semantic", {"request": "next-item"})
+        self.assertEqual(next_attempt.ordinal, 22)
+
     def test_maintenance_continuation_binds_exact_active_state_zero_calls(
         self,
     ) -> None:

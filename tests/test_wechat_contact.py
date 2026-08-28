@@ -544,7 +544,7 @@ class ContactAcceptancePackTests(unittest.TestCase):
                 output_root=workspace / "acceptance",
                 synthesis_provider_factory=lambda: provider,
                 authority_ref=self.AUTHORITY_REF,
-                absolute_cap=50,
+                absolute_cap=3,
             )
             pack = json.loads(json_path.read_text())
             self.assertEqual(len(pack["events"]), 2)
@@ -988,6 +988,87 @@ class ContactProviderBudgetTests(unittest.TestCase):
             attempt.mark_started()
             with self.assertRaisesRegex(WechatDigestError, "结果未知"):
                 budget.before_call("governance")
+
+    def test_governance_timeout_seal_consumes_exact_started_attempt(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            budget = ContactProviderBudget(
+                self._root(directory),
+                binding=_binding(),
+                authority_ref=self.AUTHORITY_REF,
+                absolute_cap=50,
+            )
+            for ordinal in range(1, 21):
+                semantic = budget.reserve(
+                    "semantic", {"request": f"semantic-{ordinal}"}
+                )
+                semantic.mark_started()
+                semantic.complete()
+            timeout = {
+                "run_id": "run_test",
+                "item_id": "item-1",
+                "atomic_information_fingerprint": "sha256:" + "a" * 64,
+                "governance_receipt_fingerprint": "sha256:" + "b" * 64,
+                "governance_metrics_fingerprint": "sha256:" + "c" * 64,
+            }
+            governance = budget.reserve(
+                "governance",
+                {
+                    "run_id": timeout["run_id"],
+                    "item_id": timeout["item_id"],
+                    "atomic_information_fingerprint": timeout[
+                        "atomic_information_fingerprint"
+                    ],
+                },
+            )
+            governance.mark_started()
+
+            resolution = budget.seal_governance_timeout(timeout_binding=timeout)
+
+            self.assertEqual(resolution["contact_attempt_total"], 21)
+            self.assertEqual(resolution["remaining"], 29)
+            usage = json.loads((budget.root / "unified-provider-usage.json").read_text())
+            self.assertEqual(
+                [item["state"] for item in usage["attempts"]][-2:],
+                ["result", "timeout_no_result"],
+            )
+            self.assertEqual(
+                budget.seal_governance_timeout(timeout_binding=timeout), resolution
+            )
+            next_attempt = budget.reserve("semantic", {"request": "next"})
+            self.assertEqual(next_attempt.ordinal, 22)
+
+    def test_governance_timeout_seal_rejects_binding_drift(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            budget = ContactProviderBudget(
+                self._root(directory),
+                binding=_binding(),
+                authority_ref=self.AUTHORITY_REF,
+                absolute_cap=2,
+            )
+            timeout = {
+                "run_id": "run_test",
+                "item_id": "item-1",
+                "atomic_information_fingerprint": "sha256:" + "a" * 64,
+                "governance_receipt_fingerprint": "sha256:" + "b" * 64,
+                "governance_metrics_fingerprint": "sha256:" + "c" * 64,
+            }
+            started = budget.reserve(
+                "governance",
+                {
+                    "run_id": timeout["run_id"],
+                    "item_id": timeout["item_id"],
+                    "atomic_information_fingerprint": timeout[
+                        "atomic_information_fingerprint"
+                    ],
+                },
+            )
+            started.mark_started()
+            drifted = {**timeout, "item_id": "item-2"}
+
+            with self.assertRaisesRegex(WechatDigestError, "唯一绑定"):
+                budget.seal_governance_timeout(timeout_binding=drifted)
+            usage = json.loads((budget.root / "unified-provider-usage.json").read_text())
+            self.assertEqual(usage["attempts"][0]["state"], "started")
 
     def test_reserved_attempt_is_idempotent_but_binding_drift_fails_closed(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
