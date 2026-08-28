@@ -1173,11 +1173,21 @@ class ContactSynthesisStore:
                     reservation_path.exists() or reservation_path.is_symlink()
                 )
                 completion = None
+                unified_binding = {
+                    "segment_ordinal": next_ordinal,
+                    "request_fingerprint": request_fingerprint,
+                    "contact_identity": _stable_contact_identity(binding),
+                }
                 if reservation_exists:
                     if _read_private(reservation_path) != reservation:
                         raise WechatDigestError(
                             "联系人模型调用 reservation 与当前 segment 不一致。"
                         )
+                    completion = (
+                        None
+                        if before_provider_call is None
+                        else before_provider_call(unified_binding)
+                    )
                 else:
                     if (
                         semantic_provider_calls
@@ -1191,7 +1201,7 @@ class ContactSynthesisStore:
                     completion = (
                         None
                         if before_provider_call is None
-                        else before_provider_call()
+                        else before_provider_call(unified_binding)
                     )
                     _private_write(reservation_path, reservation)
                     if self.after_reservation_write is not None:
