@@ -12420,6 +12420,7 @@ class _RecoveryAwareProvider:
         required_new_calls: int,
         authority_guard: object | None = None,
         global_grant: Mapping[str, object] | None = None,
+        before_provider_call: Callable[[], None] | None = None,
     ) -> None:
         if recovery.legacy_complete_context_replay:
             raise SemanticHandoffError(
@@ -12432,6 +12433,7 @@ class _RecoveryAwareProvider:
         self.required_new_calls = required_new_calls
         self._authority_guard = authority_guard
         self._global_grant = global_grant
+        self.before_provider_call = before_provider_call
         self.name = provider.name
         self.provider_version = provider.provider_version
         self.model = provider.model
@@ -12580,6 +12582,15 @@ class _RecoveryAwareProvider:
             return result
         try:
             if os.path.lexists(self.recovery._attempt_path(self._ordinal)):
+                self.recovery.publish_started(self._ordinal)
+                return self._analyze_reserved(batch)
+            if self.global_authority is None:
+                if self.before_provider_call is None:
+                    raise SemanticHandoffError(
+                        "Semantic authority 未绑定；不得启动新 Provider call。"
+                    )
+                self.recovery.publish_attempt(self._ordinal)
+                self.before_provider_call()
                 self.recovery.publish_started(self._ordinal)
                 return self._analyze_reserved(batch)
             self._enter_authority_guard()
@@ -13928,6 +13939,7 @@ class ExternalAgentSemanticHandoffService:
         privacy_binding: SemanticPrivacyBinding | None = None,
         new_call_authority: int | None = None,
         authority_binding: SemanticWindowAuthorityBinding | None = None,
+        before_provider_call: Callable[[], None] | None = None,
     ) -> SemanticHandoffResult:
         record_offset = len(provider.execution_records)
         package = self.representation_service.output_root / representation_id
@@ -14098,11 +14110,19 @@ class ExternalAgentSemanticHandoffService:
                 raise SemanticHandoffError(
                     "Semantic recovery 存在 outcome 不确定的 attempt；LEAD_DECISION_REQUIRED。"
                 )
-            if preflight.required_new_calls and authority_binding is None:
+            if (
+                preflight.required_new_calls
+                and authority_binding is None
+                and before_provider_call is None
+            ):
                 raise SemanticHandoffError(
                     "Semantic global authority 未绑定当前 window；不得启动新调用。"
                 )
-            if preflight.required_new_calls and not global_authority.exists:
+            if (
+                preflight.required_new_calls
+                and authority_binding is not None
+                and not global_authority.exists
+            ):
                 raise SemanticHandoffError(
                     "Semantic global authority 未安装；不得启动新 Provider call。"
                 )
@@ -14129,6 +14149,7 @@ class ExternalAgentSemanticHandoffService:
                 preflight.required_new_calls,
                 authority_guard=authority_guard,
                 global_grant=global_grant,
+                before_provider_call=before_provider_call,
             )
 
         audit_paths: tuple[Path, ...] = ()

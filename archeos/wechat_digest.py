@@ -2361,6 +2361,7 @@ class ExistingSemanticHandoff:
         reasoning_effort: str = DEFAULT_SEMANTIC_REASONING_EFFORT,
         batch_size: int = DEFAULT_EXTERNAL_AGENT_BATCH_SIZE,
         reviewed_git_head: str | None = None,
+        before_provider_call: Callable[[], None] | None = None,
     ) -> None:
         self.service = ExternalAgentSemanticHandoffService(
             RepresentationInformationService(
@@ -2380,6 +2381,7 @@ class ExistingSemanticHandoff:
             "timeout_seconds": timeout_seconds,
         }
         self._diagnostic_root = Path(audit_root) / "semantic-provider-diagnostics"
+        self._before_provider_call = before_provider_call
         self.provider = self._new_provider("serial")
         self.reviewed_git_head = reviewed_git_head or detect_clean_git_head()
 
@@ -2402,6 +2404,7 @@ class ExistingSemanticHandoff:
             self.provider,
             privacy_binding=privacy_binding,
             authority_binding=authority_binding,
+            before_provider_call=self._before_provider_call,
         )
 
     def prepare_results(
@@ -2413,6 +2416,27 @@ class ExistingSemanticHandoff:
         providers = tuple(
             self._new_provider(request.representation_id) for request in requests
         )
+        if self._before_provider_call is not None:
+            elapsed: dict[str, int] = {}
+            for request, provider in zip(requests, providers, strict=True):
+                started = time.monotonic()
+                self.service.execute(
+                    request.representation_id,
+                    provider,
+                    privacy_binding=request.privacy_binding,
+                    before_provider_call=self._before_provider_call,
+                )
+                elapsed[request.representation_id] = max(
+                    0, round((time.monotonic() - started) * 1000)
+                )
+            self.last_prepare_metrics = {
+                "semantic_parallelism": 1,
+                "semantic_peak_concurrency": 1 if requests else 0,
+                "semantic_wall_ms": sum(elapsed.values()),
+                "semantic_serial_estimate_ms": sum(elapsed.values()),
+                "resume_provider_calls": 0,
+            }
+            return elapsed
         elapsed = self.service.prepare_results(
             requests,
             providers,
@@ -4483,6 +4507,7 @@ class WechatDigestService:
         run_store: WechatDigestRunStore | None = None,
         semantic_batch_size: int = DEFAULT_EXTERNAL_AGENT_BATCH_SIZE,
         semantic_parallelism: int = 2,
+        before_governance_provider_call: Callable[[], None] | None = None,
         clock: Callable[[], str] = _utc_now,
     ) -> None:
         self.workspace = Path(workspace)
@@ -4515,7 +4540,7 @@ class WechatDigestService:
             self.workspace / "02_processing" / "wechat_digest", clock=clock
         )
         self._semantic_handoff: SemanticHandoffPort | None = None
-        self._before_governance_provider_call: Callable[[], None] | None = None
+        self._before_governance_provider_call = before_governance_provider_call
         self._governance_resume_state: dict[str, object] | None = None
         self._governance_migration_state: dict[str, object] | None = None
         self._governance_execution_lock = threading.Lock()

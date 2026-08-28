@@ -696,6 +696,22 @@ class ContactSynthesisStore:
         require_contact_provider_authority_ref(authority["authority_ref"])
         return authority
 
+    def ensure_provider_authority(
+        self,
+        *,
+        binding: WechatContactBinding,
+        authority_ref: str,
+        absolute_cap: int,
+    ) -> dict[str, object]:
+        """Persist the contact approval before any Provider route starts."""
+        return self._provider_authority(
+            binding=binding,
+            authority_ref=authority_ref,
+            absolute_cap=absolute_cap,
+            semantic_provider_calls=0,
+            governance_provider_calls=0,
+        )
+
     def _provider_authority(
         self,
         *,

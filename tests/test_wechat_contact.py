@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-import json
 import hashlib
+import json
 import os
 import tempfile
 import unittest
@@ -13,11 +13,12 @@ from archeos.atomic_information import (
     EvidenceRecord,
     JsonlAtomicInformationStore,
 )
+from archeos.contact_provider_budget import ContactProviderBudget
 from archeos.wechat_contact import (
-    _contact_semantic_provider_calls,
     LegacyMessageOverlap,
     OverlapFilteringWechatCaptureProvider,
     WechatContactSelectionStore,
+    _contact_semantic_provider_calls,
     build_contact_acceptance_pack,
     committed_legacy_message_keys,
     legacy_message_overlap,
@@ -882,6 +883,33 @@ class ContactAcceptancePackTests(unittest.TestCase):
                     / "result.json"
                 ).exists()
             )
+
+class ContactProviderBudgetTests(unittest.TestCase):
+    AUTHORITY_REF = (
+        "https://github.com/leevi2010-cursor/ArcheOS/issues/206"
+        "#issuecomment-1"
+    )
+
+    def test_shared_cap_is_durable_and_fails_closed_before_next_call(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "synthesis"
+            budget = ContactProviderBudget(
+                root,
+                binding=_binding(),
+                authority_ref=self.AUTHORITY_REF,
+                absolute_cap=2,
+            )
+            budget.before_call("semantic")
+            budget.before_call("governance")
+            with self.assertRaisesRegex(WechatDigestError, "达到授权上限"):
+                budget.before_call("semantic")
+            authority = ContactSynthesisStore(root).read_provider_authority(
+                _binding()
+            )
+            self.assertIsNotNone(authority)
+            usage = json.loads((root / "unified-provider-usage.json").read_text())
+            self.assertEqual(usage["entries"], ["semantic", "governance"])
+            self.assertEqual(usage["absolute_cap"], 2)
 
 
 class ContactResolutionTests(unittest.TestCase):

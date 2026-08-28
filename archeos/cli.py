@@ -10,6 +10,7 @@ from pathlib import Path
 from .analysis import FileAnalysisProvider
 from .atomic_information import JsonlAtomicInformationStore, ingest_processing_package
 from .codex_app_server import CodexAnalysisProvider, _load_sdk
+from .contact_provider_budget import ContactProviderBudget
 from .context import ContextBuilder, ContextRequest
 from .digestion import (
     AtomicInformationDigestionService,
@@ -1534,6 +1535,7 @@ def _wechat_product_command(args: argparse.Namespace) -> int:
         service_workspace = workspace
         run_store = None
         capture = base_capture
+        contact_provider_budget = None
         if args.contact is not None:
             contact_binding = base_capture.resolve_contact(args.contact)
             if args.authority_ref is not None:
@@ -1610,6 +1612,26 @@ def _wechat_product_command(args: argparse.Namespace) -> int:
                 contact_root
             )
 
+        def get_contact_provider_budget() -> ContactProviderBudget:
+            nonlocal contact_provider_budget
+            if contact_binding is None:
+                raise WechatDigestError("联系人 Provider authority 未绑定。")
+            if contact_provider_budget is None:
+                contact_root = (
+                    service_workspace
+                    / "02_processing"
+                    / "wechat_digest"
+                    / "contacts"
+                    / contact_binding.conversation_key
+                )
+                contact_provider_budget = ContactProviderBudget(
+                    contact_root / "synthesis",
+                    binding=contact_binding,
+                    authority_ref=str(contact_authority_ref),
+                    absolute_cap=int(contact_absolute_cap),
+                )
+            return contact_provider_budget
+
         def semantic_handoff() -> ExistingSemanticHandoff:
             provider_version = args.provider_version or detect_codex_provider_version(
                 args.codex_bin
@@ -1634,6 +1656,11 @@ def _wechat_product_command(args: argparse.Namespace) -> int:
                 reasoning_effort=args.reasoning_effort,
                 timeout_seconds=args.timeout_seconds,
                 batch_size=args.batch_size,
+                before_provider_call=(
+                    None
+                    if contact_binding is None
+                    else lambda: get_contact_provider_budget().before_call("semantic")
+                ),
             )
 
         service = WechatDigestService(
@@ -1642,8 +1669,15 @@ def _wechat_product_command(args: argparse.Namespace) -> int:
             semantic_handoff_factory=semantic_handoff,
             interpretation_provider=CodexAtomicInformationInterpretationProvider(),
             semantic_batch_size=args.batch_size,
-            semantic_parallelism=(1 if contact_binding is not None else args.semantic_parallelism),
+            semantic_parallelism=(
+                1 if contact_binding is not None else args.semantic_parallelism
+            ),
             run_store=run_store,
+            before_governance_provider_call=(
+                None
+                if contact_binding is None
+                else lambda: get_contact_provider_budget().before_call("governance")
+            ),
         )
         if args.prepare_next_semantic:
             prepared = service.prepare_next_semantic(batch_size=args.batch_size)
