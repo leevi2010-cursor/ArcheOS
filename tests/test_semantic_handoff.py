@@ -11771,27 +11771,18 @@ print("passed")
         receipt_path = recovery.run_dir / "run-receipt.json"
         receipt_bytes = receipt_path.read_bytes()
         tampered = json.loads(receipt_bytes)
-        tampered["representation"]["representation_id"] = (
-            "repr_" + "0" * 64
-        )
+        tampered["representation"]["representation_id"] = "repr_" + "0" * 64
         receipt_path.write_text(json.dumps(tampered), encoding="utf-8")
         with self.assertRaises(SemanticHandoffError):
             handoff.validate_pre_attempt_inventory(
-                representation.representation_id,
-                provider,
-                privacy,
+                representation.representation_id, provider, privacy
             )
         receipt_path.write_bytes(receipt_bytes)
-        package = (
-            representation_service.output_root
-            / representation.representation_id
-        )
+        package = representation_service.output_root / representation.representation_id
         package.mkdir(parents=True)
         with self.assertRaisesRegex(SemanticHandoffError, "package 已存在"):
             handoff.validate_pre_attempt_inventory(
-                representation.representation_id,
-                provider,
-                privacy,
+                representation.representation_id, provider, privacy
             )
         package.rmdir()
 
@@ -11799,19 +11790,89 @@ print("passed")
         authority.publish_attempts(((recovery, 1, binding, provider),))
         recovery.publish_reserved(1)
         with authority._locked(blocking=False):
-            _base, effective, _continuations = (
-                authority._current_effective_authority()
-            )
+            _base, effective, _continuations = authority._current_effective_authority()
             _attempts, unknown = authority._global_attempts(effective)
         self.assertFalse(unknown)
-        with self.assertRaisesRegex(
-            SemanticHandoffError, "execution inventory 非空"
-        ):
+        with self.assertRaisesRegex(SemanticHandoffError, "execution inventory 非空"):
             handoff.validate_pre_attempt_inventory(
-                representation.representation_id,
-                provider,
-                privacy,
+                representation.representation_id, provider, privacy
             )
+        self.assertEqual(runner.calls, [])
+
+    def test_contact_pre_attempt_proof_accepts_only_provider_zero_inventory(self) -> None:
+        """The contact-local proof covers both legacy Provider-0 shapes."""
+        import archeos.semantic_handoff as handoff_module
+
+        root = self.root / "contact-pre-attempt-proof"
+        representation, representation_service = self.build_service(root=root)
+        audit_root = root / "audits"
+        handoff = ExternalAgentSemanticHandoffService(
+            representation_service,
+            JsonlAtomicInformationStore(root / "atomic.jsonl"),
+            audit_root,
+        )
+        runner = FakeRunner()
+        provider = CodexCliRepresentationAnalysisProvider(
+            provider_version="0.147.0", timeout_seconds=300, runner=runner
+        )
+        privacy = self.privacy_binding()
+
+        def proof(_representation_id, privacy_binding, inventory):
+            payload = {
+                "schema_version": "wechat-contact-pre-attempt-semantic-proof/1.0",
+                "contact_identity": {
+                    "conversation_key": "wechat_conversation_" + "a" * 32,
+                    "provider_conversation_id": "synthetic",
+                    "is_group": False,
+                },
+                "workspace_fingerprint": "sha256:" + "1" * 64,
+                "run_id": "run_" + "b" * 32,
+                "plan_fingerprint": "sha256:" + "2" * 64,
+                "plan_receipt_fingerprint": "sha256:" + "3" * 64,
+                "capture_fingerprint": "sha256:" + "4" * 64,
+                "frozen_upper_bound": {"timestamp": 1},
+                "authority_ref": "https://github.com/leevi2010-cursor/ArcheOS/issues/208#issuecomment-1",
+                "absolute_cap": 2,
+                "authority_fingerprint": "sha256:" + "5" * 64,
+                "status_fingerprint": "sha256:" + "6" * 64,
+                "unified_ledger": {"state": "absent_zero", "usage_fingerprint": None},
+                "representation_id": _representation_id,
+                "privacy_binding": {
+                    "policy": privacy_binding.policy,
+                    "policy_version": privacy_binding.policy_version,
+                    "route": privacy_binding.route,
+                    "receipt_fingerprint": privacy_binding.receipt_fingerprint,
+                },
+                "semantic_inventory": inventory,
+            }
+            return {
+                **payload,
+                "proof_fingerprint": handoff_module._fingerprint(payload),
+            }
+
+        absent = handoff.validate_pre_attempt_inventory(
+            representation.representation_id,
+            provider,
+            privacy,
+            contact_pre_attempt_proof=proof,
+        )
+        self.assertEqual(absent["inventory_kind"], "absent")
+        recovery = _SemanticRecoveryRun(
+            representation_service,
+            audit_root,
+            representation.representation_id,
+            provider,
+            privacy,
+            complete_context=True,
+        )
+        recovery.ensure_run_receipt()
+        receipt_only = handoff.validate_pre_attempt_inventory(
+            representation.representation_id,
+            provider,
+            privacy,
+            contact_pre_attempt_proof=proof,
+        )
+        self.assertEqual(receipt_only["inventory_kind"], "run_receipt_only")
         self.assertEqual(runner.calls, [])
 
     def test_generic_attempt_resolution_is_recoverable_and_continues_next_ordinal(

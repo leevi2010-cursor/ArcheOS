@@ -274,6 +274,9 @@ class CliTest(unittest.TestCase):
             service_kwargs = digest_service.call_args.kwargs
             self.assertEqual(service_kwargs["workspace"], isolated.resolve())
             self.assertEqual(service_kwargs["semantic_parallelism"], 1)
+            with patch("archeos.wechat_digest.detect_clean_git_head", return_value="a" * 40):
+                handoff = service_kwargs["semantic_handoff_factory"]()
+            self.assertTrue(callable(handoff._contact_pre_attempt_proof))
             self.assertIn(
                 binding.conversation_key,
                 str(service_kwargs["run_store"].root),
