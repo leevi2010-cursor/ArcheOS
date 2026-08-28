@@ -13236,6 +13236,8 @@ class WechatDigestService:
                 return
             if previous_provider_hook is not None:
                 completion = previous_provider_hook()
+                if hasattr(completion, "mark_started"):
+                    completion.mark_started()
                 if callable(completion):
                     provider_completion = completion
             if startup_recovery is not None:

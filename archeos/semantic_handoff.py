@@ -12591,6 +12591,8 @@ class _RecoveryAwareProvider:
                     )
                 self.recovery.publish_attempt(self._ordinal)
                 completion = self.before_provider_call()
+                if hasattr(completion, "mark_started"):
+                    completion.mark_started()
                 self.recovery.publish_started(self._ordinal)
                 return self._analyze_reserved(batch, completion=completion)
             self._enter_authority_guard()

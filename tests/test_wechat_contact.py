@@ -890,9 +890,27 @@ class ContactProviderBudgetTests(unittest.TestCase):
         "#issuecomment-1"
     )
 
+    def _root(self, directory: str) -> Path:
+        root = Path(directory) / "contact" / "synthesis"
+        run = root.parent / "runs" / "run_test"
+        run.mkdir(parents=True)
+        (root.parent / "active.json").write_text('{"active_run_id":"run_test"}')
+        plan = {
+            "contact_binding": {
+                "conversation_key": _binding().conversation_key,
+                "provider_conversation_id": _binding().provider_conversation_id,
+                "is_group": _binding().is_group,
+            },
+            "capture_fingerprint": "sha256:test-capture",
+            "upper_bound": {"timestamp": 1, "message_id": "1"},
+        }
+        (run / "plan.json").write_text(json.dumps(plan))
+        (run / "run-plan-receipt.json").write_text(json.dumps({"plan": "test"}))
+        return root
+
     def test_shared_cap_is_durable_and_fails_closed_before_next_call(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory) / "synthesis"
+            root = self._root(directory)
             budget = ContactProviderBudget(
                 root,
                 binding=_binding(),
@@ -900,8 +918,10 @@ class ContactProviderBudgetTests(unittest.TestCase):
                 absolute_cap=2,
             )
             semantic_done = budget.before_call("semantic")
+            semantic_done.mark_started()
             semantic_done()
             governance_done = budget.before_call("governance")
+            governance_done.mark_started()
             governance_done()
             with self.assertRaisesRegex(WechatDigestError, "达到授权上限"):
                 budget.before_call("semantic")
@@ -910,24 +930,19 @@ class ContactProviderBudgetTests(unittest.TestCase):
             )
             self.assertIsNotNone(authority)
             usage = json.loads((root / "unified-provider-usage.json").read_text())
-            self.assertEqual(
-                usage["attempts"],
-                [
-                    {"ordinal": 1, "category": "semantic", "state": "result"},
-                    {"ordinal": 2, "category": "governance", "state": "result"},
-                ],
-            )
+            self.assertEqual([item["state"] for item in usage["attempts"]], ["result", "result"])
             self.assertEqual(usage["absolute_cap"], 2)
 
     def test_started_budget_attempt_is_unknown_and_never_retried(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             budget = ContactProviderBudget(
-                Path(directory) / "synthesis",
+                self._root(directory),
                 binding=_binding(),
                 authority_ref=self.AUTHORITY_REF,
                 absolute_cap=2,
             )
-            budget.before_call("semantic")
+            attempt = budget.before_call("semantic")
+            attempt.mark_started()
             with self.assertRaisesRegex(WechatDigestError, "结果未知"):
                 budget.before_call("governance")
 

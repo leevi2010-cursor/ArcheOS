@@ -1208,6 +1208,8 @@ class ContactSynthesisStore:
                     ),
                 }
                 _private_write(started_path, started)
+                if hasattr(completion, "mark_started"):
+                    completion.mark_started()
                 if self.after_started_write is not None:
                     self.after_started_write()
                 result = _validate_result(
