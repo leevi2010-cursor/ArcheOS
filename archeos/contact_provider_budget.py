@@ -270,7 +270,21 @@ class ContactProviderBudget:
             raise WechatDigestError("联系人统一 Provider 用量记录漂移。")
         for ordinal, attempt in enumerate(attempts, 1):
             raw = {key: value for key, value in attempt.items() if key != "attempt_fingerprint"} if isinstance(attempt, dict) else {}
-            if not isinstance(attempt, dict) or attempt.get("ordinal") != ordinal or attempt.get("category") not in _CATEGORIES or attempt.get("state") not in {"reserved", "started", "result", "unknown"} or not isinstance(attempt.get("request_binding"), dict) or attempt.get("attempt_fingerprint") != _fingerprint(raw):
+            state = attempt.get("state") if isinstance(attempt, dict) else None
+            timeout_binding = (
+                attempt.get("timeout_binding")
+                if isinstance(attempt, dict)
+                else None
+            )
+            if (
+                not isinstance(attempt, dict)
+                or attempt.get("ordinal") != ordinal
+                or attempt.get("category") not in _CATEGORIES
+                or state not in {"reserved", "started", "result", "unknown", "timeout_no_result"}
+                or not isinstance(attempt.get("request_binding"), dict)
+                or (state == "timeout_no_result") != isinstance(timeout_binding, dict)
+                or attempt.get("attempt_fingerprint") != _fingerprint(raw)
+            ):
                 raise WechatDigestError("联系人统一 Provider attempt 不可验证。")
         return attempts
 
@@ -342,6 +356,92 @@ class ContactProviderBudget:
                 }
                 payload["attempts"] = attempts
                 _write(self.path, {**payload, "usage_fingerprint": _fingerprint(payload)})
+            finally:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+    def seal_governance_timeout(
+        self, *, timeout_binding: dict[str, object]
+    ) -> dict[str, int]:
+        """Close one exact contact Governance timeout without a Provider retry."""
+
+        required = {
+            "run_id",
+            "item_id",
+            "atomic_information_fingerprint",
+            "governance_receipt_fingerprint",
+            "governance_metrics_fingerprint",
+        }
+        if (
+            set(timeout_binding) != required
+            or any(
+                not isinstance(value, str) or not value
+                for value in timeout_binding.values()
+            )
+        ):
+            raise WechatDigestError("联系人 Governance timeout binding 不可验证。")
+        with self.lock_path.open("a+") as handle:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            try:
+                current = _read(self.path)
+                attempts = self._validated(current)
+                matches = [
+                    item
+                    for item in attempts
+                    if item["category"] == "governance"
+                    and all(
+                        item["request_binding"].get(key)
+                        == timeout_binding[key]
+                        for key in (
+                            "run_id",
+                            "item_id",
+                            "atomic_information_fingerprint",
+                        )
+                    )
+                ]
+                if len(matches) != 1:
+                    raise WechatDigestError(
+                        "联系人 Governance timeout 未能唯一绑定 started attempt。"
+                    )
+                attempt = matches[0]
+                if attempt["state"] == "timeout_no_result":
+                    if attempt.get("timeout_binding") != timeout_binding:
+                        raise WechatDigestError(
+                            "联系人 Governance timeout binding 漂移。"
+                        )
+                elif attempt["state"] == "started":
+                    ordinal = int(attempt["ordinal"])
+                    raw = {
+                        key: value
+                        for key, value in attempt.items()
+                        if key != "attempt_fingerprint"
+                    }
+                    raw["state"] = "timeout_no_result"
+                    raw["timeout_binding"] = timeout_binding
+                    attempts[ordinal - 1] = {
+                        **raw,
+                        "attempt_fingerprint": _fingerprint(raw),
+                    }
+                    payload = {
+                        key: value
+                        for key, value in current.items()
+                        if key != "usage_fingerprint"
+                    }
+                    payload["attempts"] = attempts
+                    _write(
+                        self.path,
+                        {**payload, "usage_fingerprint": _fingerprint(payload)},
+                    )
+                else:
+                    raise WechatDigestError(
+                        "联系人 Governance timeout 缺少 started attempt。"
+                    )
+                total = len(attempts)
+                return {
+                    "contact_attempt_total": total,
+                    "absolute_cap": self.absolute_cap,
+                    "remaining": self.absolute_cap - total,
+                    "next_contact_ordinal": total + 1,
+                }
             finally:
                 fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 

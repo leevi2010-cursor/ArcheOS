@@ -1697,6 +1697,13 @@ def _wechat_product_command(args: argparse.Namespace) -> int:
                 if contact_binding is None
                 else lambda request: get_contact_provider_budget().reconcile_result("governance", request)
             ),
+            seal_contact_governance_timeout=(
+                None
+                if contact_binding is None
+                else lambda timeout_binding: get_contact_provider_budget().seal_governance_timeout(
+                    timeout_binding=timeout_binding
+                )
+            ),
         )
         if args.prepare_next_semantic:
             prepared = service.prepare_next_semantic(batch_size=args.batch_size)

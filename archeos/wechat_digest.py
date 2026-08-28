@@ -4520,6 +4520,8 @@ class WechatDigestService:
         before_governance_provider_call: Callable[[], None] | None = None,
         reconcile_governance_provider_result: Callable[[dict[str, object]], None]
         | None = None,
+        seal_contact_governance_timeout: Callable[[dict[str, object]], dict[str, int]]
+        | None = None,
         clock: Callable[[], str] = _utc_now,
     ) -> None:
         self.workspace = Path(workspace)
@@ -4556,6 +4558,7 @@ class WechatDigestService:
         self._reconcile_governance_provider_result = (
             reconcile_governance_provider_result
         )
+        self._seal_contact_governance_timeout = seal_contact_governance_timeout
         self._governance_resume_state: dict[str, object] | None = None
         self._governance_migration_state: dict[str, object] | None = None
         self._governance_execution_lock = threading.Lock()
@@ -9828,16 +9831,35 @@ class WechatDigestService:
                 raise WechatDigestError(
                     "Governance timeout evidence 不完整。"
                 )
-            try:
-                global_summary = _validated_global_attempt_summary(
-                    self._semantic_port().global_attempt_summary(
-                        representation_id
+            if self._seal_contact_governance_timeout is None:
+                try:
+                    provider_summary: dict[str, object] = (
+                        _validated_global_attempt_summary(
+                            self._semantic_port().global_attempt_summary(
+                                representation_id
+                            )
+                        )
                     )
+                except SemanticHandoffError as exc:
+                    raise WechatDigestError(
+                        "Semantic global attempt ledger 未能安全读回。"
+                    ) from exc
+            else:
+                provider_summary = self._seal_contact_governance_timeout(
+                    {
+                        "run_id": run_id,
+                        "item_id": item_id,
+                        "atomic_information_fingerprint": str(
+                            receipt["atomic_information_fingerprint"]
+                        ),
+                        "governance_receipt_fingerprint": _sha256_bytes(
+                            _canonical_json(receipt).encode("utf-8")
+                        ),
+                        "governance_metrics_fingerprint": _sha256_bytes(
+                            _canonical_json(metrics).encode("utf-8")
+                        ),
+                    }
                 )
-            except SemanticHandoffError as exc:
-                raise WechatDigestError(
-                    "Semantic global attempt ledger 未能安全读回。"
-                ) from exc
             governance_failure = {
                 "failure_category": "turn_timeout",
                 "preserved_but_partially_governed": True,
@@ -9874,7 +9896,7 @@ class WechatDigestService:
             final_item = self._item(final_items, item_id)
             self._verify_governance_failed_closed_item(final_item)
             return {
-                **global_summary,
+                **provider_summary,
                 "semantic_provider_calls": 0,
                 "governance_provider_calls": 0,
                 "governance_preserved_but_incomplete": 1,
