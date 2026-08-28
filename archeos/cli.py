@@ -1659,7 +1659,7 @@ def _wechat_product_command(args: argparse.Namespace) -> int:
                 before_provider_call=(
                     None
                     if contact_binding is None
-                    else lambda: get_contact_provider_budget().before_call("semantic")
+                    else lambda request: get_contact_provider_budget().reserve("semantic", request)
                 ),
             )
 
@@ -1676,7 +1676,7 @@ def _wechat_product_command(args: argparse.Namespace) -> int:
             before_governance_provider_call=(
                 None
                 if contact_binding is None
-                else lambda: get_contact_provider_budget().before_call("governance")
+                else lambda request: get_contact_provider_budget().reserve("governance", request)
             ),
         )
         if args.prepare_next_semantic:
@@ -2145,8 +2145,8 @@ def _wechat_product_command(args: argparse.Namespace) -> int:
                 authority_ref=str(contact_authority_ref),
                 absolute_cap=int(contact_absolute_cap),
                 resume_provider_calls=result.resume_provider_calls,
-                before_provider_call=lambda: get_contact_provider_budget().before_call(
-                    "contact_synthesis"
+                before_provider_call=lambda request: get_contact_provider_budget().reserve(
+                    "contact_synthesis", request
                 ),
             )
     except (

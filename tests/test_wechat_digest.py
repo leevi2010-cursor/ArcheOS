@@ -10656,7 +10656,7 @@ class WechatDigestTests(unittest.TestCase):
         semantic = RunnerBackedExistingSemanticHandoff(workspace=self.workspace, runner=runner)
         budget: ContactProviderBudget | None = None
 
-        def reserve_semantic():
+        def reserve_semantic(request):
             nonlocal budget
             if budget is None:
                 budget = ContactProviderBudget(
@@ -10664,7 +10664,7 @@ class WechatDigestTests(unittest.TestCase):
                     authority_ref="https://github.com/leevi2010-cursor/ArcheOS/issues/206#issuecomment-1",
                     absolute_cap=1,
                 )
-            return budget.before_call("semantic")
+            return budget.reserve("semantic", request)
 
         semantic._before_provider_call = reserve_semantic
         service = WechatDigestService(
@@ -10697,11 +10697,11 @@ class WechatDigestTests(unittest.TestCase):
         runner = SuccessfulV34Runner()
         semantic = RunnerBackedExistingSemanticHandoff(workspace=self.workspace, runner=runner)
         budget: ContactProviderBudget | None = None
-        def reserve():
+        def reserve(request):
             nonlocal budget
             if budget is None:
                 budget = ContactProviderBudget(root / "synthesis", binding=binding, authority_ref="https://github.com/leevi2010-cursor/ArcheOS/issues/206#issuecomment-1", absolute_cap=1)
-            return budget.before_call("semantic")
+            return budget.reserve("semantic", request)
         semantic._before_provider_call = reserve
         service = FailAfterProviderOnceService(workspace=self.workspace, capture_provider=capture, semantic_handoff_factory=lambda: semantic, interpretation_provider=NoStructuralChangeProvider(), run_store=WechatDigestRunStore(root), semantic_parallelism=1)
         with patch("archeos.wechat_digest._require_openai_codex_sdk"), self.assertRaises(WechatDigestError):

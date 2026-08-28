@@ -12581,16 +12581,31 @@ class _RecoveryAwareProvider:
             self.records.append(record)
             return result
         try:
+            request_binding = {
+                "processing_run_id": self.recovery.semantic_run_id,
+                "batch_ordinal": self._ordinal,
+                "input_fingerprint": self.recovery.batch_contracts[
+                    self._ordinal - 1
+                ]["receipt"]["input_fingerprint"],
+                "anchor_unit_ids": [unit.unit_id for unit in batch.anchor_units],
+            }
             if os.path.lexists(self.recovery._attempt_path(self._ordinal)):
+                completion = (
+                    None
+                    if self.before_provider_call is None
+                    else self.before_provider_call(request_binding)
+                )
+                if hasattr(completion, "mark_started"):
+                    completion.mark_started()
                 self.recovery.publish_started(self._ordinal)
-                return self._analyze_reserved(batch)
+                return self._analyze_reserved(batch, completion=completion)
             if self.global_authority is None:
                 if self.before_provider_call is None:
                     raise SemanticHandoffError(
                         "Semantic authority 未绑定；不得启动新 Provider call。"
                     )
+                completion = self.before_provider_call(request_binding)
                 self.recovery.publish_attempt(self._ordinal)
-                completion = self.before_provider_call()
                 if hasattr(completion, "mark_started"):
                     completion.mark_started()
                 self.recovery.publish_started(self._ordinal)
