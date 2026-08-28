@@ -9716,7 +9716,10 @@ class WechatDigestService:
                     "不存在可封存 Governance timeout 的 active run。"
                 )
             plan = self.run_store.plan(run_id)
-            if self._plan_all_history_upper(plan) is None:
+            if (
+                self._plan_all_history_upper(plan) is None
+                and self._seal_contact_governance_timeout is None
+            ):
                 raise WechatDigestError(
                     "Governance timeout 封存只能绑定 frozen campaign。"
                 )

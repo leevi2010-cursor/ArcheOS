@@ -2336,6 +2336,75 @@ class WechatDigestTests(unittest.TestCase):
         )
         return service, capture, provider, run_id, item_id
 
+    def contact_timeout_store_with_contact_plan(
+        self,
+        service: WechatDigestService,
+        run_id: str,
+    ) -> tuple[WechatDigestRunStore, WechatContactBinding]:
+        """Copy a timed-out run into one legal contact-scoped plan."""
+
+        plan = service.run_store.plan(run_id)
+        captured = message(1, conversation="failed")
+        binding = WechatContactBinding(
+            captured.conversation_key,
+            captured.provider_conversation_id,
+            captured.conversation_label,
+            captured.is_group,
+        )
+        contact_root = (
+            self.workspace
+            / "02_processing"
+            / "wechat_digest"
+            / "contacts"
+            / binding.conversation_key
+        )
+        contact_run = contact_root / "runs" / run_id
+        shutil.copytree(service.run_store.runs_root / run_id, contact_run)
+        contact_store = WechatDigestRunStore(contact_root)
+        contact_store.active_path.write_text(json.dumps({"active_run_id": run_id}))
+
+        capture, _ = contact_store.load_capture_artifacts(run_id, plan=plan)
+        created_at = str(plan["created_at"])
+        preliminary_plan, _ = _build_plan(
+            capture,
+            clock=lambda: created_at,
+            run_id=run_id,
+            created_at=created_at,
+            semantic_batch_size=int(plan["semantic_batch_size"]),
+            all_history_upper_bound=None,
+        )
+        receipt_path = contact_run / "capture" / "receipt.json"
+        capture_receipt = json.loads(receipt_path.read_text())
+        capture_receipt["plan_binding_fingerprint"] = _plan_fingerprint(
+            preliminary_plan
+        )
+        receipt_without_fingerprint = dict(capture_receipt)
+        receipt_without_fingerprint.pop("receipt_fingerprint")
+        capture_receipt["receipt_fingerprint"] = _sha256_bytes(
+            _canonical_json(receipt_without_fingerprint).encode("utf-8")
+        )
+        receipt_path.write_text(json.dumps(capture_receipt))
+        contact_plan, _ = _build_plan(
+            capture,
+            clock=lambda: created_at,
+            run_id=run_id,
+            created_at=created_at,
+            semantic_batch_size=int(plan["semantic_batch_size"]),
+            all_history_upper_bound=None,
+            capture_receipt_fingerprint=str(
+                capture_receipt["receipt_fingerprint"]
+            ),
+        )
+        (contact_run / "plan.json").write_text(json.dumps(contact_plan))
+        plan_receipt_path = contact_run / "run-plan-receipt.json"
+        plan_receipt = json.loads(plan_receipt_path.read_text())
+        plan_receipt["plan_fingerprint"] = _plan_fingerprint(contact_plan)
+        plan_receipt_path.write_text(json.dumps(plan_receipt))
+        status = contact_store.status(run_id)
+        status["plan_fingerprint"] = _plan_fingerprint(contact_plan)
+        contact_store.update_status(run_id, status)
+        return contact_store, binding
+
     def governance_startup_recovery_fixture(
         self,
         *,
@@ -3697,24 +3766,11 @@ class WechatDigestTests(unittest.TestCase):
             self.governance_timeout_fixture(include_next=False)
         )
         status = service.run_store.status(run_id)
-        captured = message(1, conversation="failed")
-        binding = WechatContactBinding(
-            captured.conversation_key,
-            captured.provider_conversation_id,
-            captured.conversation_label,
-            captured.is_group,
+        contact_store, binding = self.contact_timeout_store_with_contact_plan(
+            service, run_id
         )
-        contact_root = (
-            self.workspace
-            / "02_processing"
-            / "wechat_digest"
-            / "contacts"
-            / binding.conversation_key
-        )
-        contact_run = contact_root / "runs" / run_id
-        shutil.copytree(service.run_store.runs_root / run_id, contact_run)
-        contact_store = WechatDigestRunStore(contact_root)
-        contact_store.active_path.write_text(json.dumps({"active_run_id": run_id}))
+        self.assertIsNone(contact_store.plan(run_id)["all_history_upper_bound"])
+        contact_root = contact_store.root
         budget = ContactProviderBudget(
             contact_root / "synthesis",
             binding=binding,
@@ -3770,6 +3826,34 @@ class WechatDigestTests(unittest.TestCase):
         self.assertEqual(usage["attempts"][-1]["state"], "timeout_no_result")
         next_attempt = budget.reserve("semantic", {"request": "next-item"})
         self.assertEqual(next_attempt.ordinal, 22)
+
+    def test_contact_plan_without_seal_callback_still_requires_frozen_campaign(
+        self,
+    ) -> None:
+        service, capture, provider, run_id, _item_id = (
+            self.governance_timeout_fixture(include_next=False)
+        )
+        contact_store, _binding = self.contact_timeout_store_with_contact_plan(
+            service, run_id
+        )
+        contact_service = WechatDigestService(
+            workspace=self.workspace,
+            capture_provider=capture,
+            semantic_handoff_factory=lambda: self.semantic,
+            interpretation_provider=provider,
+            run_store=contact_store,
+        )
+        status_path = contact_store.runs_root / run_id / "status.json"
+        status_before = status_path.read_bytes()
+        capture_calls = len(capture.calls)
+        provider_calls = provider.calls
+
+        with self.assertRaisesRegex(WechatDigestError, "frozen campaign"):
+            contact_service.seal_governance_timeout()
+
+        self.assertEqual(status_path.read_bytes(), status_before)
+        self.assertEqual(len(capture.calls), capture_calls)
+        self.assertEqual(provider.calls, provider_calls)
 
     def test_maintenance_continuation_binds_exact_active_state_zero_calls(
         self,
