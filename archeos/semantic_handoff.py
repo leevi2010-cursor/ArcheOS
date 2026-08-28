@@ -14088,9 +14088,13 @@ class ExternalAgentSemanticHandoffService:
                 provider,
                 privacy_binding,
                 global_authority=(
-                    global_authority if authority_binding is not None else None
+                    global_authority
+                    if authority_binding is not None and before_provider_call is None
+                    else None
                 ),
-                window_binding=authority_binding,
+                window_binding=(
+                    authority_binding if before_provider_call is None else None
+                ),
                 complete_context=True,
             )
             if not recovery.exists or not recovery.result_only_wave:
@@ -14101,9 +14105,14 @@ class ExternalAgentSemanticHandoffService:
                     provider,
                     privacy_binding,
                     global_authority=(
-                        global_authority if authority_binding is not None else None
+                        global_authority
+                        if authority_binding is not None
+                        and before_provider_call is None
+                        else None
                     ),
-                    window_binding=authority_binding,
+                    window_binding=(
+                        authority_binding if before_provider_call is None else None
+                    ),
                 )
             preflight = recovery.preflight()
             if preflight.conservatively_counted_attempts:
@@ -14121,6 +14130,7 @@ class ExternalAgentSemanticHandoffService:
             if (
                 preflight.required_new_calls
                 and authority_binding is not None
+                and before_provider_call is None
                 and not global_authority.exists
             ):
                 raise SemanticHandoffError(
@@ -14128,7 +14138,7 @@ class ExternalAgentSemanticHandoffService:
                 )
             authority_guard = None
             global_grant = None
-            if preflight.required_new_calls:
+            if preflight.required_new_calls and before_provider_call is None:
                 authority_guard = global_authority.execution_guard(
                     window=authority_binding,
                     provider=provider,
@@ -14144,8 +14154,12 @@ class ExternalAgentSemanticHandoffService:
             analysis_provider = _RecoveryAwareProvider(
                 provider,
                 recovery,
-                global_authority if authority_binding is not None else None,
-                authority_binding,
+                (
+                    global_authority
+                    if authority_binding is not None and before_provider_call is None
+                    else None
+                ),
+                authority_binding if before_provider_call is None else None,
                 preflight.required_new_calls,
                 authority_guard=authority_guard,
                 global_grant=global_grant,

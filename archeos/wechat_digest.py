@@ -13233,6 +13233,8 @@ class WechatDigestService:
             nonlocal provider_started
             if provider_started:
                 return
+            if previous_provider_hook is not None:
+                previous_provider_hook()
             if startup_recovery is not None:
                 recovery_fingerprint = startup_recovery.get(
                     "receipt_fingerprint"

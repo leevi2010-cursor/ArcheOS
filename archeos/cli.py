@@ -2145,6 +2145,9 @@ def _wechat_product_command(args: argparse.Namespace) -> int:
                 authority_ref=str(contact_authority_ref),
                 absolute_cap=int(contact_absolute_cap),
                 resume_provider_calls=result.resume_provider_calls,
+                before_provider_call=lambda: get_contact_provider_budget().before_call(
+                    "contact_synthesis"
+                ),
             )
     except (
         OSError,

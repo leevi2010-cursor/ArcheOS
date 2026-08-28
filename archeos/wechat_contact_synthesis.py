@@ -1022,6 +1022,7 @@ class ContactSynthesisStore:
         semantic_provider_calls: int = 0,
         governance_provider_calls: int = 0,
         resume_provider_calls: int = 0,
+        before_provider_call: Callable[[], None] | None = None,
     ) -> ContactSynthesisOutcome:
         self.root.mkdir(parents=True, exist_ok=True, mode=0o700)
         os.chmod(self.root, 0o700)
@@ -1041,6 +1042,7 @@ class ContactSynthesisStore:
                     semantic_provider_calls=semantic_provider_calls,
                     governance_provider_calls=governance_provider_calls,
                     resume_provider_calls=resume_provider_calls,
+                    before_provider_call=before_provider_call,
                 )
             finally:
                 fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
@@ -1056,6 +1058,7 @@ class ContactSynthesisStore:
         semantic_provider_calls: int,
         governance_provider_calls: int,
         resume_provider_calls: int,
+        before_provider_call: Callable[[], None] | None,
     ) -> ContactSynthesisOutcome:
         ordered_ids = [item.atomic_information_id for item in revisions]
         if len(ordered_ids) != len(set(ordered_ids)):
@@ -1184,6 +1187,8 @@ class ContactSynthesisStore:
                         raise WechatDigestError(
                             "联系人模型调用已达到授权上限；既有结果保持不变。"
                         )
+                    if before_provider_call is not None:
+                        before_provider_call()
                     _private_write(reservation_path, reservation)
                     if self.after_reservation_write is not None:
                         self.after_reservation_write()

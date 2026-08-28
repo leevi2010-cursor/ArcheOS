@@ -84,7 +84,7 @@ class ContactProviderBudget:
         )
 
     def before_call(self, category: str) -> None:
-        if category not in {"semantic", "governance"}:
+        if category not in {"semantic", "governance", "contact_synthesis"}:
             raise WechatDigestError("联系人 Provider 调用类别无效。")
         self.root.mkdir(parents=True, exist_ok=True, mode=0o700)
         os.chmod(self.root, 0o700)
@@ -105,7 +105,8 @@ class ContactProviderBudget:
                         or current.get("absolute_cap") != self.absolute_cap
                         or not isinstance(entries, list)
                         or any(
-                            item not in {"semantic", "governance"}
+                            item
+                            not in {"semantic", "governance", "contact_synthesis"}
                             for item in entries
                         )
                         or current.get("usage_fingerprint")
