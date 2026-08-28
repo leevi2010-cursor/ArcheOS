@@ -72,6 +72,7 @@ from archeos.wechat_capture_helper import (
 from archeos.wechat_capture_helper import (
     _digest as capture_digest,
 )
+from archeos.wechat_contact import build_contact_acceptance_pack
 from archeos.wechat_digest import (
     TERMINAL_ITEM_STATES,
     ZERO_CURSOR,
@@ -10685,6 +10686,122 @@ class WechatDigestTests(unittest.TestCase):
         self.assertFalse((semantic.service.audit_root / "semantic-global-authority.json").exists())
         usage = json.loads((root / "synthesis" / "unified-provider-usage.json").read_text())
         self.assertEqual([item["state"] for item in usage["attempts"]], ["result"])
+
+    def test_completed_contact_run_builds_and_resumes_acceptance_pack(self) -> None:
+        """The post-run View uses the frozen ledger scope after active is null."""
+        self.workspace = self.workspace.resolve()
+        captured = message(3, conversation="acceptance-after-completion")
+        binding = WechatContactBinding(
+            captured.conversation_key,
+            captured.provider_conversation_id,
+            captured.conversation_label,
+            captured.is_group,
+        )
+        root = (
+            self.workspace
+            / "02_processing"
+            / "wechat_digest"
+            / "contacts"
+            / binding.conversation_key
+        )
+        sentinel = self.workspace / "primary-sentinel.json"
+        sentinel.write_text('{"unchanged":true}\n', encoding="utf-8")
+        before = sentinel.read_bytes()
+        runner = SuccessfulV34Runner()
+        semantic = RunnerBackedExistingSemanticHandoff(
+            workspace=self.workspace, runner=runner
+        )
+        authority_ref = "https://github.com/leevi2010-cursor/ArcheOS/issues/206#issuecomment-1"
+        budget: ContactProviderBudget | None = None
+
+        def reserve_semantic(request):
+            nonlocal budget
+            if budget is None:
+                budget = ContactProviderBudget(
+                    root / "synthesis",
+                    binding=binding,
+                    authority_ref=authority_ref,
+                    absolute_cap=2,
+                )
+            return budget.reserve("semantic", request)
+
+        semantic._before_provider_call = reserve_semantic
+        semantic._reconcile_provider_result = (
+            lambda request: budget.reconcile_result("semantic", request)
+        )
+        run_store = WechatDigestRunStore(root)
+        service = WechatDigestService(
+            workspace=self.workspace,
+            capture_provider=SyntheticCaptureProvider([captured]),
+            semantic_handoff_factory=lambda: semantic,
+            interpretation_provider=NoStructuralChangeProvider(),
+            run_store=run_store,
+            semantic_batch_size=50,
+            semantic_parallelism=1,
+        )
+        with patch("archeos.wechat_digest._require_openai_codex_sdk"):
+            result = service.run(all_history=True)
+        self.assertTrue(result.checkpoint_published)
+        self.assertIsNone(run_store.active_run_id())
+        self.assertEqual(sentinel.read_bytes(), before)
+        self.assertEqual(len(runner.calls), 1)
+
+        class SynthesisProvider:
+            name = "synthetic-contact-synthesis"
+            provider_version = "synthetic/1"
+            model = "synthetic"
+            reasoning_effort = "medium"
+
+            def __init__(self) -> None:
+                self.provider_calls = 0
+
+            def synthesize(self, request, _schema):
+                self.provider_calls += 1
+                ids = list(request["source_atomic_information_ids"])
+                return {
+                    "schema_version": "wechat-contact-event-synthesis/1.0",
+                    "request_fingerprint": request["request_fingerprint"],
+                    "source_atomic_information_ids": ids,
+                    "accounted_atomic_information_ids": ids,
+                    "object_candidates": [],
+                    "events": [],
+                    "current_state": {"completed": [], "in_progress": [], "todos": [], "commitments": [], "blockers": []},
+                    "conflicts": [],
+                    "unknowns": [{"subject": "synthetic", "details": "synthetic", "evidence_atomic_information_ids": ids}],
+                }
+
+        recovered_budget = ContactProviderBudget(
+            root / "synthesis", binding=binding, authority_ref=authority_ref, absolute_cap=2
+        )
+        provider = SynthesisProvider()
+        pack, _markdown = build_contact_acceptance_pack(
+            workspace=self.workspace,
+            run_store=run_store,
+            binding=binding,
+            output_root=root / "acceptance",
+            synthesis_provider_factory=lambda: provider,
+            authority_ref=authority_ref,
+            absolute_cap=2,
+            before_provider_call=lambda request: recovered_budget.reserve("contact_synthesis", request),
+            reconcile_provider_result=lambda request: recovered_budget.reconcile_result("contact_synthesis", request),
+        )
+        self.assertTrue(pack.exists())
+        self.assertEqual(provider.provider_calls, 1)
+        replay_provider = SynthesisProvider()
+        build_contact_acceptance_pack(
+            workspace=self.workspace,
+            run_store=run_store,
+            binding=binding,
+            output_root=root / "acceptance",
+            synthesis_provider_factory=lambda: replay_provider,
+            authority_ref=authority_ref,
+            absolute_cap=2,
+            before_provider_call=lambda request: recovered_budget.reserve("contact_synthesis", request),
+            reconcile_provider_result=lambda request: recovered_budget.reconcile_result("contact_synthesis", request),
+        )
+        self.assertEqual(replay_provider.provider_calls, 0)
+        usage = json.loads((root / "synthesis" / "unified-provider-usage.json").read_text())
+        self.assertEqual([item["state"] for item in usage["attempts"]], ["result", "result"])
 
     def test_contact_real_handoff_failed_run_resumes_without_capture_or_provider(self) -> None:
         self.workspace = self.workspace.resolve()
