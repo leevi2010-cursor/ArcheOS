@@ -10834,6 +10834,139 @@ class WechatDigestTests(unittest.TestCase):
         information = service.information_store.list_atomic_information()
         self.assertEqual(len({item.atomic_information_id for item in information}), len(information))
 
+    def test_contact_absent_pre_attempt_receipt_resumes_with_local_proof(self) -> None:
+        """A pre-#206 Provider-0 contact run resumes without global authority."""
+
+        class FailBeforeProviderHandoff(SyntheticSemanticHandoff):
+            def prepare_results(self, requests, *, parallelism):
+                del requests, parallelism
+                raise SemanticHandoffError("synthetic before-provider failure")
+
+        self.workspace = self.workspace.resolve()
+        self.workspace.chmod(0o700)
+        for name in ("01_inbox", "02_processing", "03_information", "04_core"):
+            (self.workspace / name).chmod(0o700)
+        captured = message(1, conversation="contact-absent-pre-attempt")
+        binding = WechatContactBinding(
+            captured.conversation_key,
+            captured.provider_conversation_id,
+            captured.conversation_label,
+            captured.is_group,
+        )
+        root = self.workspace / "02_processing" / "wechat_digest" / "contacts" / binding.conversation_key
+        capture = FailOnSecondFullCaptureProvider([captured])
+        initial = WechatDigestService(
+            workspace=self.workspace,
+            capture_provider=capture,
+            semantic_handoff_factory=lambda: FailBeforeProviderHandoff(self.workspace),
+            interpretation_provider=NoStructuralChangeProvider(),
+            run_store=WechatDigestRunStore(root),
+            semantic_parallelism=1,
+        )
+        with patch("archeos.wechat_digest._require_openai_codex_sdk"), self.assertRaises(WechatDigestError):
+            initial.run(all_history=True)
+        run_id = initial.run_store.active_run_id()
+        assert run_id is not None
+        failed = initial.run_store.status(run_id)
+        represented = [
+            item for item in failed["items"].values()
+            if item.get("state") == "represented"
+        ]
+        self.assertEqual(failed["failure_category"], "SemanticHandoffError")
+        self.assertEqual(len(represented), 1)
+        representation_id = represented[0]["representation_id"]
+        assert isinstance(representation_id, str)
+
+        runner = SuccessfulV34Runner()
+        unscoped = RunnerBackedExistingSemanticHandoff(
+            workspace=self.workspace, runner=runner
+        )
+        unscoped_privacy = initial.privacy_gate.evaluate(
+            initial._representation_texts(representation_id),
+            semantic_completeness_known=True,
+        )
+        with self.assertRaisesRegex(SemanticHandoffError, "global authority"):
+            unscoped.validate_pre_attempt_inventory(
+                representation_id,
+                privacy_binding=initial._semantic_privacy_binding(
+                    representation_id, unscoped_privacy
+                ),
+            )
+        self.assertEqual(runner.calls, [])
+        semantic = RunnerBackedExistingSemanticHandoff(
+            workspace=self.workspace, runner=runner
+        )
+        authority_ref = "https://github.com/leevi2010-cursor/ArcheOS/issues/208#issuecomment-1"
+        budget: ContactProviderBudget | None = None
+
+        def local_budget() -> ContactProviderBudget:
+            nonlocal budget
+            if budget is None:
+                budget = ContactProviderBudget(
+                    root / "synthesis",
+                    binding=binding,
+                    authority_ref=authority_ref,
+                    absolute_cap=2,
+                )
+            return budget
+
+        def local_proof(representation_id, privacy_binding, inventory):
+            return local_budget().ensure_pre_attempt_semantic_proof(
+                representation_id=representation_id,
+                privacy_binding={
+                    "policy": privacy_binding.policy,
+                    "policy_version": privacy_binding.policy_version,
+                    "route": privacy_binding.route,
+                    "receipt_fingerprint": privacy_binding.receipt_fingerprint,
+                },
+                semantic_inventory=inventory,
+            )
+
+        semantic._contact_pre_attempt_proof = local_proof
+        semantic._before_provider_call = lambda request: local_budget().reserve(
+            "semantic", request
+        )
+        semantic._reconcile_provider_result = lambda request: local_budget().reconcile_result(
+            "semantic", request
+        )
+        recovered = WechatDigestService(
+            workspace=self.workspace,
+            capture_provider=capture,
+            semantic_handoff_factory=lambda: semantic,
+            interpretation_provider=NoStructuralChangeProvider(),
+            run_store=WechatDigestRunStore(root),
+            semantic_parallelism=1,
+        )
+        privacy = recovered.privacy_gate.evaluate(
+            recovered._representation_texts(representation_id),
+            semantic_completeness_known=True,
+        )
+        binding_value = recovered._semantic_privacy_binding(
+            representation_id, privacy
+        )
+        first = semantic.validate_pre_attempt_inventory(
+            representation_id, privacy_binding=binding_value
+        )
+        second = semantic.validate_pre_attempt_inventory(
+            representation_id, privacy_binding=binding_value
+        )
+        self.assertEqual(first, second)
+        self.assertEqual(first["inventory_kind"], "absent")
+        self.assertEqual(runner.calls, [])
+        self.assertFalse((semantic.service.audit_root / "semantic-global-authority.json").exists())
+        self.assertEqual(
+            len(tuple((root / "synthesis" / "pre-attempt-semantic-proofs").rglob("*.json"))),
+            1,
+        )
+
+        with patch("archeos.wechat_digest._require_openai_codex_sdk"):
+            result = recovered.run()
+        self.assertTrue(result.checkpoint_published)
+        self.assertEqual(len(runner.calls), 1)
+        self.assertEqual(sum(not call[2] for call in capture.calls), 1)
+        usage = json.loads((root / "synthesis" / "unified-provider-usage.json").read_text())
+        self.assertEqual([item["state"] for item in usage["attempts"]], ["result"])
+
 
 class WechatCaptureHelperTests(unittest.TestCase):
     def setUp(self) -> None:

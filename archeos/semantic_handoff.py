@@ -14743,6 +14743,11 @@ class ExternalAgentSemanticHandoffService:
         representation_id: str,
         provider: CodexCliRepresentationAnalysisProvider,
         privacy_binding: SemanticPrivacyBinding,
+        *,
+        contact_pre_attempt_proof: Callable[
+            [str, SemanticPrivacyBinding, dict[str, object]], dict[str, object]
+        ]
+        | None = None,
     ) -> dict[str, object]:
         """Validate a representation-specific run-receipt-only boundary."""
 
@@ -14794,21 +14799,128 @@ class ExternalAgentSemanticHandoffService:
                 "result_count": 0,
             }
         authority = _SemanticGlobalAuthority(self.audit_root)
-        if not authority.exists:
-            raise SemanticHandoffError("Semantic global authority 未安装。")
-        with authority._locked(blocking=False):
-            _base, effective, _continuations = (
-                authority._current_effective_authority()
+        if contact_pre_attempt_proof is not None:
+            proof = contact_pre_attempt_proof(
+                representation_id, privacy_binding, dict(inventory)
             )
-            attempts, _unknown = authority._global_attempts(effective)
-            if any(
-                attempt.get("semantic_run_id") == recovery.semantic_run_id
-                for attempt in attempts
-            ):
-                raise SemanticHandoffError(
-                    "Semantic pre-attempt global attempt 已存在。"
+            self._validate_contact_pre_attempt_proof(
+                proof,
+                representation_id=representation_id,
+                privacy_binding=privacy_binding,
+                inventory=inventory,
+            )
+        elif authority.exists:
+            with authority._locked(blocking=False):
+                _base, effective, _continuations = (
+                    authority._current_effective_authority()
                 )
+                attempts, _unknown = authority._global_attempts(effective)
+                if any(
+                    attempt.get("semantic_run_id") == recovery.semantic_run_id
+                    for attempt in attempts
+                ):
+                    raise SemanticHandoffError(
+                        "Semantic pre-attempt global attempt 已存在。"
+                    )
+        else:
+            raise SemanticHandoffError("Semantic global authority 未安装。")
         return inventory
+
+    @staticmethod
+    def _validate_contact_pre_attempt_proof(
+        proof: Mapping[str, object],
+        *,
+        representation_id: str,
+        privacy_binding: SemanticPrivacyBinding,
+        inventory: Mapping[str, object],
+    ) -> None:
+        """Accept the narrow contact-local replacement for a global authority.
+
+        The proof is written and read back by the contact Provider budget before
+        this method sees it.  Keeping the full binding here prevents a generic
+        callback from becoming an authority bypass.
+        """
+
+        expected_fields = {
+            "schema_version",
+            "contact_identity",
+            "workspace_fingerprint",
+            "run_id",
+            "plan_fingerprint",
+            "plan_receipt_fingerprint",
+            "capture_fingerprint",
+            "frozen_upper_bound",
+            "authority_ref",
+            "absolute_cap",
+            "authority_fingerprint",
+            "status_fingerprint",
+            "unified_ledger",
+            "representation_id",
+            "privacy_binding",
+            "semantic_inventory",
+            "proof_fingerprint",
+        }
+        if set(proof) != expected_fields:
+            raise SemanticHandoffError("联系人 pre-attempt Semantic proof 形态损坏。")
+        payload = {
+            key: value for key, value in proof.items() if key != "proof_fingerprint"
+        }
+        contact_identity = proof.get("contact_identity")
+        ledger = proof.get("unified_ledger")
+        frozen_upper = proof.get("frozen_upper_bound")
+        if (
+            proof.get("schema_version")
+            != "wechat-contact-pre-attempt-semantic-proof/1.0"
+            or not isinstance(contact_identity, dict)
+            or set(contact_identity)
+            != {"conversation_key", "provider_conversation_id", "is_group"}
+            or any(
+                not isinstance(contact_identity.get(key), str)
+                or not contact_identity.get(key)
+                for key in ("conversation_key", "provider_conversation_id")
+            )
+            or not isinstance(contact_identity.get("is_group"), bool)
+            or not isinstance(frozen_upper, dict)
+            or not isinstance(proof.get("authority_ref"), str)
+            or not proof.get("authority_ref")
+            or isinstance(proof.get("absolute_cap"), bool)
+            or not isinstance(proof.get("absolute_cap"), int)
+            or int(proof["absolute_cap"]) < 1
+            or any(
+                not isinstance(proof.get(key), str)
+                or re.fullmatch(r"sha256:[0-9a-f]{64}", str(proof.get(key)))
+                is None
+                for key in (
+                    "workspace_fingerprint",
+                    "plan_fingerprint",
+                    "plan_receipt_fingerprint",
+                    "authority_fingerprint",
+                    "status_fingerprint",
+                    "proof_fingerprint",
+                )
+            )
+            or not isinstance(proof.get("run_id"), str)
+            or not proof.get("run_id")
+            or proof.get("representation_id") != representation_id
+            or proof.get("privacy_binding") != asdict(privacy_binding)
+            or proof.get("semantic_inventory") != dict(inventory)
+            or not isinstance(ledger, dict)
+            or set(ledger) != {"state", "usage_fingerprint"}
+            or ledger.get("state") not in {"absent_zero", "durable_zero"}
+            or (
+                ledger.get("state") == "absent_zero"
+                and ledger.get("usage_fingerprint") is not None
+            )
+            or (
+                ledger.get("state") == "durable_zero"
+                and re.fullmatch(
+                    r"sha256:[0-9a-f]{64}", str(ledger.get("usage_fingerprint"))
+                )
+                is None
+            )
+            or proof.get("proof_fingerprint") != _fingerprint(payload)
+        ):
+            raise SemanticHandoffError("联系人 pre-attempt Semantic proof 不可验证。")
 
     def global_attempt_summary(self, representation_id: str) -> dict[str, int]:
         """Read the validated global attempt ledger without starting a Provider."""

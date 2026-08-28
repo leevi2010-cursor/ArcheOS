@@ -2363,6 +2363,10 @@ class ExistingSemanticHandoff:
         reviewed_git_head: str | None = None,
         before_provider_call: Callable[[], None] | None = None,
         reconcile_provider_result: Callable[[dict[str, object]], None] | None = None,
+        contact_pre_attempt_proof: Callable[
+            [str, SemanticPrivacyBinding, dict[str, object]], dict[str, object]
+        ]
+        | None = None,
     ) -> None:
         self.service = ExternalAgentSemanticHandoffService(
             RepresentationInformationService(
@@ -2384,6 +2388,7 @@ class ExistingSemanticHandoff:
         self._diagnostic_root = Path(audit_root) / "semantic-provider-diagnostics"
         self._before_provider_call = before_provider_call
         self._reconcile_provider_result = reconcile_provider_result
+        self._contact_pre_attempt_proof = contact_pre_attempt_proof
         self.provider = self._new_provider("serial")
         self.reviewed_git_head = reviewed_git_head or detect_clean_git_head()
 
@@ -2470,6 +2475,7 @@ class ExistingSemanticHandoff:
             representation_id,
             self.provider,
             privacy_binding,
+            contact_pre_attempt_proof=self._contact_pre_attempt_proof,
         )
 
     def install_global_authority(

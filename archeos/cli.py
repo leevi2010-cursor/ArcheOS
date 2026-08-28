@@ -1666,6 +1666,15 @@ def _wechat_product_command(args: argparse.Namespace) -> int:
                     if contact_binding is None
                     else lambda request: get_contact_provider_budget().reconcile_result("semantic", request)
                 ),
+                contact_pre_attempt_proof=(
+                    None
+                    if contact_binding is None
+                    else lambda representation_id, privacy_binding, inventory: get_contact_provider_budget().ensure_pre_attempt_semantic_proof(
+                        representation_id=representation_id,
+                        privacy_binding=asdict(privacy_binding),
+                        semantic_inventory=inventory,
+                    )
+                ),
             )
 
         service = WechatDigestService(

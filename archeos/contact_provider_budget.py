@@ -16,6 +16,7 @@ from .wechat_contact_synthesis import (
 from .wechat_digest import WechatContactBinding, WechatDigestError
 
 _SCHEMA = "wechat-contact-unified-provider-usage/2.0"
+_PRE_ATTEMPT_PROOF_SCHEMA = "wechat-contact-pre-attempt-semantic-proof/1.0"
 _CATEGORIES = {"semantic", "governance", "contact_synthesis"}
 
 
@@ -80,12 +81,14 @@ class ContactProviderBudget:
 
     def __init__(self, root: Path, *, binding: WechatContactBinding, authority_ref: str, absolute_cap: int) -> None:
         self.root = Path(root)
+        self.binding = binding
         self.contact_identity = {"conversation_key": binding.conversation_key, "provider_conversation_id": binding.provider_conversation_id, "is_group": binding.is_group}
         self.authority_ref = require_contact_provider_authority_ref(authority_ref)
         if isinstance(absolute_cap, bool) or not isinstance(absolute_cap, int) or absolute_cap < 1:
             raise WechatDigestError("联系人模型调用 absolute cap 必须为正数。")
         self.absolute_cap = absolute_cap
         self.path = self.root / "unified-provider-usage.json"
+        self.pre_attempt_proofs_root = self.root / "pre-attempt-semantic-proofs"
         self.lock_path = self.root / ".unified-provider-usage.lock"
         ContactSynthesisStore(self.root).ensure_provider_authority(binding=binding, authority_ref=self.authority_ref, absolute_cap=absolute_cap)
 
@@ -142,6 +145,123 @@ class ContactProviderBudget:
         except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
             raise WechatDigestError("联系人 Provider scope 无法绑定当前 frozen run。") from exc
         return {"contact_identity": self.contact_identity, "workspace_fingerprint": _fingerprint(str(contact_root.resolve())), "run_id": run_id, "plan_fingerprint": _fingerprint(plan), "plan_receipt_fingerprint": _fingerprint(receipt), "capture_fingerprint": capture, "frozen_upper_bound": upper, "authority_ref": self.authority_ref, "absolute_cap": self.absolute_cap}
+
+    def ensure_pre_attempt_semantic_proof(
+        self,
+        *,
+        representation_id: str,
+        privacy_binding: dict[str, object],
+        semantic_inventory: dict[str, object],
+    ) -> dict[str, object]:
+        """Persist and read back the exact contact proof before a legacy-free resume.
+
+        This is deliberately narrower than a Provider reservation: it proves that
+        a frozen contact run is still at an unambiguous Provider-0 boundary.
+        """
+
+        if (
+            not isinstance(representation_id, str)
+            or not representation_id
+            or set(privacy_binding)
+            != {"policy", "policy_version", "route", "receipt_fingerprint"}
+            or any(not isinstance(value, str) or not value for value in privacy_binding.values())
+            or set(semantic_inventory)
+            != {
+                "inventory_kind",
+                "semantic_run_id",
+                "run_receipt_fingerprint",
+                "attempt_count",
+                "reserved_count",
+                "started_count",
+                "result_count",
+            }
+            or semantic_inventory.get("inventory_kind")
+            not in {"absent", "run_receipt_only"}
+            or any(
+                semantic_inventory.get(key) != 0
+                for key in ("attempt_count", "reserved_count", "started_count", "result_count")
+            )
+        ):
+            raise WechatDigestError("联系人 pre-attempt Semantic proof 输入无效。")
+        scope = self._scope()
+        contact_root = self.root.parent
+        run_id = scope["run_id"]
+        assert isinstance(run_id, str)
+        try:
+            status = json.loads(
+                (contact_root / "runs" / run_id / "status.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            if (
+                not isinstance(status, dict)
+                or status.get("state") != "failed"
+                or status.get("failure_category") != "SemanticHandoffError"
+                or status.get("checkpoint_published") is not False
+                or not isinstance(status.get("items"), dict)
+            ):
+                raise ValueError
+            matching_items = [
+                item
+                for item in status["items"].values()
+                if isinstance(item, dict)
+                and item.get("state") == "represented"
+                and item.get("representation_id") == representation_id
+            ]
+            if len(matching_items) != 1:
+                raise ValueError
+            authority = ContactSynthesisStore(self.root).read_provider_authority(
+                self.binding
+            )
+            if (
+                authority is None
+                or authority.get("authority_ref") != self.authority_ref
+                or authority.get("absolute_cap") != self.absolute_cap
+            ):
+                raise ValueError
+            if self.path.exists() or self.path.is_symlink():
+                usage = _read(self.path)
+                attempts = self._validated(usage)
+                if attempts:
+                    raise ValueError
+                ledger = {
+                    "state": "durable_zero",
+                    "usage_fingerprint": usage.get("usage_fingerprint"),
+                }
+            else:
+                ledger = {"state": "absent_zero", "usage_fingerprint": None}
+        except (OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise WechatDigestError(
+                "联系人 pre-attempt Semantic proof 无法绑定当前 frozen run。"
+            ) from exc
+        payload = {
+            "schema_version": _PRE_ATTEMPT_PROOF_SCHEMA,
+            "contact_identity": self.contact_identity,
+            "workspace_fingerprint": scope["workspace_fingerprint"],
+            "run_id": run_id,
+            "plan_fingerprint": scope["plan_fingerprint"],
+            "plan_receipt_fingerprint": scope["plan_receipt_fingerprint"],
+            "capture_fingerprint": scope["capture_fingerprint"],
+            "frozen_upper_bound": scope["frozen_upper_bound"],
+            "authority_ref": self.authority_ref,
+            "absolute_cap": self.absolute_cap,
+            "authority_fingerprint": authority["authority_fingerprint"],
+            "status_fingerprint": _fingerprint(status),
+            "unified_ledger": ledger,
+            "representation_id": representation_id,
+            "privacy_binding": privacy_binding,
+            "semantic_inventory": semantic_inventory,
+        }
+        proof = {**payload, "proof_fingerprint": _fingerprint(payload)}
+        proof_path = self.pre_attempt_proofs_root / run_id / f"{representation_id}.json"
+        if proof_path.exists() or proof_path.is_symlink():
+            if _read(proof_path) != proof:
+                raise WechatDigestError("联系人 pre-attempt Semantic proof 漂移。")
+        else:
+            _write(proof_path, proof)
+        if _read(proof_path) != proof:
+            raise WechatDigestError("联系人 pre-attempt Semantic proof 读回失败。")
+        return proof
 
     def _validated(self, current: dict[str, object]) -> list[dict[str, object]]:
         attempts = current.get("attempts")
