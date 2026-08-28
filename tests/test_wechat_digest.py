@@ -3837,6 +3837,39 @@ class WechatDigestTests(unittest.TestCase):
         )
         status = service.run_store.status(run_id)
         item = status["items"][item_id]
+        old_timeout = dict(item)
+        old_timeout["atomic_information_ids"] = [
+            revision.atomic_information_id
+            for revision in service.information_store.list_atomic_information()
+            if revision.origin_source_id == old_timeout["source_id"]
+        ]
+        old_metrics = dict(old_timeout["governance_metrics"])
+        old_metrics.update(
+            {
+                "app_server_start_count": 0,
+                "thread_count": 1,
+                "turn_count": 1,
+                "timeout_count": 1,
+                "failure_count": 1,
+                "failure_categories": {"timeout": 1},
+            }
+        )
+        old_timeout.update(
+            {
+                "state": "failed_closed",
+                "privacy_route": "approved",
+                "privacy_categories": [],
+                "governance_metrics": old_metrics,
+                "governance_failure": {
+                    "failure_category": "turn_timeout",
+                    "preserved_but_partially_governed": True,
+                    "provider_retry_permitted": False,
+                },
+            }
+        )
+        status["items"]["old-timeout"] = old_timeout
+        for ordinal in range(1, 6):
+            status["items"][f"planned-{ordinal}"] = {"state": "planned"}
         metrics = dict(item["governance_metrics"])
         metrics.update({"app_server_start_count": 1, "thread_count": 0,
                         "turn_count": 0, "timeout_count": 0, "failure_count": 1,
@@ -3865,6 +3898,7 @@ class WechatDigestTests(unittest.TestCase):
             run_store=contact_store,
             seal_contact_governance_startup_transport_failure=lambda binding: budget.seal_governance_startup_transport_failure(startup_binding=binding),
         )
+        contact_service._load_active_capture_artifacts = lambda *_args: (None, None)
         semantic_calls, provider_calls, capture_calls = self.semantic.provider.calls, provider.calls, len(capture.calls)
         resolution = contact_service.seal_contact_governance_startup_transport_failure()
         self.assertEqual(resolution["contact_attempt_total"], 43)

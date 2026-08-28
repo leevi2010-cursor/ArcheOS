@@ -1402,6 +1402,12 @@ def _wechat_product_command(args: argparse.Namespace) -> int:
         and args.contact is not None
         and args.isolated_acceptance_dir is not None
     )
+    if args.seal_contact_governance_startup_transport_failure and not contact_seal:
+        print(
+            "error: 联系人 Governance 启动 transport 封存必须同时指定 "
+            "--contact 与 --isolated-acceptance-dir。"
+        )
+        return 2
     if maintenance_count and (
         args.contact is not None or args.isolated_acceptance_dir is not None
     ) and not contact_seal:

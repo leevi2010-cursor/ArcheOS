@@ -9937,10 +9937,32 @@ class WechatDigestService:
                 if not isinstance(item_id, str) or not isinstance(item, dict):
                     raise WechatDigestError("微信运行状态 items 损坏。")
                 receipt_value = item.get("governance_receipt")
-                if receipt_value is not None and _validated_governance_receipt(
-                    receipt_value
-                ).get("phase") == "started":
+                if receipt_value is None:
+                    if item.get("state") not in TERMINAL_ITEM_STATES | {"planned"}:
+                        raise WechatDigestError("Governance 启动封存存在未收敛 item。")
+                    continue
+                receipt_value = _validated_governance_receipt(receipt_value)
+                if receipt_value.get("phase") != "started":
+                    continue
+                if item.get("state") == "failed_closed":
+                    failure = item.get("governance_failure")
+                    if (
+                        isinstance(failure, dict)
+                        and failure.get("failure_category") == "turn_timeout"
+                    ):
+                        self._verify_governance_failed_closed_item(item)
+                        continue
+                    if (
+                        isinstance(failure, dict)
+                        and failure.get("failure_category") == "startup_transport"
+                    ):
+                        candidates.append((item_id, item))
+                        continue
+                    raise WechatDigestError("Governance 启动封存存在未知 failed_closed item。")
+                if item.get("state") == "represented":
                     candidates.append((item_id, item))
+                    continue
+                raise WechatDigestError("Governance 启动封存存在未收敛 item。")
             if len(candidates) != 1:
                 raise WechatDigestError("Governance 启动封存必须唯一绑定一个 started item。")
             item_id, item = candidates[0]

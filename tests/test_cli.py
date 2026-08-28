@@ -772,6 +772,28 @@ class CliTest(unittest.TestCase):
     @patch("archeos.cli.WechatDigestService")
     @patch("archeos.cli.WechatCliCaptureProvider")
     @patch("archeos.cli.require_workspace")
+    def test_startup_transport_seal_requires_contact_and_isolated_before_construction(
+        self,
+        require_workspace: Mock,
+        capture_provider: Mock,
+        digest_service: Mock,
+    ) -> None:
+        for arguments in (
+            ["wechat", "digest", "--seal-contact-governance-startup-transport-failure"],
+            [
+                "wechat", "digest", "--contact", "contact-1",
+                "--seal-contact-governance-startup-transport-failure",
+            ],
+        ):
+            with redirect_stdout(StringIO()):
+                self.assertEqual(main(arguments), 2)
+        require_workspace.assert_not_called()
+        capture_provider.assert_not_called()
+        digest_service.assert_not_called()
+
+    @patch("archeos.cli.WechatDigestService")
+    @patch("archeos.cli.WechatCliCaptureProvider")
+    @patch("archeos.cli.require_workspace")
     def test_wechat_digest_resolves_governance_startup_with_business_summary(
         self,
         require_workspace: Mock,
