@@ -700,13 +700,35 @@ class ContactAcceptancePackTests(unittest.TestCase):
             self._revision(2, concern="项目甲", statement="确认项目甲报价"),
         )
         with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            run = root / "runs" / "run_test"
+            run.mkdir(parents=True)
+            (root / "active.json").write_text('{"active_run_id":"run_test"}')
+            (run / "plan.json").write_text(
+                json.dumps(
+                    {
+                        "capture_fingerprint": "sha256:test-capture",
+                        "upper_bound": {"timestamp": 1, "message_id": "1"},
+                        "conversations": [
+                            {"conversation_key": _binding().conversation_key}
+                        ],
+                    }
+                )
+            )
+            (run / "run-plan-receipt.json").write_text('{"plan":"test"}')
+            budget = ContactProviderBudget(
+                root / "synthesis",
+                binding=_binding(),
+                authority_ref=self.AUTHORITY_REF,
+                absolute_cap=1,
+            )
             interrupted_provider = self.SynthesisProvider()
 
             def interrupt() -> None:
                 raise RuntimeError("synthetic interruption")
 
             interrupted = ContactSynthesisStore(
-                Path(directory), segment_size=2, after_result_write=interrupt
+                root / "synthesis", segment_size=2, after_result_write=interrupt
             )
             with self.assertRaisesRegex(RuntimeError, "synthetic interruption"):
                 interrupted.synthesize(
@@ -714,22 +736,38 @@ class ContactAcceptancePackTests(unittest.TestCase):
                     binding=_binding(),
                     provider=interrupted_provider,
                     authority_ref=self.AUTHORITY_REF,
-                    absolute_cap=50,
+                    absolute_cap=1,
+                    before_provider_call=lambda request: budget.reserve(
+                        "contact_synthesis", request
+                    ),
+                    reconcile_provider_result=lambda request: budget.reconcile_result(
+                        "contact_synthesis", request
+                    ),
                 )
             self.assertEqual(interrupted_provider.provider_calls, 1)
             recovery_provider = self.SynthesisProvider()
             recovered = ContactSynthesisStore(
-                Path(directory), segment_size=2
+                root / "synthesis", segment_size=2
             ).synthesize(
                 revisions,
                 binding=_binding(name="新名称"),
                 provider=recovery_provider,
                 authority_ref=self.AUTHORITY_REF,
-                absolute_cap=50,
+                absolute_cap=1,
+                before_provider_call=lambda request: budget.reserve(
+                    "contact_synthesis", request
+                ),
+                reconcile_provider_result=lambda request: budget.reconcile_result(
+                    "contact_synthesis", request
+                ),
             )
             self.assertEqual(recovered.provider_calls, 0)
             self.assertEqual(recovered.resumed_segments, 1)
             self.assertEqual(len(recovered.result["events"]), 1)
+            usage = json.loads(
+                (root / "synthesis" / "unified-provider-usage.json").read_text()
+            )
+            self.assertEqual([item["state"] for item in usage["attempts"]], ["result"])
 
     def test_reserved_attempt_can_start_once_and_reports_unified_budget(self) -> None:
         revisions = (self._revision(1, concern="项目甲", statement="已询价"),)

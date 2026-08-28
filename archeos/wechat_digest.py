@@ -4511,6 +4511,8 @@ class WechatDigestService:
         semantic_batch_size: int = DEFAULT_EXTERNAL_AGENT_BATCH_SIZE,
         semantic_parallelism: int = 2,
         before_governance_provider_call: Callable[[], None] | None = None,
+        reconcile_governance_provider_result: Callable[[dict[str, object]], None]
+        | None = None,
         clock: Callable[[], str] = _utc_now,
     ) -> None:
         self.workspace = Path(workspace)
@@ -4544,6 +4546,9 @@ class WechatDigestService:
         )
         self._semantic_handoff: SemanticHandoffPort | None = None
         self._before_governance_provider_call = before_governance_provider_call
+        self._reconcile_governance_provider_result = (
+            reconcile_governance_provider_result
+        )
         self._governance_resume_state: dict[str, object] | None = None
         self._governance_migration_state: dict[str, object] | None = None
         self._governance_execution_lock = threading.Lock()
@@ -4578,6 +4583,13 @@ class WechatDigestService:
         self._completed_window_chain_cache: tuple[
             tuple[object, ...], tuple[SemanticCompletedWindowBinding, ...]
         ] | None = None
+
+    def reconcile_governance_provider_result(
+        self, request: dict[str, object]
+    ) -> None:
+        """Close an exact unified attempt only after strict receipt readback."""
+        if self._reconcile_governance_provider_result is not None:
+            self._reconcile_governance_provider_result(request)
 
     @staticmethod
     def _cursor_tuple(cursor: WechatCursor) -> tuple[int, str, str]:
@@ -13196,6 +13208,17 @@ class WechatDigestService:
                     "微信 Governance migration batch binding 漂移。"
                 )
             self._verify_governance_receipt_effects(receipt)
+            if receipt["phase"] in {"interpreted", "applying", "applied", "completed"}:
+                self.reconcile_governance_provider_result(
+                    {
+                        "run_id": run_id,
+                        "item_id": item_id,
+                        "atomic_information_fingerprint": atomic_fingerprint,
+                        "atomic_information_ids": list(
+                            receipt["batch_atomic_information_ids"]
+                        ),
+                    }
+                )
             if receipt["phase"] == "completed":
                 return bool(receipt["pending_human"]), tuple(
                     str(object_id) for object_id in receipt["context_object_ids"]
@@ -13228,24 +13251,24 @@ class WechatDigestService:
 
         provider_started = False
         provider_completion: Callable[[], None] | None = None
+        provider_request: dict[str, object] | None = None
         batch_persisted = resume_state is not None
         latest_batch_receipt = (
             None if existing_receipt is None else dict(existing_receipt)
         )
 
         def mark_provider_started(request: dict[str, object]) -> None:
-            nonlocal provider_started, provider_completion
+            nonlocal provider_started, provider_completion, provider_request
             if provider_started:
                 return
             if previous_provider_hook is not None:
-                completion = previous_provider_hook(
-                    {
-                        "run_id": run_id,
-                        "item_id": item_id,
-                        "atomic_information_fingerprint": atomic_fingerprint,
-                        **request,
-                    }
-                )
+                provider_request = {
+                    "run_id": run_id,
+                    "item_id": item_id,
+                    "atomic_information_fingerprint": atomic_fingerprint,
+                    **request,
+                }
+                completion = previous_provider_hook(provider_request)
                 if hasattr(completion, "mark_started"):
                     completion.mark_started()
                 if callable(completion):
@@ -13347,9 +13370,20 @@ class WechatDigestService:
                 governance_receipt=latest_batch_receipt,
             )
             batch_persisted = True
-            if provider_completion is not None:
+            readback_item = self._item(
+                self.run_store.status(run_id)["items"], item_id
+            )
+            readback_receipt = _validated_governance_receipt(
+                readback_item.get("governance_receipt")
+            )
+            if readback_receipt != latest_batch_receipt:
+                raise WechatDigestError("微信 Governance interpretation receipt 写入后无法读回。")
+            self._verify_governance_receipt_effects(readback_receipt)
+            if provider_request is not None:
+                self.reconcile_governance_provider_result(provider_request)
+            elif provider_completion is not None:
                 provider_completion()
-                provider_completion = None
+            provider_completion = None
 
         def persist_application_intent(index: int) -> None:
             nonlocal latest_batch_receipt

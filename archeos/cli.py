@@ -1683,6 +1683,11 @@ def _wechat_product_command(args: argparse.Namespace) -> int:
                 if contact_binding is None
                 else lambda request: get_contact_provider_budget().reserve("governance", request)
             ),
+            reconcile_governance_provider_result=(
+                None
+                if contact_binding is None
+                else lambda request: get_contact_provider_budget().reconcile_result("governance", request)
+            ),
         )
         if args.prepare_next_semantic:
             prepared = service.prepare_next_semantic(batch_size=args.batch_size)
@@ -2151,6 +2156,9 @@ def _wechat_product_command(args: argparse.Namespace) -> int:
                 absolute_cap=int(contact_absolute_cap),
                 resume_provider_calls=result.resume_provider_calls,
                 before_provider_call=lambda request: get_contact_provider_budget().reserve(
+                    "contact_synthesis", request
+                ),
+                reconcile_provider_result=lambda request: get_contact_provider_budget().reconcile_result(
                     "contact_synthesis", request
                 ),
             )

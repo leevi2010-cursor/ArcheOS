@@ -335,6 +335,7 @@ def build_contact_acceptance_pack(
     synthesis_segment_size: int = 100,
     resume_provider_calls: int = 0,
     before_provider_call: Callable[[], None] | None = None,
+    reconcile_provider_result: Callable[[dict[str, object]], None] | None = None,
 ) -> tuple[Path, Path]:
     """Build one contact View while excluding a concurrent contact digest."""
 
@@ -351,6 +352,7 @@ def build_contact_acceptance_pack(
             absolute_cap=absolute_cap,
             resume_provider_calls=resume_provider_calls,
             before_provider_call=before_provider_call,
+            reconcile_provider_result=reconcile_provider_result,
         )
 
 
@@ -366,6 +368,7 @@ def _build_contact_acceptance_pack_unlocked(
     absolute_cap: int,
     resume_provider_calls: int,
     before_provider_call: Callable[[], None] | None,
+    reconcile_provider_result: Callable[[dict[str, object]], None] | None,
 ) -> tuple[Path, Path]:
     """Project one durable contact-level synthesis into a private business View."""
 
@@ -528,6 +531,7 @@ def _build_contact_acceptance_pack_unlocked(
         governance_provider_calls=governance_provider_calls,
         resume_provider_calls=resume_provider_calls,
         before_provider_call=before_provider_call,
+        reconcile_provider_result=reconcile_provider_result,
     )
     synthesis = synthesis_outcome.result
 
