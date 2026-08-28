@@ -103,7 +103,7 @@ class ContactProviderBudget:
             run_id = active["active_run_id"]
             plan = json.loads((contact_root / "runs" / run_id / "plan.json").read_text())
             receipt = json.loads((contact_root / "runs" / run_id / "run-plan-receipt.json").read_text())
-        except (OSError, KeyError, TypeError, json.JSONDecodeError) as exc:
+        except (OSError, KeyError, TypeError, json.JSONDecodeError):
             return {
                 "contact_identity": self.contact_identity,
                 "workspace_fingerprint": _fingerprint(str(contact_root.resolve())),

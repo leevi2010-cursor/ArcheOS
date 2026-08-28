@@ -919,6 +919,18 @@ class ContactProviderBudgetTests(unittest.TestCase):
             )
             self.assertEqual(usage["absolute_cap"], 2)
 
+    def test_started_budget_attempt_is_unknown_and_never_retried(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            budget = ContactProviderBudget(
+                Path(directory) / "synthesis",
+                binding=_binding(),
+                authority_ref=self.AUTHORITY_REF,
+                absolute_cap=2,
+            )
+            budget.before_call("semantic")
+            with self.assertRaisesRegex(WechatDigestError, "结果未知"):
+                budget.before_call("governance")
+
 
 class ContactResolutionTests(unittest.TestCase):
     def test_exact_name_or_technical_key_must_resolve_uniquely(self) -> None:
