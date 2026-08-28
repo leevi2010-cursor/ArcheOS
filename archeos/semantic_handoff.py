@@ -12577,6 +12577,20 @@ class _RecoveryAwareProvider:
             )
         recovered = loaded[self._ordinal - 1]
         if recovered is not None:
+            if self.before_provider_call is not None:
+                receipt = self.recovery.batch_contracts[self._ordinal - 1]["receipt"]
+                completion = self.before_provider_call(
+                    {
+                        "processing_run_id": self.recovery.semantic_run_id,
+                        "batch_ordinal": self._ordinal,
+                        "input_fingerprint": receipt["input_fingerprint"],
+                        "anchor_unit_ids": list(receipt["anchor_unit_ids"]),
+                    }
+                )
+                if hasattr(completion, "mark_started"):
+                    completion.mark_started()
+                if callable(completion):
+                    completion()
             result, record = recovered
             self.records.append(record)
             return result
