@@ -903,6 +903,7 @@ class ContactProviderBudgetTests(unittest.TestCase):
             },
             "capture_fingerprint": "sha256:test-capture",
             "upper_bound": {"timestamp": 1, "message_id": "1"},
+            "conversations": [{"conversation_key": _binding().conversation_key}],
         }
         (run / "plan.json").write_text(json.dumps(plan))
         (run / "run-plan-receipt.json").write_text(json.dumps({"plan": "test"}))

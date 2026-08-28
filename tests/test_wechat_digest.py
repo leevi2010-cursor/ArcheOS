@@ -26,6 +26,7 @@ from archeos.atomic_information import (
     JsonlAtomicInformationStore,
     ingest_processing_package,
 )
+from archeos.contact_provider_budget import ContactProviderBudget
 from archeos.digestion import (
     BusinessLanguageHumanJudgmentPort,
     CodexAtomicInformationInterpretationProvider,
@@ -80,6 +81,7 @@ from archeos.wechat_digest import (
     ExistingSemanticHandoff,
     WechatCapture,
     WechatCliCaptureProvider,
+    WechatContactBinding,
     WechatCursor,
     WechatDigestError,
     WechatDigestRunStore,
@@ -10624,6 +10626,64 @@ class WechatDigestTests(unittest.TestCase):
                 / "checkpoint.json"
             ).exists()
         )
+
+    def test_contact_isolated_real_handoff_uses_local_durable_authority(self) -> None:
+        """The real recovery handoff may start without a primary global authority."""
+        primary = Path(self.temporary.name) / "primary-workspace"
+        primary.mkdir()
+        sentinel = primary / "state.json"
+        sentinel.write_text('{"unchanged":true}\n', encoding="utf-8")
+        before = sentinel.read_bytes()
+        self.workspace = self.workspace.resolve()
+        self.workspace.chmod(0o700)
+        for directory in (
+            self.workspace,
+            self.workspace / "02_processing",
+            self.workspace / "02_processing" / "semantic_handoff_runs",
+        ):
+            directory.mkdir(parents=True, exist_ok=True)
+            os.chmod(directory, 0o700)
+        captured = message(1)
+        binding = WechatContactBinding(
+            captured.conversation_key,
+            captured.provider_conversation_id,
+            captured.conversation_label,
+            captured.is_group,
+        )
+        root = self.workspace / "02_processing" / "wechat_digest" / "contacts" / binding.conversation_key
+        run_store = WechatDigestRunStore(root)
+        runner = SuccessfulV34Runner()
+        semantic = RunnerBackedExistingSemanticHandoff(workspace=self.workspace, runner=runner)
+        budget: ContactProviderBudget | None = None
+
+        def reserve_semantic():
+            nonlocal budget
+            if budget is None:
+                budget = ContactProviderBudget(
+                    root / "synthesis", binding=binding,
+                    authority_ref="https://github.com/leevi2010-cursor/ArcheOS/issues/206#issuecomment-1",
+                    absolute_cap=1,
+                )
+            return budget.before_call("semantic")
+
+        semantic._before_provider_call = reserve_semantic
+        service = WechatDigestService(
+            workspace=self.workspace,
+            capture_provider=SyntheticCaptureProvider([captured]),
+            semantic_handoff_factory=lambda: semantic,
+            interpretation_provider=NoStructuralChangeProvider(),
+            run_store=run_store,
+            semantic_batch_size=50,
+            semantic_parallelism=1,
+        )
+        with patch("archeos.wechat_digest._require_openai_codex_sdk"):
+            result = service.run(all_history=True)
+        self.assertTrue(result.checkpoint_published)
+        self.assertEqual(len(runner.calls), 1)
+        self.assertEqual(sentinel.read_bytes(), before)
+        self.assertFalse((semantic.service.audit_root / "semantic-global-authority.json").exists())
+        usage = json.loads((root / "synthesis" / "unified-provider-usage.json").read_text())
+        self.assertEqual([item["state"] for item in usage["attempts"]], ["result"])
 
 
 class WechatCaptureHelperTests(unittest.TestCase):

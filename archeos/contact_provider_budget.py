@@ -102,7 +102,16 @@ class ContactProviderBudget:
             if not isinstance(plan, dict) or not isinstance(receipt, dict):
                 raise TypeError
             capture, upper = plan.get("capture_fingerprint"), plan.get("upper_bound")
-            if not isinstance(capture, str) or upper is None or plan.get("contact_binding") != self.contact_identity:
+            conversations = plan.get("conversations")
+            if (
+                not isinstance(capture, str)
+                or upper is None
+                or not isinstance(conversations, list)
+                or len(conversations) != 1
+                or not isinstance(conversations[0], dict)
+                or conversations[0].get("conversation_key")
+                != self.contact_identity["conversation_key"]
+            ):
                 raise ValueError
         except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
             raise WechatDigestError("联系人 Provider scope 无法绑定当前 frozen run。") from exc
