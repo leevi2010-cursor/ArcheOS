@@ -88,6 +88,43 @@ class ContactProviderBudget:
             absolute_cap=absolute_cap,
         )
 
+    def _scope(self) -> dict[str, object]:
+        """Bind the ledger to one contact run without opening captured bodies."""
+        contact_root = self.root.parent
+        try:
+            active = json.loads((contact_root / "active.json").read_text())
+            run_id = active["active_run_id"]
+            plan = json.loads((contact_root / "runs" / run_id / "plan.json").read_text())
+            receipt = json.loads((contact_root / "runs" / run_id / "run-plan-receipt.json").read_text())
+        except (OSError, KeyError, TypeError, json.JSONDecodeError) as exc:
+            return {
+                "contact_identity": self.contact_identity,
+                "workspace_fingerprint": _fingerprint(str(contact_root.resolve())),
+                "run_id": None,
+                "plan_fingerprint": None,
+                "plan_receipt_fingerprint": None,
+                "capture_fingerprint": None,
+                "frozen_upper_bound": None,
+                "authority_ref": self.authority_ref,
+                "absolute_cap": self.absolute_cap,
+                "contact_binding": None,
+            }
+        if not isinstance(run_id, str):
+            raise WechatDigestError("联系人 Provider scope 无法绑定当前 frozen run。")
+        identity = plan.get("contact_binding")
+        return {
+            "contact_identity": self.contact_identity,
+            "workspace_fingerprint": _fingerprint(str(contact_root.resolve())),
+            "run_id": run_id,
+            "plan_fingerprint": _fingerprint(plan),
+            "plan_receipt_fingerprint": _fingerprint(receipt),
+            "capture_fingerprint": plan.get("capture_fingerprint"),
+            "frozen_upper_bound": plan.get("upper_bound"),
+            "authority_ref": self.authority_ref,
+            "absolute_cap": self.absolute_cap,
+            "contact_binding": identity,
+        }
+
     def before_call(self, category: str):
         if category not in {"semantic", "governance", "contact_synthesis"}:
             raise WechatDigestError("联系人 Provider 调用类别无效。")
@@ -108,7 +145,7 @@ class ContactProviderBudget:
                         current.get("schema_version") != _SCHEMA
                         or current.get("authority_ref") != self.authority_ref
                         or current.get("absolute_cap") != self.absolute_cap
-                        or current.get("contact_identity") != self.contact_identity
+                        or current.get("scope") != self._scope()
                         or not isinstance(attempts, list)
                         or any(
                             not isinstance(item, dict)
@@ -136,7 +173,7 @@ class ContactProviderBudget:
                     "schema_version": _SCHEMA,
                     "authority_ref": self.authority_ref,
                     "absolute_cap": self.absolute_cap,
-                    "contact_identity": self.contact_identity,
+                    "scope": self._scope(),
                     "attempts": [
                         *attempts,
                         {
