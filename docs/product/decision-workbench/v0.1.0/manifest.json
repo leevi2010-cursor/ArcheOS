@@ -1,0 +1,65 @@
+{
+  "artifact_set_id": "archeos-decision-workbench-v0.1.0",
+  "version": "0.1.0",
+  "status": "in_review",
+  "parent_project": "ArcheOS",
+  "issue": 114,
+  "authority_base": {
+    "ref": "origin/main",
+    "commit": "3166a3252e82fc9ffac6639ff37ff95e6d972fb3"
+  },
+  "artifacts": [
+    {
+      "id": "archeos-decision-workbench-product-brief",
+      "path": "docs/product/decision-workbench/v0.1.0/PRODUCT_BRIEF.md",
+      "version": "0.1.0",
+      "status": "approved",
+      "sha256": "48ee181b4c2c2dc14d1b89578714b71176d93a96927ada41053110f44fb0ffea"
+    },
+    {
+      "id": "archeos-decision-workbench-prd",
+      "path": "docs/product/decision-workbench/v0.1.0/PRD.md",
+      "version": "0.1.0",
+      "status": "approved",
+      "sha256": "89e6c0f17a6ac31c89329eb31ff7956fa06988e36c01f3b7f91d7057f6b38b57",
+      "depends_on": [
+        "archeos-decision-workbench-product-brief@0.1.0"
+      ]
+    },
+    {
+      "id": "archeos-decision-workbench-frontend-architecture",
+      "path": "docs/product/decision-workbench/v0.1.0/FRONTEND_ARCHITECTURE.md",
+      "version": "0.1.0",
+      "status": "in_review",
+      "sha256": "ebb14544d78e9b342a93dfaa1d8cf1b730f30f6c75d1b7cad3037f47d54dedef",
+      "depends_on": [
+        "archeos-decision-workbench-prd@0.1.0"
+      ]
+    },
+    {
+      "id": "adr-006-react-human-view-mock-boundary",
+      "path": "docs/decisions/ADR-006-react-human-view-mock-boundary.md",
+      "version": "0.1.0",
+      "status": "in_review",
+      "sha256": "ec39559eceb6c3a995c92e35745d8336e3732404864770b943ecfc86efe12456",
+      "depends_on": [
+        "archeos-decision-workbench-frontend-architecture@0.1.0"
+      ]
+    },
+    {
+      "id": "development-roadmap-human-view-section",
+      "path": "docs/development/ROADMAP.md",
+      "version": "2026-08-19-issue-114",
+      "status": "in_review",
+      "section": "横向能力：Human View / Frontend",
+      "sha256": "105814cd91a31e72d2250b23159d9b1c9cb378c712f4a3cef3580e98e0691080",
+      "depends_on": [
+        "adr-006-react-human-view-mock-boundary@0.1.0"
+      ]
+    }
+  ],
+  "implementation_gate": {
+    "status": "blocked",
+    "reason": "Issue #114 must merge with independent Product, Architecture and Concept review before a frontend implementation Issue can become Ready."
+  }
+}
