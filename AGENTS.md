@@ -37,6 +37,18 @@ Agents must keep these layers separate. Processing a recording or document is no
 - 测试、CI 或外部任务等待使用确定性进程或一次 bounded wait；无状态变化时不得持续调用高智能模型轮询。只在完成、失败、边界变化或需要决策时唤醒 Agent。
 - `Draft PR Ready` 是默认阶段终点。Merge、真实数据验收、主存储写入、Provider activation、checkpoint 推进和下一个 Issue 都是独立阶段，除非当前 work order 逐项明确授权，否则不得自动串联。
 
+## Worktree lifecycle
+
+ArcheOS 手工工作树使用以下唯一目录与生命周期：
+
+1. 主仓库固定为 `/Users/leo/Projects/ArcheOS`，作为干净的 `main` 控制目录；Issue 开发不在主仓库中直接进行。
+2. 手工工作树统一创建在 `/Users/leo/Projects/ArcheOS-worktrees/issue-<number>-<slug>`，分支统一命名为 `codex/issue-<number>-<slug>`。
+3. 一项 Issue 对应一个分支、一个工作树和一个 PR；同一 PR 的审查修复继续使用原工作树，不另建平行工作树。
+4. 创建前从最新 `origin/main` 建立工作树，并核验目标目录不存在、分支未被其他工作树占用。
+5. PR 合并或任务明确取消后，只有在工作树干净、成果已合并或明确放弃、且没有需要保留的本地运行资料时，才使用 `git worktree remove <path>` 清理；随后执行 `git worktree prune` 并读回工作树列表。
+6. 不使用 `rm -rf` 或 `git worktree remove --force` 绕过清理检查。分支删除是独立动作，仅在合并或明确放弃且保留条件核验完成后执行。
+7. Codex 自动管理的 `~/.codex/worktrees` 不迁移到手工目录，由对应任务生命周期管理；清理前同样需要核验任务、PR、工作树状态和本地资料。
+
 ## Product-led planning authority
 
 ArcheOS development follows this planning chain:
